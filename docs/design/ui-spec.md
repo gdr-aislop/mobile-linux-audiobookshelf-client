@@ -82,19 +82,23 @@ Fractal) rather than copying Lissen's Material Design look.
 - `AdwNavigationPage` pushed from Home/Library.
 - Top: large cover art, title, author/narrator, duration, progress bar if partially listened.
 - Actions row: primary "Play"/"Resume" button, secondary download button.
-- **Download options (Lissen-style)**: the download button is a menu button (`GtkMenuButton` with
-  an `AdwPopoverMenu`), not a single-action toggle — tapping it opens a scope picker instead of
-  immediately downloading everything:
+- **Download options (Lissen-style)**: the download button opens an `AdwBottomSheet` titled
+  "Download book" (libadwaita's adaptive bottom-sheet widget, matching Lissen's own sheet) instead
+  of immediately downloading everything:
   - **Current chapter** — just the chapter currently playing/at the last playback position.
-  - **Next chapter** — the chapter immediately after the current one.
+  - **Next chapters** — an inline numeric stepper (`−` / count / `+`) on this row lets the user
+    pick exactly how many upcoming chapters to fetch, defaulting to 10 and clamped to the number
+    of chapters actually remaining after the current one. Tapping the row (outside the stepper)
+    starts the download for that many chapters; the other rows have no stepper and act immediately
+    on tap.
   - **Remaining chapters** — from the current position to the end of the book.
   - **Entire book** — all chapters, regardless of playback position.
+  - **Clear downloaded chapters** — a destructive row, separated from the four download options,
+    that removes whatever has been downloaded locally for this item.
 
-  Each option's row shows a subtitle with the concrete scope (chapter name/count and total
-  duration) so the user knows what they're committing to before tapping. Once a download starts,
-  the button itself reflects overall state for the item (idle download icon → in-progress spinner
-  or progress ring → checkmark once at least the current chapter is fully downloaded), mirroring
-  the badge already used on Library covers.
+  Once a download starts, the download button itself reflects overall state for the item (idle
+  download icon → in-progress spinner or progress ring → checkmark once at least the current
+  chapter is fully downloaded), mirroring the badge already used on Library covers.
 - `AdwExpanderRow` or plain text block for description (truncated with "more").
 - Chapter/episode list as `AdwActionRow`s, each showing chapter title + duration, tap to seek.
 - **Offline-availability marker**: each chapter row that has been downloaded shows a small
