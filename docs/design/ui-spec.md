@@ -58,20 +58,51 @@ Fractal) rather than copying Lissen's Material Design look.
 - Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (progress ring overlay
   on cover), "Recently added". Each cover is a tappable card pushing Item detail.
 - Empty/offline state: `AdwStatusPage` ("No library synced yet").
+- **Offline-mode toggle**: a `GtkToggleButton` in the header bar (leading side, opposite the
+  avatar), iconified with an airplane/cloud-off glyph and labeled "Offline". When active, an
+  `AdwBanner`-style strip appears below the header ("Showing downloaded items only") and every
+  shelf (Continue listening, Recently added) and the Libraries list filter down to items that are
+  downloaded fully or partially — the same downloaded-item definition used everywhere else in this
+  spec (see Item detail). This is state shared with the equivalent toggle on Library browse, not a
+  per-screen setting.
 
 ### Library browse
 - Header bar with `GtkSearchEntry` (revealed via search button) and a filter/sort `GtkMenuButton`.
 - Content: `GtkGridView` of cover art (grid mode) or `GtkListView` with `AdwActionRow`s (list mode,
   useful for podcast episode-style feeds); toggle between the two via header bar button.
 - Sticky section headers when sorted/grouped by author or series (`GtkListView` section headers).
+- **Offline-mode toggle**: same control and behavior as Home's, surfaced as a trailing filter chip
+  (`GtkToggleButton` styled like the existing sort/filter chips) alongside Author/Series/Genre.
+  When active, the grid filters to downloaded items only and a summary line reports the filtered
+  count (e.g. "Showing 6 of 214 — downloaded items only"); each covered item keeps the small
+  download badge already used to mark downloaded covers (see Item detail's download states). An
+  empty result shows `AdwStatusPage` ("No downloaded items").
 
 ### Item detail
 - `AdwNavigationPage` pushed from Home/Library.
 - Top: large cover art, title, author/narrator, duration, progress bar if partially listened.
-- Actions row: primary "Play"/"Resume" button, secondary download button (`GtkButton` with a
-  download/checkmark/spinner icon reflecting download state).
+- Actions row: primary "Play"/"Resume" button, secondary download button.
+- **Download options (Lissen-style)**: the download button is a menu button (`GtkMenuButton` with
+  an `AdwPopoverMenu`), not a single-action toggle — tapping it opens a scope picker instead of
+  immediately downloading everything:
+  - **Current chapter** — just the chapter currently playing/at the last playback position.
+  - **Next chapter** — the chapter immediately after the current one.
+  - **Remaining chapters** — from the current position to the end of the book.
+  - **Entire book** — all chapters, regardless of playback position.
+
+  Each option's row shows a subtitle with the concrete scope (chapter name/count and total
+  duration) so the user knows what they're committing to before tapping. Once a download starts,
+  the button itself reflects overall state for the item (idle download icon → in-progress spinner
+  or progress ring → checkmark once at least the current chapter is fully downloaded), mirroring
+  the badge already used on Library covers.
 - `AdwExpanderRow` or plain text block for description (truncated with "more").
 - Chapter/episode list as `AdwActionRow`s, each showing chapter title + duration, tap to seek.
+- **Offline-availability marker**: each chapter row that has been downloaded shows a small
+  filled checkmark-in-circle glyph trailing the duration, distinct from the "currently playing"
+  bars icon already used on the active chapter. Chapters not yet downloaded show no glyph at all —
+  presence of the glyph is the signal, so the list isn't cluttered with a "not downloaded" icon on
+  every other row. A one-line legend ("● downloaded") sits in the "Chapters" section header so the
+  glyph's meaning doesn't need to be inferred.
 
 ### Player — mini
 - Fixed bar: 40–48px cover thumbnail, title + author (single line, ellipsized), play/pause icon
@@ -92,9 +123,18 @@ Fractal) rather than copying Lissen's Material Design look.
   an `AdwActionRow` per downloaded item with a remove button. Empty state via `AdwStatusPage`.
 
 ### Settings
-- `AdwPreferencesPage` with groups: **Account** (server URL, logged-in user, sign out),
-  **Playback** (default speed, skip-forward/back intervals, sleep-timer default),
-  **Appearance** (follow system / light / dark), **About** (version, license, links).
+- `AdwPreferencesPage` with groups: **Account**, **Servers**, **Playback** (default speed,
+  skip-forward/back intervals, sleep-timer default), **Appearance** (follow system / light /
+  dark), **About** (version, license, links).
+- **Account** group: one row showing the *active* server/account (username, server host,
+  "active" subtitle) with a chevron, and one "Switch or manage servers" row that opens the
+  Servers list below. There is deliberately no top-level "Sign Out" action here — with multiple
+  servers supported, "sign out" is ambiguous about *which* account, so it isn't a global control.
+- **Servers** group: one `AdwActionRow` per configured server (host as title, logged-in username
+  and "active" marker as subtitle), each with a trailing menu button (`⋯` / `GtkMenuButton`)
+  opening a small popover with **Switch to this server**, **Sign Out**, and **Remove Server**
+  (destructive style). This is where sign-out actually lives — scoped to one server/account at a
+  time — plus an "Add Server" row at the end to register another Audiobookshelf instance.
 
 ## 4. Adaptive/responsive behavior summary
 
@@ -115,4 +155,6 @@ Fractal) rather than copying Lissen's Material Design look.
   errors (e.g. "Failed to sync progress — will retry").
 - **Offline-first playback:** downloaded items remain playable and browsable without a server
   connection; the app clearly marks which items are available offline (small download badge on
-  covers/rows).
+  covers/rows, and per-chapter offline markers in Item detail). The Home/Library offline-mode
+  toggle (see those sections) lets a user deliberately narrow either screen to only such items
+  even while online, e.g. before a trip.
