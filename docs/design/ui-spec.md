@@ -21,6 +21,7 @@ Fractal) rather than copying Lissen's Material Design look.
 | **Player (full)** | Now-playing page: large cover, scrubber, chapter list, speed, sleep timer, skip ±. |
 | **Downloads** | Manage items downloaded for offline playback; storage usage; remove. |
 | **Settings** | Account/server management, playback defaults (speed, skip interval), appearance, about. |
+| **Connection** | Per-server advanced connection settings: headers, TLS, client cert, local address, user agent. |
 
 ## 2. Navigation model
 
@@ -150,7 +151,32 @@ Fractal) rather than copying Lissen's Material Design look.
   and "active" marker as subtitle), each with a trailing menu button (`⋯` / `GtkMenuButton`)
   opening a small popover with **Switch to this server**, **Sign Out**, and **Remove Server**
   (destructive style). This is where sign-out actually lives — scoped to one server/account at a
-  time — plus an "Add Server" row at the end to register another Audiobookshelf instance.
+  time — plus an "Add Server" row at the end to register another Audiobookshelf instance. Tapping
+  a server row's body (as opposed to its `⋯` menu) pushes that server's **Connection** page.
+
+### Connection
+- `AdwNavigationPage` pushed from a server row in Settings' Servers group; one instance per
+  configured server, covering the advanced connection settings a self-hosted Audiobookshelf setup
+  commonly needs (custom reverse proxies, self-signed certs, LAN-only servers).
+- **Server connection** group: a single `AdwActionRow` showing the server's full URL as its
+  subtitle (monospace, since it's a literal value being confirmed rather than a label) with a
+  trailing info-button opening a popover/tooltip explaining what this connection is used for.
+- **Advanced** group:
+  - **Custom Headers** — `AdwActionRow`, chevron, pushes a page for adding request headers sent on
+    every server call (e.g. for auth proxies in front of Audiobookshelf).
+  - **Disable SSL verification** — `AdwSwitchRow`; off by default, since disabling verification is
+    a deliberate opt-in for servers with self-signed or otherwise unverifiable certificates.
+  - **Client certificate** — `AdwActionRow`, chevron, pushes a page to select/import a client
+    certificate for mTLS.
+  - **Local network server address** — `AdwActionRow`, chevron, pushes a page to set an alternate
+    address used automatically when on the server's home Wi-Fi (avoiding a round trip through the
+    public internet for LAN clients).
+  - **Change User Agent** — `AdwActionRow`, chevron, pushes a page to override the `User-Agent`
+    header the app sends (useful when a server or proxy filters by it).
+- A destructive **"Disconnect from the Server"** plain-text action (styled like `AdwButton`'s
+  `destructive-action` but as a flat/link-style button, not a filled button, since it's an
+  infrequent, page-level action rather than a primary one) sits below the Advanced group,
+  vertically separated rather than boxed in its own card.
 
 ## 4. Adaptive/responsive behavior summary
 
