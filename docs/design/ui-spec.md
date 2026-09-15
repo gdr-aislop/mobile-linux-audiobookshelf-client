@@ -67,16 +67,28 @@ Fractal) rather than copying Lissen's Material Design look.
   per-screen setting.
 
 ### Library browse
-- Header bar with `GtkSearchEntry` (revealed via search button) and a filter/sort `GtkMenuButton`.
+- Header bar with `GtkSearchEntry` (revealed via search button), a filter/sort `GtkMenuButton`, and
+  a trailing **view-options button** (three-line "adjustments" icon) that opens the view options
+  sheet described below.
 - Content: `GtkGridView` of cover art (grid mode) or `GtkListView` with `AdwActionRow`s (list mode,
   useful for podcast episode-style feeds); toggle between the two via header bar button.
 - Sticky section headers when sorted/grouped by author or series (`GtkListView` section headers).
-- **Offline-mode toggle**: same control and behavior as Home's, surfaced as a trailing filter chip
-  (`GtkToggleButton` styled like the existing sort/filter chips) alongside Author/Series/Genre.
-  When active, the grid filters to downloaded items only and a summary line reports the filtered
-  count (e.g. "Showing 6 of 214 — downloaded items only"); each covered item keeps the small
-  download badge already used to mark downloaded covers (see Item detail's download states). An
-  empty result shows `AdwStatusPage` ("No downloaded items").
+- Category chips (All/Author/Series/Genre) stay in a scrollable row below the header for quick
+  filtering, unchanged.
+- **View options sheet**: an `AdwBottomSheet` (grip handle, no title needed — the rows are
+  self-explanatory) with:
+  - **Downloaded only** — `AdwSwitchRow`. When on, the grid filters to items downloaded fully or
+    partially, matching Home's offline-mode behavior (see below) but scoped to this library; an
+    empty result shows `AdwStatusPage` ("No downloaded items").
+  - **Hide finished** — `AdwSwitchRow`, filters out fully-listened items.
+  - **Grouping** — `AdwComboRow` (e.g. "By Series", "By Author", "None").
+  - **Sort by** — `AdwComboRow` (e.g. "Date of creation", "Title", "Author", "Duration").
+  - **Application settings** — plain `AdwActionRow` with a chevron, navigating to the Settings tab;
+    included here because it's where Lissen places it and it's a reasonable one-tap shortcut from
+    the library a user spends most of their time in.
+  All rows use native libadwaita controls (real `GtkSwitch`-style pill toggles, not a
+  platform-specific switch skin) and the sheet itself is the same `AdwBottomSheet` pattern used for
+  Item detail's download sheet, so the two don't feel like different UI systems.
 
 ### Item detail
 - `AdwNavigationPage` pushed from Home/Library.
