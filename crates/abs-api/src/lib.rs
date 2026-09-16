@@ -9,6 +9,9 @@
 
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
+mod ext;
+pub use ext::{LoginError, LoginResult};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25,7 +28,7 @@ mod tests {
     /// a representative handful across different areas of the spec's actual coverage (libraries,
     /// authors) rather than all 46, so this test stays readable while still catching a broken or
     /// incomplete codegen run. This only needs to type-check, never run.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::let_underscore_future)]
     fn representative_operations_type_check(client: &Client) {
         let _ = client.get_libraries();
         let _ = client.get_library_by_id(&"id".parse().unwrap(), None, None);

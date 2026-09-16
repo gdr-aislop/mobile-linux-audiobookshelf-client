@@ -1,13 +1,12 @@
 //! Multi-server/account management: adding a server and logging in, switching the active
 //! account, and signing out. Thin orchestration over `abs-storage::repo::{servers, accounts}`
-//! and `auth::login` — the interesting invariants (exactly one active account, cascade cleanup)
-//! already live in the storage layer's tests; this module's tests focus on the
+//! and `abs_api::Client::login` — the interesting invariants (exactly one active account,
+//! cascade cleanup) already live in the storage layer's tests; this module's tests focus on the
 //! login-then-persist flow and its failure modes.
 
 use abs_storage::repo::{accounts, servers};
 use sqlx::SqlitePool;
 
-use crate::auth;
 use crate::error::Result;
 
 pub struct AddedAccount {
@@ -20,19 +19,19 @@ pub struct AddedAccount {
 /// as an orphaned, credential-less entry.
 pub async fn add_server_and_login(
     pool: &SqlitePool,
-    http: &reqwest::Client,
     url: &str,
     username: &str,
     password: &str,
 ) -> Result<AddedAccount> {
     let server_id = servers::add(pool, url).await?;
 
-    let login_result = match auth::login(http, url, username, password).await {
+    let client = abs_api::Client::new(url);
+    let login_result = match client.login(username, password).await {
         Ok(result) => result,
         Err(err) => {
             // Don't leave a credential-less server behind after a failed login.
             let _ = servers::remove(pool, &server_id).await;
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -65,6 +64,7 @@ pub async fn remove_server(pool: &SqlitePool, server_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CoreError;
     use abs_storage::connect_and_migrate;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -93,8 +93,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let http = reqwest::Client::new();
-        let added = add_server_and_login(&pool, &http, &server.uri(), "jane", "hunter2")
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2")
             .await
             .unwrap();
 
@@ -112,10 +111,9 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
 
         let pool = pool().await;
-        let http = reqwest::Client::new();
-        let result = add_server_and_login(&pool, &http, &server.uri(), "jane", "wrong").await;
+        let result = add_server_and_login(&pool, &server.uri(), "jane", "wrong").await;
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::Login(_))));
         assert!(servers::list(&pool).await.unwrap().is_empty(), "no server row should remain");
     }
 
@@ -125,8 +123,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let http = reqwest::Client::new();
-        let added = add_server_and_login(&pool, &http, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
 
         switch_active_account(&pool, &added.account_id).await.unwrap();
         assert!(accounts::get(&pool, &added.account_id).await.unwrap().is_active);
@@ -138,8 +135,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let http = reqwest::Client::new();
-        let added = add_server_and_login(&pool, &http, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
 
         sign_out(&pool, &added.account_id).await.unwrap();
 
@@ -153,8 +149,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let http = reqwest::Client::new();
-        let added = add_server_and_login(&pool, &http, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
 
         remove_server(&pool, &added.server_id).await.unwrap();
 

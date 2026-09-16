@@ -3,11 +3,8 @@ pub enum CoreError {
     #[error("storage error: {0}")]
     Storage(#[from] abs_storage::StorageError),
 
-    #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
-
-    #[error("authentication failed: {0}")]
-    AuthFailed(String),
+    #[error("login failed: {0}")]
+    Login(#[from] abs_api::LoginError),
 
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),

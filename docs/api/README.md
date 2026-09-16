@@ -122,17 +122,43 @@ a small, local exception, not a reason to abandon codegen for the other 45 opera
 
 ## Handling endpoints the spec doesn't cover
 
-`abs-core` needs item detail, playback progress, and login — none of which `abs-api` exposes,
-since they're missing from the vendored spec entirely (see the gaps note above). Rather than
-hand-maintaining a parallel spec fragment for them, `abs-core` calls these directly with a plain
-`reqwest::Client` (the same one `abs-api`'s `Client` wraps, so auth headers and base URL stay
-shared) against the real routes confirmed in the server source
-(`server/routers/ApiRouter.js`): `GET /api/items/:id`, `POST /api/items/:id/play`,
-`PATCH /api/items/:id/media`, `GET /api/me/progress`, and whatever `/login` turns out to be. These
-calls are untyped at the OpenAPI-codegen level — model their request/response shapes as plain
-`serde` structs in `abs-core` itself, next to the logic that uses them, rather than inventing a
-second generated-client layer for a handful of endpoints. If upstream ever documents them, they
-move into `abs-api` and the hand-written versions in `abs-core` are deleted.
+`abs-core` needs item detail, playback progress, and login — none of which the generated part of
+`abs-api` exposes, since they're missing from the vendored spec entirely (see the gaps note
+above). The first version of this handled it by having `abs-core` call these endpoints directly
+with its own `reqwest::Client` — that turned out to be a real abstraction leak (two independent
+ways to talk to the server, with base-URL/auth-header setup duplicated between them) and was
+corrected before it shipped.
+
+The actual pattern: `progenitor` generates `pub fn client(&self) -> &reqwest::Client` and `pub fn
+baseurl(&self) -> &String` accessors on `Client` specifically so a crate can extend it — confirmed
+by reading the generated code, not assumed. So gap endpoints are hand-written as a plain `impl
+Client` block in `crates/abs-api/src/ext.rs`, using those same accessors, sitting right alongside
+the generated methods:
+
+```rust
+// crates/abs-api/src/ext.rs
+impl Client {
+    pub async fn login(&self, username: &str, password: &str) -> Result<LoginResult, LoginError> {
+        let response = self.client()
+            .post(format!("{}/login", self.baseurl()))
+            .header("x-return-tokens", "true")
+            .json(&LoginRequest { username, password })
+            .send()
+            .await?;
+        // ...
+    }
+}
+```
+
+`lib.rs` re-exports whatever hand-written types these methods need (`pub use ext::{LoginResult,
+LoginError};`) alongside the generated `types` module. The result: `abs-core` (and everything
+above it) depends on exactly one client type — `abs_api::Client` — for every server call, whether
+a given method happens to be generated from the spec or hand-written for a gap; it never
+constructs a `reqwest::Client` itself. The same pattern covers the still-missing item-detail and
+progress endpoints (`GET /api/items/:id`, `POST /api/items/:id/play`, `PATCH /api/items/:id/media`,
+`GET /api/me/progress`, confirmed against `server/routers/ApiRouter.js`) whenever those are
+implemented. If upstream ever documents one of these in the OpenAPI spec, the generated method
+takes over and the hand-written one in `ext.rs` is deleted.
 
 ## Updating the client
 
