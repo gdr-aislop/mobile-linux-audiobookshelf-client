@@ -5,3 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+abs-api.workspace = true
+abs-storage.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true
