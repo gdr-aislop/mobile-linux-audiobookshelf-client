@@ -9,6 +9,8 @@
 //! to `adw::Banner` (same method names, deliberately) the day the app's minimum libadwaita moves
 //! to 1.3+.
 
+#[cfg(test)]
+use adw::glib;
 use adw::prelude::*;
 
 #[derive(Clone)]
@@ -53,6 +55,11 @@ impl ErrorBanner {
 
     pub fn set_title(&self, text: &str) {
         self.label.set_label(text);
+    }
+
+    #[cfg(test)]
+    pub fn title(&self) -> glib::GString {
+        self.label.label()
     }
 
     pub fn set_revealed(&self, revealed: bool) {

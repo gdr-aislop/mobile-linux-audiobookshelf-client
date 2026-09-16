@@ -211,6 +211,8 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
         move |_| {
             let is_password_mode = mode_password.is_active();
             banner.set_revealed(false);
+            username_row.remove_css_class("error");
+            password_row.remove_css_class("error");
 
             if !is_password_mode {
                 banner.set_title("Signing in with an API token isn't supported yet — use your username and password.");
@@ -232,6 +234,8 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
             let list = list.clone();
             let connect_button = connect_button.clone();
             let banner = banner.clone();
+            let username_row = username_row.clone();
+            let password_row = password_row.clone();
             let on_success = on_success.clone();
 
             glib::spawn_future_local(async move {
@@ -245,6 +249,14 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
                 match result {
                     Ok(added) => on_success(added),
                     Err(err) => {
+                        // Only an authentication failure implicates the username/password
+                        // fields — tinting them on a connectivity failure (unreachable host,
+                        // DNS, TLS) would misdirect the user into thinking their password is
+                        // wrong when the server itself couldn't be reached.
+                        if matches!(err, CoreError::Login(abs_api::LoginError::InvalidCredentials)) {
+                            username_row.add_css_class("error");
+                            password_row.add_css_class("error");
+                        }
                         banner.set_title(&error_message(&err));
                         banner.set_revealed(true);
                     }
@@ -271,13 +283,16 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
 
 /// Never clears the fields on failure — the user shouldn't have to retype everything after a
 /// typo. Message text is keyed off the error variant, per `docs/design/ui-spec.md`'s error state.
+/// The username/password field tint (see the Connect click handler) is keyed off the same
+/// `InvalidCredentials` variant this function branches on, but deliberately not applied for
+/// `Network`/other variants — a connectivity failure isn't a credentials problem.
 fn error_message(err: &CoreError) -> String {
     match err {
         CoreError::Login(abs_api::LoginError::InvalidCredentials) => {
             "Unable to sign in — check your username and password and try again.".to_string()
         }
         CoreError::Login(abs_api::LoginError::Network(_)) => {
-            "Couldn't reach that server — check the URL and try again.".to_string()
+            "Can't reach this server — check the URL and your connection.".to_string()
         }
         _ => "Something went wrong — please try again.".to_string(),
     }
@@ -393,27 +408,72 @@ mod tests {
                 hooks.banner.widget().reveals_child(),
                 "the error banner should now be visible"
             );
+            assert!(
+                hooks.username_row.has_css_class("error") && hooks.password_row.has_css_class("error"),
+                "a credentials failure should tint the username/password fields"
+            );
         }
     }
 
+    /// Covers both the disabled/toggling behavior and the connectivity-failure error state in one
+    /// `#[test]` fn: libtest gives every `#[test]` its own OS thread even under
+    /// `--test-threads=1`, and `gtk4::init()` can only succeed once per process/thread — running
+    /// two GTK-touching non-`#[ignore]`d tests as separate fns panics with "Failed to acquire
+    /// default main context" (the same class of bug already documented on the live-server test
+    /// above).
     #[test]
-    fn connect_button_starts_disabled_and_toggling_mode_swaps_visible_fields() {
+    fn connect_button_starts_disabled_toggling_mode_and_handles_connectivity_failure() {
         gtk4::init().expect("gtk4::init for this test");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
 
-        let pool = runtime.block_on(pool());
-        let screen = build(pool, |_| {});
-        let hooks = screen.test_hooks();
+        // Starts disabled; filling every required Password-mode field enables Connect.
+        {
+            let pool = runtime.block_on(pool());
+            let screen = build(pool, |_| {});
+            let hooks = screen.test_hooks();
 
-        assert!(!hooks.connect_button.is_sensitive(), "empty form should start disabled");
+            assert!(!hooks.connect_button.is_sensitive(), "empty form should start disabled");
 
-        hooks.url_row.set_text(DEMO_SERVER_URL);
-        hooks.username_row.set_text("demo");
-        hooks.password_row.set_text("demo");
-        assert!(
-            hooks.connect_button.is_sensitive(),
-            "filling every required Password-mode field should enable Connect"
-        );
+            hooks.url_row.set_text(DEMO_SERVER_URL);
+            hooks.username_row.set_text("demo");
+            hooks.password_row.set_text("demo");
+            assert!(
+                hooks.connect_button.is_sensitive(),
+                "filling every required Password-mode field should enable Connect"
+            );
+        }
+
+        // Connectivity failures (nothing listening at the given address) must show a different
+        // banner message than a credentials failure, and must NOT tint the username/password
+        // fields — see docs/design/ui-spec.md's Welcome/Server login error-state section. Uses a
+        // real TCP connection attempt to an address nothing listens on rather than wiremock, so
+        // this exercises abs_api::LoginError::Network for real; it's fast (immediate connection
+        // refused) and needs no external network, so it isn't #[ignore]d.
+        {
+            let pool = runtime.block_on(pool());
+            let screen = build(pool, |_| {});
+            let hooks = screen.test_hooks();
+
+            hooks.url_row.set_text("http://127.0.0.1:1");
+            hooks.username_row.set_text("demo");
+            hooks.password_row.set_text("demo");
+            hooks.connect_button.emit_clicked();
+
+            pump_until(
+                || hooks.banner.widget().reveals_child(),
+                Duration::from_secs(15),
+            );
+
+            assert!(hooks.banner.widget().reveals_child(), "the error banner should now be visible");
+            assert_eq!(
+                hooks.banner.title(),
+                "Can't reach this server — check the URL and your connection."
+            );
+            assert!(
+                !hooks.username_row.has_css_class("error") && !hooks.password_row.has_css_class("error"),
+                "a connectivity failure must not tint the username/password fields"
+            );
+        }
     }
 }
