@@ -209,6 +209,15 @@ pub struct ItemPlaybackInfo {
     pub audio_files: Vec<AudioFileRef>,
 }
 
+#[derive(Debug, Serialize)]
+struct UpdateProgressRequest {
+    #[serde(rename = "currentTime")]
+    current_time: f64,
+    duration: f64,
+    #[serde(rename = "isFinished")]
+    is_finished: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryItemsError {
     #[error("network error: {0}")]
@@ -300,6 +309,37 @@ impl Client {
         Ok(ItemPlaybackInfo { audio_files })
     }
 
+    /// Push local playback progress up to the server, so it shows up in the official apps and
+    /// survives a fresh install. Hand-written: `/api/me/*` has zero coverage in the vendored spec
+    /// (see `third_party/audiobookshelf-openapi/README.md`'s "Known gaps"). Confirmed live against
+    /// `https://audiobooks.dev/audiobookshelf`: `PATCH /api/me/progress/:libraryItemId` with a
+    /// JSON body of `{currentTime, duration, isFinished}` returns `200 OK` and the change shows up
+    /// in a subsequent `GET /api/me`'s `mediaProgress`; a nonexistent item id returns `404`. The
+    /// server computes its own `progress` fraction — passing one had no visible effect — so this
+    /// only sends the fields that actually matter.
+    pub async fn update_media_progress(
+        &self,
+        item_id: &str,
+        current_time_seconds: f64,
+        duration_seconds: f64,
+        is_finished: bool,
+    ) -> Result<(), LibraryItemsError> {
+        let response = self
+            .client()
+            .patch(format!("{}/api/me/progress/{item_id}", self.baseurl()))
+            .json(&UpdateProgressRequest { current_time: current_time_seconds, duration: duration_seconds, is_finished })
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!(
+                "PATCH /api/me/progress/{item_id} returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// Log in with a username and password, returning the tokens needed for subsequent
     /// authenticated requests. Not in the vendored spec at all (no auth endpoints are documented)
     /// — hand-written against the real route confirmed in the server source (`server/Auth.js`):
@@ -347,7 +387,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -484,6 +524,35 @@ mod tests {
         let audio_file = info.audio_files.first().expect("a real item should have at least one audio file");
         assert!(!audio_file.ino.is_empty());
         assert!(audio_file.duration_seconds > 0.0);
+    }
+
+    /// End-to-end against the real public demo server: logs in, updates progress for a real item,
+    /// then confirms via `GET /api/me` that it actually landed server-side — `PATCH
+    /// /api/me/progress/:id` returning `200 OK` isn't itself proof the server persisted anything.
+    /// `#[ignore]`d; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn update_media_progress_against_the_live_demo_server() {
+        const DEMO_SERVER_URL: &str = "https://audiobooks.dev/audiobookshelf";
+        let login = Client::new(DEMO_SERVER_URL).login("demo", "demo").await.unwrap();
+        let api = Client::with_bearer_token(DEMO_SERVER_URL, &login.access_token).unwrap();
+
+        let libraries = api.get_libraries().await.unwrap().into_inner().libraries;
+        let library_id = libraries[0].id.clone().expect("the demo server's first library should have an id");
+        let items = api.get_library_items_with_media(&library_id.to_string()).await.unwrap();
+        let item = items.first().expect("the demo server's first library should have at least one item");
+
+        api.update_media_progress(&item.id, 77.0, item.duration_seconds, false).await.unwrap();
+
+        let me: serde_json::Value =
+            api.client().get(format!("{DEMO_SERVER_URL}/api/me")).send().await.unwrap().json().await.unwrap();
+        let synced = me["mediaProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["libraryItemId"] == item.id)
+            .expect("the item just updated should appear in mediaProgress");
+        assert_eq!(synced["currentTime"].as_f64().unwrap(), 77.0);
     }
 
     #[tokio::test]
@@ -636,6 +705,38 @@ mod tests {
 
         let client = Client::new(&server.uri());
         let err = client.get_item_playback_info("item-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn update_media_progress_sends_the_expected_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/me/progress/item-1"))
+            .and(body_partial_json(serde_json::json!({
+                "currentTime": 42.5,
+                "duration": 200.0,
+                "isFinished": false,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        client.update_media_progress("item-1", 42.5, 200.0, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_media_progress_propagates_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let err = client.update_media_progress("item-1", 42.5, 200.0, false).await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
     }
 

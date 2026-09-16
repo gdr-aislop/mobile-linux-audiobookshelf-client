@@ -49,6 +49,8 @@ struct NowPlaying {
     item_id: String,
     server_id: String,
     account_id: String,
+    server_url: String,
+    access_token: String,
     title: String,
     author: Option<String>,
     duration_seconds: f64,
@@ -88,9 +90,10 @@ impl Inner {
         }
     }
 
-    /// Fire-and-forget: spawns the actual DB write rather than awaiting it, since every call site
-    /// is a synchronous GTK signal handler or the tick timer, neither of which can await. Captures
-    /// the position/ids up front rather than re-reading `self` from inside the spawned future.
+    /// Fire-and-forget: spawns the actual DB write (and, best-effort, the server sync) rather
+    /// than awaiting them, since every call site is a synchronous GTK signal handler or the tick
+    /// timer, neither of which can await. Captures the position/ids up front rather than
+    /// re-reading `self` from inside the spawned future.
     fn write_progress(&mut self, is_finished: bool) {
         let Some(now_playing) = &self.now_playing else { return };
         let position = self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -98,12 +101,24 @@ impl Inner {
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
         let item_id = now_playing.item_id.clone();
+        let server_url = now_playing.server_url.clone();
+        let access_token = now_playing.access_token.clone();
+        let duration_seconds = now_playing.duration_seconds;
         self.last_progress_write = Instant::now();
 
         glib::spawn_future_local(async move {
             if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, position, is_finished).await
             {
                 tracing::warn!(%err, "couldn't persist playback progress");
+            }
+            // Best-effort: the local write above is this client's own source of truth (Home's
+            // "Continue Listening" reads it), so a network hiccup syncing it up to the server
+            // must not be treated as a playback error.
+            if let Err(err) =
+                abs_core::streaming::sync_progress_to_server(&server_url, &access_token, &item_id, position, duration_seconds, is_finished)
+                    .await
+            {
+                tracing::warn!(%err, "couldn't sync playback progress to the server");
             }
         });
     }
@@ -201,14 +216,33 @@ impl PlayerController {
                 )
             });
 
-            let mut inner = inner_rc.borrow_mut();
-            if let Err(err) = inner.backend.load(&target.url) {
-                tracing::warn!(%err, "couldn't load the audio stream");
-                return;
+            {
+                let mut inner = inner_rc.borrow_mut();
+                if let Err(err) = inner.backend.load(&target.url) {
+                    tracing::warn!(%err, "couldn't load the audio stream");
+                    return;
+                }
+                // A seek needs the pipeline to have actually *reached* PAUSED, not just been
+                // asked to — pausing is itself an async state change, and for a network-streamed
+                // source (connecting, buffering) it can take a real moment. Requesting the seek
+                // before that lands is not an error `AudioBackend` reports; it silently no-ops,
+                // which used to mean "resume mid-book" quietly resumed from 0 instead.
+                let _ = inner.backend.pause();
             }
-            // A seek needs the pipeline at least PAUSED — pausing first is also what lets us
-            // resume mid-book instead of always starting a fresh load at position 0.
-            let _ = inner.backend.pause();
+            if resume_at.is_some() {
+                // `duration()` can come back `Some` from container metadata alone, before the
+                // pipeline has actually finished prerolling into `PAUSED` — which is what seeking
+                // actually requires. `position()` only starts returning a value once preroll has
+                // genuinely completed, so it's the more accurate "ready to seek" signal.
+                for _ in 0..50 {
+                    if inner_rc.borrow().backend.position().is_some() {
+                        break;
+                    }
+                    glib::timeout_future(Duration::from_millis(100)).await;
+                }
+            }
+
+            let mut inner = inner_rc.borrow_mut();
             if let Some(resume_at) = resume_at {
                 let _ = inner.backend.seek(Duration::from_secs_f64(resume_at));
             }
@@ -218,6 +252,8 @@ impl PlayerController {
                 item_id: item.item_id,
                 server_id: server.id,
                 account_id: account.id,
+                server_url: server.url,
+                access_token: account.token,
                 title: item.title,
                 author: item.author,
                 duration_seconds: target.duration_seconds,
@@ -448,7 +484,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::test_support::{pool, pump_until};
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     /// A real, valid WAV file's bytes — served over HTTP by wiremock so `PlayerController::start`
     /// exercises the actual network fetch (via GStreamer's own HTTP source), not a `file://` URI.
@@ -475,6 +511,32 @@ pub(crate) mod tests {
         Box::new(abs_player::GstBackend::new_with_sink("fakesink").expect("build a playbin with a fake sink"))
     }
 
+    /// Responds to a `Range: bytes=START-[END]` request with `206 Partial Content` and the
+    /// matching slice, like the real Audiobookshelf server does (confirmed live: its file
+    /// endpoint sends `accept-ranges: bytes`) — GStreamer's `souphttpsrc` issues a byte-range
+    /// request for every seek, including the one `PlayerController::start` performs to resume
+    /// mid-book, so a mock that ignores `Range` and always replies with the full body from byte 0
+    /// would make every resume-from-progress test pass or fail for the wrong reason.
+    fn ranged_response(body: Vec<u8>) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync {
+        move |req: &Request| {
+            let Some(range) = req.headers.get("Range").and_then(|v| v.to_str().ok()) else {
+                return ResponseTemplate::new(200).insert_header("Accept-Ranges", "bytes").set_body_bytes(body.clone());
+            };
+            let Some(spec) = range.strip_prefix("bytes=") else {
+                return ResponseTemplate::new(200).insert_header("Accept-Ranges", "bytes").set_body_bytes(body.clone());
+            };
+            let (start_str, end_str) = spec.split_once('-').unwrap_or((spec, ""));
+            let start: usize = start_str.parse().unwrap_or(0);
+            let end = if end_str.is_empty() { body.len() - 1 } else { end_str.parse().unwrap_or(body.len() - 1) };
+            let end = end.min(body.len() - 1);
+            let slice = body[start..=end].to_vec();
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", format!("bytes {start}-{end}/{}", body.len()))
+                .insert_header("Accept-Ranges", "bytes")
+                .set_body_bytes(slice)
+        }
+    }
+
     pub(crate) async fn mock_playable_item(mock_server: &MockServer, item_id: &str, seconds: u32) {
         Mock::given(method("GET"))
             .and(path(format!("/api/items/{item_id}")))
@@ -485,7 +547,12 @@ pub(crate) mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/api/items/{item_id}/file/1")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(silent_wav_bytes(seconds)))
+            .respond_with(ranged_response(silent_wav_bytes(seconds)))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/me/progress/{item_id}")))
+            .respond_with(ResponseTemplate::new(200))
             .mount(mock_server)
             .await;
     }
@@ -576,6 +643,55 @@ pub(crate) mod tests {
             runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap();
         assert!(progress.is_some(), "pausing should persist playback progress");
         assert!(!progress.unwrap().is_finished, "pausing mid-book must not mark it finished");
+
+        // Progress isn't only local — it should also be pushed to the server, so it shows up in
+        // the official apps and survives a fresh install.
+        let synced_requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        let progress_sync = synced_requests
+            .iter()
+            .find(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+            .expect("pausing should also sync progress to the server");
+        let body: serde_json::Value = progress_sync.body_json().unwrap();
+        assert_eq!(body["isFinished"], false);
+        controller.stop();
+    }
+
+    /// Regression test for a real bug caught in manual live testing (not by any prior test — this
+    /// path had no coverage at all): `start()` requested a seek immediately after requesting
+    /// `pause()`, but a seek needs the pipeline to have *reached* `PAUSED`, not just been asked to
+    /// — for a network-streamed source that transition isn't instant, so the seek silently
+    /// no-opped and "resume mid-book" quietly restarted from 0 instead. Fixed by polling for
+    /// `duration()` to become available (this crate's own signal that PAUSED was actually reached
+    /// — see `abs-player`'s own tests) before attempting the resume seek.
+    pub(crate) fn run_start_resumes_from_existing_progress(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 10));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 6.0, false)).unwrap();
+
+        let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+        let controller = PlayerController::new(pool, test_backend(), {
+            let seen = seen.clone();
+            move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
+        });
+
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+        );
+
+        pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
+        // A `FLUSH` seek's position update lands on the pipeline's own streaming thread, not
+        // synchronously inside `seek()` — give it a brief moment to actually land. 500ms of real
+        // (sync'd) playback is nowhere near enough to "catch up" from 0 to past 5s on its own, so
+        // this can't pass by coincidence if the resume seek silently no-opped.
+        pump_until(|| false, Duration::from_millis(500));
+        let position = seen.borrow().last().unwrap().position_seconds;
+        assert!(position >= 5.0, "starting an item with existing progress should resume near it, not from 0 (got {position}s)");
         controller.stop();
     }
 

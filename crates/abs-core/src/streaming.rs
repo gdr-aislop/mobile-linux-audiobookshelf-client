@@ -37,10 +37,30 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
     })
 }
 
+/// Pushes local playback progress up to the server, so it shows up in the official apps and
+/// survives a fresh install — not just recorded in this client's own local `progress` table.
+/// Callers are expected to treat a failure here as non-fatal: the local write (the source of
+/// truth for this client's own "Continue Listening") already happened by the time this runs, and
+/// a transient network failure syncing it up shouldn't be surfaced as a playback error.
+pub async fn sync_progress_to_server(
+    server_url: &str,
+    access_token: &str,
+    item_id: &str,
+    current_time_seconds: f64,
+    duration_seconds: f64,
+    is_finished: bool,
+) -> Result<()> {
+    let api = abs_api::Client::with_bearer_token(server_url, access_token)
+        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+    api.update_media_progress(item_id, current_time_seconds, duration_seconds, is_finished)
+        .await
+        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -111,6 +131,36 @@ mod tests {
             .await;
 
         let result = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_progress_to_server_sends_the_expected_request() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/me/progress/item-1"))
+            .and(body_partial_json(serde_json::json!({
+                "currentTime": 42.5,
+                "duration": 100.0,
+                "isFinished": false,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_progress_to_server_propagates_server_errors() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let result = sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await;
         assert!(result.is_err());
     }
 }

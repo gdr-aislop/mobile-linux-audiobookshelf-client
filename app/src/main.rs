@@ -83,6 +83,7 @@ mod tests {
         crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
         crate::screens::main_window::tests::run(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
+        crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
         crate::player::tests::run_multi_track_item_sets_a_caveat_note(&runtime);
         crate::player::tests::run_end_of_stream_pauses_and_marks_finished(&runtime);
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
