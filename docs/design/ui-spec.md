@@ -58,9 +58,18 @@ Fractal) rather than copying Lissen's Material Design look.
   required fields for the current mode are filled in** — on first launch, with an empty form,
   this is the state the user actually sees.
 - **Error state**: on a failed connection attempt, an inline `AdwBanner`-style strip appears above
-  the form with a short explanation (e.g. "Unable to sign in — check your username and password
-  and try again"), and the offending field's label switches to an error/red tint. The form
-  retains whatever the user typed — a failed attempt should never clear the fields.
+  the form, with copy that distinguishes *why* it failed rather than one generic message:
+  - **Authentication failure** (bad credentials/token): "Unable to sign in — check your username
+    and password and try again", and the offending field's (username/password/token) label
+    switches to an error/red tint.
+  - **Connectivity failure** (unreachable host, DNS failure, TLS/certificate error, timeout):
+    "Can't reach this server — check the URL and your connection", with no field-level red tint,
+    since this isn't a credentials problem and tinting the password field would misdirect the
+    user. Self-hosted Audiobookshelf setups hit this case at least as often as bad passwords
+    (wrong port, VPN not up, LAN-only address used off-network), so conflating the two would
+    send users fixing the wrong thing.
+  The form retains whatever the user typed in either case — a failed attempt should never clear
+  the fields.
 - This screen (via `abs_core::accounts::add_server_and_login`) is what's shown whenever
   `abs_storage::repo::accounts::get_active` returns `None` — i.e. on first launch, or after
   signing out of every configured server.
@@ -81,11 +90,22 @@ Fractal) rather than copying Lissen's Material Design look.
   downloaded fully or partially — the same downloaded-item definition used everywhere else in this
   spec (see Item detail). This is state shared with the equivalent toggle on Library browse, not a
   per-screen setting.
+- **Sync now**: a header-bar menu item (in the same `⋯` overflow as any other page-level actions)
+  that forces an immediate resync of library contents and playback progress with the server,
+  rather than waiting on whatever background sync interval is configured. Self-hosted servers on
+  home networks are more likely to have stale or interrupted background syncs than a hosted
+  service would, so this needs to be a user-triggerable action, not just an automatic behavior.
+  Shows a transient `AdwToast` on completion or failure. Shared with Library browse (see below).
 
 ### Library browse
-- Header bar with `GtkSearchEntry` (revealed via search button), a filter/sort `GtkMenuButton`, and
-  a trailing **view-options button** (three-line "adjustments" icon) that opens the view options
-  sheet described below.
+- Header bar with a **persistent, always-visible `GtkSearchEntry`** — not revealed behind a search
+  button — since search is a high-frequency action in a large library and worth the permanent
+  header-bar space on a device where reaching a reveal-then-tap-then-type sequence one-handed is
+  already awkward. Also a filter/sort `GtkMenuButton` and a trailing **view-options button**
+  (three-line "adjustments" icon) that opens the view options sheet described below; these two stay
+  compact icon-buttons since they're used less often than search.
+- **Sync now**: same header-bar `⋯` menu item as Home (see above), forcing an immediate resync of
+  this library's contents and the user's playback progress.
 - Content: `GtkGridView` of cover art (grid mode) or `GtkListView` with `AdwActionRow`s (list mode,
   useful for podcast episode-style feeds); toggle between the two via header bar button.
 - Sticky section headers when sorted/grouped by author or series (`GtkListView` section headers).
@@ -105,6 +125,11 @@ Fractal) rather than copying Lissen's Material Design look.
   All rows use native libadwaita controls (real `GtkSwitch`-style pill toggles, not a
   platform-specific switch skin) and the sheet itself is the same `AdwBottomSheet` pattern used for
   Item detail's download sheet, so the two don't feel like different UI systems.
+- **Touch targets**: the 44×44px minimum (§ 4) applies per interactive element, not per control
+  group — this matters for any compact paired control like the download sheet's chapter-count
+  stepper (see Item detail) and for adjacent tap zones like a row's body vs. its trailing `⋯` menu
+  button (see Downloads, Settings' Servers group): each needs its own full-size hit target with
+  enough spacing from its neighbor to avoid mis-taps.
 
 ### Item detail
 - `AdwNavigationPage` pushed from Home/Library.
@@ -114,15 +139,28 @@ Fractal) rather than copying Lissen's Material Design look.
   "Download book" (libadwaita's adaptive bottom-sheet widget, matching Lissen's own sheet) instead
   of immediately downloading everything:
   - **Current chapter** — just the chapter currently playing/at the last playback position.
-  - **Next chapters** — an inline numeric stepper (`−` / count / `+`) on this row lets the user
-    pick exactly how many upcoming chapters to fetch, defaulting to 10 and clamped to the number
-    of chapters actually remaining after the current one. Tapping the row (outside the stepper)
-    starts the download for that many chapters; the other rows have no stepper and act immediately
-    on tap.
+  - **Next chapters** — an inline numeric stepper (`−` / count / `+`, each button ≥44×44px per
+    the touch-target note above) on this row lets the user pick exactly how many upcoming
+    chapters to fetch, defaulting to 10 and clamped to the number of chapters actually remaining
+    after the current one. Tapping the row (outside the stepper) starts the download for that
+    many chapters; the other rows have no stepper and act immediately on tap.
   - **Remaining chapters** — from the current position to the end of the book.
   - **Entire book** — all chapters, regardless of playback position.
   - **Clear downloaded chapters** — a destructive row, separated from the four download options,
     that removes whatever has been downloaded locally for this item.
+
+  Each of the four scope rows shows an **estimated download size** as its subtitle (e.g.
+  "≈340 MB"), computed from the chapter file sizes already present in the item's metadata, so the
+  user can make an informed choice before committing — important on a device with limited local
+  storage. If an option's estimated size exceeds current free space, that row's subtitle switches
+  to an error tint reading "Not enough free space" instead of letting the download start and fail
+  partway through.
+
+  **Downloads are resumable**: if a download is interrupted (connectivity loss, app closed),
+  re-tapping the same scope option continues from the last completed chapter/byte rather than
+  restarting from scratch. While a download is in progress, the download button's in-progress
+  state (spinner/progress ring) is tappable to reveal a **cancel** action that aborts it, leaving
+  whatever chapters completed so far in place as valid offline content.
 
   Once a download starts, the download button itself reflects overall state for the item (idle
   download icon → in-progress spinner or progress ring → checkmark once at least the current
@@ -139,7 +177,11 @@ Fractal) rather than copying Lissen's Material Design look.
 ### Player — mini
 - Fixed bar: 40–48px cover thumbnail, title + author (single line, ellipsized), play/pause icon
   button, thin progress line along the bottom edge of the bar.
-- Swipe-up gesture or tap opens the full player.
+- Swipe-up gesture or tap opens the full player. **Not yet validated**: the swipe-up gesture's
+  hit-zone needs to be confirmed against phosh's own edge-swipe gesture zones on real Librem 5
+  hardware before being treated as final, since a bottom-edge swipe risks colliding with the
+  shell's own overview/app-switcher gesture. Tap-to-expand is the guaranteed fallback regardless
+  of what the swipe gesture ends up being scoped to.
 - This bar is pinned above the tab bar (phone) or the sidebar/content split (wide) on **every**
   tab, not just Home — see the "Home" and "Library browse" mockups, both of which show it fixed
   below their scrollable content. It reflects whatever's currently loaded regardless of which
@@ -166,6 +208,20 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   media widget already gives always-on visibility and controls without user action, so a second,
   separately-dismissible notification would just duplicate it.
 
+### Hardware controls & interruptions
+- **Volume keys**: map directly to system output volume, never repurposed for skip-forward/back
+  or other playback actions — this device is a phone, and volume keys doubling as anything else
+  would surprise anyone used to normal phone behavior.
+- **Call interruption**: MPRIS is outbound-only (it exposes this app's player state and accepts
+  transport commands from the shell) and has no concept of inbound "audio focus" events, so it
+  can't be used to detect an incoming call — unlike Android, Linux mobile has no OS-level audio
+  focus API. Instead, `abs-player` watches call state via **ModemManager**
+  (`org.freedesktop.ModemManager1`'s voice-call interface) and pauses playback immediately when a
+  call becomes active. Playback is **not** auto-resumed when the call ends — the user resumes
+  manually via the mini-player or the lock-screen MPRIS card, since auto-resuming audio at an
+  arbitrary moment after a call (still mid-conversation, walking away, etc.) would be more
+  surprising than useful.
+
 ### Player — full
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for
   "Sleep timer", "Playback speed", "Add bookmark").
@@ -178,6 +234,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 ### Downloads
 - `AdwPreferencesPage`-style grouped list: a summary row (storage used / device free space), then
   an `AdwActionRow` per downloaded item with a remove button. Empty state via `AdwStatusPage`.
+- An item still mid-download shows a progress indicator in place of the remove button plus a
+  **cancel** action (≥44×44px, spaced apart from the row's own tap target per the touch-target
+  note above) that aborts that item's download in progress — same resumable-download behavior as
+  Item detail: cancelling stops the transfer but keeps whatever chapters already completed.
 
 ### Settings
 - `AdwPreferencesPage` with groups: **Account**, **Servers**, **Playback** (default speed,
@@ -188,7 +248,8 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   Servers list below. There is deliberately no top-level "Sign Out" action here — with multiple
   servers supported, "sign out" is ambiguous about *which* account, so it isn't a global control.
 - **Servers** group: one `AdwActionRow` per configured server (host as title, logged-in username
-  and "active" marker as subtitle), each with a trailing menu button (`⋯` / `GtkMenuButton`)
+  and "active" marker as subtitle), each with a trailing menu button (`⋯` / `GtkMenuButton`,
+  ≥44×44px and spaced apart from the row body's own tap target per the touch-target note above)
   opening a small popover with **Switch to this server**, **Sign Out**, and **Remove Server**
   (destructive style). This is where sign-out actually lives — scoped to one server/account at a
   time — plus an "Add Server" row at the end to register another Audiobookshelf instance. Tapping
@@ -224,6 +285,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   - **< 600px (phone/phosh):** single-pane navigation, bottom tab bar, full-screen player.
   - **≥ 600px (tablet/desktop):** `AdwNavigationSplitView` sidebar + content, player as a
     window-sized dialog rather than full-screen takeover.
+  - This is evaluated purely on window width, with no separate orientation-based logic: a Librem 5
+    rotated to landscape gets exactly the same sidebar layout as any other window whose width
+    crosses 600px, and a portrait window narrower than that stays single-pane regardless of the
+    device's physical orientation.
 - All list/grid views reflow item counts per row based on available width (`GtkGridView` with a
   minimum tile width, not a fixed column count) so the same layout scales from phone to desktop.
 - Touch targets sized per GNOME HIG (minimum 44×44px) throughout, since phosh is a touch shell.
