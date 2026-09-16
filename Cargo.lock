@@ -26,12 +26,14 @@ dependencies = [
 name = "abs-app"
 version = "0.1.0"
 dependencies = [
+ "abs-api",
  "abs-core",
  "abs-player",
  "abs-storage",
  "gtk4",
  "libadwaita",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

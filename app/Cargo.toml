@@ -9,6 +9,7 @@ name = "abs-app"
 path = "src/main.rs"
 
 [dependencies]
+abs-api.workspace = true
 abs-core.workspace = true
 abs-storage.workspace = true
 abs-player.workspace = true
@@ -25,3 +26,6 @@ tracing-subscriber.workspace = true
 # error here rather than a runtime surprise on Crimson.
 gtk4 = { version = "0.9", features = ["v4_8"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,4 +1,6 @@
 mod application;
+mod screens;
+mod widgets;
 
 use adw::prelude::*;
 use application::AppState;
@@ -35,5 +37,13 @@ async fn setup() -> AppState {
         .expect("load playback settings");
     tracing::info!(?playback_settings, "loaded playback settings");
 
-    AppState { pool, paths }
+    let active_account = abs_storage::repo::accounts::get_active(&pool)
+        .await
+        .expect("check for an active account");
+    tracing::info!(
+        has_active_account = active_account.is_some(),
+        "resolved startup screen"
+    );
+
+    AppState { pool, paths, active_account }
 }

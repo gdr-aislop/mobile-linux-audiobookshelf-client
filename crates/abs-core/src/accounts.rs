@@ -16,7 +16,9 @@ pub struct AddedAccount {
 
 /// Register a new server and log into it in one step — the flow behind the Welcome/Server login
 /// screen. On login failure, the newly-created server row is rolled back rather than left behind
-/// as an orphaned, credential-less entry.
+/// as an orphaned, credential-less entry. The new account becomes the active one: this is the
+/// only way to add an account today, so leaving it inactive would mean the app forgets you're
+/// signed in the next time it starts and shows the Welcome screen again.
 pub async fn add_server_and_login(
     pool: &SqlitePool,
     url: &str,
@@ -36,6 +38,7 @@ pub async fn add_server_and_login(
     };
 
     let account_id = accounts::add(pool, &server_id, &login_result.username, &login_result.access_token).await?;
+    accounts::set_active(pool, &account_id).await?;
 
     Ok(AddedAccount { server_id, account_id })
 }
@@ -103,6 +106,7 @@ mod tests {
         let stored_account = accounts::get(&pool, &added.account_id).await.unwrap();
         assert_eq!(stored_account.username, "jane");
         assert_eq!(stored_account.token, "abc123");
+        assert!(stored_account.is_active, "the newly added account should become active");
     }
 
     #[tokio::test]

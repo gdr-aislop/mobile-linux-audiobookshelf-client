@@ -1,0 +1,419 @@
+//! The Welcome/Server login screen — shown whenever `abs_storage::repo::accounts::get_active`
+//! returns `None` (first launch, or after signing out of every configured server). See
+//! `docs/design/ui-spec.md`'s "Welcome / Server login" section and the published mockup for the
+//! visual design this implements.
+
+use std::rc::Rc;
+
+use abs_core::accounts::AddedAccount;
+use abs_core::error::CoreError;
+use adw::glib;
+use adw::prelude::*;
+use sqlx::SqlitePool;
+
+/// Only Password mode is wired to a real backend call right now — `abs-core`/`abs-api` have no
+/// token-based login (Audiobookshelf's `/login` is username+password only; a bare API token isn't
+/// a login mechanism the server exposes). The toggle is kept for visual completeness with the
+/// design spec, but Connect in this mode shows an explanatory banner instead of silently failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Password,
+    ApiToken,
+}
+
+pub struct WelcomeScreen {
+    pub root: gtk4::Widget,
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+#[cfg(test)]
+pub struct TestHooks {
+    pub url_row: adw::EntryRow,
+    pub username_row: adw::EntryRow,
+    pub password_row: adw::PasswordEntryRow,
+    pub connect_button: gtk4::Button,
+    pub banner: crate::widgets::banner::ErrorBanner,
+}
+
+#[cfg(test)]
+impl WelcomeScreen {
+    pub fn test_hooks(&self) -> &TestHooks {
+        &self.hooks
+    }
+}
+
+/// Builds the screen. `on_success` fires once, with the newly-added account, after a successful
+/// connect — the caller (`application.rs`) is responsible for swapping window content.
+pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> WelcomeScreen {
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Start)
+        .margin_top(48)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .width_request(340)
+        .spacing(0)
+        .build();
+
+    // Hero: icon, title, subtitle.
+    let icon = gtk4::Image::builder()
+        .icon_name("network-server-symbolic")
+        .pixel_size(40)
+        .css_classes(["welcome-icon"])
+        .build();
+    let title = gtk4::Label::builder()
+        .label("Connect to your Audiobookshelf server")
+        .wrap(true)
+        .justify(gtk4::Justification::Center)
+        .css_classes(["title-2"])
+        .margin_top(14)
+        .build();
+    let subtitle = gtk4::Label::builder()
+        .label("Enter your server address and sign in to start listening.")
+        .wrap(true)
+        .justify(gtk4::Justification::Center)
+        .css_classes(["dim-label"])
+        .margin_top(6)
+        .build();
+    content.append(&icon);
+    content.append(&title);
+    content.append(&subtitle);
+
+    // Auth-mode toggle: two linked GtkToggleButtons — AdwToggleGroup is 1.4+ and won't compile
+    // under this crate's v1_2 feature ceiling, so this is the hand-rolled equivalent.
+    let mode_password = gtk4::ToggleButton::builder().label("Password").active(true).build();
+    let mode_token = gtk4::ToggleButton::builder().label("API Token").build();
+    mode_token.set_group(Some(&mode_password));
+    let mode_box = gtk4::Box::builder()
+        .css_classes(["linked"])
+        .halign(gtk4::Align::Fill)
+        .margin_top(22)
+        .margin_bottom(16)
+        .build();
+    mode_password.set_hexpand(true);
+    mode_token.set_hexpand(true);
+    mode_box.append(&mode_password);
+    mode_box.append(&mode_token);
+    content.append(&mode_box);
+
+    // Error banner — hidden until a connect attempt fails.
+    let banner = crate::widgets::banner::ErrorBanner::new();
+    content.append(banner.widget());
+
+    // Fields, grouped as a libadwaita-1.2-safe ".boxed-list".
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .margin_top(12)
+        .build();
+
+    let url_row = adw::EntryRow::builder().title("Server URL").show_apply_button(false).build();
+    let username_row = adw::EntryRow::builder().title("Username").show_apply_button(false).build();
+    let password_row = adw::PasswordEntryRow::builder().title("Password").show_apply_button(false).build();
+    let token_row = adw::EntryRow::builder().title("API Token").show_apply_button(false).build();
+    token_row.set_visible(false);
+
+    list.append(&url_row);
+    list.append(&username_row);
+    list.append(&password_row);
+    list.append(&token_row);
+    content.append(&list);
+
+    let connect_button = gtk4::Button::builder()
+        .label("Connect")
+        .css_classes(["suggested-action", "pill"])
+        .hexpand(true)
+        .sensitive(false)
+        .margin_top(22)
+        .height_request(44)
+        .build();
+    content.append(&connect_button);
+
+    // --- Mode switching: show/hide the fields each mode needs. ---
+    let update_visibility: Rc<dyn Fn(AuthMode)> = Rc::new({
+        let username_row = username_row.clone();
+        let password_row = password_row.clone();
+        let token_row = token_row.clone();
+        move |mode: AuthMode| {
+            let is_password = mode == AuthMode::Password;
+            username_row.set_visible(is_password);
+            password_row.set_visible(is_password);
+            token_row.set_visible(!is_password);
+        }
+    });
+
+    // --- Connect button sensitivity: enabled once the current mode's required fields are filled. ---
+    let update_sensitivity: Rc<dyn Fn()> = Rc::new({
+        let mode_password = mode_password.clone();
+        let url_row = url_row.clone();
+        let username_row = username_row.clone();
+        let password_row = password_row.clone();
+        let token_row = token_row.clone();
+        let connect_button = connect_button.clone();
+        move || {
+            let url_filled = !url_row.text().trim().is_empty();
+            let mode_filled = if mode_password.is_active() {
+                !username_row.text().trim().is_empty() && !password_row.text().trim().is_empty()
+            } else {
+                !token_row.text().trim().is_empty()
+            };
+            connect_button.set_sensitive(url_filled && mode_filled);
+        }
+    });
+
+    mode_password.connect_toggled({
+        let update_visibility = update_visibility.clone();
+        let update_sensitivity = update_sensitivity.clone();
+        move |btn| {
+            if btn.is_active() {
+                update_visibility(AuthMode::Password);
+                update_sensitivity();
+            }
+        }
+    });
+    mode_token.connect_toggled({
+        let update_visibility = update_visibility.clone();
+        let update_sensitivity = update_sensitivity.clone();
+        move |btn| {
+            if btn.is_active() {
+                update_visibility(AuthMode::ApiToken);
+                update_sensitivity();
+            }
+        }
+    });
+
+    for entry in [&url_row, &username_row, &token_row] {
+        entry.connect_changed({
+            let update_sensitivity = update_sensitivity.clone();
+            move |_| update_sensitivity()
+        });
+    }
+    password_row.connect_changed({
+        let update_sensitivity = update_sensitivity.clone();
+        move |_| update_sensitivity()
+    });
+
+    // --- Connect click: disable the form, spawn the login call, react to the result. ---
+    connect_button.connect_clicked({
+        let pool = pool.clone();
+        let mode_password = mode_password.clone();
+        let url_row = url_row.clone();
+        let username_row = username_row.clone();
+        let password_row = password_row.clone();
+        let mode_box = mode_box.clone();
+        let list = list.clone();
+        let connect_button = connect_button.clone();
+        let banner = banner.clone();
+        let on_success = Rc::new(on_success);
+        move |_| {
+            let is_password_mode = mode_password.is_active();
+            banner.set_revealed(false);
+
+            if !is_password_mode {
+                banner.set_title("Signing in with an API token isn't supported yet — use your username and password.");
+                banner.set_revealed(true);
+                return;
+            }
+
+            let url = url_row.text().trim().to_string();
+            let username = username_row.text().trim().to_string();
+            let password = password_row.text().to_string();
+
+            mode_box.set_sensitive(false);
+            list.set_sensitive(false);
+            connect_button.set_sensitive(false);
+            connect_button.set_label("Connecting…");
+
+            let pool = pool.clone();
+            let mode_box = mode_box.clone();
+            let list = list.clone();
+            let connect_button = connect_button.clone();
+            let banner = banner.clone();
+            let on_success = on_success.clone();
+
+            glib::spawn_future_local(async move {
+                let result = abs_core::accounts::add_server_and_login(&pool, &url, &username, &password).await;
+
+                mode_box.set_sensitive(true);
+                list.set_sensitive(true);
+                connect_button.set_label("Connect");
+                connect_button.set_sensitive(true);
+
+                match result {
+                    Ok(added) => on_success(added),
+                    Err(err) => {
+                        banner.set_title(&error_message(&err));
+                        banner.set_revealed(true);
+                    }
+                }
+            });
+        }
+    });
+
+    #[cfg(test)]
+    let hooks = TestHooks {
+        url_row: url_row.clone(),
+        username_row: username_row.clone(),
+        password_row: password_row.clone(),
+        connect_button: connect_button.clone(),
+        banner: banner.clone(),
+    };
+
+    WelcomeScreen {
+        root: content.upcast(),
+        #[cfg(test)]
+        hooks,
+    }
+}
+
+/// Never clears the fields on failure — the user shouldn't have to retype everything after a
+/// typo. Message text is keyed off the error variant, per `docs/design/ui-spec.md`'s error state.
+fn error_message(err: &CoreError) -> String {
+    match err {
+        CoreError::Login(abs_api::LoginError::InvalidCredentials) => {
+            "Unable to sign in — check your username and password and try again.".to_string()
+        }
+        CoreError::Login(abs_api::LoginError::Network(_)) => {
+            "Couldn't reach that server — check the URL and try again.".to_string()
+        }
+        _ => "Something went wrong — please try again.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    const DEMO_SERVER_URL: &str = "https://audiobooks.dev/audiobookshelf";
+
+    async fn pool() -> SqlitePool {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3"))
+            .await
+            .unwrap();
+        std::mem::forget(tmp);
+        pool
+    }
+
+    /// Drains the default `MainContext` — the same one `glib::spawn_future_local` schedules
+    /// onto — until `done()` returns true or `timeout` elapses. `iteration(false)` is
+    /// non-blocking, so this is a plain poll loop, not a nested main loop.
+    fn pump_until(done: impl Fn() -> bool, timeout: Duration) {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + timeout;
+        while !done() && Instant::now() < deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Exercises the real Connect button — `emit_clicked()` invokes the actual production
+    /// signal handler, not a simulated input event — against the live public demo server
+    /// (confirmed reachable and running server 2.36.0 before this test was written; see
+    /// `crates/abs-core/tests/live_demo_server.rs`). This is also what catches a real
+    /// GTK-main-loop-vs-Tokio-runtime bridging bug: `add_server_and_login` uses `sqlx`/
+    /// `reqwest`, both of which need an entered Tokio runtime context to do any I/O at all —
+    /// if `main.rs` didn't keep one entered for the GTK main loop's lifetime, this test would
+    /// hang or panic with "no reactor running" instead of completing.
+    ///
+    /// Both the success and failure scenarios live in one `#[test]` function rather than two:
+    /// `gtk4::init()` binds to whichever OS thread calls it first, and libtest gives every
+    /// `#[test]` fn its own fresh thread even under `--test-threads=1` (that flag only limits
+    /// how many run *concurrently*, not which thread each runs on) — so a second test calling
+    /// `gtk4::init()` from its own thread panics with "Attempted to initialize GTK from two
+    /// different threads." Running both scenarios sequentially, after a single `gtk4::init()`,
+    /// avoids that.
+    #[test]
+    #[ignore]
+    fn connect_button_logs_in_against_the_live_demo_server() {
+        gtk4::init().expect("gtk4::init for this test");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        // Success case: correct demo credentials.
+        {
+            let pool = runtime.block_on(pool());
+            let result: Rc<RefCell<Option<AddedAccount>>> = Rc::new(RefCell::new(None));
+
+            let screen = build(pool, {
+                let result = result.clone();
+                move |added| *result.borrow_mut() = Some(added)
+            });
+            let hooks = screen.test_hooks();
+
+            hooks.url_row.set_text(DEMO_SERVER_URL);
+            hooks.username_row.set_text("demo");
+            hooks.password_row.set_text("demo");
+
+            assert!(
+                hooks.connect_button.is_sensitive(),
+                "Connect should be enabled once every required field is filled"
+            );
+            hooks.connect_button.emit_clicked();
+
+            pump_until(|| result.borrow().is_some(), Duration::from_secs(15));
+
+            let added = result.borrow_mut().take().expect("on_success should have fired");
+            assert!(!added.server_id.is_empty());
+            assert!(!added.account_id.is_empty());
+            assert!(
+                !hooks.banner.widget().reveals_child(),
+                "the error banner must not be showing after a successful login"
+            );
+        }
+
+        // Failure case: wrong password against the same live server.
+        {
+            let pool = runtime.block_on(pool());
+            let succeeded = Rc::new(RefCell::new(false));
+
+            let screen = build(pool, {
+                let succeeded = succeeded.clone();
+                move |_| *succeeded.borrow_mut() = true
+            });
+            let hooks = screen.test_hooks();
+
+            hooks.url_row.set_text(DEMO_SERVER_URL);
+            hooks.username_row.set_text("demo");
+            hooks.password_row.set_text("definitely-wrong-password");
+            hooks.connect_button.emit_clicked();
+
+            pump_until(
+                || hooks.banner.widget().reveals_child(),
+                Duration::from_secs(15),
+            );
+
+            assert!(!*succeeded.borrow(), "on_success must not fire on a failed login");
+            assert!(
+                hooks.banner.widget().reveals_child(),
+                "the error banner should now be visible"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_button_starts_disabled_and_toggling_mode_swaps_visible_fields() {
+        gtk4::init().expect("gtk4::init for this test");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        let pool = runtime.block_on(pool());
+        let screen = build(pool, |_| {});
+        let hooks = screen.test_hooks();
+
+        assert!(!hooks.connect_button.is_sensitive(), "empty form should start disabled");
+
+        hooks.url_row.set_text(DEMO_SERVER_URL);
+        hooks.username_row.set_text("demo");
+        hooks.password_row.set_text("demo");
+        assert!(
+            hooks.connect_button.is_sensitive(),
+            "filling every required Password-mode field should enable Connect"
+        );
+    }
+}
