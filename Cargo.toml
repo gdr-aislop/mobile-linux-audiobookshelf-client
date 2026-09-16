@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abs-api",
+    "crates/abs-storage",
+    "crates/abs-core",
+    "crates/abs-player",
+    "app",
+]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client"
+
+[workspace.dependencies]
+# Generated API client build chain
+progenitor = "0.9"
+progenitor-client = "0.9"
+openapiv3 = "2"
+syn = "2"
+prettyplease = "0.2"
+
+# Shared runtime/data deps
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+schemars = "0.8"
+thiserror = "1"
+tracing = "0.1"
+
+# Storage
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+directories = "5"
+
+# Test-only
+tempfile = "3"
+wiremock = "0.6"
+
+# Local crates
+abs-api = { path = "crates/abs-api" }
+abs-storage = { path = "crates/abs-storage" }
+abs-core = { path = "crates/abs-core" }
+abs-player = { path = "crates/abs-player" }

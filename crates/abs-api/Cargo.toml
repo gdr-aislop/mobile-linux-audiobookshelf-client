@@ -1,0 +1,25 @@
+[package]
+name = "abs-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+progenitor.workspace = true
+openapiv3.workspace = true
+serde_json.workspace = true
+syn.workspace = true
+prettyplease.workspace = true
+
+[dependencies]
+progenitor-client.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true

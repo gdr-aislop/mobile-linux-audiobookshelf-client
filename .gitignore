@@ -1,0 +1,16 @@
+/target
+/build
+
+# Cargo.lock is intentionally committed (this is an application, not a library)
+
+# vendor/ is reserved for `cargo vendor` output used by the offline Debian build;
+# it is regenerated as part of producing the packaging source, not committed here.
+/vendor/
+
+# local/dev SQLite databases, if any land in-tree
+*.sqlite3
+*.sqlite3-journal
+
+# editor/OS cruft
+.DS_Store
+*.swp
