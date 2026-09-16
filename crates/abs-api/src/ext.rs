@@ -147,8 +147,23 @@ pub struct InvalidBearerToken;
 impl Client {
     /// Builds a client that attaches `Authorization: Bearer <token>` to every request it sends.
     /// `token` is normally `LoginResult::access_token` fresh from `login`, or an already-persisted
-    /// account's stored token.
+    /// account's stored token. Uses a 15s connect/request timeout — long enough to tolerate a slow
+    /// mobile connection, short enough that a call never hangs indefinitely when the server or
+    /// network is simply gone (offline, airplane mode, etc.).
     pub fn with_bearer_token(baseurl: &str, token: &str) -> Result<Self, InvalidBearerToken> {
+        Self::with_bearer_token_and_timeout(baseurl, token, std::time::Duration::from_secs(15))
+    }
+
+    /// Same as [`Client::with_bearer_token`], with a caller-chosen timeout instead of the default
+    /// 15s. For calls on a critical path (e.g. resolving a playable URL) the default is
+    /// appropriate; for best-effort background work (e.g. reconciling progress against the
+    /// server before falling back to what's already stored locally) a much shorter timeout keeps
+    /// a bad connection from being felt as a hang.
+    pub fn with_bearer_token_and_timeout(
+        baseurl: &str,
+        token: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, InvalidBearerToken> {
         let mut headers = reqwest::header::HeaderMap::new();
         let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| InvalidBearerToken)?;
@@ -157,8 +172,8 @@ impl Client {
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(timeout)
+            .timeout(timeout)
             .build()
             .expect("a reqwest::Client with only headers/timeouts set should never fail to build");
 
@@ -216,6 +231,49 @@ struct UpdateProgressRequest {
     duration: f64,
     #[serde(rename = "isFinished")]
     is_finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerProgress {
+    pub library_item_id: String,
+    pub current_time_seconds: f64,
+    pub duration_seconds: f64,
+    pub is_finished: bool,
+    /// Milliseconds since the Unix epoch — the server's own field is a plain JS timestamp, not an
+    /// RFC3339 string, so callers reconciling against `abs_storage`'s `DateTime<Utc>` need to
+    /// convert it themselves (`chrono::DateTime::from_timestamp_millis`).
+    pub last_update_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMediaProgress {
+    #[serde(rename = "libraryItemId")]
+    library_item_id: Option<String>,
+    #[serde(rename = "currentTime")]
+    current_time: Option<f64>,
+    duration: Option<f64>,
+    #[serde(rename = "isFinished")]
+    is_finished: Option<bool>,
+    #[serde(rename = "lastUpdate")]
+    last_update: Option<i64>,
+}
+
+impl RawMediaProgress {
+    fn into_server_progress(self) -> Option<ServerProgress> {
+        Some(ServerProgress {
+            library_item_id: self.library_item_id?,
+            current_time_seconds: self.current_time.unwrap_or(0.0),
+            duration_seconds: self.duration.unwrap_or(0.0),
+            is_finished: self.is_finished.unwrap_or(false),
+            last_update_ms: self.last_update.unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MeResponseBody {
+    #[serde(rename = "mediaProgress", default)]
+    media_progress: Vec<RawMediaProgress>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -340,6 +398,46 @@ impl Client {
         Ok(())
     }
 
+    /// Fetch this item's progress as the server currently has it, for reconciling against what's
+    /// stored locally before resuming playback — so opening a book reflects progress made on
+    /// another device or the official apps, not just this client's own last local write.
+    /// Hand-written, same `/api/me/*` gap as `update_media_progress`. Confirmed live: `GET
+    /// /api/me/progress/:libraryItemId` returns `200` with the progress object when one exists,
+    /// and `404` when it doesn't — which is a normal, expected "no progress yet" outcome here, not
+    /// an error.
+    pub async fn get_media_progress(&self, item_id: &str) -> Result<Option<ServerProgress>, LibraryItemsError> {
+        let response = self.client().get(format!("{}/api/me/progress/{item_id}", self.baseurl())).send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!(
+                "GET /api/me/progress/{item_id} returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let raw: RawMediaProgress = response.json().await?;
+        Ok(raw.into_server_progress())
+    }
+
+    /// Fetch every item this account has progress on, in one call — for reconciling Home's
+    /// "Continue Listening" shelf against the server without one request per item. Hand-written:
+    /// `GET /api/me` isn't in the vendored spec either, and returns the full user object with a
+    /// `mediaProgress` array alongside fields this client has no use for (permissions, accessible
+    /// libraries, etc.), which are simply ignored here.
+    pub async fn get_all_media_progress(&self) -> Result<Vec<ServerProgress>, LibraryItemsError> {
+        let response = self.client().get(format!("{}/api/me", self.baseurl())).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!("GET /api/me returned HTTP {}", response.status())));
+        }
+
+        let body: MeResponseBody = response.json().await?;
+        Ok(body.media_progress.into_iter().filter_map(RawMediaProgress::into_server_progress).collect())
+    }
+
     /// Log in with a username and password, returning the tokens needed for subsequent
     /// authenticated requests. Not in the vendored spec at all (no auth endpoints are documented)
     /// — hand-written against the real route confirmed in the server source (`server/Auth.js`):
@@ -403,6 +501,31 @@ mod tests {
         let client = Client::with_bearer_token(&server.uri(), "secret-token-123").unwrap();
         let response = client.get_libraries().await.unwrap();
         assert!(response.into_inner().libraries.is_empty());
+    }
+
+    /// A closed port refuses a connection immediately — it doesn't exercise the *timeout* at all,
+    /// just normal error handling. This proves the timeout itself actually cuts off a request
+    /// that's genuinely stuck (TCP connects fine, the server just never answers — closer to what
+    /// "connectivity silently drops mid-request" looks like than an immediate refusal), so a real
+    /// network failure can never hang the caller indefinitely regardless of what stage it's stuck
+    /// at. Uses a 200ms timeout (not the 15s/5s a real caller would use) purely to keep this test
+    /// fast; the mechanism being tested is the same.
+    #[tokio::test]
+    async fn with_bearer_token_and_timeout_does_not_hang_on_a_server_that_never_responds() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept the connection and hold it open forever without writing a response.
+            let _ = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+
+        let client = Client::with_bearer_token_and_timeout(&format!("http://{addr}"), "token", std::time::Duration::from_millis(200)).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = client.get_media_progress("item-1").await;
+        assert!(result.is_err(), "a request to a server that never responds must time out, not succeed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "the timeout should cut this off in ~200ms, not hang");
     }
 
     #[tokio::test]
@@ -553,6 +676,32 @@ mod tests {
             .find(|p| p["libraryItemId"] == item.id)
             .expect("the item just updated should appear in mediaProgress");
         assert_eq!(synced["currentTime"].as_f64().unwrap(), 77.0);
+    }
+
+    /// End-to-end against the real public demo server: pushes a known progress value, then reads
+    /// it back through both `get_media_progress` (the single-item endpoint) and
+    /// `get_all_media_progress` (the bulk `/api/me` endpoint) and checks both agree with what was
+    /// written. `#[ignore]`d; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn get_media_progress_against_the_live_demo_server() {
+        const DEMO_SERVER_URL: &str = "https://audiobooks.dev/audiobookshelf";
+        let login = Client::new(DEMO_SERVER_URL).login("demo", "demo").await.unwrap();
+        let api = Client::with_bearer_token(DEMO_SERVER_URL, &login.access_token).unwrap();
+
+        let libraries = api.get_libraries().await.unwrap().into_inner().libraries;
+        let library_id = libraries[0].id.clone().expect("the demo server's first library should have an id");
+        let items = api.get_library_items_with_media(&library_id.to_string()).await.unwrap();
+        let item = items.first().expect("the demo server's first library should have at least one item");
+
+        api.update_media_progress(&item.id, 99.0, item.duration_seconds, false).await.unwrap();
+
+        let single = api.get_media_progress(&item.id).await.unwrap().expect("progress was just written");
+        assert_eq!(single.current_time_seconds, 99.0);
+
+        let all = api.get_all_media_progress().await.unwrap();
+        let same_item = all.iter().find(|p| p.library_item_id == item.id).expect("should also appear in the bulk list");
+        assert_eq!(same_item.current_time_seconds, 99.0);
     }
 
     #[tokio::test]
@@ -737,6 +886,100 @@ mod tests {
 
         let client = Client::new(&server.uri());
         let err = client.update_media_progress("item-1", 42.5, 200.0, false).await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_media_progress_parses_an_existing_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "libraryItemId": "item-1",
+                "currentTime": 123.5,
+                "duration": 3600.0,
+                "isFinished": false,
+                "lastUpdate": 1_700_000_000_000i64,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let progress = client.get_media_progress("item-1").await.unwrap().expect("a progress record exists");
+        assert_eq!(progress.library_item_id, "item-1");
+        assert_eq!(progress.current_time_seconds, 123.5);
+        assert_eq!(progress.last_update_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn get_media_progress_with_no_record_is_none_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        assert!(client.get_media_progress("item-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_media_progress_propagates_other_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_media_progress("item-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_all_media_progress_parses_every_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "mediaProgress": [
+                    { "libraryItemId": "item-1", "currentTime": 10.0, "duration": 100.0, "isFinished": false, "lastUpdate": 1 },
+                    { "libraryItemId": "item-2", "currentTime": 20.0, "duration": 200.0, "isFinished": true, "lastUpdate": 2 },
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let all = client.get_all_media_progress().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].library_item_id, "item-1");
+        assert_eq!(all[1].library_item_id, "item-2");
+        assert!(all[1].is_finished);
+    }
+
+    #[tokio::test]
+    async fn get_all_media_progress_with_no_progress_is_an_empty_vec() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "mediaProgress": [] })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        assert!(client.get_all_media_progress().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_all_media_progress_propagates_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/me")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_all_media_progress().await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
     }
 

@@ -194,7 +194,18 @@ impl PlayerController {
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
 
-            let target = match abs_core::streaming::resolve_stream_target(&server.url, &account.token, &item.item_id).await {
+            // Resolving the stream URL is required to proceed; reconciling progress against the
+            // server is a nice-to-have that must never add its own delay on top — run both
+            // concurrently (each already has its own bounded timeout) rather than one after the
+            // other, so a slow or unreachable server is only ever felt once, not twice.
+            let (target_result, reconcile_result) = tokio::join!(
+                abs_core::streaming::resolve_stream_target(&server.url, &account.token, &item.item_id),
+                abs_core::progress_sync::reconcile_item_progress(&pool, &server.url, &account.token, &account.id, &server.id, &item.item_id),
+            );
+            if let Err(err) = reconcile_result {
+                tracing::warn!(%err, item_id = %item.item_id, "couldn't reconcile progress with the server; using local progress");
+            }
+            let target = match target_result {
                 Ok(target) => target,
                 Err(err) => {
                     tracing::warn!(%err, item_id = %item.item_id, "couldn't resolve a playable URL");
@@ -202,6 +213,8 @@ impl PlayerController {
                 }
             };
 
+            // Reads whatever `reconcile_item_progress` just wrote, if it succeeded — falling back
+            // to this client's own last local write (or nothing) otherwise.
             let resume_at = abs_storage::repo::progress::get(&pool, &account.id, &server.id, &item.item_id)
                 .await
                 .ok()

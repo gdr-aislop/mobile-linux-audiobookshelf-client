@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod downloads;
 pub mod error;
 pub mod playback;
+pub mod progress_sync;
 pub mod settings;
 pub mod streaming;
 pub mod sync;

@@ -174,6 +174,17 @@ pub fn build(
 
             let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
 
+            // Reconciling "Continue Listening" against the server's progress runs after
+            // sync_all, not concurrently with it: an item's progress can only be attached once
+            // the item itself has been synced locally (a fresh login has no local items at all
+            // yet). It's still best-effort and bounded by its own short timeout — a failure here
+            // (offline, slow connection) is logged and never surfaced as this screen's sync
+            // banner, which is about library/item sync, not this.
+            if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
+            {
+                tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
+            }
+
             if let Ok(data) = load(&pool, &server_id, &account_id).await {
                 apply(&data, &widgets);
             }
