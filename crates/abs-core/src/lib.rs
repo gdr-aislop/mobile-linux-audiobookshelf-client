@@ -8,6 +8,7 @@ pub mod downloads;
 pub mod error;
 pub mod playback;
 pub mod settings;
+pub mod streaming;
 pub mod sync;
 
 pub use error::{CoreError, Result};

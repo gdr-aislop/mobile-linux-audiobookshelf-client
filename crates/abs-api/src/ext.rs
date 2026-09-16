@@ -181,6 +181,34 @@ pub struct LibraryItemSummary {
     pub added_at_ms: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ItemDetailResponseBody {
+    media: Option<RawItemMedia>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawItemMedia {
+    #[serde(rename = "audioFiles", default)]
+    audio_files: Vec<RawAudioFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAudioFile {
+    ino: Option<String>,
+    duration: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioFileRef {
+    pub ino: String,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemPlaybackInfo {
+    pub audio_files: Vec<AudioFileRef>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryItemsError {
     #[error("network error: {0}")]
@@ -238,6 +266,38 @@ impl Client {
                 })
             })
             .collect())
+    }
+
+    /// Fetch the audio file(s) backing an item, for resolving a playable URL. Hand-written: the
+    /// vendored spec has **zero** `/api/items/*` coverage at all (see
+    /// `third_party/audiobookshelf-openapi/README.md`'s "Known gaps") — there is no generated
+    /// method to call here. Confirmed live against `https://audiobooks.dev/audiobookshelf` that
+    /// `GET /api/items/:id` returns `media.audioFiles[].{ino, duration}`, and that
+    /// `GET /api/items/:id/file/:ino?token=<access_token>` streams the actual audio bytes — so
+    /// this only needs to parse the `ino`/`duration` pair per file; the actual streaming URL is
+    /// assembled by the caller (`abs_core::streaming::resolve_stream_target`), not here.
+    pub async fn get_item_playback_info(&self, item_id: &str) -> Result<ItemPlaybackInfo, LibraryItemsError> {
+        let response = self.client().get(format!("{}/api/items/{item_id}", self.baseurl())).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!(
+                "GET /api/items/{item_id} returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let body: ItemDetailResponseBody = response.json().await?;
+        let audio_files = body
+            .media
+            .map(|m| m.audio_files)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| {
+                Some(AudioFileRef { ino: f.ino?, duration_seconds: f.duration.unwrap_or(0.0) })
+            })
+            .collect();
+
+        Ok(ItemPlaybackInfo { audio_files })
     }
 
     /// Log in with a username and password, returning the tokens needed for subsequent
@@ -404,6 +464,28 @@ mod tests {
         );
     }
 
+    /// End-to-end against the real public demo server: logs in, finds a real library and item,
+    /// then confirms `get_item_playback_info` actually returns a usable audio file — this is what
+    /// caught, live, that the real server needs the login the same way every other call does
+    /// (`with_bearer_token`, not a plain `Client::new`). `#[ignore]`d; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn get_item_playback_info_against_the_live_demo_server() {
+        const DEMO_SERVER_URL: &str = "https://audiobooks.dev/audiobookshelf";
+        let login = Client::new(DEMO_SERVER_URL).login("demo", "demo").await.unwrap();
+        let api = Client::with_bearer_token(DEMO_SERVER_URL, &login.access_token).unwrap();
+
+        let libraries = api.get_libraries().await.unwrap().into_inner().libraries;
+        let library_id = libraries[0].id.clone().expect("the demo server's first library should have an id");
+        let items = api.get_library_items_with_media(&library_id.to_string()).await.unwrap();
+        let item = items.first().expect("the demo server's first library should have at least one item");
+
+        let info = api.get_item_playback_info(&item.id).await.unwrap();
+        let audio_file = info.audio_files.first().expect("a real item should have at least one audio file");
+        assert!(!audio_file.ino.is_empty());
+        assert!(audio_file.duration_seconds > 0.0);
+    }
+
     #[tokio::test]
     async fn get_library_items_with_media_parses_title_author_and_duration() {
         let server = MockServer::start().await;
@@ -476,6 +558,84 @@ mod tests {
 
         let client = Client::new(&server.uri());
         let err = client.get_library_items_with_media("lib-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_parses_audio_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [
+                        { "ino": "111", "duration": 1800.5 },
+                        { "ino": "222", "duration": 1200.0 },
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+
+        assert_eq!(info.audio_files.len(), 2);
+        assert_eq!(info.audio_files[0].ino, "111");
+        assert_eq!(info.audio_files[0].duration_seconds, 1800.5);
+        assert_eq!(info.audio_files[1].ino, "222");
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_with_no_audio_files_is_an_empty_vec_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": { "audioFiles": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+        assert!(info.audio_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_skips_audio_files_missing_ino() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [
+                        { "duration": 1800.5 },
+                        { "ino": "222", "duration": 1200.0 },
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+
+        assert_eq!(info.audio_files.len(), 1);
+        assert_eq!(info.audio_files[0].ino, "222");
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_propagates_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_item_playback_info("item-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
     }
 

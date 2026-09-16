@@ -1,4 +1,5 @@
 mod application;
+mod player;
 mod screens;
 #[cfg(test)]
 mod test_support;
@@ -56,7 +57,7 @@ async fn setup() -> AppState {
         "resolved startup screen"
     );
 
-    AppState { pool, active_account }
+    AppState { pool, active_account, playback_settings }
 }
 
 /// Every GTK-touching test across `screens::*` funnels through exactly these two `#[test]` fns.
@@ -72,6 +73,7 @@ mod tests {
     #[test]
     fn gtk_fast_scenarios() {
         gtk4::init().expect("gtk4::init for this test");
+        abs_player::init().expect("gstreamer::init for this test");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
 
@@ -80,6 +82,12 @@ mod tests {
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
         crate::screens::main_window::tests::run(&runtime);
+        crate::player::tests::run_start_and_pause_persists_progress(&runtime);
+        crate::player::tests::run_multi_track_item_sets_a_caveat_note(&runtime);
+        crate::player::tests::run_end_of_stream_pauses_and_marks_finished(&runtime);
+        crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
+        crate::screens::player::tests::run(&runtime);
+        crate::screens::player::tests::run_multi_track_caveat_is_shown(&runtime);
     }
 
     #[test]

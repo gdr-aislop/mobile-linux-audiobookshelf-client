@@ -10,7 +10,10 @@
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
 mod ext;
-pub use ext::{InvalidBearerToken, LibraryItemSummary, LibraryItemsError, LoginError, LoginResult};
+pub use ext::{
+    AudioFileRef, InvalidBearerToken, ItemPlaybackInfo, LibraryItemSummary, LibraryItemsError, LoginError,
+    LoginResult,
+};
 
 #[cfg(test)]
 mod tests {

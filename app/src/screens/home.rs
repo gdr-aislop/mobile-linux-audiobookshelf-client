@@ -16,6 +16,8 @@ use sqlx::SqlitePool;
 use abs_core::error::Result as CoreResult;
 use abs_storage::models::{Account, Item, Library, Progress, Server};
 
+use crate::player::PlayRequest;
+
 pub struct HomeScreen {
     pub root: gtk4::Widget,
     #[cfg(test)]
@@ -50,6 +52,7 @@ struct HomeWidgets {
     recent_row: gtk4::Box,
     libraries_list: gtk4::ListBox,
     banner: crate::widgets::banner::ErrorBanner,
+    on_play: std::rc::Rc<dyn Fn(PlayRequest)>,
 }
 
 struct HomeData {
@@ -60,8 +63,15 @@ struct HomeData {
 
 /// Builds the screen. `server`/`account` are already-resolved rows (the caller, `main_window`,
 /// looks them up once) rather than bare ids, so this module never has to fail on a missing
-/// server/account — that would be a caller bug, not a Home-screen concern.
-pub fn build(pool: SqlitePool, server: Server, account: Account) -> HomeScreen {
+/// server/account — that would be a caller bug, not a Home-screen concern. `on_play` is how
+/// tapping a cover card starts playback — Home never touches `abs-player`/`abs-core::streaming`
+/// itself, matching the `on_success`-callback pattern `welcome.rs` already uses.
+pub fn build(
+    pool: SqlitePool,
+    server: Server,
+    account: Account,
+    on_play: impl Fn(PlayRequest) + Clone + 'static,
+) -> HomeScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Home", "")));
 
@@ -141,6 +151,7 @@ pub fn build(pool: SqlitePool, server: Server, account: Account) -> HomeScreen {
         recent_row: recent_row.clone(),
         libraries_list: libraries_list.clone(),
         banner: banner.clone(),
+        on_play: std::rc::Rc::new(on_play),
     };
 
     // Render once immediately from whatever's already cached locally (so a returning session
@@ -232,13 +243,14 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
             0.0
         };
         let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&cover_card(&item.title, &subtitle));
+        widgets.continue_row.append(&cover_card(item, &subtitle, &widgets.on_play));
     }
     widgets.continue_section.set_visible(!data.continue_items.is_empty());
 
     clear_box(&widgets.recent_row);
     for item in &data.recent_items {
-        widgets.recent_row.append(&cover_card(&item.title, &item_subtitle(item)));
+        let subtitle = item_subtitle(item);
+        widgets.recent_row.append(&cover_card(item, &subtitle, &widgets.on_play));
     }
 
     clear_listbox(&widgets.libraries_list);
@@ -284,7 +296,10 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
 
 /// No real cover-art image (see the module doc) — a plain title-plate card, matching the
 /// mockups' own placeholder treatment for items without artwork.
-fn cover_card(title: &str, subtitle: &str) -> gtk4::Box {
+/// A tappable cover card — there's no Item Detail screen yet, so tapping directly starts
+/// playback rather than the ui-spec's real "tap -> Item detail -> Play" flow (same "skip screens
+/// not yet built" scoping already used for Library/Downloads/Settings' stub tabs).
+fn cover_card(item: &Item, subtitle: &str, on_play: &std::rc::Rc<dyn Fn(PlayRequest)>) -> gtk4::Widget {
     let card = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).width_request(132).spacing(6).build();
 
     let plate = gtk4::Box::builder()
@@ -294,7 +309,7 @@ fn cover_card(title: &str, subtitle: &str) -> gtk4::Box {
         .valign(gtk4::Align::Center)
         .build();
     let plate_label = gtk4::Label::builder()
-        .label(title)
+        .label(&item.title)
         .wrap(true)
         .justify(gtk4::Justification::Center)
         .hexpand(true)
@@ -313,7 +328,13 @@ fn cover_card(title: &str, subtitle: &str) -> gtk4::Box {
 
     card.append(&plate);
     card.append(&meta);
-    card
+
+    let button = gtk4::Button::builder().css_classes(["flat"]).child(&card).build();
+    let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
+    let on_play = on_play.clone();
+    button.connect_clicked(move |_| on_play(request.clone()));
+
+    button.upcast()
 }
 
 fn library_row(library: &Library) -> adw::ActionRow {
@@ -387,7 +408,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account);
+        let screen = build(pool, server, account, |_| {});
         let hooks = screen.test_hooks();
 
         // `status_page` starts hidden (only shown for a confirmed-empty result), so waiting on
@@ -413,7 +434,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account);
+        let screen = build(pool, server, account, |_| {});
         let hooks = screen.test_hooks();
 
         // There's no "sync finished" signal to await directly here (an always-empty result looks
@@ -435,7 +456,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account);
+        let screen = build(pool, server, account, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -459,7 +480,7 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
-        let screen = build(pool, server, account);
+        let screen = build(pool, server, account, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));

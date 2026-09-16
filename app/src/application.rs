@@ -15,6 +15,7 @@ use crate::screens;
 pub struct AppState {
     pub pool: SqlitePool,
     pub active_account: Option<abs_storage::models::Account>,
+    pub playback_settings: abs_core::settings::PlaybackSettings,
 }
 
 pub fn build_application(state: AppState) -> adw::Application {
@@ -40,6 +41,7 @@ fn build_window(app: &adw::Application, state: &AppState) {
             let pool = state.pool.clone();
             let window_for_callback = window.clone();
             let on_success_pool = pool.clone();
+            let playback_settings = state.playback_settings;
             let screen = screens::welcome::build(pool, move |added| {
                 let pool = on_success_pool.clone();
                 let window_for_callback = window_for_callback.clone();
@@ -52,7 +54,8 @@ fn build_window(app: &adw::Application, state: &AppState) {
                     let account = abs_storage::repo::accounts::get(&pool, &added.account_id)
                         .await
                         .expect("the account just created by add_server_and_login must exist");
-                    let main_window = screens::main_window::build(pool, server, account);
+                    let main_window =
+                        screens::main_window::build(pool, server, account, playback_settings, window_for_callback.clone());
                     window_for_callback.set_content(Some(&main_window.root));
                 });
             });
@@ -62,11 +65,13 @@ fn build_window(app: &adw::Application, state: &AppState) {
             let pool = state.pool.clone();
             let account = account.clone();
             let window_for_callback = window.clone();
+            let playback_settings = state.playback_settings;
             glib::spawn_future_local(async move {
                 let server = abs_storage::repo::servers::get(&pool, &account.server_id)
                     .await
                     .expect("an active account's server must exist");
-                let main_window = screens::main_window::build(pool, server, account);
+                let main_window =
+                    screens::main_window::build(pool, server, account, playback_settings, window_for_callback.clone());
                 window_for_callback.set_content(Some(&main_window.root));
             });
         }

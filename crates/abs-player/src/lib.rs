@@ -75,6 +75,13 @@ impl GstBackend {
         let pipeline = gst::ElementFactory::make("playbin").build()?;
         if let Some(sink_name) = sink_element_name {
             let sink = gst::ElementFactory::make(sink_name).build()?;
+            // Unlike most sinks, `fakesink` defaults `sync` to `false` — it would otherwise
+            // render as fast as the CPU/network allow instead of at the pipeline clock's real
+            // pace, which breaks any test that expects to observe mid-playback state (e.g.
+            // pausing partway through a clip) rather than an already-finished one. Real sinks
+            // (`autoaudiosink` et al.) already default `sync` to `true`, so this only changes
+            // behavior for the test backend.
+            sink.set_property("sync", true);
             pipeline.set_property("audio-sink", &sink);
         }
         Ok(Self { pipeline, current_speed: 1.0 })
@@ -141,11 +148,18 @@ impl AudioBackend for GstBackend {
     }
 
     fn poll_event(&self) -> Option<PlayerEvent> {
-        let msg = self.bus().pop()?;
-        match msg.view() {
-            gst::MessageView::Eos(_) => Some(PlayerEvent::EndOfStream),
-            gst::MessageView::Error(e) => Some(PlayerEvent::Error(e.error().to_string())),
-            _ => None,
+        // `playbin` posts plenty of bus messages besides `Eos`/`Error` (state changes,
+        // buffering, tags, ...). A caller polling once per tick must not have a real `Eos`
+        // stuck behind an uninteresting message for another whole tick interval, so drain the
+        // bus here until an event worth reporting turns up or the bus is actually empty.
+        let bus = self.bus();
+        loop {
+            let msg = bus.pop()?;
+            match msg.view() {
+                gst::MessageView::Eos(_) => return Some(PlayerEvent::EndOfStream),
+                gst::MessageView::Error(e) => return Some(PlayerEvent::Error(e.error().to_string())),
+                _ => continue,
+            }
         }
     }
 }

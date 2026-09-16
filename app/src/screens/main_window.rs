@@ -14,8 +14,10 @@
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
+use abs_core::settings::PlaybackSettings;
 use abs_storage::models::{Account, Server};
 
+use crate::player::{self, PlayRequest};
 use crate::screens;
 
 pub struct MainWindow {
@@ -28,6 +30,7 @@ pub struct MainWindow {
 pub struct TestHooks {
     pub stack: adw::ViewStack,
     pub switcher_bar: adw::ViewSwitcherBar,
+    pub mini_bar: crate::player::MiniPlayerHooks,
 }
 
 #[cfg(test)]
@@ -37,24 +40,66 @@ impl MainWindow {
     }
 }
 
-pub fn build(pool: SqlitePool, server: Server, account: Account) -> MainWindow {
+pub fn build(
+    pool: SqlitePool,
+    server: Server,
+    account: Account,
+    playback_settings: PlaybackSettings,
+    window: adw::ApplicationWindow,
+) -> MainWindow {
+    let mini_bar = player::build_mini_bar(pool.clone(), player::real_backend());
+
     let stack = adw::ViewStack::new();
 
-    stack.add_titled_with_icon(&screens::home::build(pool, server, account).root, Some("home"), "Home", "go-home-symbolic");
+    let on_play = {
+        let controller = mini_bar.controller.clone();
+        let server = server.clone();
+        let account = account.clone();
+        move |request: PlayRequest| controller.start(server.clone(), account.clone(), request)
+    };
+
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    stack.add_titled_with_icon(
+        &screens::home::build(pool, server, account, on_play).root,
+        Some("home"),
+        "Home",
+        "go-home-symbolic",
+    );
     stack.add_titled_with_icon(&stub_page("system-file-manager-symbolic", "Library"), Some("library"), "Library", "system-file-manager-symbolic");
     stack.add_titled_with_icon(&stub_page("folder-download-symbolic", "Downloads"), Some("downloads"), "Downloads", "folder-download-symbolic");
     stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
 
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&stack);
+    root.append(&mini_bar.root);
     root.append(&switcher_bar);
+
+    // Tapping the mini bar opens the full player by swapping the window's content — there's no
+    // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
+    // so this is the same content-swap mechanism `application.rs` already uses for Welcome -> main
+    // window. Collapsing restores `root` (this shell), not a fresh `build()` call — no state lost.
+    let mini_bar_gesture = gtk4::GestureClick::new();
+    mini_bar_gesture.connect_released({
+        let controller = mini_bar.controller.clone();
+        let window = window.clone();
+        let root = root.clone();
+        move |_, _, _, _| {
+            let player_screen = screens::player::build(controller.clone(), playback_settings, {
+                let window = window.clone();
+                let root = root.clone();
+                move || window.set_content(Some(&root))
+            });
+            window.set_content(Some(&player_screen.root));
+        }
+    });
+    mini_bar.root.add_controller(mini_bar_gesture);
 
     MainWindow {
         root: root.upcast(),
         #[cfg(test)]
-        hooks: TestHooks { stack, switcher_bar },
+        hooks: TestHooks { stack, switcher_bar, mini_bar: mini_bar.hooks },
     }
 }
 
@@ -83,12 +128,14 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
-        let window = build(pool, server, account);
+        let app_window = adw::ApplicationWindow::builder().build();
+        let window = build(pool, server, account, abs_core::settings::PlaybackSettings::default(), app_window);
         let hooks = window.test_hooks();
 
         for name in ["home", "library", "downloads", "settings"] {
             assert!(hooks.stack.child_by_name(name).is_some(), "missing destination: {name}");
         }
         assert!(hooks.switcher_bar.reveals(), "the tab bar should always be shown");
+        assert!(!hooks.mini_bar.bar.is_visible(), "the mini bar should stay hidden until something plays");
     }
 }
