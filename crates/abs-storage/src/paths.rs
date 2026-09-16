@@ -4,12 +4,16 @@
 
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
+use directories::BaseDirs;
 
-/// Reverse-DNS application identity used to resolve XDG directories.
-const QUALIFIER: &str = "io";
-const ORGANIZATION: &str = "github.gdr_aislop";
-const APPLICATION: &str = "Audiobookshelf";
+/// The app's reverse-DNS identity — also the GTK application id and, on Flatpak, the sandbox's
+/// per-app data directory name, so this is deliberately used verbatim as the directory name
+/// below rather than through `directories::ProjectDirs`. `ProjectDirs::from(qualifier,
+/// organization, application)` looks like the natural fit, but on Linux it ignores `qualifier`
+/// and `organization` entirely and just lowercases `application` — confirmed by actually running
+/// it, not assumed — which would have put this app's data under `~/.local/share/audiobookshelf/`
+/// instead of the reverse-DNS-named directory GNOME apps (and Flatpak) actually use.
+pub const APP_ID: &str = "io.github.gdr_aislop.Audiobookshelf";
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -21,10 +25,10 @@ impl AppPaths {
     /// Resolve paths from the real XDG environment. Returns `None` if no home directory can be
     /// determined at all (extremely unusual — `directories` falls back sensibly otherwise).
     pub fn resolve() -> Option<Self> {
-        let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)?;
+        let dirs = BaseDirs::new()?;
         Some(Self {
-            data_dir: dirs.data_dir().to_path_buf(),
-            cache_dir: dirs.cache_dir().to_path_buf(),
+            data_dir: dirs.data_dir().join(APP_ID),
+            cache_dir: dirs.cache_dir().join(APP_ID),
         })
     }
 
@@ -183,6 +187,19 @@ mod tests {
         // conventional home directory.
         if let Some(paths) = AppPaths::resolve() {
             assert_ne!(paths.data_dir(), paths.cache_dir());
+        }
+    }
+
+    #[test]
+    fn resolve_uses_the_literal_app_id_as_the_directory_name() {
+        // Regression test: `ProjectDirs::from(qualifier, org, application)` ignores qualifier
+        // and organization on Linux and lowercases `application`, which would silently put data
+        // under `~/.local/share/audiobookshelf/` instead of the reverse-DNS-named directory this
+        // app (and Flatpak) actually expects — confirmed by running it, not assumed. `resolve()`
+        // must build the path from `BaseDirs` + the literal `APP_ID`, not `ProjectDirs`.
+        if let Some(paths) = AppPaths::resolve() {
+            assert_eq!(paths.data_dir().file_name().unwrap(), APP_ID);
+            assert_eq!(paths.cache_dir().file_name().unwrap(), APP_ID);
         }
     }
 }

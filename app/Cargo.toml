@@ -9,3 +9,19 @@ name = "abs-app"
 path = "src/main.rs"
 
 [dependencies]
+abs-core.workspace = true
+abs-storage.workspace = true
+abs-player.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Feature-gated to the API surface available in libadwaita 1.2 / GTK4 4.8 (PureOS Crimson's
+# actual shipped versions — see docs/architecture note in the plan). This is a compile-time
+# guarantee, not just discipline: enabling only up to these version features means anything from
+# libadwaita 1.4+ (AdwNavigationSplitView, AdwBreakpoint, AdwToolbarView, AdwSwitchRow, ...) or
+# GTK 4.10+ simply isn't exposed by these crates, so accidentally depending on it is a compile
+# error here rather than a runtime surprise on Crimson.
+gtk4 = { version = "0.9", features = ["v4_8"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
