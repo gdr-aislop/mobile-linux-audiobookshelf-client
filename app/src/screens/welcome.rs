@@ -211,6 +211,7 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
         move |_| {
             let is_password_mode = mode_password.is_active();
             banner.set_revealed(false);
+            banner.set_details(None);
             username_row.remove_css_class("error");
             password_row.remove_css_class("error");
 
@@ -258,6 +259,7 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
                             password_row.add_css_class("error");
                         }
                         banner.set_title(&error_message(&err));
+                        banner.set_details(login_details(&err).as_deref());
                         banner.set_revealed(true);
                     }
                 }
@@ -291,10 +293,26 @@ fn error_message(err: &CoreError) -> String {
         CoreError::Login(abs_api::LoginError::InvalidCredentials) => {
             "Unable to sign in — check your username and password and try again.".to_string()
         }
-        CoreError::Login(abs_api::LoginError::Network(_)) => {
+        CoreError::Login(abs_api::LoginError::Tls(_)) => {
+            "Can't verify this server's certificate — if you trust it, allow it in that server's connection settings.".to_string()
+        }
+        CoreError::Login(abs_api::LoginError::Connect(_) | abs_api::LoginError::Network(_)) => {
             "Can't reach this server — check the URL and your connection.".to_string()
         }
+        CoreError::Login(abs_api::LoginError::Timeout(_)) => {
+            "This server took too long to respond — check your connection and try again.".to_string()
+        }
         _ => "Something went wrong — please try again.".to_string(),
+    }
+}
+
+/// The raw underlying transport-error text for the banner's "Show details" disclosure — `None`
+/// for anything that isn't a low-level transport failure (a bad password or an unexpected server
+/// response aren't the kind of opaque library text this disclosure exists for).
+fn login_details(err: &CoreError) -> Option<String> {
+    match err {
+        CoreError::Login(login_err) => login_err.details(),
+        _ => None,
     }
 }
 
@@ -412,6 +430,10 @@ mod tests {
                 hooks.username_row.has_css_class("error") && hooks.password_row.has_css_class("error"),
                 "a credentials failure should tint the username/password fields"
             );
+            assert!(
+                !hooks.banner.details_visible(),
+                "a bad password isn't a low-level transport error — there's no raw detail to show"
+            );
         }
     }
 
@@ -445,11 +467,13 @@ mod tests {
         }
 
         // Connectivity failures (nothing listening at the given address) must show a different
-        // banner message than a credentials failure, and must NOT tint the username/password
-        // fields — see docs/design/ui-spec.md's Welcome/Server login error-state section. Uses a
-        // real TCP connection attempt to an address nothing listens on rather than wiremock, so
-        // this exercises abs_api::LoginError::Network for real; it's fast (immediate connection
-        // refused) and needs no external network, so it isn't #[ignore]d.
+        // banner message than a credentials failure, must NOT tint the username/password fields
+        // — see docs/design/ui-spec.md's Welcome/Server login error-state section — and, since
+        // this is a low-level transport failure, must expose the raw error via the banner's
+        // "Show details" disclosure. Uses a real TCP connection attempt to an address nothing
+        // listens on rather than wiremock, so this exercises abs_api::LoginError::Connect for
+        // real; it's fast (immediate connection refused) and needs no external network, so it
+        // isn't #[ignore]d.
         {
             let pool = runtime.block_on(pool());
             let screen = build(pool, |_| {});
@@ -473,6 +497,14 @@ mod tests {
             assert!(
                 !hooks.username_row.has_css_class("error") && !hooks.password_row.has_css_class("error"),
                 "a connectivity failure must not tint the username/password fields"
+            );
+            assert!(
+                hooks.banner.details_visible(),
+                "a connectivity failure should expose the 'Show details' disclosure"
+            );
+            assert!(
+                !hooks.banner.details_text().is_empty(),
+                "the details disclosure should carry the raw transport error text"
             );
         }
     }

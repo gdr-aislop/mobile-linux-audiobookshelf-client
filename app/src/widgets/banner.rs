@@ -17,6 +17,8 @@ use adw::prelude::*;
 pub struct ErrorBanner {
     revealer: gtk4::Revealer,
     label: gtk4::Label,
+    expander: gtk4::Expander,
+    details_label: gtk4::Label,
 }
 
 impl ErrorBanner {
@@ -29,16 +31,39 @@ impl ErrorBanner {
             .css_classes(["error"])
             .build();
 
-        let content = gtk4::Box::builder()
+        let message_row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
+            .build();
+        message_row.append(&icon);
+        message_row.append(&label);
+
+        // Collapsed by default: raw HTTP/TLS library text isn't meant for a general audience, but
+        // a self-hosted user debugging an unusual TLS/proxy setup benefits from being able to see
+        // (and copy, via `selectable`) the exact underlying error. Hidden entirely — not just
+        // collapsed — when there's nothing to show (see `set_details`).
+        let details_label = gtk4::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .selectable(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let expander = gtk4::Expander::builder()
+            .label("Show details")
+            .child(&details_label)
+            .visible(false)
+            .build();
+
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
             .margin_top(8)
             .margin_bottom(8)
             .margin_start(12)
             .margin_end(12)
             .build();
-        content.append(&icon);
-        content.append(&label);
+        content.append(&message_row);
+        content.append(&expander);
 
         let revealer = gtk4::Revealer::builder()
             .transition_type(gtk4::RevealerTransitionType::SlideDown)
@@ -46,7 +71,7 @@ impl ErrorBanner {
             .reveal_child(false)
             .build();
 
-        Self { revealer, label }
+        Self { revealer, label, expander, details_label }
     }
 
     pub fn widget(&self) -> &gtk4::Revealer {
@@ -60,6 +85,32 @@ impl ErrorBanner {
     #[cfg(test)]
     pub fn title(&self) -> glib::GString {
         self.label.label()
+    }
+
+    /// `Some(text)` shows the collapsed "Show details" expander with `text` inside; `None` hides
+    /// the expander entirely (also collapsing it, so it doesn't reopen already-expanded next time
+    /// details are shown for an unrelated error).
+    pub fn set_details(&self, details: Option<&str>) {
+        match details {
+            Some(text) => {
+                self.details_label.set_label(text);
+                self.expander.set_visible(true);
+            }
+            None => {
+                self.expander.set_expanded(false);
+                self.expander.set_visible(false);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn details_visible(&self) -> bool {
+        self.expander.is_visible()
+    }
+
+    #[cfg(test)]
+    pub fn details_text(&self) -> glib::GString {
+        self.details_label.label()
     }
 
     pub fn set_revealed(&self, revealed: bool) {

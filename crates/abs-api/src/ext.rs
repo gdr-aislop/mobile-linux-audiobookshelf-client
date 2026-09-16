@@ -42,10 +42,67 @@ pub struct LoginResult {
 pub enum LoginError {
     #[error("invalid username or password")]
     InvalidCredentials,
+    #[error("couldn't verify this server's TLS certificate: {0}")]
+    Tls(reqwest::Error),
+    #[error("couldn't connect to this server: {0}")]
+    Connect(reqwest::Error),
+    #[error("timed out waiting for this server to respond: {0}")]
+    Timeout(reqwest::Error),
     #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
+}
+
+impl LoginError {
+    /// The full underlying error text (this error plus its `source()` chain), for an optional
+    /// "Show details" disclosure in the UI — never the primary message, since raw HTTP/TLS
+    /// library text isn't meant for a general audience, but worth having for a self-hosted user
+    /// debugging an unusual TLS/proxy setup.
+    pub fn details(&self) -> Option<String> {
+        let err: &(dyn std::error::Error + 'static) = match self {
+            LoginError::Tls(e) | LoginError::Connect(e) | LoginError::Timeout(e) | LoginError::Network(e) => e,
+            LoginError::InvalidCredentials | LoginError::UnexpectedResponse(_) => return None,
+        };
+        let mut parts = vec![err.to_string()];
+        let mut current = err.source();
+        while let Some(source) = current {
+            parts.push(source.to_string());
+            current = source.source();
+        }
+        Some(parts.join(" → "))
+    }
+}
+
+/// Turns a raw transport error into one of `LoginError`'s categorized variants.
+fn classify_transport_error(err: reqwest::Error) -> LoginError {
+    if err.is_timeout() {
+        return LoginError::Timeout(err);
+    }
+    if is_tls_error(&err) {
+        return LoginError::Tls(err);
+    }
+    if err.is_connect() {
+        return LoginError::Connect(err);
+    }
+    LoginError::Network(err)
+}
+
+/// Walks the error's `source()` chain looking for a TLS/certificate cause. String-matching on
+/// `Display` text (rather than downcasting to a concrete native-tls/rustls/openssl error type) is
+/// deliberate: reqwest is built here with its default TLS backend (native-tls/OpenSSL on Linux —
+/// confirmed via Cargo.toml/Cargo.lock, no `rustls-tls` feature enabled), and matching on wording
+/// keeps this working across whatever backend or version actually surfaces the error, at the cost
+/// of being best-effort — a false negative just falls through to `Connect`/`Network`, never wrong
+/// in the dangerous direction (it never *hides* a real TLS error as a credentials problem).
+fn is_tls_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    const MARKERS: [&str; 6] =
+        ["certificate", "self signed", "self-signed", "ssl", "tls", "handshake"];
+    let text = err.to_string().to_lowercase();
+    if MARKERS.iter().any(|m| text.contains(m)) {
+        return true;
+    }
+    err.source().is_some_and(is_tls_error)
 }
 
 impl Client {
@@ -63,7 +120,8 @@ impl Client {
             .header("x-return-tokens", "true")
             .json(&LoginRequest { username, password })
             .send()
-            .await?;
+            .await
+            .map_err(classify_transport_error)?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(LoginError::InvalidCredentials);
@@ -75,7 +133,7 @@ impl Client {
             )));
         }
 
-        let body: LoginResponseBody = response.json().await?;
+        let body: LoginResponseBody = response.json().await.map_err(classify_transport_error)?;
         let access_token = body.user.access_token.ok_or_else(|| {
             LoginError::UnexpectedResponse(
                 "login succeeded but response carried no accessToken (was x-return-tokens sent?)"
@@ -150,6 +208,33 @@ mod tests {
         let client = Client::new(&server.uri());
         let err = client.login("jane", "hunter2").await.unwrap_err();
         assert!(matches!(err, LoginError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn connection_refused_surfaces_as_connect_error_with_details() {
+        // Nothing listens on this address, so this fails immediately without any real network —
+        // fast and hermetic, unlike the TLS test below.
+        let client = Client::new("http://127.0.0.1:1");
+        let err = client.login("jane", "hunter2").await.unwrap_err();
+        assert!(matches!(err, LoginError::Connect(_)), "got {err:?}");
+        assert!(err.details().is_some(), "a Connect error should carry raw details");
+    }
+
+    /// Confirms `classify_transport_error`'s TLS detection against a real handshake failure, not
+    /// just the marker-string logic in isolation — badssl.com's self-signed subdomain exists
+    /// specifically for tests like this one. `#[ignore]`d so `cargo test --workspace` stays
+    /// hermetic; run explicitly with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn untrusted_certificate_surfaces_as_tls_error_with_details() {
+        let client = Client::new("https://self-signed.badssl.com");
+        let err = client.login("jane", "hunter2").await.unwrap_err();
+        assert!(matches!(err, LoginError::Tls(_)), "got {err:?}");
+        let details = err.details().expect("a Tls error should carry raw details");
+        assert!(
+            details.to_lowercase().contains("cert") || details.to_lowercase().contains("ssl"),
+            "expected certificate-related detail text, got: {details}"
+        );
     }
 
     #[tokio::test]
