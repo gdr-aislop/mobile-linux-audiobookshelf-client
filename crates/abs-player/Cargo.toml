@@ -5,3 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+gstreamer = "0.23"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hound = "3"
