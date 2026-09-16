@@ -140,6 +140,31 @@ Fractal) rather than copying Lissen's Material Design look.
 - Fixed bar: 40–48px cover thumbnail, title + author (single line, ellipsized), play/pause icon
   button, thin progress line along the bottom edge of the bar.
 - Swipe-up gesture or tap opens the full player.
+- This bar is pinned above the tab bar (phone) or the sidebar/content split (wide) on **every**
+  tab, not just Home — see the "Home" and "Library browse" mockups, both of which show it fixed
+  below their scrollable content. It reflects whatever's currently loaded regardless of which
+  screen the user navigated to since starting playback.
+
+### System media integration
+Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,
+a seek bar — so playback is visible and controllable from the lock screen and notification shade
+even when the app isn't focused. The direct GNOME/phosh equivalent is **not** a hand-drawn
+`GNotification`, but exporting the **MPRIS2** D-Bus interfaces
+(`org.mpris.MediaPlayer2`/`org.mpris.MediaPlayer2.Player`) from `abs-player`. GNOME Shell and phosh
+already know how to render cover art, title/author, transport controls, and a scrub position from
+those properties on their own system surfaces — the Shell's quick-settings media widget and the
+lock screen's media card — with no custom UI code needed for either. See the
+`SystemMediaWidget.dc.html` mockup, which depicts the phosh lock screen card this produces (marked
+in the mockup itself as OS-rendered, not app UI, since there's nothing here for this app to paint).
+- **Properties to keep current**, on every playback state change (play/pause/seek/position tick),
+  not just at session start: `PlaybackStatus`, `Metadata` (`xesam:title`, `xesam:artist`,
+  `mpris:artUrl` pointing at the cached cover file, `mpris:length`), `Position`, `Rate`.
+- **Methods**: `PlayPause`/`Play`/`Pause`, `Seek`, and `Next`/`Previous` mapped to this app's
+  skip-forward/back-N-seconds actions rather than a literal track change — matching what Lissen's
+  own notification buttons actually do.
+- A plain `GNotification` is deliberately **not** part of this design: the quick-settings/lock-screen
+  media widget already gives always-on visibility and controls without user action, so a second,
+  separately-dismissible notification would just duplicate it.
 
 ### Player — full
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for

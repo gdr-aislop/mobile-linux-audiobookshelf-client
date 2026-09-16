@@ -13,6 +13,7 @@ Each file is one screen from `docs/design/ui-spec.md`:
 | `Library.dc.html` | Library browse (incl. the view-options sheet) |
 | `ItemDetail.dc.html` | Item detail (incl. the download-scope sheet) |
 | `Player.dc.html` | Full player |
+| `SystemMediaWidget.dc.html` | The phosh lock-screen media card produced by our MPRIS integration — OS-rendered, not app UI; see `ui-spec.md`'s "System media integration" section |
 | `Settings.dc.html` | Settings (incl. Servers group) |
 | `Connection.dc.html` | Per-server Connection settings |
 

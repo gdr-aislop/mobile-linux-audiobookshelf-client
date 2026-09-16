@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root{
+    --fg:#ffffff; --fg-dim:rgba(255,255,255,.65); --accent:#78aeed;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#3d3846;}
+  .phone{width:390px;height:844px;background:linear-gradient(180deg,#1a1a22,#232330 55%,#1a1a22);
+    font-family:Cantarell,-apple-system,"Segoe UI",system-ui,sans-serif;
+    color:var(--fg);display:flex;flex-direction:column;overflow:hidden;position:relative;}
+  .annotation{position:absolute;top:10px;left:10px;right:10px;background:rgba(255,214,79,.14);
+    border:1px dashed rgba(255,214,79,.55);border-radius:8px;padding:7px 10px;font-size:10.5px;
+    line-height:1.4;color:#ffd64f;z-index:5;}
+  .lockscreen{flex:1;display:flex;flex-direction:column;align-items:center;padding-top:64px;}
+  .clock{font-size:56px;font-weight:200;letter-spacing:1px;}
+  .date{font-size:14px;color:var(--fg-dim);margin-top:4px;}
+  .spacer{flex:1;}
+  .media-card{width:340px;margin-bottom:56px;background:rgba(255,255,255,.08);
+    border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:14px 16px 16px;
+    backdrop-filter:blur(18px);box-shadow:0 8px 28px rgba(0,0,0,.35);}
+  .media-source{display:flex;align-items:center;gap:6px;font-size:10.5px;font-weight:700;
+    color:var(--fg-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;}
+  .media-source .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);}
+  .media-row{display:flex;gap:12px;align-items:center;}
+  .media-cover{width:56px;height:56px;border-radius:10px;flex:0 0 auto;
+    background:linear-gradient(160deg,#1a5fb4,#3584e4);box-shadow:0 2px 8px rgba(0,0,0,.3);}
+  .media-text{flex:1;min-width:0;}
+  .media-title{font-size:14.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .media-sub{font-size:12px;color:var(--fg-dim);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .media-scrub{margin-top:14px;height:3px;border-radius:3px;background:rgba(255,255,255,.18);position:relative;}
+  .media-scrub .fill{position:absolute;left:0;top:0;bottom:0;width:63%;background:var(--accent);border-radius:3px;}
+  .media-time{display:flex;justify-content:space-between;font-size:10px;color:var(--fg-dim);
+    margin-top:6px;font-variant-numeric:tabular-nums;}
+  .media-transport{display:flex;align-items:center;justify-content:center;gap:34px;margin-top:12px;}
+  .m-skip{color:var(--fg);opacity:.9;}
+  .m-play{width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.14);
+    display:flex;align-items:center;justify-content:center;}
+  .footnote{position:absolute;bottom:8px;left:10px;right:10px;font-size:9.5px;line-height:1.4;
+    color:var(--fg-dim);text-align:center;}
+</style>
+</helmet>
+
+<div class="phone">
+  <div class="annotation">
+    Rendered by GNOME Shell / phosh from our MPRIS2 metadata &mdash; not app-drawn UI. This is
+    the Linux equivalent of Lissen's Android media-style notification: the lock screen (shown
+    here) and the Shell's quick-settings media widget both read the same
+    <code>org.mpris.MediaPlayer2.Player</code> properties we publish, so there is one source of
+    truth and nothing for the app to paint.
+  </div>
+
+  <div class="lockscreen">
+    <div class="clock">09:22</div>
+    <div class="date">Wednesday, 16 September</div>
+    <div class="spacer"></div>
+
+    <div class="media-card">
+      <div class="media-source"><span class="dot"></span>Audiobookshelf</div>
+      <div class="media-row">
+        <div class="media-cover"></div>
+        <div class="media-text">
+          <div class="media-title">Project Hail Mary</div>
+          <div class="media-sub">Andy Weir &middot; Ch. 14</div>
+        </div>
+      </div>
+      <div class="media-scrub"><div class="fill"></div></div>
+      <div class="media-time"><span>3:22:01</span><span>&minus;1:58:31</span></div>
+      <div class="media-transport">
+        <div class="m-skip">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 4.5A6.5 6.5 0 1017 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11 1.8v5.4h5.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="m-play">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="5.5" y="4" width="3.4" height="12" rx="1.1" fill="#fff"/><rect x="11.1" y="4" width="3.4" height="12" rx="1.1" fill="#fff"/></svg>
+        </div>
+        <div class="m-skip">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 4.5A6.5 6.5 0 015 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11 1.8v5.4H5.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    Skip buttons map to our skip-back/forward-N-seconds actions (MPRIS Previous/Next), matching
+    Lissen's own notification actions rather than a literal previous/next track.
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
