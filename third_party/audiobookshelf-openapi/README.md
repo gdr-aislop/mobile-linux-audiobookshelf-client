@@ -37,6 +37,15 @@ own incremental OpenAPI documentation effort, not a vendoring mistake on our par
 list against upstream's route table whenever the spec is updated, since new coverage may close
 some of these gaps over time.
 
+There's also a subtler gap within a path the spec *does* cover: `GET /api/libraries/:id/items`
+generates fine, but its response schema types the `results` array as `LibraryItemBase`, which has
+no `media` property — even though the real server always includes `media.metadata.{title,
+authorName, narratorName, description}` and `media.duration` on every item (confirmed live against
+`https://audiobooks.dev/audiobookshelf`). Deserializing into the generated type silently drops
+that data rather than erroring, so it looked spec-covered until item sync actually needed the
+title/author/duration fields. Handled the same way as the gaps above: a hand-written
+`get_library_items_with_media` in `abs-api/src/ext.rs` alongside `login`.
+
 ## Updating
 
 1. Pull the latest `docs/openapi.json` from the upstream repo (pin to a specific commit/tag, not

@@ -1,5 +1,7 @@
 mod application;
 mod screens;
+#[cfg(test)]
+mod test_support;
 mod widgets;
 
 use adw::prelude::*;
@@ -54,5 +56,40 @@ async fn setup() -> AppState {
         "resolved startup screen"
     );
 
-    AppState { pool, paths, active_account }
+    AppState { pool, active_account }
+}
+
+/// Every GTK-touching test across `screens::*` funnels through exactly these two `#[test]` fns.
+/// `gtk4::init()` binds to whichever OS thread first calls it, and Rust's built-in test harness
+/// gives every `#[test]` fn its own fresh OS thread even under `--test-threads=1` (that flag only
+/// limits how many run *concurrently*, not which thread each runs on) — so two `#[test]` fns that
+/// both call `gtk4::init()` panic with "Attempted to initialize GTK from two different threads" or
+/// "Failed to acquire default main context", regardless of file. Each screen module keeps its own
+/// test code local (`pub(crate) mod tests` with plain `run`/`run_live` functions, not `#[test]`s)
+/// for readability; only the actual entry point lives here.
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gtk_fast_scenarios() {
+        gtk4::init().expect("gtk4::init for this test");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        crate::screens::welcome::tests::run(&runtime);
+        crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
+        crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
+        crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::main_window::tests::run(&runtime);
+    }
+
+    #[test]
+    #[ignore]
+    fn gtk_live_demo_server_scenarios() {
+        gtk4::init().expect("gtk4::init for this test");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        crate::screens::welcome::tests::run_live(&runtime);
+        crate::screens::home::tests::run_live(&runtime);
+    }
 }

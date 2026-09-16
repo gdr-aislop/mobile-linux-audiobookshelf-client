@@ -317,33 +317,13 @@ fn login_details(err: &CoreError) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::test_support::{pool, pump_until};
     use std::cell::RefCell;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const DEMO_SERVER_URL: &str = "https://audiobooks.dev/audiobookshelf";
-
-    async fn pool() -> SqlitePool {
-        let tmp = tempfile::tempdir().unwrap();
-        let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3"))
-            .await
-            .unwrap();
-        std::mem::forget(tmp);
-        pool
-    }
-
-    /// Drains the default `MainContext` — the same one `glib::spawn_future_local` schedules
-    /// onto — until `done()` returns true or `timeout` elapses. `iteration(false)` is
-    /// non-blocking, so this is a plain poll loop, not a nested main loop.
-    fn pump_until(done: impl Fn() -> bool, timeout: Duration) {
-        let context = glib::MainContext::default();
-        let deadline = Instant::now() + timeout;
-        while !done() && Instant::now() < deadline {
-            while context.iteration(false) {}
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
 
     /// Exercises the real Connect button — `emit_clicked()` invokes the actual production
     /// signal handler, not a simulated input event — against the live public demo server
@@ -354,20 +334,9 @@ mod tests {
     /// if `main.rs` didn't keep one entered for the GTK main loop's lifetime, this test would
     /// hang or panic with "no reactor running" instead of completing.
     ///
-    /// Both the success and failure scenarios live in one `#[test]` function rather than two:
-    /// `gtk4::init()` binds to whichever OS thread calls it first, and libtest gives every
-    /// `#[test]` fn its own fresh thread even under `--test-threads=1` (that flag only limits
-    /// how many run *concurrently*, not which thread each runs on) — so a second test calling
-    /// `gtk4::init()` from its own thread panics with "Attempted to initialize GTK from two
-    /// different threads." Running both scenarios sequentially, after a single `gtk4::init()`,
-    /// avoids that.
-    #[test]
-    #[ignore]
-    fn connect_button_logs_in_against_the_live_demo_server() {
-        gtk4::init().expect("gtk4::init for this test");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _guard = runtime.enter();
-
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every GTK-touching live-server
+    /// scenario in this binary has to run from one single entry point.
+    pub(crate) fn run_live(runtime: &tokio::runtime::Runtime) {
         // Success case: correct demo credentials.
         {
             let pool = runtime.block_on(pool());
@@ -437,18 +406,13 @@ mod tests {
         }
     }
 
-    /// Covers both the disabled/toggling behavior and the connectivity-failure error state in one
-    /// `#[test]` fn: libtest gives every `#[test]` its own OS thread even under
-    /// `--test-threads=1`, and `gtk4::init()` can only succeed once per process/thread — running
-    /// two GTK-touching non-`#[ignore]`d tests as separate fns panics with "Failed to acquire
-    /// default main context" (the same class of bug already documented on the live-server test
-    /// above).
-    #[test]
-    fn connect_button_starts_disabled_toggling_mode_and_handles_connectivity_failure() {
-        gtk4::init().expect("gtk4::init for this test");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _guard = runtime.enter();
-
+    /// Covers both the disabled/toggling behavior and the connectivity-failure error state. Not a
+    /// `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching scenario in
+    /// this binary has to run from one single entry point (`gtk4::init()` can only succeed once
+    /// per process/thread, and libtest gives every `#[test]` fn its own fresh OS thread even under
+    /// `--test-threads=1`, which only limits how many run *concurrently*, not which thread each
+    /// runs on).
+    pub(crate) fn run(runtime: &tokio::runtime::Runtime) {
         // Starts disabled; filling every required Password-mode field enables Connect.
         {
             let pool = runtime.block_on(pool());

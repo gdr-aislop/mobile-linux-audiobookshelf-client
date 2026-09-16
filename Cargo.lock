@@ -32,11 +32,13 @@ dependencies = [
  "abs-storage",
  "gtk4",
  "libadwaita",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
