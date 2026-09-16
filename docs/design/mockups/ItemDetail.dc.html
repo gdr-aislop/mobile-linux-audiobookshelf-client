@@ -1,0 +1,183 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root{
+    --bg:#fafafa; --headerbar:#fafafa; --card:#ffffff; --fg:#2e3436; --fg-dim:#77767b;
+    --accent:#3584e4; --divider:rgba(0,0,0,.09); --shade:rgba(0,0,0,.05);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#3d3846;}
+  .phone{width:390px;height:844px;background:var(--bg);font-family:Cantarell,-apple-system,"Segoe UI",system-ui,sans-serif;
+    color:var(--fg);display:flex;flex-direction:column;overflow:hidden;position:relative;}
+  .headerbar{height:47px;min-height:47px;background:var(--headerbar);border-bottom:1px solid var(--divider);
+    display:flex;align-items:center;justify-content:center;position:relative;padding:0 8px;}
+  .headerbar .title{font-size:14px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;}
+  .headerbar .btn{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--fg);}
+  .headerbar .btn.left{position:absolute;left:8px;}
+  .headerbar .btn.right{position:absolute;right:8px;}
+  .content{flex:1;overflow-y:auto;padding-bottom:12px;}
+  .hero{display:flex;flex-direction:column;align-items:center;padding:22px 24px 16px;}
+  .cover-lg{width:172px;height:172px;border-radius:14px;background:linear-gradient(160deg,#1a5fb4,#3584e4);
+    box-shadow:0 4px 8px rgba(0,0,0,.2),0 1px 3px rgba(0,0,0,.15);display:flex;align-items:flex-end;overflow:hidden;position:relative;}
+  .cover-lg .band{position:absolute;left:0;right:0;height:50px;background:rgba(0,0,0,.18);}
+  .cover-lg .plate{position:relative;z-index:1;color:#fff;font-size:16px;font-weight:800;line-height:1.2;padding:14px;text-shadow:0 1px 4px rgba(0,0,0,.4);}
+  .book-title{margin-top:16px;font-size:18px;font-weight:800;text-align:center;}
+  .book-sub{margin-top:4px;font-size:13px;color:var(--fg-dim);text-align:center;}
+  .progress-row{width:100%;margin-top:14px;padding:0 8px;}
+  .pbar{height:5px;border-radius:5px;background:#e5e5e6;overflow:hidden;}
+  .pbar .fill{height:100%;width:63%;background:var(--accent);}
+  .ptext{display:flex;justify-content:space-between;font-size:11px;color:var(--fg-dim);margin-top:5px;}
+  .actions{display:flex;gap:10px;padding:14px 20px 4px;position:relative;}
+  .btn-primary{flex:1;height:42px;border-radius:10px;background:var(--accent);color:#fff;display:flex;align-items:center;
+    justify-content:center;gap:8px;font-size:14px;font-weight:700;}
+  .btn-secondary{width:42px;height:42px;border-radius:10px;background:#eeeeef;display:flex;align-items:center;justify-content:center;color:var(--fg);position:relative;}
+  .btn-secondary.dl-open{background:var(--accent);color:#fff;}
+
+  .sheet-scrim{position:absolute;inset:0;background:rgba(0,0,0,.42);z-index:6;}
+  .dl-sheet{position:absolute;left:0;right:0;bottom:0;background:#fff;border-radius:18px 18px 0 0;
+    box-shadow:0 -4px 20px rgba(0,0,0,.25);z-index:7;padding:8px 0 22px;}
+  .dl-sheet .grip{width:36px;height:4px;border-radius:3px;background:#d7d7d8;margin:0 auto 14px;}
+  .dl-sheet .sheet-title{text-align:center;font-size:15px;font-weight:700;padding:0 20px 12px;}
+  .dl-item{display:flex;align-items:center;gap:10px;padding:13px 20px;font-size:14px;font-weight:500;
+    border-top:1px solid var(--divider);}
+  .dl-item:first-of-type{border-top:1px solid var(--divider);}
+  .dl-item .label{flex:1;}
+  .stepper{display:flex;align-items:center;gap:14px;flex:0 0 auto;}
+  .stepper .step-btn{width:26px;height:26px;border-radius:50%;background:#eeeeef;display:flex;align-items:center;
+    justify-content:center;color:var(--accent);flex:0 0 auto;}
+  .stepper .step-val{font-size:15px;font-weight:700;min-width:18px;text-align:center;}
+  .dl-item.danger{color:#c01c28;font-weight:600;border-top:1px solid var(--divider);margin-top:4px;}
+  .desc{padding:16px 20px 4px;font-size:13px;line-height:1.55;color:#4a4846;}
+  .section-title{padding:14px 20px 8px;font-size:13px;font-weight:700;color:var(--fg-dim);display:flex;align-items:center;justify-content:space-between;}
+  .section-title .dl-hint{font-size:11px;font-weight:600;color:var(--fg-dim);display:flex;align-items:center;gap:4px;}
+  .list-card{margin:0 16px 16px;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--divider);}
+  .chapter-row{display:flex;align-items:center;gap:12px;padding:11px 12px;border-bottom:1px solid var(--divider);}
+  .chapter-row:last-child{border-bottom:none;}
+  .chapter-row.current{background:rgba(53,132,228,.08);}
+  .ch-num{width:22px;font-size:12px;color:var(--fg-dim);font-weight:600;text-align:center;flex:0 0 auto;}
+  .ch-title{flex:1;font-size:13px;font-weight:600;}
+  .chapter-row.current .ch-title{color:var(--accent);}
+  .ch-dur{font-size:11.5px;color:var(--fg-dim);}
+  .playing-icon{width:14px;height:14px;color:var(--accent);flex:0 0 auto;}
+  .offline-icon{width:14px;height:14px;color:#2ec27e;flex:0 0 auto;}
+</style>
+</helmet>
+
+<div class="phone">
+  <div class="headerbar">
+    <div class="btn left">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M11.5 3.5L5 9l6.5 5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="title">Project Hail Mary</div>
+    <div class="btn right">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="4" cy="9" r="1.3" fill="currentColor"/><circle cx="9" cy="9" r="1.3" fill="currentColor"/><circle cx="14" cy="9" r="1.3" fill="currentColor"/></svg>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="hero">
+      <div class="cover-lg"><div class="band"></div><div class="plate">Project Hail Mary</div></div>
+      <div class="book-title">Project Hail Mary</div>
+      <div class="book-sub">Andy Weir &middot; narrated by Ray Porter</div>
+      <div class="progress-row">
+        <div class="pbar"><div class="fill"></div></div>
+        <div class="ptext"><span>10h 12m listened</span><span>5h 58m left</span></div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <div class="btn-primary">
+        <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M4 2.8v9.4l8-4.7-8-4.7z" fill="#fff"/></svg>
+        Resume
+      </div>
+      <div class="btn-secondary dl-open">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><path d="M8.5 2v9.4M4.3 7.7l4.2 4.2 4.2-4.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 14h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </div>
+    </div>
+
+    <div class="desc">
+      A lone astronaut must save humanity from extinction after waking up on a solo mission with
+      no memory of how he got there &mdash; or why he's the last one left. A story of first contact,
+      desperate science, and an unlikely friendship that spans the stars.
+    </div>
+
+    <div class="section-title">
+      Chapters &middot; 32
+      <span class="dl-hint">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="5.5" cy="5.5" r="5" stroke="currentColor" stroke-width="1.1"/><path d="M3.2 5.6l1.5 1.5 3.1-3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        downloaded
+      </span>
+    </div>
+    <div class="list-card">
+      <div class="chapter-row">
+        <div class="ch-num">12</div>
+        <div class="ch-title">The Taumoeba Problem</div>
+        <svg class="offline-icon" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M4.2 7.1l1.9 1.9 3.9-4.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="ch-dur">28m</div>
+      </div>
+      <div class="chapter-row">
+        <div class="ch-num">13</div>
+        <div class="ch-title">First Contact Protocol</div>
+        <svg class="offline-icon" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M4.2 7.1l1.9 1.9 3.9-4.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="ch-dur">31m</div>
+      </div>
+      <div class="chapter-row current">
+        <svg class="playing-icon" viewBox="0 0 14 14" fill="none"><rect x="2" y="2" width="3" height="10" rx="1" fill="currentColor"/><rect x="9" y="2" width="3" height="10" rx="1" fill="currentColor"/></svg>
+        <div class="ch-title">Rocky's Ship</div>
+        <svg class="offline-icon" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M4.2 7.1l1.9 1.9 3.9-4.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="ch-dur">34m</div>
+      </div>
+      <div class="chapter-row">
+        <div class="ch-num">15</div>
+        <div class="ch-title">Xenonite Experiments</div>
+        <div class="ch-dur">26m</div>
+      </div>
+      <div class="chapter-row">
+        <div class="ch-num">16</div>
+        <div class="ch-title">Return to Earth</div>
+        <div class="ch-dur">29m</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sheet-scrim"></div>
+  <div class="dl-sheet">
+    <div class="grip"></div>
+    <div class="sheet-title">Download book</div>
+
+    <div class="dl-item">
+      <span class="label">Current chapter</span>
+    </div>
+    <div class="dl-item">
+      <span class="label">Next chapters</span>
+      <div class="stepper">
+        <div class="step-btn">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </div>
+        <div class="step-val">10</div>
+        <div class="step-btn">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="dl-item">
+      <span class="label">Remaining chapters</span>
+    </div>
+    <div class="dl-item">
+      <span class="label">Entire book</span>
+    </div>
+    <div class="dl-item danger">
+      <span class="label">Clear downloaded chapters</span>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

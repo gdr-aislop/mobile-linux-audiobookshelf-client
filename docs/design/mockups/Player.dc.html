@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root{
+    --bg:#fafafa; --headerbar:#fafafa; --fg:#2e3436; --fg-dim:#77767b;
+    --accent:#3584e4; --divider:rgba(0,0,0,.09);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#3d3846;}
+  .phone{width:390px;height:844px;background:linear-gradient(180deg,#eef3fb,#fafafa 40%);
+    font-family:Cantarell,-apple-system,"Segoe UI",system-ui,sans-serif;
+    color:var(--fg);display:flex;flex-direction:column;overflow:hidden;position:relative;}
+  .headerbar{height:47px;min-height:47px;display:flex;align-items:center;justify-content:center;position:relative;padding:0 8px;}
+  .headerbar .title{font-size:12.5px;font-weight:700;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.6px;}
+  .headerbar .btn{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--fg);}
+  .headerbar .btn.left{position:absolute;left:8px;}
+  .headerbar .btn.right{position:absolute;right:8px;}
+  .content{flex:1;display:flex;flex-direction:column;align-items:center;padding:8px 28px 24px;overflow:hidden;}
+  .cover-xl{width:264px;height:264px;border-radius:16px;margin-top:14px;background:linear-gradient(160deg,#1a5fb4,#3584e4);
+    box-shadow:0 10px 24px rgba(26,95,180,.35),0 2px 6px rgba(0,0,0,.15);display:flex;align-items:flex-end;overflow:hidden;position:relative;}
+  .cover-xl .band{position:absolute;left:0;right:0;height:70px;background:rgba(0,0,0,.18);}
+  .cover-xl .plate{position:relative;z-index:1;color:#fff;font-size:20px;font-weight:800;line-height:1.2;padding:18px;text-shadow:0 1px 4px rgba(0,0,0,.4);}
+  .np-title{margin-top:22px;font-size:19px;font-weight:800;text-align:center;}
+  .np-sub{margin-top:4px;font-size:13.5px;color:var(--fg-dim);text-align:center;}
+  .np-chapter{margin-top:2px;font-size:12px;color:var(--accent);font-weight:600;text-align:center;}
+  .scrub-wrap{width:100%;margin-top:22px;}
+  .scrub{height:5px;border-radius:5px;background:#dfe3e8;position:relative;}
+  .scrub .fill{position:absolute;left:0;top:0;bottom:0;width:57%;background:var(--accent);border-radius:5px;}
+  .scrub .knob{position:absolute;left:57%;top:50%;width:13px;height:13px;border-radius:50%;background:#fff;
+    border:2px solid var(--accent);transform:translate(-50%,-50%);box-shadow:0 1px 3px rgba(0,0,0,.3);}
+  .time-row{display:flex;justify-content:space-between;font-size:11.5px;color:var(--fg-dim);margin-top:8px;font-variant-numeric:tabular-nums;}
+  .transport{display:flex;align-items:center;justify-content:center;gap:30px;margin-top:26px;}
+  .skip-btn{width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--fg);position:relative;}
+  .skip-btn .n{position:absolute;font-size:9.5px;font-weight:700;color:var(--fg);}
+  .play-btn{width:72px;height:72px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;
+    box-shadow:0 6px 16px rgba(53,132,228,.4);}
+  .secondary-row{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:30px;width:100%;}
+  .pill-btn{height:38px;border-radius:19px;background:#eef0f2;display:flex;align-items:center;gap:7px;padding:0 16px;font-size:13px;font-weight:700;color:var(--fg);}
+  .pill-btn.sleep{color:var(--accent);background:rgba(53,132,228,.12);}
+</style>
+</helmet>
+
+<div class="phone">
+  <div class="headerbar">
+    <div class="btn left">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M13.5 5L9 9l4.5 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="title">Playing from Audiobooks</div>
+    <div class="btn right">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="4" cy="9" r="1.3" fill="currentColor"/><circle cx="9" cy="9" r="1.3" fill="currentColor"/><circle cx="14" cy="9" r="1.3" fill="currentColor"/></svg>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="cover-xl"><div class="band"></div><div class="plate">Project Hail Mary</div></div>
+    <div class="np-title">Project Hail Mary</div>
+    <div class="np-sub">Andy Weir &middot; Ray Porter</div>
+    <div class="np-chapter">Chapter 14 &middot; Rocky's Ship</div>
+
+    <div class="scrub-wrap">
+      <div class="scrub"><div class="fill"></div><div class="knob"></div></div>
+      <div class="time-row"><span>10:12:04</span><span>&minus;5:58:31</span></div>
+    </div>
+
+    <div class="transport">
+      <div class="skip-btn">
+        <svg width="26" height="26" viewBox="0 0 26 26" fill="none"><path d="M13 5.5A7.5 7.5 0 1120 15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M13 2.5v6h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="n" style="top:16px;">15</span>
+      </div>
+      <div class="play-btn">
+        <svg width="26" height="26" viewBox="0 0 26 26" fill="none"><rect x="6.5" y="5" width="4.4" height="16" rx="1.4" fill="#fff"/><rect x="15.1" y="5" width="4.4" height="16" rx="1.4" fill="#fff"/></svg>
+      </div>
+      <div class="skip-btn">
+        <svg width="26" height="26" viewBox="0 0 26 26" fill="none"><path d="M13 5.5A7.5 7.5 0 006 15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M13 2.5v6H7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="n" style="top:16px;">30</span>
+      </div>
+    </div>
+
+    <div class="secondary-row">
+      <div class="pill-btn">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7h3l1.5-4L9 12l1.5-5H12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        1.2&times;
+      </div>
+      <div class="pill-btn sleep">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7.5" r="5.2" stroke="currentColor" stroke-width="1.4"/><path d="M7 4.3v3.2l2.2 1.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        30 min
+      </div>
+      <div class="pill-btn">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2.5 3.5h9M2.5 7h9M2.5 10.5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        Chapters
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root{
+    --bg:#fafafa; --headerbar:#fafafa; --card:#ffffff; --fg:#2e3436; --fg-dim:#77767b;
+    --accent:#3584e4; --divider:rgba(0,0,0,.09); --shade:rgba(0,0,0,.05);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#3d3846;}
+  a{color:var(--accent);} a:hover{color:#1c71d8;}
+  .phone{width:390px;height:844px;background:var(--bg);font-family:Cantarell,-apple-system,"Segoe UI",system-ui,sans-serif;
+    color:var(--fg);display:flex;flex-direction:column;overflow:hidden;position:relative;}
+  .headerbar{height:47px;min-height:47px;background:var(--headerbar);border-bottom:1px solid var(--divider);
+    display:flex;align-items:center;justify-content:center;position:relative;padding:0 8px;}
+  .headerbar .title{font-size:15px;font-weight:700;}
+  .headerbar .btn{position:absolute;width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;}
+  .headerbar .btn.right{right:8px;}
+  .headerbar .btn.left{left:8px;}
+  .headerbar .btn:active{background:var(--shade);}
+  .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#62a0ea,#3584e4);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:700;}
+  .offline-toggle{position:absolute;left:8px;height:30px;border-radius:8px;display:flex;align-items:center;gap:5px;
+    padding:0 9px;font-size:11.5px;font-weight:700;color:var(--fg-dim);}
+  .offline-toggle.on{background:var(--accent);color:#fff;}
+  .offline-toggle.off{background:#eeeeef;color:var(--fg-dim);}
+  .offline-banner{margin:8px 16px 0;background:rgba(53,132,228,.1);border:1px solid rgba(53,132,228,.25);border-radius:10px;
+    padding:8px 12px;display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:600;color:#1a5fb4;}
+  .content{flex:1;overflow-y:auto;padding-bottom:4px;}
+  .section{padding:18px 16px 4px;}
+  .section h2{font-size:13px;font-weight:700;color:var(--fg-dim);text-transform:none;margin:0 0 10px;letter-spacing:.2px;}
+  .row{display:flex;gap:12px;overflow-x:auto;padding:2px 16px 14px;scrollbar-width:none;}
+  .row::-webkit-scrollbar{display:none;}
+  .cover-card{flex:0 0 auto;width:132px;display:flex;flex-direction:column;gap:6px;}
+  .cover{width:132px;height:132px;border-radius:12px;position:relative;box-shadow:0 1px 2px rgba(0,0,0,.15),0 1px 6px rgba(0,0,0,.08);
+    display:flex;align-items:flex-end;overflow:hidden;}
+  .cover .band{position:absolute;left:0;right:0;height:34px;background:rgba(0,0,0,.18);}
+  .cover .title-plate{position:relative;z-index:1;color:#fff;font-size:11px;font-weight:700;line-height:1.25;padding:8px 9px;
+    text-shadow:0 1px 3px rgba(0,0,0,.4);}
+  .progress-pill{position:absolute;bottom:8px;right:8px;left:8px;height:4px;background:rgba(255,255,255,.35);border-radius:4px;overflow:hidden;}
+  .progress-pill .fill{height:100%;background:#fff;border-radius:4px;}
+  .meta{font-size:11.5px;color:var(--fg-dim);}
+  .meta .t{color:var(--fg);font-weight:600;display:block;font-size:12.5px;margin-bottom:1px;}
+  .list-card{margin:2px 16px 18px;background:var(--card);border-radius:12px;overflow:hidden;
+    box-shadow:0 1px 2px rgba(0,0,0,.06);border:1px solid var(--divider);}
+  .action-row{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid var(--divider);}
+  .action-row:last-child{border-bottom:none;}
+  .thumb{width:44px;height:44px;border-radius:8px;flex:0 0 auto;}
+  .ar-title{font-size:13.5px;font-weight:600;}
+  .ar-sub{font-size:11.5px;color:var(--fg-dim);margin-top:1px;}
+  .chevron{margin-left:auto;color:#c7c6ca;}
+  .mini-player{height:56px;flex:0 0 auto;background:#f2f2f3;border-top:1px solid var(--divider);
+    display:flex;align-items:center;gap:10px;padding:0 10px;position:relative;}
+  .mini-player .mthumb{width:38px;height:38px;border-radius:6px;flex:0 0 auto;}
+  .mini-player .mtext{flex:1;min-width:0;}
+  .mini-player .mtitle{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .mini-player .msub{font-size:11px;color:var(--fg-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .mini-player .mprogress{position:absolute;left:0;right:0;bottom:0;height:2.5px;background:rgba(0,0,0,.08);}
+  .mini-player .mprogress .fill{height:100%;background:var(--accent);}
+  .iconbtn{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 auto;}
+  .iconbtn:active{background:rgba(0,0,0,.06);}
+  .tabbar{height:64px;flex:0 0 auto;background:var(--headerbar);border-top:1px solid var(--divider);
+    display:flex;align-items:stretch;padding-bottom:8px;}
+  .tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--fg-dim);}
+  .tab.active{color:var(--accent);}
+  .tab .label{font-size:10.5px;font-weight:600;}
+</style>
+</helmet>
+
+<div class="phone">
+  <div class="headerbar">
+    <div class="btn left offline-toggle on">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M1 6.5h11M6.5 1v11" stroke="none"/><path d="M1.6 9.4L6.5 2l4.9 7.4a1 1 0 01-.83 1.55H2.43a1 1 0 01-.83-1.55z" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/><path d="M1.6 2.6l9.8 7.8" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/></svg>
+      Offline
+    </div>
+    <div class="title">Home</div>
+    <div class="btn right"><div class="avatar">JR</div></div>
+  </div>
+
+  <div class="offline-banner">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M7 4v3.4l2.2 1.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Showing downloaded items only
+  </div>
+
+  <div class="content">
+    <div class="section"><h2>Continue Listening</h2></div>
+    <div class="row">
+      <div class="cover-card">
+        <div class="cover" style="background:linear-gradient(160deg,#1a5fb4,#3584e4);">
+          <div class="band"></div>
+          <div class="title-plate">Project Hail<br>Mary</div>
+          <div class="progress-pill"><div class="fill" style="width:63%"></div></div>
+        </div>
+        <div class="meta"><span class="t">Project Hail Mary</span>Andy Weir &middot; 63% &middot; 5h 58m left</div>
+      </div>
+      <div class="cover-card">
+        <div class="cover" style="background:linear-gradient(160deg,#c64600,#e66100);">
+          <div class="band"></div>
+          <div class="title-plate">Klara and<br>the Sun</div>
+          <div class="progress-pill"><div class="fill" style="width:8%"></div></div>
+        </div>
+        <div class="meta"><span class="t">Klara and the Sun</span>Kazuo Ishiguro &middot; 8% &middot; 9h 24m left</div>
+      </div>
+    </div>
+
+    <div class="section"><h2>Recently Added</h2></div>
+    <div class="row">
+      <div class="cover-card">
+        <div class="cover" style="background:linear-gradient(160deg,#a51d2d,#e01b24);">
+          <div class="band"></div>
+          <div class="title-plate">Dune</div>
+        </div>
+        <div class="meta"><span class="t">Dune</span>Frank Herbert &middot; 21h 2m</div>
+      </div>
+      <div class="cover-card">
+        <div class="cover" style="background:linear-gradient(160deg,#63452c,#986a44);">
+          <div class="band"></div>
+          <div class="title-plate">Circe</div>
+        </div>
+        <div class="meta"><span class="t">Circe</span>Madeline Miller &middot; 12h 8m</div>
+      </div>
+    </div>
+
+    <div class="section"><h2>Your Libraries</h2></div>
+    <div class="list-card">
+      <div class="action-row">
+        <div class="thumb" style="background:linear-gradient(160deg,#1a5fb4,#3584e4);"></div>
+        <div>
+          <div class="ar-title">Audiobooks</div>
+          <div class="ar-sub">6 downloaded</div>
+        </div>
+        <div class="chevron">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+      <div class="action-row">
+        <div class="thumb" style="background:linear-gradient(160deg,#c64600,#e66100);"></div>
+        <div>
+          <div class="ar-title">Podcasts</div>
+          <div class="ar-sub">0 downloaded</div>
+        </div>
+        <div class="chevron">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mini-player">
+    <div class="mprogress"><div class="fill" style="width:63%"></div></div>
+    <div class="mthumb" style="background:linear-gradient(160deg,#1a5fb4,#3584e4);"></div>
+    <div class="mtext">
+      <div class="mtitle">Project Hail Mary</div>
+      <div class="msub">Andy Weir &middot; Ch. 14</div>
+    </div>
+    <div class="iconbtn">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="3" y="2.5" width="3.2" height="11" rx="1" fill="currentColor"/><rect x="9.8" y="2.5" width="3.2" height="11" rx="1" fill="currentColor"/></svg>
+    </div>
+  </div>
+
+  <div class="tabbar">
+    <div class="tab active">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 9.5L10 3l7 6.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 8.5V16.5a1 1 0 001 1h8a1 1 0 001-1V8.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div class="label">Home</div>
+    </div>
+    <div class="tab">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="3" y="3" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6"/><rect x="11" y="3" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="11" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6"/><rect x="11" y="11" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6"/></svg>
+      <div class="label">Library</div>
+    </div>
+    <div class="tab">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 3v10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M6 9.5l4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15.5h12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <div class="label">Downloads</div>
+    </div>
+    <div class="tab">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="2.3" stroke="currentColor" stroke-width="1.6"/><path d="M10 3.5v1.6M10 14.9v1.6M16.5 10h-1.6M5.1 10H3.5M14.6 5.4l-1.1 1.1M6.5 13.5l-1.1 1.1M14.6 14.6l-1.1-1.1M6.5 6.5L5.4 5.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <div class="label">Settings</div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

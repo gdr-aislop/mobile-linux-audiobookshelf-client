@@ -1,0 +1,13 @@
+{
+  "artboards": [
+    { "file": "Welcome.dc.html", "x": -940, "y": 0, "w": 390, "h": 844 },
+    { "file": "WelcomeError.dc.html", "x": -470, "y": 0, "w": 390, "h": 844 },
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 390, "h": 844 },
+    { "file": "Library.dc.html", "x": 470, "y": 0, "w": 390, "h": 844 },
+    { "file": "ItemDetail.dc.html", "x": 940, "y": 0, "w": 390, "h": 844 },
+    { "file": "Player.dc.html", "x": 1410, "y": 0, "w": 390, "h": 844 },
+    { "file": "Settings.dc.html", "x": 1880, "y": 0, "w": 390, "h": 844 },
+    { "file": "Connection.dc.html", "x": 2350, "y": 0, "w": 390, "h": 844 }
+  ],
+  "launch": { "view": "canvas" }
+}

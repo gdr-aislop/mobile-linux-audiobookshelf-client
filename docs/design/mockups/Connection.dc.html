@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root{
+    --bg:#fafafa; --headerbar:#fafafa; --card:#ffffff; --fg:#2e3436; --fg-dim:#77767b;
+    --accent:#3584e4; --divider:rgba(0,0,0,.09); --shade:rgba(0,0,0,.05);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#3d3846;}
+  .phone{width:390px;height:844px;background:var(--bg);font-family:Cantarell,-apple-system,"Segoe UI",system-ui,sans-serif;
+    color:var(--fg);display:flex;flex-direction:column;overflow:hidden;position:relative;}
+  .headerbar{height:47px;min-height:47px;background:var(--headerbar);border-bottom:1px solid var(--divider);
+    display:flex;align-items:center;justify-content:center;position:relative;padding:0 8px;}
+  .headerbar .title{font-size:15px;font-weight:700;}
+  .headerbar .btn{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--fg);}
+  .headerbar .btn.left{position:absolute;left:8px;}
+  .content{flex:1;overflow-y:auto;padding:14px 16px 16px;}
+  .group-label{font-size:12px;font-weight:700;color:var(--fg-dim);margin:14px 4px 8px;text-transform:uppercase;letter-spacing:.4px;}
+  .group-label:first-child{margin-top:0;}
+  .list-card{background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--divider);}
+  .row{display:flex;align-items:center;gap:12px;padding:12px 13px;border-bottom:1px solid var(--divider);min-height:22px;}
+  .row:last-child{border-bottom:none;}
+  .row-text{flex:1;min-width:0;}
+  .row-title{font-size:13.5px;font-weight:600;}
+  .row-sub{font-size:11.5px;color:var(--fg-dim);margin-top:1px;}
+  .row-sub.mono{font-family:ui-monospace,"Cascadia Code","Source Code Pro",monospace;color:var(--fg);
+    font-size:12px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .chevron{color:#c7c6ca;flex:0 0 auto;}
+  .iconbtn-ghost{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    color:var(--fg-dim);flex:0 0 auto;}
+  .switch{width:38px;height:22px;border-radius:11px;position:relative;flex:0 0 auto;}
+  .switch.on{background:var(--accent);}
+  .switch.off{background:#d7d7d8;}
+  .switch .knob{position:absolute;top:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);}
+  .switch.on .knob{right:2px;}
+  .switch.off .knob{left:2px;}
+  .disconnect{text-align:center;margin-top:28px;font-size:13.5px;font-weight:700;color:#c01c28;}
+</style>
+</helmet>
+
+<div class="phone">
+  <div class="headerbar">
+    <div class="btn left">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M11.5 3.5L5 9l6.5 5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="title">Connection</div>
+  </div>
+
+  <div class="content">
+    <div class="group-label">Server connection</div>
+    <div class="list-card">
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">library.homeserver.dev</div>
+          <div class="row-sub mono">https://library.homeserver.dev</div>
+        </div>
+        <div class="iconbtn-ghost">
+          <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><circle cx="8.5" cy="8.5" r="6.8" stroke="currentColor" stroke-width="1.4"/><path d="M8.5 7.7v4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8.5" cy="5.3" r=".9" fill="currentColor"/></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="group-label">Advanced</div>
+    <div class="list-card">
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">Custom Headers</div>
+          <div class="row-sub">Specify headers for server connections</div>
+        </div>
+        <div class="chevron"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">Disable SSL verification</div>
+          <div class="row-sub">Connect to servers with any certificate</div>
+        </div>
+        <div class="switch off"><div class="knob"></div></div>
+      </div>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">Client certificate</div>
+          <div class="row-sub">Use a client certificate for mTLS</div>
+        </div>
+        <div class="chevron"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">Local network server address</div>
+          <div class="row-sub">Define server access for home Wi-Fi</div>
+        </div>
+        <div class="chevron"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">Change User Agent</div>
+          <div class="row-sub">Customize the application User-Agent header</div>
+        </div>
+        <div class="chevron"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      </div>
+    </div>
+
+    <div class="disconnect">Disconnect from the Server</div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
