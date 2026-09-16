@@ -45,10 +45,25 @@ Fractal) rather than copying Lissen's Material Design look.
 ## 3. Screen-by-screen detail
 
 ### Welcome / Server login
-- `AdwStatusPage` with app icon, "Connect to your Audiobookshelf server".
-- `AdwEntryRow` for server URL, `AdwPasswordEntryRow` for password, or a toggle to switch to
-  API-token entry.
-- Primary `AdwButton` (suggested-action style) "Connect". Inline `AdwBanner` for connection errors.
+- `AdwStatusPage`-style centered layout: app icon, "Connect to your Audiobookshelf server" title,
+  a one-line description. No header-bar back button — this is the first thing a user with no
+  configured server sees, so there's nothing to navigate back to.
+- A segmented toggle (`AdwToggleGroup`/two-button segmented control, matching the same pattern
+  used for Settings' Theme picker) switches the form between two auth modes:
+  - **Password** — Server URL, Username, and a masked Password field (with a show/hide eye-icon
+    toggle) as one grouped card of `AdwEntryRow`/`AdwPasswordEntryRow`-equivalent rows.
+  - **API Token** — Server URL and a single Token field; username/password are hidden entirely
+    rather than just disabled, since they're not applicable to this mode.
+- Primary `AdwButton` (suggested-action style, full width) "Connect", **disabled until the
+  required fields for the current mode are filled in** — on first launch, with an empty form,
+  this is the state the user actually sees.
+- **Error state**: on a failed connection attempt, an inline `AdwBanner`-style strip appears above
+  the form with a short explanation (e.g. "Unable to sign in — check your username and password
+  and try again"), and the offending field's label switches to an error/red tint. The form
+  retains whatever the user typed — a failed attempt should never clear the fields.
+- This screen (via `abs_core::accounts::add_server_and_login`) is what's shown whenever
+  `abs_storage::repo::accounts::get_active` returns `None` — i.e. on first launch, or after
+  signing out of every configured server.
 
 ### Library picker
 - Shown only if the server exposes >1 library. Simple `AdwActionRow` list, one row per library
