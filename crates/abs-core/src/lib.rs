@@ -4,6 +4,7 @@
 //! unit-testable without a display or audio hardware — see each module's tests.
 
 pub mod accounts;
+pub mod chapters;
 pub mod downloads;
 pub mod error;
 pub mod playback;
