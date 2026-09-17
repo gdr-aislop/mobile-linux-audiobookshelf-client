@@ -254,6 +254,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   (destructive style). This is where sign-out actually lives — scoped to one server/account at a
   time — plus an "Add Server" row at the end to register another Audiobookshelf instance. Tapping
   a server row's body (as opposed to its `⋯` menu) pushes that server's **Connection** page.
+- **About** group: a single `AdwActionRow` with the app version as its subtitle, opening an
+  `AdwAboutDialog` (app name, version, website, license) on tap. The version is sourced at compile
+  time from `CARGO_PKG_VERSION` — the workspace's single version number — and is the exact same
+  string the `--version`/`-v` command-line flags print, so it can never drift between the two.
 
 ### Connection
 - `AdwNavigationPage` pushed from a server row in Settings' Servers group; one instance per

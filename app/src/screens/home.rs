@@ -254,7 +254,7 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
     for library in &libraries {
         recent_items.extend(abs_storage::repo::items::list_for_library(pool, server_id, &library.id).await?);
     }
-    recent_items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    recent_items.sort_by_key(|a| std::cmp::Reverse(a.added_at));
     recent_items.truncate(10);
 
     let mut continue_items = Vec::new();

@@ -7,7 +7,15 @@
 //! see `third_party/audiobookshelf-openapi/README.md`'s "Known gaps" section. Calls against
 //! those endpoints are out of scope for this generated client until upstream documents them.
 
-include!(concat!(env!("OUT_DIR"), "/client.rs"));
+// The generated code carries an `#[allow(elided_named_lifetimes)]`, a lint name newer
+// toolchains renamed to `mismatched_lifetime_syntaxes` — allow both here (and the rename
+// warning itself) rather than post-processing codegen output in build.rs. A wrapping module is
+// required: an `allow` attribute directly on `include!` doesn't reach the expanded items.
+#[allow(renamed_and_removed_lints, elided_named_lifetimes, mismatched_lifetime_syntaxes)]
+mod client {
+    include!(concat!(env!("OUT_DIR"), "/client.rs"));
+}
+pub use client::*;
 
 mod ext;
 pub use ext::{

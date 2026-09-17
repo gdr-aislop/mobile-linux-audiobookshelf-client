@@ -9,6 +9,17 @@ use adw::prelude::*;
 use application::AppState;
 
 fn main() -> adw::glib::ExitCode {
+    // `--version` / `-v`: print and exit before *any* side effect — notably before setup()
+    // resolves XDG paths and opens/migrates the user's database, which a version query has no
+    // business doing. Parsed by hand here rather than via GApplication's option machinery
+    // (`add_main_option` + `handle-local-options`) because that only runs inside `app.run()`,
+    // after this file's eager `setup()` has already happened. Nothing below this point runs
+    // for the flag: no Tokio runtime, no GStreamer, no disk access.
+    if std::env::args().any(|arg| arg == "--version" || arg == "-v") {
+        println!("{}", application::version_line());
+        return 0.into();
+    }
+
     tracing_subscriber::fmt::init();
 
     // One shared Tokio runtime for the whole app (see the architecture plan's async-runtime

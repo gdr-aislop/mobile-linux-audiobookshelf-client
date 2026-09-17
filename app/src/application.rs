@@ -19,6 +19,15 @@ pub struct AppState {
     pub playback_settings: abs_core::settings::PlaybackSettings,
 }
 
+/// The user-facing version string. Sourced at compile time from this crate's manifest, which
+/// itself inherits the workspace's single `[workspace.package].version` — there is exactly one
+/// place a version number is written. Shared by the `--version`/`-v` command-line flags
+/// (handled in `main` before any setup) and, eventually, the Settings screen's About row
+/// (docs/design/ui-spec.md).
+pub fn version_line() -> String {
+    format!("Audiobookshelf {}", env!("CARGO_PKG_VERSION"))
+}
+
 pub fn build_application(state: AppState) -> adw::Application {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
@@ -94,4 +103,24 @@ fn build_window(app: &adw::Application, state: &AppState) {
     }
 
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_line;
+
+    #[test]
+    fn version_line_is_the_display_name_plus_a_dotted_version() {
+        let line = version_line();
+        let version = line
+            .strip_prefix("Audiobookshelf ")
+            .expect("version line should start with the display name");
+        assert!(!version.is_empty(), "version must not be empty");
+        let parts: Vec<&str> = version.split('.').collect();
+        assert!(parts.len() >= 2, "version should be dotted, got: {version}");
+        assert!(
+            parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+            "version should be numeric and dotted, got: {version}"
+        );
+    }
 }
