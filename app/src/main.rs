@@ -102,6 +102,7 @@ mod tests {
         crate::screens::library::tests::run_list_view_rows_show_title_and_subtitle(&runtime);
         crate::screens::library::tests::run_tapping_a_list_row_invokes_on_play(&runtime);
         crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too(&runtime);
+        crate::screens::library::tests::run_view_mode_is_remembered_across_screen_rebuilds(&runtime);
         crate::widgets::item_card::tests::run();
         crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing();
         crate::screens::main_window::tests::run(&runtime);

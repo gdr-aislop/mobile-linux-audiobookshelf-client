@@ -5,11 +5,17 @@
 //! Deliberately out of scope for this pass (see the implementation plan): category chips (author/
 //! series/genre — this app doesn't model series/genre at all yet), the view-options bottom sheet
 //! ("Downloaded only", "Hide finished", "Grouping"), and sticky section headers when grouped (no
-//! "group by" concept exists yet, and `GtkListBox` — used for list mode here, see `ViewMode` —
-//! has no native section-header support the way the spec's literal `GtkListView` would). Search
-//! and sort are client-side over the already-synced local table — neither `abs-storage` nor the
-//! real Audiobookshelf API surface this client uses expose search/sort/pagination query params, so
-//! there is nothing server-side to delegate to yet.
+//! "group by" concept exists yet, and `GtkListBox` — used for list mode here, see
+//! `abs_core::settings::LibraryViewMode` — has no native section-header support the way the
+//! spec's literal `GtkListView` would). Search and sort are client-side over the already-synced
+//! local table — neither `abs-storage` nor the real Audiobookshelf API surface this client uses
+//! expose search/sort/pagination query params, so there is nothing server-side to delegate to yet.
+//!
+//! The grid/list choice is persisted via `abs_core::settings::{load,save}_library_view_mode` (a
+//! plain key/value setting, same pattern as every other typed setting in that module) — restored
+//! at startup and re-saved whenever the header's view toggle changes. Search text and sort order
+//! are session-only, not persisted — the ui-spec doesn't ask for that, and a stale search filter
+//! silently narrowing a freshly-opened Library screen would be a surprise, not a convenience.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -19,6 +25,7 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use abs_core::error::Result as CoreResult;
+use abs_core::settings::LibraryViewMode;
 use abs_storage::models::{Account, Item, Server};
 use abs_storage::AppPaths;
 
@@ -64,12 +71,6 @@ enum SortKey {
     Duration,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ViewMode {
-    Grid,
-    List,
-}
-
 #[derive(Clone)]
 pub struct SortButtons {
     pub date_added: gtk4::Button,
@@ -90,7 +91,7 @@ struct LibraryWidgets {
     banner: crate::widgets::banner::ErrorBanner,
     search_entry: gtk4::SearchEntry,
     sort: Rc<Cell<SortKey>>,
-    view_mode: Rc<Cell<ViewMode>>,
+    view_mode: Rc<Cell<LibraryViewMode>>,
     data: Rc<std::cell::RefCell<LibraryData>>,
     on_play: Rc<dyn Fn(PlayRequest)>,
 }
@@ -200,7 +201,7 @@ pub fn build(
         banner: banner.clone(),
         search_entry: search_entry.clone(),
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
-        view_mode: Rc::new(Cell::new(ViewMode::Grid)),
+        view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
         data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new() })),
         on_play: Rc::new(on_play),
     };
@@ -210,16 +211,40 @@ pub fn build(
         move |_| render_from_current_data(&widgets)
     });
 
-    view_toggle.connect_toggled({
+    let view_toggle_handler = view_toggle.connect_toggled({
+        let pool = pool.clone();
         let widgets = widgets.clone();
         move |toggle| {
-            let mode = if toggle.is_active() { ViewMode::List } else { ViewMode::Grid };
-            widgets.view_mode.set(mode);
-            toggle.set_icon_name(if mode == ViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
-            toggle.set_tooltip_text(Some(if mode == ViewMode::List { "Grid view" } else { "List view" }));
-            widgets.flow_box.set_visible(mode == ViewMode::Grid);
-            widgets.list_box.set_visible(mode == ViewMode::List);
-            render_from_current_data(&widgets);
+            let mode = if toggle.is_active() { LibraryViewMode::List } else { LibraryViewMode::Grid };
+            apply_view_mode(mode, &widgets, toggle);
+            glib::spawn_future_local({
+                let pool = pool.clone();
+                async move {
+                    if let Err(err) = abs_core::settings::save_library_view_mode(&pool, mode).await {
+                        tracing::warn!(%err, "couldn't persist the Library view mode; it won't be remembered next launch");
+                    }
+                }
+            });
+        }
+    });
+
+    // Loaded once, asynchronously, right after construction (a local-only DB read, no network).
+    // The toggle's own handler is blocked while this sets the *initial* `active` state — without
+    // that, restoring a persisted List mode would itself fire `connect_toggled`, which would
+    // immediately re-save the exact value it just loaded (harmless, but a pointless write on every
+    // single launch) and — worse, if a future edit made that handler do anything not idempotent —
+    // a real bug waiting to happen.
+    glib::spawn_future_local({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let view_toggle = view_toggle.clone();
+        async move {
+            if let Ok(mode) = abs_core::settings::load_library_view_mode(&pool).await {
+                view_toggle.block_signal(&view_toggle_handler);
+                view_toggle.set_active(mode == LibraryViewMode::List);
+                view_toggle.unblock_signal(&view_toggle_handler);
+                apply_view_mode(mode, &widgets, &view_toggle);
+            }
         }
     });
 
@@ -321,6 +346,20 @@ fn apply(items: Vec<Item>, widgets: &LibraryWidgets) {
     render_from_current_data(widgets);
 }
 
+/// Applies a view mode to every widget it affects — the toggle button's own icon/tooltip, which
+/// container is visible, and a re-render — and updates `widgets.view_mode` first so that
+/// re-render sees the new mode. Shared by the toggle's `connect_toggled` handler and by restoring
+/// the persisted mode at startup, so both paths stay in sync by construction rather than by
+/// keeping two copies of this logic in step by hand.
+fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk4::ToggleButton) {
+    widgets.view_mode.set(mode);
+    toggle.set_icon_name(if mode == LibraryViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
+    toggle.set_tooltip_text(Some(if mode == LibraryViewMode::List { "Grid view" } else { "List view" }));
+    widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
+    widgets.list_box.set_visible(mode == LibraryViewMode::List);
+    render_from_current_data(widgets);
+}
+
 fn render_from_current_data(widgets: &LibraryWidgets) {
     let query = widgets.search_entry.text().to_lowercase();
     let sort = widgets.sort.get();
@@ -349,14 +388,14 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // posture already used everywhere else in this file, just gated per mode so switching modes
     // (or searching/sorting while a mode is hidden) doesn't do wasted work on the other one.
     match widgets.view_mode.get() {
-        ViewMode::Grid => {
+        LibraryViewMode::Grid => {
             clear_flow_box(&widgets.flow_box);
             for item in visible {
                 let subtitle = item_subtitle(item);
                 widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_play, true), -1);
             }
         }
-        ViewMode::List => {
+        LibraryViewMode::List => {
             clear_list_box(&widgets.list_box);
             for item in visible {
                 widgets.list_box.append(&library_list_row(item, &widgets.on_play));
@@ -830,6 +869,47 @@ pub(crate) mod tests {
 
         hooks.search_entry.set_text("zed");
         pump_until(|| list_box_titles(&hooks.list_box) == vec!["Zed Book".to_string()], Duration::from_secs(5));
+    }
+
+    /// Building a second screen against the same pool simulates the next time this tab is opened
+    /// (same local DB, fresh widgets) — the persisted mode should apply itself without the user
+    /// having to click the toggle again.
+    pub(crate) fn run_view_mode_is_remembered_across_screen_rebuilds(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), |_| {});
+        let first_hooks = first_screen.test_hooks();
+        pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
+
+        first_hooks.view_toggle.set_active(true);
+        pump_until(|| first_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let second_hooks = second_screen.test_hooks();
+        pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+
+        assert!(second_hooks.list_box.is_visible(), "a freshly built screen should restore the persisted List mode");
+        assert!(!second_hooks.flow_box.is_visible());
     }
 
     /// End-to-end against the real public demo server, mirroring `welcome.rs`/`home.rs`'s live

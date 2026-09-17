@@ -44,6 +44,7 @@ mod keys {
     pub const HIDE_FINISHED: &str = "library.hide_finished";
     pub const GROUPING: &str = "library.grouping";
     pub const SORT_BY: &str = "library.sort_by";
+    pub const VIEW_MODE: &str = "library.view_mode";
 }
 
 /// Parse a stored value, falling back to `default` (and logging) on a missing key or a value
@@ -216,6 +217,45 @@ pub async fn save_library_view_options(pool: &SqlitePool, options: &LibraryViewO
     Ok(())
 }
 
+/// Grid vs. list for the Library browse screen's content — a separate setting from
+/// `LibraryViewOptions` above, which models that screen's not-yet-built view-options *sheet*
+/// (Downloaded only/Hide finished/Grouping/Sort by). Per `docs/design/ui-spec.md`, the grid/list
+/// choice toggles via its own header-bar button, a distinct control from that sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibraryViewMode {
+    #[default]
+    Grid,
+    List,
+}
+
+impl std::str::FromStr for LibraryViewMode {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "grid" => Ok(LibraryViewMode::Grid),
+            "list" => Ok(LibraryViewMode::List),
+            _ => Err(()),
+        }
+    }
+}
+
+impl LibraryViewMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            LibraryViewMode::Grid => "grid",
+            LibraryViewMode::List => "list",
+        }
+    }
+}
+
+pub async fn load_library_view_mode(pool: &SqlitePool) -> Result<LibraryViewMode> {
+    parse_or_default(pool, keys::VIEW_MODE, LibraryViewMode::default()).await
+}
+
+pub async fn save_library_view_mode(pool: &SqlitePool, mode: LibraryViewMode) -> Result<()> {
+    kv::set(pool, keys::VIEW_MODE, mode.as_str()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +351,27 @@ mod tests {
         for s in [SortBy::DateOfCreation, SortBy::Title, SortBy::Author, SortBy::Duration] {
             assert_eq!(s.as_str().parse::<SortBy>().unwrap(), s);
         }
+    }
+
+    #[tokio::test]
+    async fn library_view_mode_defaults_to_grid() {
+        let pool = pool().await;
+        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::Grid);
+    }
+
+    #[tokio::test]
+    async fn library_view_mode_round_trips_each_variant() {
+        let pool = pool().await;
+        for mode in [LibraryViewMode::Grid, LibraryViewMode::List] {
+            save_library_view_mode(&pool, mode).await.unwrap();
+            assert_eq!(load_library_view_mode(&pool).await.unwrap(), mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn library_view_mode_falls_back_to_default_on_unrecognized_value() {
+        let pool = pool().await;
+        kv::set(&pool, "library.view_mode", "masonry").await.unwrap();
+        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::Grid);
     }
 }
