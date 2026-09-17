@@ -42,10 +42,12 @@ pub struct PlayRequest {
 pub struct PlayerSnapshot {
     pub title: String,
     pub author: Option<String>,
+    /// Book-level position — the current file's offset within the book plus the pipeline's
+    /// position inside that file. Progress and chapters are defined book-level, so every
+    /// consumer of a snapshot (scrubber, mini bar, MPRIS) speaks the same units.
     pub position_seconds: f64,
     pub duration_seconds: f64,
     pub is_playing: bool,
-    pub multi_track_note: Option<String>,
     pub speed: f64,
     pub sleep_timer_active: bool,
     pub cover_path: Option<std::path::PathBuf>,
@@ -85,8 +87,13 @@ struct NowPlaying {
     access_token: String,
     title: String,
     author: Option<String>,
+    /// Book-level duration (the sum of every track's duration), as `StreamTarget` reports it.
     duration_seconds: f64,
-    multi_track_note: Option<String>,
+    /// One entry per audio file of the item, in book order — an item split across multiple files
+    /// is played by advancing through these as each one ends.
+    tracks: Vec<abs_core::streaming::StreamTrack>,
+    /// Which entry of `tracks` the backend currently holds loaded.
+    current_track: usize,
     is_playing: bool,
     chapters: Vec<ChapterInfo>,
     speed: f64,
@@ -95,6 +102,16 @@ struct NowPlaying {
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
+
+/// Maps a book-level position to `(track index, seconds into that track)` — the inverse of
+/// `Inner::book_position`. A position exactly at a track boundary lands on the *later* track (a
+/// book position equal to a track's own start means "play this track from 0"), which is also what
+/// makes a boundary-adjacent resume pick up the next file instead of the previous one's final
+/// instant.
+fn locate_track(tracks: &[abs_core::streaming::StreamTrack], book_seconds: f64) -> (usize, f64) {
+    let index = tracks.iter().rposition(|t| t.offset_seconds <= book_seconds + 1e-6).unwrap_or(0);
+    (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
+}
 
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
@@ -116,14 +133,24 @@ impl Inner {
         Some(PlayerSnapshot {
             title: now_playing.title.clone(),
             author: now_playing.author.clone(),
-            position_seconds: self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            position_seconds: self.book_position(),
             duration_seconds: now_playing.duration_seconds,
             is_playing: now_playing.is_playing,
-            multi_track_note: now_playing.multi_track_note.clone(),
             speed: now_playing.speed,
             sleep_timer_active: now_playing.sleep_timer != SleepTimerState::Off,
             cover_path: now_playing.cover_path.clone(),
         })
+    }
+
+    /// The book-level playback position: the current track's offset within the book plus the
+    /// backend's position inside that track. Progress, chapters and bookmarks are all defined
+    /// book-level (they're shared with the server and its other clients), while the pipeline only
+    /// ever knows where it is inside the single file it holds — so every read of "where are we"
+    /// funnels through here rather than through `backend.position()` directly.
+    fn book_position(&self) -> f64 {
+        let Some(now_playing) = &self.now_playing else { return 0.0 };
+        let within_track = self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        now_playing.tracks.get(now_playing.current_track).map(|t| t.offset_seconds).unwrap_or(0.0) + within_track
     }
 
     fn publish(&self) {
@@ -143,7 +170,7 @@ impl Inner {
     /// backend — for a write at an explicit position instead (marking finished, resetting),
     /// see `write_progress_at`.
     fn write_progress(&mut self, is_finished: bool) {
-        let position = self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let position = self.book_position();
         self.write_progress_at(position, is_finished);
     }
 
@@ -176,6 +203,98 @@ impl Inner {
             {
                 tracing::warn!(%err, "couldn't sync playback progress to the server");
             }
+        });
+    }
+
+    /// At end-of-stream: if another track follows the current one, refines the track map against
+    /// the file that just finished and returns `(item_id, next_index)` for
+    /// `spawn_load_track` — leaving `is_playing` set, since from the state machine's point of
+    /// view playback continues. `None` means the item really is over and the caller should run
+    /// its existing pause-and-mark-finished path.
+    fn next_track_after_end_of_stream(&mut self) -> Option<(String, usize)> {
+        let now_playing = self.now_playing.as_mut()?;
+        let next = now_playing.current_track + 1;
+        if next >= now_playing.tracks.len() {
+            return None;
+        }
+
+        // Prefer the pipeline's *actual* duration for the file that just ended over the
+        // server-reported one (which can be missing — parsed as 0.0 — or slightly off): shift
+        // the following tracks' offsets by the difference, so book-level positions stay
+        // continuous across the boundary and don't jump backwards when a duration was unknown.
+        if let Some(actual) = self.backend.duration().filter(|d| !d.is_zero()) {
+            let delta =
+                now_playing.tracks[now_playing.current_track].offset_seconds + actual.as_secs_f64()
+                    - now_playing.tracks[next].offset_seconds;
+            if delta.abs() > f64::EPSILON {
+                for track in &mut now_playing.tracks[next..] {
+                    track.offset_seconds += delta;
+                }
+            }
+        }
+
+        now_playing.current_track = next;
+        Some((now_playing.item_id.clone(), next))
+    }
+
+    /// Loads item `track_index`'s file and optionally seeks `within_seconds` into it, on the GLib
+    /// main loop rather than synchronously — both callers (end-of-track advance and cross-track
+    /// seeks) run from the tick handler, which must not block on a network-streamed pipeline's
+    /// preroll. Seeking — including `set_speed`, which is itself a seek-with-rate — needs the
+    /// pipeline to have actually *reached* `PAUSED` (the same readiness requirement and polling
+    /// pattern as `start()`'s resume seek), so anything needing a seek waits for `position()` to
+    /// become available first; a plain start-of-track load skips the wait entirely. `load()`
+    /// resets the pipeline's speed to 1.0, so the item's speed is re-applied afterwards.
+    /// Resumes playing only if the item is still flagged as playing at that point, so a user
+    /// pausing mid-transition is respected rather than overridden.
+    fn spawn_load_track(inner_rc: Rc<RefCell<Inner>>, item_id: String, track_index: usize, within_seconds: f64) {
+        glib::spawn_future_local(async move {
+            let (url, speed) = {
+                let inner = inner_rc.borrow();
+                let Some(now_playing) = &inner.now_playing else { return };
+                if now_playing.item_id != item_id {
+                    return;
+                }
+                let Some(track) = now_playing.tracks.get(track_index) else { return };
+                (track.url.clone(), now_playing.speed)
+            };
+
+            {
+                let mut inner = inner_rc.borrow_mut();
+                if let Err(err) = inner.backend.load(&url) {
+                    tracing::warn!(%err, track = track_index, "couldn't load the next track");
+                    if let Some(now_playing) = &mut inner.now_playing {
+                        if now_playing.item_id == item_id {
+                            now_playing.is_playing = false;
+                        }
+                    }
+                    inner.publish();
+                    return;
+                }
+            }
+
+            let needs_seek_readiness = within_seconds > 0.0 || (speed - 1.0).abs() > f64::EPSILON;
+            if needs_seek_readiness {
+                let _ = inner_rc.borrow_mut().backend.pause();
+                for _ in 0..50 {
+                    if inner_rc.borrow().backend.position().is_some() {
+                        break;
+                    }
+                    glib::timeout_future(Duration::from_millis(100)).await;
+                }
+                if within_seconds > 0.0 {
+                    let _ = inner_rc.borrow_mut().backend.seek(Duration::from_secs_f64(within_seconds));
+                }
+                if (speed - 1.0).abs() > f64::EPSILON {
+                    let _ = inner_rc.borrow_mut().backend.set_speed(speed);
+                }
+            }
+
+            let mut inner = inner_rc.borrow_mut();
+            if inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.is_playing) {
+                let _ = inner.backend.play();
+            }
+            inner.publish();
         });
     }
 }
@@ -268,7 +387,7 @@ impl PlayerController {
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
         let item_id = now_playing.item_id.clone();
-        let position = inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let position = inner.book_position();
         drop(inner);
 
         glib::spawn_future_local(async move {
@@ -301,11 +420,14 @@ impl PlayerController {
     /// as `mark_as_finished`, worth keeping as real functionality rather than a debug-only
     /// backdoor. A no-op if nothing is playing.
     pub fn reset_progress(&self) {
-        let mut inner = self.inner.borrow_mut();
-        if inner.now_playing.is_none() {
+        if self.inner.borrow().now_playing.is_none() {
             return;
         }
-        let _ = inner.backend.seek(Duration::from_secs(0));
+        // Book position 0 is track 0's start — which is a cross-track seek whenever a later file
+        // is loaded, so this goes through `seek_to_seconds`'s mapping rather than the backend
+        // directly.
+        self.seek_to_seconds(0.0);
+        let mut inner = self.inner.borrow_mut();
         inner.publish();
         inner.write_progress_at(0.0, false);
     }
@@ -343,7 +465,8 @@ impl PlayerController {
             };
 
             // Reads whatever `reconcile_item_progress` just wrote, if it succeeded — falling back
-            // to this client's own last local write (or nothing) otherwise.
+            // to this client's own last local write (or nothing) otherwise. Book-level, so it can
+            // fall in any track of a multi-file item.
             let resume_at = abs_storage::repo::progress::get(&pool, &account.id, &server.id, &item.item_id)
                 .await
                 .ok()
@@ -351,12 +474,11 @@ impl PlayerController {
                 .map(|p| p.current_time_seconds)
                 .filter(|s| *s > 0.0 && *s < target.duration_seconds);
 
-            let multi_track_note = (target.track_count > 1).then(|| {
-                format!(
-                    "Playing track 1 of {} — full multi-track playback isn't supported yet.",
-                    target.track_count
-                )
-            });
+            // A book-level resume position maps to (track, within-track) — the right file is the
+            // one that gets loaded, rather than always starting from the first and trusting the
+            // position to be inside it.
+            let (start_track, start_within) =
+                resume_at.map(|at| locate_track(&target.tracks, at)).unwrap_or((0, 0.0));
 
             // Local DB write only, no network involved — inline rather than part of the
             // `tokio::join!` above, which is reserved for concurrent network calls.
@@ -371,7 +493,7 @@ impl PlayerController {
 
             {
                 let mut inner = inner_rc.borrow_mut();
-                if let Err(err) = inner.backend.load(&target.url) {
+                if let Err(err) = inner.backend.load(&target.tracks[start_track].url) {
                     tracing::warn!(%err, "couldn't load the audio stream");
                     return;
                 }
@@ -385,7 +507,7 @@ impl PlayerController {
             // A non-default speed also needs a seek internally (`AudioBackend::set_speed` is
             // implemented as a seek-with-rate, GStreamer having no rate-only call), so it has the
             // same readiness requirement as the resume seek below.
-            let needs_seek_ready = resume_at.is_some() || (default_speed - 1.0).abs() > f64::EPSILON;
+            let needs_seek_ready = start_within > 0.0 || (default_speed - 1.0).abs() > f64::EPSILON;
             if needs_seek_ready {
                 // `duration()` can come back `Some` from container metadata alone, before the
                 // pipeline has actually finished prerolling into `PAUSED` — which is what seeking
@@ -400,8 +522,8 @@ impl PlayerController {
             }
 
             let mut inner = inner_rc.borrow_mut();
-            if let Some(resume_at) = resume_at {
-                let _ = inner.backend.seek(Duration::from_secs_f64(resume_at));
+            if start_within > 0.0 {
+                let _ = inner.backend.seek(Duration::from_secs_f64(start_within));
             }
             // `set_speed` is itself a seek-with-rate (see `abs-player`'s own doc comment) — even
             // setting it to the already-default 1.0 would perform a redundant seek that queries
@@ -424,7 +546,8 @@ impl PlayerController {
                 title: item.title,
                 author: item.author,
                 duration_seconds: target.duration_seconds,
-                multi_track_note,
+                tracks: target.tracks,
+                current_track: start_track,
                 is_playing: true,
                 chapters,
                 speed: applied_speed,
@@ -467,13 +590,13 @@ impl PlayerController {
     }
 
     pub fn skip(&self, delta_seconds: f64) {
-        let mut inner = self.inner.borrow_mut();
-        let Some(now_playing) = &inner.now_playing else { return };
-        let duration = now_playing.duration_seconds;
-        let current = inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let target = (current + delta_seconds).clamp(0.0, duration);
-        let _ = inner.backend.seek(Duration::from_secs_f64(target));
-        inner.publish();
+        let target = {
+            let inner = self.inner.borrow();
+            let Some(now_playing) = &inner.now_playing else { return };
+            let current = inner.book_position();
+            (current + delta_seconds).clamp(0.0, now_playing.duration_seconds)
+        };
+        self.seek_to_seconds(target);
     }
 
     pub fn seek_fraction(&self, fraction: f64) {
@@ -481,14 +604,32 @@ impl PlayerController {
         self.seek_to_seconds(fraction.clamp(0.0, 1.0) * duration_seconds);
     }
 
-    /// Seeks to an absolute position — the primitive behind `seek_fraction`, and used directly by
-    /// the chapters sheet (tap-to-seek to a chapter's start) and MPRIS `Seek`/`SetPosition`.
+    /// Seeks to an absolute book-level position — the primitive behind `seek_fraction`, `skip`,
+    /// the chapters sheet (tap-to-seek to a chapter's start) and MPRIS `Seek`/`SetPosition`. A
+    /// position inside a different file than the one loaded (or past its end) is a cross-track
+    /// seek: the state machine switches to the target track and `spawn_load_track` brings the
+    /// actual pipeline there asynchronously.
     pub fn seek_to_seconds(&self, seconds: f64) {
-        let mut inner = self.inner.borrow_mut();
-        let Some(now_playing) = &inner.now_playing else { return };
-        let target = seconds.clamp(0.0, now_playing.duration_seconds);
-        let _ = inner.backend.seek(Duration::from_secs_f64(target));
-        inner.publish();
+        let cross_track = {
+            let mut inner = self.inner.borrow_mut();
+            let Some(now_playing) = &inner.now_playing else { return };
+            let target = seconds.clamp(0.0, now_playing.duration_seconds);
+            let (track_index, within) = locate_track(&now_playing.tracks, target);
+            if track_index == now_playing.current_track {
+                let _ = inner.backend.seek(Duration::from_secs_f64(within));
+                inner.publish();
+                None
+            } else {
+                let now_playing = inner.now_playing.as_mut().expect("checked just above");
+                now_playing.current_track = track_index;
+                let item_id = now_playing.item_id.clone();
+                inner.publish();
+                Some((item_id, track_index, within))
+            }
+        };
+        if let Some((item_id, track_index, within)) = cross_track {
+            Inner::spawn_load_track(self.inner.clone(), item_id, track_index, within);
+        }
     }
 
     /// Changes the playback rate. Only updates the reported speed if the backend actually
@@ -519,7 +660,7 @@ impl PlayerController {
     /// inside any known chapter).
     pub fn set_sleep_timer_end_of_chapter(&self) {
         let mut inner = self.inner.borrow_mut();
-        let position = inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let position = inner.book_position();
         let Some(now_playing) = &mut inner.now_playing else { return };
         let end = now_playing
             .chapters
@@ -548,11 +689,17 @@ impl PlayerController {
         if let Some(event) = inner.backend.poll_event() {
             match event {
                 abs_player::PlayerEvent::EndOfStream => {
-                    let _ = inner.backend.pause();
-                    if let Some(now_playing) = &mut inner.now_playing {
-                        now_playing.is_playing = false;
+                    if let Some((item_id, next_track)) = inner.next_track_after_end_of_stream() {
+                        // The next file exists — keep going. The load happens on the main loop
+                        // (see `spawn_load_track`); the state machine has already moved on.
+                        Inner::spawn_load_track(self.inner.clone(), item_id, next_track, 0.0);
+                    } else {
+                        let _ = inner.backend.pause();
+                        if let Some(now_playing) = &mut inner.now_playing {
+                            now_playing.is_playing = false;
+                        }
+                        inner.write_progress(true);
                     }
-                    inner.write_progress(true);
                 }
                 abs_player::PlayerEvent::Error(err) => {
                     tracing::warn!(%err, "playback error");
@@ -567,9 +714,7 @@ impl PlayerController {
         if let Some(SleepTimerState::Armed(deadline)) = inner.now_playing.as_ref().map(|n| n.sleep_timer) {
             let reached = match deadline {
                 SleepTimerDeadline::WallClock(at) => Instant::now() >= at,
-                SleepTimerDeadline::Position(end) => {
-                    inner.backend.position().is_some_and(|p| p.as_secs_f64() >= end)
-                }
+                SleepTimerDeadline::Position(end) => inner.book_position() >= end,
             };
             if reached {
                 let _ = inner.backend.pause();
@@ -966,7 +1111,6 @@ pub(crate) mod tests {
         assert_eq!(first.title, "Test Book");
         assert_eq!(first.author.as_deref(), Some("Some Author"));
         assert!(first.is_playing, "starting playback should leave it playing");
-        assert!(first.multi_track_note.is_none(), "a single-file item has no multi-track caveat");
 
         controller.pause();
         let after_pause = seen.borrow().last().cloned().unwrap();
@@ -1059,47 +1203,189 @@ pub(crate) mod tests {
         controller.stop();
     }
 
-    pub(crate) fn run_multi_track_item_sets_a_caveat_note(runtime: &tokio::runtime::Runtime) {
+    /// Like `mock_playable_item`, but the item is split across two audio files — the shape the
+    /// multi-track sequencing scenarios need. Both files are served as short, real, ranged WAVs
+    /// so end-of-stream handover and cross-file seeking exercise actual GStreamer pipelines.
+    pub(crate) async fn mock_two_track_item(mock_server: &MockServer, seconds_per_track: u32) {
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": { "audioFiles": [
+                    { "ino": "1", "duration": f64::from(seconds_per_track) },
+                    { "ino": "2", "duration": f64::from(seconds_per_track) },
+                ] }
+            })))
+            .mount(mock_server)
+            .await;
+        for ino in ["1", "2"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/items/item-1/file/{ino}")))
+                .respond_with(ranged_response(silent_wav_bytes(seconds_per_track)))
+                .mount(mock_server)
+                .await;
+        }
+        Mock::given(method("PATCH"))
+            .and(path("/api/me/progress/item-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
+    /// scenario in this binary has to run from one single entry point. Multi-file items used to
+    /// stop dead (and mark the whole book finished) at the first file's end, with a caveat note
+    /// saying so; the scenarios that follow pin the sequential playback that replaced that.
+    pub(crate) fn run_multi_track_advances_to_the_next_track(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/items/item-1"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "media": { "audioFiles": [
-                        { "ino": "1", "duration": 3.0 },
-                        { "ino": "2", "duration": 3.0 },
-                    ] }
-                })))
-                .mount(&mock_server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/api/items/item-1/file/1"))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(silent_wav_bytes(3)))
-                .mount(&mock_server)
-                .await;
-        });
+        runtime.block_on(mock_two_track_item(&mock_server, 2));
 
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), {
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
 
         controller.start(
-            server,
-            account,
+            server.clone(),
+            account.clone(),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
 
-        pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
-        let snapshot = seen.borrow().last().cloned().unwrap();
-        assert!(snapshot.multi_track_note.is_some(), "a 2-file item should carry a multi-track caveat");
-        assert!(snapshot.multi_track_note.unwrap().contains('2'));
+        // Track 1 is 2s: the book-level position must keep going past it into the second track's
+        // range, not stop at the boundary.
+        pump_until(|| seen.borrow().last().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(15));
+        assert!(seen.borrow().last().unwrap().is_playing, "advancing to the next track should not stop playback");
+
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2"),
+            "the second file should actually have been fetched"
+        );
+
+        controller.pause();
+        pump_until(|| false, Duration::from_millis(300));
+        let progress =
+            runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap();
+        assert!(!progress.unwrap().is_finished, "reaching the first track's end must not mark the book finished");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Only the *last* track's end-of-stream
+    /// is the book's end: a very short two-track clip so both handover and the final stop arrive
+    /// quickly, then progress must read finished at the book-level end.
+    pub(crate) fn run_multi_track_final_track_marks_finished(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item(&mock_server, 1));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), {
+            let seen = seen.clone();
+            move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
+        });
+
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
+        );
+
+        // `is_playing` stays true through the first track's handover, so the first false reading
+        // is the final end-of-stream.
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_playing), Duration::from_secs(15));
+
+        pump_until(|| false, Duration::from_millis(300));
+        let progress =
+            runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert!(progress.is_finished, "the final track's end should mark the book finished");
+        assert!(
+            progress.current_time_seconds >= 1.9,
+            "should be recorded at the book-level end, got {}",
+            progress.current_time_seconds
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Seeking to a book-level position
+    /// inside the second file must load that file and land the pipeline at the mapped in-track
+    /// offset — asserted while paused, so a correct seek *stays* at its target rather than
+    /// drifting (which is also what keeps this from passing by natural playback reaching the
+    /// target on its own).
+    pub(crate) fn run_seek_across_track_boundary_lands_in_the_next_file(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item(&mock_server, 3));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds > 0.5), Duration::from_secs(10));
+        controller.pause();
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+
+        controller.seek_to_seconds(4.0); // 1s into the second 3s file
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 3.9), Duration::from_secs(10));
+        let position = controller.snapshot().unwrap().position_seconds;
+        assert!(position <= 4.5, "a paused cross-track seek should land at its target and stay there (got {position})");
+
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2"),
+            "seeking into the second track should fetch the second file"
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Book-level progress saved by another
+    /// client (or an earlier session) can fall inside a later file: resuming at 6s of a 5s+5s
+    /// book must load the second file directly at its in-track offset — and, the part the old
+    /// first-file-only behavior got wrong, must not fetch the first file at all.
+    pub(crate) fn run_resume_jumps_straight_to_the_second_track(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item(&mock_server, 5));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 6.0, false)).unwrap();
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 5.9), Duration::from_secs(15));
+        let position = controller.snapshot().unwrap().position_seconds;
+        assert!(position <= 7.0, "resuming should land near the saved book position, got {position}");
+
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/1"),
+            "resuming into the second track must not fetch the first file"
+        );
+        assert!(
+            requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2"),
+            "resuming into the second track should fetch the second file"
+        );
         controller.stop();
     }
 

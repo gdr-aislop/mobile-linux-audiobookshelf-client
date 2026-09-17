@@ -96,12 +96,14 @@ mod tests {
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
         crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
-        crate::player::tests::run_multi_track_item_sets_a_caveat_note(&runtime);
+        crate::player::tests::run_multi_track_advances_to_the_next_track(&runtime);
+        crate::player::tests::run_multi_track_final_track_marks_finished(&runtime);
+        crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file(&runtime);
+        crate::player::tests::run_resume_jumps_straight_to_the_second_track(&runtime);
         crate::player::tests::run_end_of_stream_pauses_and_marks_finished(&runtime);
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
         crate::player::tests::run_add_bookmark_persists_a_row(&runtime);
         crate::screens::player::tests::run(&runtime);
-        crate::screens::player::tests::run_multi_track_caveat_is_shown(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);

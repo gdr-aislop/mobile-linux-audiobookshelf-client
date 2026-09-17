@@ -25,7 +25,6 @@ pub struct TestHooks {
     pub scrubber: gtk4::Scale,
     pub elapsed_label: gtk4::Label,
     pub remaining_label: gtk4::Label,
-    pub multi_track_label: gtk4::Label,
     pub chapters_button: gtk4::MenuButton,
     pub chapters_popover: gtk4::Popover,
     pub chapters_list: gtk4::ListBox,
@@ -129,14 +128,6 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     transport.append(&play_button);
     transport.append(&skip_forward);
 
-    let multi_track_label = gtk4::Label::builder()
-        .wrap(true)
-        .justify(gtk4::Justification::Center)
-        .css_classes(["caption", "dim-label"])
-        .margin_top(14)
-        .visible(false)
-        .build();
-
     // Secondary row: speed, sleep timer, chapters. `AdwBottomSheet`/popover-menu widgets from
     // libadwaita 1.4+ are unavailable at this crate's v1.2 ceiling, so every one of these is a
     // plain `GtkMenuButton` + `GtkPopover` holding a `GtkBox` of buttons — matching this
@@ -221,7 +212,6 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     content.append(&time_row);
     content.append(&transport);
     content.append(&secondary_row);
-    content.append(&multi_track_label);
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
@@ -327,7 +317,6 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         let scrubber = scrubber.clone();
         let elapsed_label = elapsed_label.clone();
         let remaining_label = remaining_label.clone();
-        let multi_track_label = multi_track_label.clone();
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
         let cover = cover.clone();
@@ -353,14 +342,6 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
 
             elapsed_label.set_label(&format_hms(snapshot.position_seconds));
             remaining_label.set_label(&format!("-{}", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0))));
-
-            match &snapshot.multi_track_note {
-                Some(note) => {
-                    multi_track_label.set_label(note);
-                    multi_track_label.set_visible(true);
-                }
-                None => multi_track_label.set_visible(false),
-            }
 
             speed_label.set_label(&format_speed(snapshot.speed));
             if snapshot.sleep_timer_active {
@@ -388,7 +369,6 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             scrubber,
             elapsed_label,
             remaining_label,
-            multi_track_label,
             chapters_button,
             chapters_popover,
             chapters_list,
@@ -502,44 +482,6 @@ pub(crate) mod tests {
         controller.stop();
     }
 
-    pub(crate) fn run_multi_track_caveat_is_shown(runtime: &tokio::runtime::Runtime) {
-        let mock_server = runtime.block_on(wiremock::MockServer::start());
-        runtime.block_on(async {
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/api/items/item-1"))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "media": { "audioFiles": [
-                        { "ino": "1", "duration": 5.0 },
-                        { "ino": "2", "duration": 5.0 },
-                    ] }
-                })))
-                .mount(&mock_server)
-                .await;
-        });
-
-        let pool = runtime.block_on(crate::test_support::pool());
-        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
-        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
-
-        // No `/file/1` mock is needed for this test — the point is the caveat text, which is
-        // computed from `get_item_playback_info`'s response alone, before any audio ever loads.
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
-        controller.start(
-            server,
-            account,
-            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
-            1.0,
-        );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
-
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
-        let hooks = screen.test_hooks();
-
-        assert!(hooks.multi_track_label.is_visible());
-        assert!(hooks.multi_track_label.label().contains('2'));
-        controller.stop();
-    }
-
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Seeds a two-chapter item, opens the
     /// chapters popover, checks both rows are listed with the right titles, then activates the
     /// second row and checks the controller actually seeks to its start.
@@ -556,8 +498,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        // Tap-to-seek needs real, seekable audio — unlike the multi-track caveat test above,
-        // which only needs `get_item_playback_info`'s response, not real playback.
+        // Tap-to-seek needs real, seekable audio, not just a parsed `get_item_playback_info`
+        // response — hence `mock_playable_item_with_chapters` and the readiness wait below.
         let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
