@@ -101,12 +101,17 @@ pub fn build(
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     stack.add_titled_with_icon(
-        &screens::home::build(pool, paths, server, account, on_play).root,
+        &screens::home::build(pool.clone(), paths.clone(), server.clone(), account.clone(), on_play.clone()).root,
         Some("home"),
         "Home",
         "go-home-symbolic",
     );
-    stack.add_titled_with_icon(&stub_page("system-file-manager-symbolic", "Library"), Some("library"), "Library", "system-file-manager-symbolic");
+    stack.add_titled_with_icon(
+        &screens::library::build(pool, paths, server, account, on_play).root,
+        Some("library"),
+        "Library",
+        "system-file-manager-symbolic",
+    );
     stack.add_titled_with_icon(&stub_page("folder-download-symbolic", "Downloads"), Some("downloads"), "Downloads", "folder-download-symbolic");
     stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");
 

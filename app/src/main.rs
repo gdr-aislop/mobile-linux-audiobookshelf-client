@@ -92,6 +92,13 @@ mod tests {
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::library::tests::run_renders_all_synced_items(&runtime);
+        crate::screens::library::tests::run_search_filters_by_title_and_author(&runtime);
+        crate::screens::library::tests::run_sort_changes_order(&runtime);
+        crate::screens::library::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::library::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
+        crate::screens::library::tests::run_tapping_a_card_invokes_on_play(&runtime);
+        crate::widgets::item_card::tests::run();
         crate::screens::main_window::tests::run(&runtime);
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
@@ -123,5 +130,6 @@ mod tests {
 
         crate::screens::welcome::tests::run_live(&runtime);
         crate::screens::home::tests::run_live(&runtime);
+        crate::screens::library::tests::run_live(&runtime);
     }
 }
