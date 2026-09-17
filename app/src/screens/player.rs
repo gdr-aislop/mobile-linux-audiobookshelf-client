@@ -114,6 +114,7 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .max_content_height(320)
         .propagate_natural_height(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
+        .width_request(260)
         .child(&chapters_list)
         .build();
     let chapters_popover = gtk4::Popover::builder().child(&chapters_scroller).build();
