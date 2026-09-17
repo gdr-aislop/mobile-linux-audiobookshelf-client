@@ -19,10 +19,35 @@ pub struct CoverImage {
 impl CoverImage {
     /// `size` is both width and height — every cover slot in this app is square.
     pub fn new(size: i32) -> Self {
+        // Every widget here is pinned to a fixed, non-expanding `size`x`size` box. This was only
+        // ever exercised with the placeholder showing (no `gdk-pixbuf` WebP loader was available
+        // in this session's sandbox until late in testing) — once a real decoded image loaded, a
+        // real bug surfaced live: `GtkPicture` defaults to `hexpand`/`vexpand: true`, and with
+        // only one sibling in a shelf row (as Home's "Continue Listening" often has), nothing else
+        // claimed the leftover space, so the whole card stretched into a short, wide rectangle
+        // instead of staying square — `content-fit: Cover` then cropped the real cover into that
+        // wrong-aspect box, visibly distorting it. Explicit `hexpand(false)`/`vexpand(false)` plus
+        // `halign`/`valign: Fill` (so it still fills exactly the fixed size, no more, no less) on
+        // both the picture and the overlay fixes it regardless of caller/context.
         let placeholder = gtk4::Box::builder().css_classes(["card"]).width_request(size).height_request(size).build();
-        let picture = gtk4::Picture::builder().width_request(size).height_request(size).content_fit(gtk4::ContentFit::Cover).visible(false).build();
+        let picture = gtk4::Picture::builder()
+            .width_request(size)
+            .height_request(size)
+            .content_fit(gtk4::ContentFit::Cover)
+            .hexpand(false)
+            .vexpand(false)
+            .halign(gtk4::Align::Fill)
+            .valign(gtk4::Align::Fill)
+            .visible(false)
+            .build();
 
-        let overlay = gtk4::Overlay::builder().child(&placeholder).build();
+        let overlay = gtk4::Overlay::builder()
+            .child(&placeholder)
+            .width_request(size)
+            .height_request(size)
+            .hexpand(false)
+            .vexpand(false)
+            .build();
         overlay.add_overlay(&picture);
 
         Self { overlay, placeholder, picture }

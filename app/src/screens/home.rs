@@ -3,11 +3,9 @@
 //! `abs_core::sync::sync_all`. See `docs/design/ui-spec.md`'s "Home" section and the published
 //! mockup for the visual design this implements.
 //!
-//! Deliberately out of scope for this pass (see the implementation plan): real cover-art images
-//! (shows a plain title card instead — no `abs-api` coverage for `/api/items/:id/cover` yet), the
-//! offline-mode toggle and manual "Sync now" action, and server-side progress sync (so "Continue
-//! Listening" only reflects local progress rows, which nothing writes yet without a Player
-//! screen — an empty shelf here is the expected, correct state for now, not a bug).
+//! Deliberately out of scope for this pass (see the implementation plan): the offline-mode toggle
+//! and manual "Sync now" action. Cover art now reuses the same `abs_core::covers`/`CoverImage`
+//! pipeline the player screen already built.
 
 use adw::glib;
 use adw::prelude::*;
@@ -15,8 +13,10 @@ use sqlx::SqlitePool;
 
 use abs_core::error::Result as CoreResult;
 use abs_storage::models::{Account, Item, Library, Progress, Server};
+use abs_storage::AppPaths;
 
 use crate::player::PlayRequest;
+use crate::widgets::cover_image::CoverImage;
 
 pub struct HomeScreen {
     pub root: gtk4::Widget,
@@ -68,6 +68,7 @@ struct HomeData {
 /// itself, matching the `on_success`-callback pattern `welcome.rs` already uses.
 pub fn build(
     pool: SqlitePool,
+    paths: AppPaths,
     server: Server,
     account: Account,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
@@ -81,9 +82,14 @@ pub fn build(
         .next()
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "?".to_string());
+    // There's no account-switcher/sign-out screen built yet (per `docs/design/ui-spec.md`, that
+    // lives in Settings' Servers group, still a stub tab) — until it exists, this button can't
+    // actually do anything, so a tooltip is the honest fix: it should read as "this is who I'm
+    // signed in as", not as a dead button whose purpose is a mystery.
     let avatar = gtk4::Button::builder()
         .css_classes(["circular", "suggested-action"])
         .valign(gtk4::Align::Center)
+        .tooltip_text(format!("Signed in as {}", account.username))
         .child(&gtk4::Label::new(Some(&avatar_letter)))
         .build();
     header.pack_end(&avatar);
@@ -162,6 +168,7 @@ pub fn build(
     // never imports `abs_api` at all.
     glib::spawn_future_local({
         let pool = pool.clone();
+        let paths = paths.clone();
         let widgets = widgets.clone();
         let server_url = server.url.clone();
         let server_id = server.id.clone();
@@ -185,8 +192,32 @@ pub fn build(
                 tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
             }
 
+            let mut data_after_sync = None;
             if let Ok(data) = load(&pool, &server_id, &account_id).await {
                 apply(&data, &widgets);
+                data_after_sync = Some(data);
+            }
+
+            // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
+            // uses for the player screen) — fetched concurrently for every item just rendered,
+            // after the rest of the screen is already showing, so a slow/offline server delays
+            // only the artwork, never the initial render. `fetch_and_cache_cover` itself no-ops
+            // once a cover is already cached on disk, so this is cheap on every subsequent visit.
+            if let Some(data) = &data_after_sync {
+                let item_ids: std::collections::BTreeSet<&str> = data
+                    .recent_items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .chain(data.continue_items.iter().map(|(item, _)| item.id.as_str()))
+                    .collect();
+                let fetches = item_ids
+                    .into_iter()
+                    .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
+                futures::future::join_all(fetches).await;
+
+                if let Ok(data) = load(&pool, &server_id, &account_id).await {
+                    apply(&data, &widgets);
+                }
             }
 
             match sync_result {
@@ -301,46 +332,60 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
     gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Automatic)
         .vscrollbar_policy(gtk4::PolicyType::Never)
+        // Without this, a `GtkScrolledWindow` with vertical scrolling disabled still only
+        // requests its own default minimum height, not its child's actual (wrapped-label-and-all)
+        // natural height — the row's second line of text (author/duration) was getting clipped
+        // at the bottom of the shelf rather than being fully shown. This tells it to size to fit.
+        .propagate_natural_height(true)
         .child(row)
         .build()
 }
 
-/// No real cover-art image (see the module doc) — a plain title-plate card, matching the
-/// mockups' own placeholder treatment for items without artwork.
 /// A tappable cover card — there's no Item Detail screen yet, so tapping directly starts
 /// playback rather than the ui-spec's real "tap -> Item detail -> Play" flow (same "skip screens
 /// not yet built" scoping already used for Library/Downloads/Settings' stub tabs).
 fn cover_card(item: &Item, subtitle: &str, on_play: &std::rc::Rc<dyn Fn(PlayRequest)>) -> gtk4::Widget {
-    let card = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).width_request(132).spacing(6).build();
+    const COVER_SIZE: i32 = 132;
 
-    let plate = gtk4::Box::builder()
-        .css_classes(["card"])
-        .width_request(132)
-        .height_request(132)
-        .valign(gtk4::Align::Center)
-        .build();
-    let plate_label = gtk4::Label::builder()
+    // `hexpand` was set on the old placeholder's title label so long titles could wrap to fill
+    // it — but a `GtkBox`'s own hexpand is computed from its children unless overridden, so that
+    // one `true` propagated all the way up to this card's wrapping `GtkButton`. With only one
+    // sibling in the row (as "Continue Listening" usually has), nothing else claimed the leftover
+    // width, so the card visibly stretched across the whole shelf instead of staying square. Every
+    // widget in this card is explicitly `hexpand(false)` now so a single-item shelf can't do that.
+    let card = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).width_request(COVER_SIZE).hexpand(false).spacing(6).build();
+
+    let cover = CoverImage::new(COVER_SIZE);
+    cover.widget().set_hexpand(false);
+    cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
+
+    // Single-line + ellipsize for both labels, deliberately not `wrap`: a wrapped label combined
+    // with `ellipsize` asks Pango for a natural height that doesn't actually reserve room for the
+    // wrapped line count (confirmed live — the second line was rendering *underneath* whatever
+    // came next, not visible as "wrapped", since the box only reserved single-line height for it).
+    // Fixed single-line height per label keeps every card in a shelf the same height regardless
+    // of title/author length, which also avoids per-card height mismatches entirely.
+    let title_label = gtk4::Label::builder()
         .label(&item.title)
-        .wrap(true)
-        .justify(gtk4::Justification::Center)
-        .hexpand(true)
-        .margin_start(8)
-        .margin_end(8)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .xalign(0.0)
+        .hexpand(false)
         .css_classes(["heading"])
         .build();
-    plate.append(&plate_label);
 
     let meta = gtk4::Label::builder()
         .label(subtitle)
-        .wrap(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .xalign(0.0)
+        .hexpand(false)
         .css_classes(["caption", "dim-label"])
         .build();
 
-    card.append(&plate);
+    card.append(cover.widget());
+    card.append(&title_label);
     card.append(&meta);
 
-    let button = gtk4::Button::builder().css_classes(["flat"]).child(&card).build();
+    let button = gtk4::Button::builder().css_classes(["flat"]).hexpand(false).child(&card).build();
     let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
     let on_play = on_play.clone();
     button.connect_clicked(move |_| on_play(request.clone()));
@@ -419,7 +464,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
         let hooks = screen.test_hooks();
 
         // `status_page` starts hidden (only shown for a confirmed-empty result), so waiting on
@@ -445,7 +490,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
         let hooks = screen.test_hooks();
 
         // There's no "sync finished" signal to await directly here (an always-empty result looks
@@ -467,7 +512,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, server, account, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -491,7 +536,7 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
-        let screen = build(pool, server, account, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));

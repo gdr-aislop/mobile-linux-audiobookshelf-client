@@ -31,6 +31,7 @@ dependencies = [
  "abs-player",
  "abs-storage",
  "chrono",
+ "futures",
  "gio",
  "gtk4",
  "hound",

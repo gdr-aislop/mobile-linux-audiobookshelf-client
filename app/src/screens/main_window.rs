@@ -56,7 +56,7 @@ pub fn build(
     playback_settings: PlaybackSettings,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
-    let mini_bar = player::build_mini_bar(pool.clone(), paths, player::real_backend());
+    let mini_bar = player::build_mini_bar(pool.clone(), paths.clone(), player::real_backend());
 
     // MPRIS registration is best-effort — no session bus (a bare console, a locked-down sandbox)
     // must never be fatal to playback, so a failure here is just a warning. On success, the
@@ -101,7 +101,7 @@ pub fn build(
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     stack.add_titled_with_icon(
-        &screens::home::build(pool, server, account, on_play).root,
+        &screens::home::build(pool, paths, server, account, on_play).root,
         Some("home"),
         "Home",
         "go-home-symbolic",
