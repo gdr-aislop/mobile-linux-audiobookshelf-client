@@ -274,7 +274,10 @@ done
 if [ -n "$SOUP_LIB" ]; then
     DEPLOY_ARGS+=(--library "$SOUP_LIB")
 else
-    warn "libsoup-3 not found; https:// playback will not work in the AppImage"
+    # Hard failure: https:// playback is the app's whole purpose. (In practice this fires when
+    # the build environment satisfied plugins-good's "libsoup2.4-1 OR libsoup-3.0-0" dependency
+    # with soup2 — install libsoup-3.0-0 explicitly, the Dockerfile/CI do.)
+    die "libsoup-3 not found in the build environment; https:// playback would be broken"
 fi
 
 OUTPUT_PATH="$OUTPUT_DIR/$APP_NAME-$VERSION-$ARCH.AppImage"
@@ -301,6 +304,13 @@ for f in "$OUTPUT_DIR"/*.AppImage; do
     produced="$f"
 done
 [ -n "$produced" ] || die "no AppImage produced in $OUTPUT_DIR"
+
+# linuxdeploy can silently ignore a --library input it doesn't like; the soup
+# plugin dlopens libsoup, so nothing else in the bundle references it and its
+# absence is invisible to every other check. Verify it landed.
+[ -e "$APPDIR/usr/lib/libsoup-3.0.so.0" ] \
+    || die "libsoup-3.0.so.0 did not land in the AppDir; https:// playback would be broken"
+
 if [ "$produced" != "$OUTPUT_PATH" ]; then
     mv "$produced" "$OUTPUT_PATH"
 fi

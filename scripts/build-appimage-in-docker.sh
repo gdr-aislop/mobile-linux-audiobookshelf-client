@@ -11,6 +11,10 @@
 # cargo download cache lives in ~/.cache/abs-appimage-build/cargo, and builds
 # use a target dir separate from host builds (build/appimage-target).
 #
+# All output (image build + packaging run) is teed to build/appimage/build.log
+# for post-mortem debugging — warnings like a missing runtime library are easy
+# to miss in the live scroll.
+#
 # This wrapper is a developer convenience, not used by CI:
 # .github/workflows/release.yml runs the build script directly inside its own
 # debian:bookworm container job.
@@ -32,7 +36,11 @@ done
 [ -n "$ENGINE" ] || die "no working docker or podman found (is the daemon running?)"
 
 IMAGE="abs-appimage-builder:bookworm"
-$ENGINE build -t "$IMAGE" -f scripts/appimage-builder-bookworm.Dockerfile .
+
+LOG_FILE="$REPO_ROOT/build/appimage/build.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+: > "$LOG_FILE"
+echo "logging to $LOG_FILE" >&2
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/abs-appimage-build"
 mkdir -p "$CACHE_DIR/cargo"
@@ -41,16 +49,32 @@ REPO_MOUNT="$REPO_ROOT:/repo"
 # SELinux hosts (Fedora/RHEL with podman) need relabeling for the bind mount.
 if [ "$ENGINE" = "podman" ] && command -v getenforce >/dev/null 2>&1 \
     && [ "$(getenforce 2>/dev/null || true)" = "Enforcing" ]; then
-    REPO_MOUNT="$REPO_ROOT:/repo:Z"
+    REPO_MOUNT="$REPO_MOUNT:Z"
 fi
 
-exec "$ENGINE" run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp \
-    -e CARGO_HOME=/cargo-home \
-    -e CARGO_TARGET_DIR=/repo/build/appimage-target \
-    -w /repo \
-    -v "$REPO_MOUNT" \
-    -v "$CACHE_DIR/cargo:/cargo-home" \
-    "$IMAGE" \
-    ./scripts/build-appimage.sh "$@"
+run_containerized_build() {
+    echo "=== [$ENGINE build] $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
+    "$ENGINE" build -t "$IMAGE" -f scripts/appimage-builder-bookworm.Dockerfile .
+    echo "=== [$ENGINE run] ./scripts/build-appimage.sh $* ==="
+    "$ENGINE" run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e CARGO_HOME=/cargo-home \
+        -e CARGO_TARGET_DIR=/repo/build/appimage-target \
+        -w /repo \
+        -v "$REPO_MOUNT" \
+        -v "$CACHE_DIR/cargo:/cargo-home" \
+        "$IMAGE" \
+        ./scripts/build-appimage.sh "$@"
+}
+
+# Tee everything to the log; pipefail propagates the container's exit status
+# through tee. set -e is suspended so a failing build still reaches the
+# epilogue (and the log records the exit code before we exit with it).
+set +e
+run_containerized_build "$@" 2>&1 | tee "$LOG_FILE"
+status=$?
+set -e
+
+echo "=== exit: $status (log: $LOG_FILE) ===" >&2
+exit "$status"

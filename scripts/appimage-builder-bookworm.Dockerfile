@@ -9,6 +9,10 @@
 FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
+# libsoup-3.0-0 must be explicit: gstreamer1.0-plugins-good depends on
+# "libsoup2.4-1 OR libsoup-3.0-0", and apt happily satisfies that with soup2 —
+# leaving no libsoup-3 for GStreamer's soup plugin to dlopen at runtime, which
+# kills all https:// playback in the produced AppImage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config git curl ca-certificates file patchelf \
         libgtk-4-dev libadwaita-1-dev \
@@ -19,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         librsvg2-common adwaita-icon-theme \
         gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
         gstreamer1.0-libav gstreamer1.0-pulseaudio \
+        libsoup-3.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \
