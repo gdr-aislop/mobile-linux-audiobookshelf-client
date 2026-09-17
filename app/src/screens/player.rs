@@ -1,8 +1,8 @@
 //! The full player screen — `docs/design/ui-spec.md`'s "Player — full" section: core transport,
 //! a secondary row of speed/sleep-timer/chapters controls, and a header `⋯` menu for "Add
-//! bookmark". Opened by `main_window` swapping window content in (there's no
-//! `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling, both v1.4+); the
-//! down-chevron header button calls `on_collapse` to swap back.
+//! bookmark", "Mark as finished", and "Reset progress". Opened by `main_window` swapping window
+//! content in (there's no `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita
+//! ceiling, both v1.4+); the down-chevron header button calls `on_collapse` to swap back.
 
 use adw::prelude::*;
 
@@ -37,6 +37,8 @@ pub struct TestHooks {
     pub sleep_timer_popover_box: gtk4::Box,
     pub menu_button: gtk4::MenuButton,
     pub add_bookmark_button: gtk4::Button,
+    pub mark_as_finished_button: gtk4::Button,
+    pub reset_progress_button: gtk4::Button,
     pub toast_overlay: adw::ToastOverlay,
 }
 
@@ -60,13 +62,27 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     header.pack_start(&collapse_button);
     header.set_title_widget(Some(&adw::WindowTitle::new("Now Playing", "")));
 
-    // The spec's `⋯` menu is dropped down to just "Add bookmark" — speed and sleep timer live as
-    // secondary-row buttons instead (see the scope decision in this plan). Plain
-    // `GtkMenuButton`/`GtkPopover`/`GtkButton`, same convention as the other popovers on this
-    // screen, not `GMenu`/`GAction`.
+    // The spec's `⋯` menu is dropped down to "Add bookmark" plus two testing/recovery actions —
+    // speed and sleep timer live as secondary-row buttons instead (see the scope decision in this
+    // plan). Plain `GtkMenuButton`/`GtkPopover`/`GtkButton`, same convention as the other popovers
+    // on this screen, not `GMenu`/`GAction`. "Reset progress" is styled destructive (it throws
+    // away the current listening position) but, matching the spec's own precedent for "Clear
+    // downloaded chapters", isn't behind a confirmation dialog — `AdwAlertDialog` isn't available
+    // at this crate's libadwaita v1.2 ceiling anyway, and being tucked inside a secondary menu is
+    // enough friction for something this recoverable (nothing about the book itself is deleted).
     let add_bookmark_button = gtk4::Button::builder().label("Add bookmark").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+    let mark_as_finished_button = gtk4::Button::builder().label("Mark as finished").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+    // `destructive-action` combined with `flat` renders invisible (background-matching) text in
+    // this popover's context — confirmed live: the button worked when clicked, but its label was
+    // blank. `destructive-action` is meant for a solid filled button, not a flat text row, so
+    // this one skips `flat` and gets its own margin to read as a distinct, deliberately separate
+    // action rather than a fourth identical-looking menu row.
+    let reset_progress_button = gtk4::Button::builder().label("Reset progress").css_classes(["destructive-action"]).margin_top(6).build();
     let menu_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     menu_popover_box.append(&add_bookmark_button);
+    menu_popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    menu_popover_box.append(&mark_as_finished_button);
+    menu_popover_box.append(&reset_progress_button);
     let menu_popover = gtk4::Popover::builder().child(&menu_popover_box).build();
     let menu_button = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").popover(&menu_popover).build();
     header.pack_end(&menu_button);
@@ -224,6 +240,26 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             toast_overlay.add_toast(adw::Toast::new("Bookmark added"));
         }
     });
+    mark_as_finished_button.connect_clicked({
+        let controller = controller.clone();
+        let menu_popover = menu_popover.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            controller.mark_as_finished();
+            menu_popover.popdown();
+            toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
+        }
+    });
+    reset_progress_button.connect_clicked({
+        let controller = controller.clone();
+        let menu_popover = menu_popover.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            controller.reset_progress();
+            menu_popover.popdown();
+            toast_overlay.add_toast(adw::Toast::new("Progress reset"));
+        }
+    });
 
     let skip_back_seconds = playback_settings.skip_back_seconds as f64;
     let skip_forward_seconds = playback_settings.skip_forward_seconds as f64;
@@ -364,6 +400,8 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             sleep_timer_popover_box,
             menu_button,
             add_bookmark_button,
+            mark_as_finished_button,
+            reset_progress_button,
             toast_overlay,
         },
     }
@@ -669,6 +707,76 @@ pub(crate) mod tests {
             runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks").fetch_one(&pool)).unwrap();
         assert_eq!(count, 1, "clicking Add bookmark should persist a row");
         assert!(hooks.toast_overlay.child().is_some(), "the toast overlay should still be hosting the screen content");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking "Mark as finished" should
+    /// pause playback and persist `is_finished = true` at the item's full duration, mirroring
+    /// what actually reaching the end of a book does.
+    pub(crate) fn run_mark_as_finished_button_updates_progress(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+
+        hooks.mark_as_finished_button.emit_clicked();
+        pump_until(|| !controller.snapshot().unwrap().is_playing, Duration::from_secs(5));
+        assert!(!controller.snapshot().unwrap().is_playing, "marking finished should pause playback");
+
+        pump_until(|| false, Duration::from_millis(300));
+        let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert!(progress.is_finished, "should be recorded as finished");
+        assert_eq!(progress.current_time_seconds, 5.0, "should be recorded at the item's full duration");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking "Reset progress" should
+    /// persist position 0 (not finished) and seek the actual, currently-loaded backend back to
+    /// the start too, so the effect is visible without reopening the player.
+    pub(crate) fn run_reset_progress_button_resets_position_and_seeks(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        controller.skip(2.0);
+        pump_until(|| controller.snapshot().unwrap().position_seconds > 1.0, Duration::from_secs(5));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+
+        hooks.reset_progress_button.emit_clicked();
+        pump_until(|| controller.snapshot().unwrap().position_seconds < 0.5, Duration::from_secs(5));
+        assert!(controller.snapshot().unwrap().position_seconds < 0.5, "resetting should seek the loaded backend back to the start");
+
+        pump_until(|| false, Duration::from_millis(300));
+        let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert!(!progress.is_finished);
+        assert_eq!(progress.current_time_seconds, 0.0);
         controller.stop();
     }
 

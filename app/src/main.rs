@@ -95,6 +95,8 @@ mod tests {
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);
         crate::screens::player::tests::run_add_bookmark_button_persists_a_row(&runtime);
+        crate::screens::player::tests::run_mark_as_finished_button_updates_progress(&runtime);
+        crate::screens::player::tests::run_reset_progress_button_resets_position_and_seeks(&runtime);
         crate::widgets::cover_image::tests::run();
     }
 

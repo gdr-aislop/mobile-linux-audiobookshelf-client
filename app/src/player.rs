@@ -139,10 +139,20 @@ impl Inner {
     /// Fire-and-forget: spawns the actual DB write (and, best-effort, the server sync) rather
     /// than awaiting them, since every call site is a synchronous GTK signal handler or the tick
     /// timer, neither of which can await. Captures the position/ids up front rather than
-    /// re-reading `self` from inside the spawned future.
+    /// re-reading `self` from inside the spawned future. Reads the current position from the
+    /// backend — for a write at an explicit position instead (marking finished, resetting),
+    /// see `write_progress_at`.
     fn write_progress(&mut self, is_finished: bool) {
-        let Some(now_playing) = &self.now_playing else { return };
         let position = self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        self.write_progress_at(position, is_finished);
+    }
+
+    /// The shared implementation behind `write_progress` (backend's current position),
+    /// `PlayerController::mark_as_finished` (`duration_seconds`), and
+    /// `PlayerController::reset_progress` (`0.0`) — same fire-and-forget local-write-then-sync
+    /// shape in every case, differing only in which position gets written.
+    fn write_progress_at(&mut self, position: f64, is_finished: bool) {
+        let Some(now_playing) = &self.now_playing else { return };
         let pool = self.pool.clone();
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
@@ -266,6 +276,38 @@ impl PlayerController {
                 tracing::warn!(%err, "couldn't save bookmark");
             }
         });
+    }
+
+    /// Pauses (if playing) and marks the current item finished at its full duration — the same
+    /// end state reaching the actual end of the book leaves it in, triggered manually. Useful for
+    /// testing (no more manually scrubbing to the end or editing the DB by hand) and a real,
+    /// shippable action in its own right — Audiobookshelf's other clients let you do the same. A
+    /// no-op if nothing is playing.
+    pub fn mark_as_finished(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(duration_seconds) = inner.now_playing.as_ref().map(|np| np.duration_seconds) else { return };
+        if inner.backend.pause().is_ok() {
+            if let Some(now_playing) = &mut inner.now_playing {
+                now_playing.is_playing = false;
+            }
+        }
+        inner.publish();
+        inner.write_progress_at(duration_seconds, true);
+    }
+
+    /// Resets the current item's progress back to the start — local and server — and seeks
+    /// playback there too, so the effect is visible immediately without reopening anything.
+    /// Useful for testing (repeatedly restarting a book from scratch) and, per the same reasoning
+    /// as `mark_as_finished`, worth keeping as real functionality rather than a debug-only
+    /// backdoor. A no-op if nothing is playing.
+    pub fn reset_progress(&self) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.now_playing.is_none() {
+            return;
+        }
+        let _ = inner.backend.seek(Duration::from_secs(0));
+        inner.publish();
+        inner.write_progress_at(0.0, false);
     }
 
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
