@@ -377,7 +377,7 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
 
     match sort {
         SortKey::DateAdded => visible.sort_by_key(|item| std::cmp::Reverse(item.added_at)),
-        SortKey::Title => visible.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+        SortKey::Title => visible.sort_by_key(|a| a.title.to_lowercase()),
         SortKey::Author => visible.sort_by(|a, b| {
             a.author.as_deref().unwrap_or("").to_lowercase().cmp(&b.author.as_deref().unwrap_or("").to_lowercase())
         }),
@@ -903,6 +903,27 @@ pub(crate) mod tests {
 
         first_hooks.view_toggle.set_active(true);
         pump_until(|| first_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        // The toggle's save is a fire-and-forget `spawn_future_local` (and the list rows render
+        // synchronously), so the rows appearing proves nothing about the write having committed.
+        // Probe the persisted value on the same main context — a future queued after the save —
+        // and only rebuild once it reads back List, so the second screen's load can't race the
+        // first screen's save.
+        let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        glib::spawn_future_local({
+            let pool = pool.clone();
+            let persisted = persisted.clone();
+            async move {
+                loop {
+                    if abs_core::settings::load_library_view_mode(&pool).await.ok() == Some(abs_core::settings::LibraryViewMode::List) {
+                        persisted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    glib::timeout_future(Duration::from_millis(20)).await;
+                }
+            }
+        });
+        pump_until(|| persisted.load(std::sync::atomic::Ordering::SeqCst), Duration::from_secs(5));
 
         let second_screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
         let second_hooks = second_screen.test_hooks();
