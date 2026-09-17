@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 
 use crate::error::Result;
@@ -15,7 +16,18 @@ pub async fn connect_and_migrate(path: &Path) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // WAL: readers never block on (or behind) the writer. Without this, the pool's
+        // concurrent readers queue behind any write transaction with the busy handler, which
+        // showed up in the wild as multi-second point SELECTs/INSERTs and a saturated pool
+        // (every connection stuck waiting on the file lock) freezing the UI's async work.
+        .journal_mode(SqliteJournalMode::Wal)
+        // WAL's standard companion: fsync only at checkpoints, not per commit — durability
+        // vs. speed tradeoff is a non-issue for cache-and-progress data.
+        .synchronous(SqliteSynchronous::Normal)
+        // Explicit rather than the default: a contended write waits (up to this long) instead
+        // of erroring with "database is locked".
+        .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)

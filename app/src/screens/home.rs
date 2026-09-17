@@ -166,36 +166,54 @@ pub fn build(
     // library's items didn't) should still show whatever did land rather than discarding it, with
     // the banner surfaced separately. This is the only place this screen touches `abs_core`; it
     // never imports `abs_api` at all.
+    //
+    // The network/DB pipeline runs inside `tokio::spawn` (worker threads), not directly in this
+    // `spawn_future_local` future: the latter is polled on the GTK main thread, so HTTP body
+    // chunk handling, statement building and cache-file writes done directly here steal frames
+    // from the main loop — visibly, when dozens of per-item cover fetches all poll at once
+    // (observed as a multi-second UI hang while scrolling the Continue Listening shelf). The
+    // main context only parks on the `JoinHandle`s, which costs nothing to await, and widget
+    // updates happen back on this thread between stages.
     glib::spawn_future_local({
         let pool = pool.clone();
-        let paths = paths.clone();
         let widgets = widgets.clone();
-        let server_url = server.url.clone();
         let server_id = server.id.clone();
         let account_id = account.id.clone();
-        let access_token = account.token.clone();
         async move {
             if let Ok(data) = load(&pool, &server_id, &account_id).await {
                 apply(&data, &widgets);
             }
 
-            let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
+            let spawned_sync = tokio::spawn({
+                let pool = pool.clone();
+                let server_url = server.url.clone();
+                let server_id = server_id.clone();
+                let account_id = account_id.clone();
+                let access_token = account.token.clone();
+                async move {
+                    let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
 
-            // Reconciling "Continue Listening" against the server's progress runs after
-            // sync_all, not concurrently with it: an item's progress can only be attached once
-            // the item itself has been synced locally (a fresh login has no local items at all
-            // yet). It's still best-effort and bounded by its own short timeout — a failure here
-            // (offline, slow connection) is logged and never surfaced as this screen's sync
-            // banner, which is about library/item sync, not this.
-            if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
-            {
-                tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
-            }
+                    // Reconciling "Continue Listening" against the server's progress runs after
+                    // sync_all, not concurrently with it: an item's progress can only be attached
+                    // once the item itself has been synced locally (a fresh login has no local
+                    // items at all yet). It's still best-effort and bounded by its own short
+                    // timeout — a failure here (offline, slow connection) is logged and never
+                    // surfaced as this screen's sync banner, which is about library/item sync,
+                    // not this.
+                    if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
+                    {
+                        tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
+                    }
 
-            let mut data_after_sync = None;
-            if let Ok(data) = load(&pool, &server_id, &account_id).await {
-                apply(&data, &widgets);
-                data_after_sync = Some(data);
+                    let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
+                    (sync_result, data_after_sync)
+                }
+            });
+            let (sync_result, data_after_sync) = spawned_sync
+                .await
+                .expect("the Home sync task must not panic");
+            if let Some(data) = &data_after_sync {
+                apply(data, &widgets);
             }
 
             // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
@@ -203,19 +221,40 @@ pub fn build(
             // after the rest of the screen is already showing, so a slow/offline server delays
             // only the artwork, never the initial render. `fetch_and_cache_cover` itself no-ops
             // once a cover is already cached on disk, so this is cheap on every subsequent visit.
-            if let Some(data) = &data_after_sync {
-                let item_ids: std::collections::BTreeSet<&str> = data
+            let spawned_covers = data_after_sync.as_ref().map(|data| {
+                let item_ids: std::collections::BTreeSet<String> = data
                     .recent_items
                     .iter()
-                    .map(|item| item.id.as_str())
-                    .chain(data.continue_items.iter().map(|(item, _)| item.id.as_str()))
+                    .map(|item| item.id.clone())
+                    .chain(data.continue_items.iter().map(|(item, _)| item.id.clone()))
                     .collect();
-                let fetches = item_ids
-                    .into_iter()
-                    .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
-                futures::future::join_all(fetches).await;
+                tokio::spawn({
+                    let pool = pool.clone();
+                    let paths = paths.clone();
+                    let server_url = server.url.clone();
+                    let server_id = server_id.clone();
+                    let account_id = account_id.clone();
+                    let access_token = account.token.clone();
+                    async move {
+                        let fetches = item_ids.into_iter().map(|item_id| {
+                            let pool = pool.clone();
+                            let paths = paths.clone();
+                            let server_url = server_url.clone();
+                            let access_token = access_token.clone();
+                            let server_id = server_id.clone();
+                            async move {
+                                abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, &item_id).await
+                            }
+                        });
+                        futures::future::join_all(fetches).await;
 
-                if let Ok(data) = load(&pool, &server_id, &account_id).await {
+                        load(&pool, &server_id, &account_id).await.ok()
+                    }
+                })
+            });
+            if let Some(spawned_covers) = spawned_covers {
+                let data_after_covers = spawned_covers.await.expect("the Home cover-fetch task must not panic");
+                if let Some(data) = data_after_covers {
                     apply(&data, &widgets);
                 }
             }

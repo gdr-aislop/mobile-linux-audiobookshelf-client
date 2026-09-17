@@ -262,6 +262,21 @@ for d in "$APPDIR/usr/lib/gstreamer-1.0" "$APPDIR/usr/lib/gio/modules" \
     fi
 done
 
+# GStreamer's soup plugin (souphttpsrc — the only https:// source element) dlopen()s libsoup
+# at runtime instead of linking it, so it's invisible to dependency resolution: nothing in the
+# bundle has it as DT_NEEDED, and a host without a *glibc* libsoup-3 (or with none at all)
+# gets "No URI handler implemented for https" and playback fails. Hand the library to
+# linuxdeploy via --library so it and its own dependencies land in the bundle.
+SOUP_LIB=""
+for candidate in /usr/lib/*/libsoup-3.0.so.0 /usr/lib/libsoup-3.0.so.0; do
+    if [ -e "$candidate" ]; then SOUP_LIB="$candidate"; break; fi
+done
+if [ -n "$SOUP_LIB" ]; then
+    DEPLOY_ARGS+=(--library "$SOUP_LIB")
+else
+    warn "libsoup-3 not found; https:// playback will not work in the AppImage"
+fi
+
 OUTPUT_PATH="$OUTPUT_DIR/$APP_NAME-$VERSION-$ARCH.AppImage"
 (
     cd "$OUTPUT_DIR"
