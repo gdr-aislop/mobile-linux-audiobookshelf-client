@@ -33,7 +33,7 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
-wiremock = "0.6"
+wiremock.workspace = true
 hound = "3"
 chrono.workspace = true
 
