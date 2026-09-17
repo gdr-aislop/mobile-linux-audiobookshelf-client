@@ -292,9 +292,8 @@ pub fn build(
                 apply(data, &widgets);
             }
 
-            let spawned = tokio::spawn({
+            let spawned_sync = tokio::spawn({
                 let pool = pool.clone();
-                let paths = paths.clone();
                 let session = session.clone();
                 let server_url = server_url.clone();
                 let server_id = server_id.clone();
@@ -309,35 +308,50 @@ pub fn build(
                         tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
                     }
 
-                    let mut item_ids_after_sync: Vec<String> = Vec::new();
-                    if let Ok(data) = load(&pool, &server_id).await {
-                        item_ids_after_sync = data.iter().map(|item| item.id.clone()).collect();
-                    }
-
-                    // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
-                    // fetched concurrently for everything just rendered.
-                    if !item_ids_after_sync.is_empty() {
-                        let fetches = item_ids_after_sync
-                            .iter()
-                            .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
-                        futures::future::join_all(fetches).await;
-                    }
-
                     sync_result
                 }
             });
-            let sync_result = spawned.await.expect("the Library sync task must not panic");
+            let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
 
-            if let Ok(data) = load(&pool, &server_id).await {
+            let data_after_sync = load(&pool, &server_id).await.ok();
+            let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
+            if let Some(data) = data_after_sync {
                 apply(data, &widgets);
             }
 
-            match sync_result {
+            match &sync_result {
                 Ok(()) => widgets.banner.set_revealed(false),
                 Err(err) => {
                     widgets.banner.set_title("Couldn't sync — showing what's cached.");
                     widgets.banner.set_details(Some(&err.to_string()));
                     widgets.banner.set_revealed(true);
+                }
+            }
+
+            // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
+            // fetched concurrently for everything just rendered — after the rest of the screen
+            // is already showing (the `apply` above), so a slow/offline server delays only the
+            // artwork, never the initial post-sync render. Same two-stage `tokio::spawn` shape
+            // as `home.rs`'s `spawn_sync_cycle`.
+            if !item_ids_after_sync.is_empty() {
+                let spawned_covers = tokio::spawn({
+                    let pool = pool.clone();
+                    let paths = paths.clone();
+                    let session = session.clone();
+                    let server_url = server_url.clone();
+                    let server_id = server_id.clone();
+                    async move {
+                        let access_token = session.access_token().await;
+                        let fetches = item_ids_after_sync
+                            .iter()
+                            .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
+                        futures::future::join_all(fetches).await;
+                    }
+                });
+                spawned_covers.await.expect("the Library cover-fetch task must not panic");
+
+                if let Ok(data) = load(&pool, &server_id).await {
+                    apply(data, &widgets);
                 }
             }
         }
