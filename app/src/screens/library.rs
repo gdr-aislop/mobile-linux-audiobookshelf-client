@@ -2,12 +2,14 @@
 //! library, per `docs/design/ui-spec.md`'s "Library browse" section. Unlike Home's two curated
 //! 10-item shelves, this shows everything.
 //!
-//! Deliberately out of scope for this pass (see the implementation plan): the list/grid view
-//! toggle, category chips (author/series/genre — this app doesn't model series/genre at all yet),
-//! the view-options bottom sheet ("Downloaded only", "Hide finished", "Grouping"), and sticky
-//! section headers. Search and sort are client-side over the already-synced local table — neither
-//! `abs-storage` nor the real Audiobookshelf API surface this client uses expose search/sort/
-//! pagination query params, so there is nothing server-side to delegate to yet.
+//! Deliberately out of scope for this pass (see the implementation plan): category chips (author/
+//! series/genre — this app doesn't model series/genre at all yet), the view-options bottom sheet
+//! ("Downloaded only", "Hide finished", "Grouping"), and sticky section headers when grouped (no
+//! "group by" concept exists yet, and `GtkListBox` — used for list mode here, see `ViewMode` —
+//! has no native section-header support the way the spec's literal `GtkListView` would). Search
+//! and sort are client-side over the already-synced local table — neither `abs-storage` nor the
+//! real Audiobookshelf API surface this client uses expose search/sort/pagination query params, so
+//! there is nothing server-side to delegate to yet.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -40,9 +42,11 @@ pub struct LibraryScreen {
 pub struct TestHooks {
     pub status_page: adw::StatusPage,
     pub flow_box: gtk4::FlowBox,
+    pub list_box: gtk4::ListBox,
     pub search_entry: gtk4::SearchEntry,
     pub banner: crate::widgets::banner::ErrorBanner,
     pub sort_buttons: SortButtons,
+    pub view_toggle: gtk4::ToggleButton,
 }
 
 #[cfg(test)]
@@ -58,6 +62,12 @@ enum SortKey {
     Title,
     Author,
     Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    Grid,
+    List,
 }
 
 #[derive(Clone)]
@@ -76,9 +86,11 @@ struct LibraryWidgets {
     status_page: adw::StatusPage,
     scroller: gtk4::ScrolledWindow,
     flow_box: gtk4::FlowBox,
+    list_box: gtk4::ListBox,
     banner: crate::widgets::banner::ErrorBanner,
     search_entry: gtk4::SearchEntry,
     sort: Rc<Cell<SortKey>>,
+    view_mode: Rc<Cell<ViewMode>>,
     data: Rc<std::cell::RefCell<LibraryData>>,
     on_play: Rc<dyn Fn(PlayRequest)>,
 }
@@ -122,6 +134,13 @@ pub fn build(
     let sort_menu_button = gtk4::MenuButton::builder().icon_name("view-sort-descending-symbolic").tooltip_text("Sort by").popover(&sort_popover).build();
     header.pack_end(&sort_menu_button);
 
+    // The spec's real toggle lives inside a not-yet-built "view options" bottom sheet (see this
+    // module's doc comment) — matching how sort was already implemented as a plain popover instead
+    // of that full sheet, this is a single toggle button rather than the sheet. Starts showing the
+    // "switch to list" icon since Grid is the default mode.
+    let view_toggle = gtk4::ToggleButton::builder().icon_name("view-list-symbolic").tooltip_text("List view").build();
+    header.pack_end(&view_toggle);
+
     let banner = crate::widgets::banner::ErrorBanner::new();
 
     let flow_box = gtk4::FlowBox::builder()
@@ -136,9 +155,24 @@ pub fn build(
         .valign(gtk4::Align::Start)
         .build();
 
+    // List mode: a plain `GtkListBox` of `AdwActionRow`s (same "boxed list" pattern `home.rs`'s
+    // `libraries_list` already uses), not the spec's literal `GtkListView` — this codebase already
+    // substitutes a simpler widget for the grid too (`GtkFlowBox`, not `GtkGridView`). Hidden until
+    // the user switches to List mode.
+    let list_box = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(12)
+        .margin_bottom(16)
+        .visible(false)
+        .build();
+
     let scroll_content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     scroll_content.append(banner.widget());
     scroll_content.append(&flow_box);
+    scroll_content.append(&list_box);
 
     let scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&scroll_content).build();
 
@@ -162,9 +196,11 @@ pub fn build(
         status_page: status_page.clone(),
         scroller: scroller.clone(),
         flow_box: flow_box.clone(),
+        list_box: list_box.clone(),
         banner: banner.clone(),
         search_entry: search_entry.clone(),
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
+        view_mode: Rc::new(Cell::new(ViewMode::Grid)),
         data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new() })),
         on_play: Rc::new(on_play),
     };
@@ -172,6 +208,19 @@ pub fn build(
     search_entry.connect_search_changed({
         let widgets = widgets.clone();
         move |_| render_from_current_data(&widgets)
+    });
+
+    view_toggle.connect_toggled({
+        let widgets = widgets.clone();
+        move |toggle| {
+            let mode = if toggle.is_active() { ViewMode::List } else { ViewMode::Grid };
+            widgets.view_mode.set(mode);
+            toggle.set_icon_name(if mode == ViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
+            toggle.set_tooltip_text(Some(if mode == ViewMode::List { "Grid view" } else { "List view" }));
+            widgets.flow_box.set_visible(mode == ViewMode::Grid);
+            widgets.list_box.set_visible(mode == ViewMode::List);
+            render_from_current_data(&widgets);
+        }
     });
 
     for (button, key) in [
@@ -248,7 +297,7 @@ pub fn build(
     LibraryScreen {
         root: root.upcast(),
         #[cfg(test)]
-        hooks: TestHooks { status_page, flow_box, search_entry, banner, sort_buttons },
+        hooks: TestHooks { status_page, flow_box, list_box, search_entry, banner, sort_buttons, view_toggle },
     }
 }
 
@@ -296,10 +345,23 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         SortKey::Duration => visible.sort_by(|a, b| b.duration_seconds.total_cmp(&a.duration_seconds)),
     }
 
-    clear_flow_box(&widgets.flow_box);
-    for item in visible {
-        let subtitle = item_subtitle(item);
-        widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_play), -1);
+    // Only the active container is rebuilt — same "full rebuild on every render, not incremental"
+    // posture already used everywhere else in this file, just gated per mode so switching modes
+    // (or searching/sorting while a mode is hidden) doesn't do wasted work on the other one.
+    match widgets.view_mode.get() {
+        ViewMode::Grid => {
+            clear_flow_box(&widgets.flow_box);
+            for item in visible {
+                let subtitle = item_subtitle(item);
+                widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_play, true), -1);
+            }
+        }
+        ViewMode::List => {
+            clear_list_box(&widgets.list_box);
+            for item in visible {
+                widgets.list_box.append(&library_list_row(item, &widgets.on_play));
+            }
+        }
     }
 }
 
@@ -308,9 +370,35 @@ fn item_subtitle(item: &Item) -> String {
     format!("{} · {hours:.1}h", item.author.as_deref().unwrap_or("Unknown author"))
 }
 
+/// A list-mode row — same information as a grid tile (cover thumbnail, title, subtitle), just laid
+/// out horizontally per `docs/design/ui-spec.md`'s "useful for podcast episode-style feeds" framing.
+/// Mirrors `home.rs`'s `library_row()` shape (an `AdwActionRow` with a prefix), swapping the
+/// symbolic icon for a small cover thumbnail via the same `CoverImage` widget `item_card.rs` uses.
+fn library_list_row(item: &Item, on_play: &Rc<dyn Fn(PlayRequest)>) -> adw::ActionRow {
+    const THUMBNAIL_SIZE: i32 = 48;
+
+    let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
+    cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
+
+    let row = adw::ActionRow::builder().title(&item.title).subtitle(item_subtitle(item)).activatable(true).build();
+    row.add_prefix(cover.widget());
+
+    let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
+    let on_play = on_play.clone();
+    row.connect_activated(move |_| on_play(request.clone()));
+
+    row
+}
+
 fn clear_flow_box(fb: &gtk4::FlowBox) {
     while let Some(child) = fb.child_at_index(0) {
         fb.remove(&child);
+    }
+}
+
+fn clear_list_box(lb: &gtk4::ListBox) {
+    while let Some(child) = lb.row_at_index(0) {
+        lb.remove(&child);
     }
 }
 
@@ -354,6 +442,17 @@ pub(crate) mod tests {
                 .and_then(|w| w.downcast::<gtk4::Label>().ok())
                 .expect("card's second child is the title label");
             titles.push(title_label.text().to_string());
+            index += 1;
+        }
+        titles
+    }
+
+    fn list_box_titles(list_box: &gtk4::ListBox) -> Vec<String> {
+        let mut titles = Vec::new();
+        let mut index = 0;
+        while let Some(row) = list_box.row_at_index(index) {
+            let action_row = row.downcast::<adw::ActionRow>().expect("list box row is an AdwActionRow");
+            titles.push(action_row.title().to_string());
             index += 1;
         }
         titles
@@ -569,6 +668,168 @@ pub(crate) mod tests {
 
         assert_eq!(played.borrow().len(), 1);
         assert_eq!(played.borrow()[0].item_id, "item-1");
+    }
+
+    pub(crate) fn run_list_view_toggle_switches_visible_container(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "The Martian", "Andy Weir", 1_600_000_000_000, 7200.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        assert!(hooks.flow_box.is_visible(), "grid should be visible by default");
+        assert!(!hooks.list_box.is_visible());
+
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(5));
+
+        assert!(!hooks.flow_box.is_visible(), "switching to list mode should hide the grid");
+        assert!(hooks.list_box.is_visible());
+        assert_eq!(list_box_titles(&hooks.list_box).len(), 2);
+
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(5));
+        assert!(hooks.flow_box.is_visible(), "switching back to grid mode should show it again");
+        assert!(!hooks.list_box.is_visible());
+    }
+
+    pub(crate) fn run_list_view_rows_show_title_and_subtitle(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
+        assert_eq!(row.title(), "Project Hail Mary");
+        assert_eq!(row.subtitle().unwrap(), "Andy Weir · 1.0h");
+    }
+
+    pub(crate) fn run_tapping_a_list_row_invokes_on_play(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let played: Rc<std::cell::RefCell<Vec<PlayRequest>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let on_play = {
+            let played = played.clone();
+            move |request: PlayRequest| played.borrow_mut().push(request)
+        };
+
+        let screen = build(pool, crate::test_support::test_paths(), server, account, on_play);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
+        row.emit_by_name::<()>("activated", &[]);
+
+        assert_eq!(played.borrow().len(), 1);
+        assert_eq!(played.borrow()[0].item_id, "item-1");
+    }
+
+    pub(crate) fn run_search_and_sort_apply_in_list_mode_too(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Zed Book", "Author A", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Alpha Book", "Author B", 1_600_000_000_000, 7200.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(5));
+
+        assert_eq!(list_box_titles(&hooks.list_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
+
+        hooks.sort_buttons.title.emit_clicked();
+        pump_until(|| list_box_titles(&hooks.list_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
+
+        hooks.search_entry.set_text("zed");
+        pump_until(|| list_box_titles(&hooks.list_box) == vec!["Zed Book".to_string()], Duration::from_secs(5));
     }
 
     /// End-to-end against the real public demo server, mirroring `welcome.rs`/`home.rs`'s live

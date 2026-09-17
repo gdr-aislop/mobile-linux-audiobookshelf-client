@@ -98,7 +98,12 @@ mod tests {
         crate::screens::library::tests::run_shows_a_banner_when_sync_fails(&runtime);
         crate::screens::library::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::library::tests::run_tapping_a_card_invokes_on_play(&runtime);
+        crate::screens::library::tests::run_list_view_toggle_switches_visible_container(&runtime);
+        crate::screens::library::tests::run_list_view_rows_show_title_and_subtitle(&runtime);
+        crate::screens::library::tests::run_tapping_a_list_row_invokes_on_play(&runtime);
+        crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too(&runtime);
         crate::widgets::item_card::tests::run();
+        crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing();
         crate::screens::main_window::tests::run(&runtime);
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);

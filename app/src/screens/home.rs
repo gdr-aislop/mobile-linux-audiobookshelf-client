@@ -285,14 +285,14 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
             0.0
         };
         let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play));
+        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
     }
     widgets.continue_section.set_visible(!data.continue_items.is_empty());
 
     clear_box(&widgets.recent_row);
     for item in &data.recent_items {
         let subtitle = item_subtitle(item);
-        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play));
+        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
     }
 
     clear_listbox(&widgets.libraries_list);
