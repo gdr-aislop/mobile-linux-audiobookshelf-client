@@ -45,6 +45,15 @@ pub struct PlayerSnapshot {
     pub multi_track_note: Option<String>,
 }
 
+/// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
+/// through `PlayerSnapshot` on every 250ms tick, since chapters don't change during playback.
+#[derive(Clone)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
 struct NowPlaying {
     item_id: String,
     server_id: String,
@@ -56,6 +65,7 @@ struct NowPlaying {
     duration_seconds: f64,
     multi_track_note: Option<String>,
     is_playing: bool,
+    chapters: Vec<ChapterInfo>,
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
@@ -64,7 +74,11 @@ struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
     pool: SqlitePool,
     now_playing: Option<NowPlaying>,
-    mini_update: SnapshotListener,
+    /// Permanent listeners, notified on every published snapshot for the app's whole lifetime —
+    /// the mini-player bar's closure is pushed here at construction, and MPRIS (once wired) is
+    /// pushed here too via `PlayerController::add_listener`. Distinct from `full_update`, the one
+    /// optional slot toggled as the full player screen opens/closes.
+    listeners: Vec<SnapshotListener>,
     full_update: Option<SnapshotListener>,
     last_progress_write: Instant,
 }
@@ -84,7 +98,9 @@ impl Inner {
 
     fn publish(&self) {
         let Some(snapshot) = self.snapshot() else { return };
-        (self.mini_update)(&snapshot);
+        for listener in &self.listeners {
+            listener(&snapshot);
+        }
         if let Some(full_update) = &self.full_update {
             full_update(&snapshot);
         }
@@ -146,7 +162,7 @@ impl PlayerController {
                 backend,
                 pool,
                 now_playing: None,
-                mini_update: Box::new(mini_update),
+                listeners: vec![Box::new(mini_update)],
                 full_update: None,
                 last_progress_write: Instant::now(),
             })),
@@ -183,8 +199,22 @@ impl PlayerController {
         self.inner.borrow_mut().full_update = None;
     }
 
+    /// Registers a permanent snapshot listener, notified alongside the mini-player bar's for the
+    /// app's whole lifetime — unlike `set_full_update`, this has no corresponding "clear" (nothing
+    /// currently needs to stop listening once registered; MPRIS, once wired, will use this).
+    #[allow(dead_code, reason = "unused until MPRIS wiring lands; part of this phase's foundation refactor")]
+    pub fn add_listener(&self, listener: impl Fn(&PlayerSnapshot) + 'static) {
+        self.inner.borrow_mut().listeners.push(Box::new(listener));
+    }
+
     pub fn snapshot(&self) -> Option<PlayerSnapshot> {
         self.inner.borrow().snapshot()
+    }
+
+    /// The currently-playing item's chapters, if any — for the chapters sheet. Empty if nothing
+    /// is playing or the item has no chapter data.
+    pub fn chapters(&self) -> Vec<ChapterInfo> {
+        self.inner.borrow().now_playing.as_ref().map(|np| np.chapters.clone()).unwrap_or_default()
     }
 
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
@@ -229,6 +259,17 @@ impl PlayerController {
                 )
             });
 
+            // Local DB write only, no network involved — inline rather than part of the
+            // `tokio::join!` above, which is reserved for concurrent network calls.
+            if let Err(err) = abs_core::chapters::sync_item_chapters(&pool, &server.id, &item.item_id, &target.chapters).await {
+                tracing::warn!(%err, item_id = %item.item_id, "couldn't persist chapters locally");
+            }
+            let chapters = target
+                .chapters
+                .iter()
+                .map(|c| ChapterInfo { title: c.title.clone(), start_seconds: c.start_seconds, end_seconds: c.end_seconds })
+                .collect();
+
             {
                 let mut inner = inner_rc.borrow_mut();
                 if let Err(err) = inner.backend.load(&target.url) {
@@ -272,6 +313,7 @@ impl PlayerController {
                 duration_seconds: target.duration_seconds,
                 multi_track_note,
                 is_playing: true,
+                chapters,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();
@@ -319,9 +361,16 @@ impl PlayerController {
     }
 
     pub fn seek_fraction(&self, fraction: f64) {
+        let Some(duration_seconds) = self.inner.borrow().now_playing.as_ref().map(|np| np.duration_seconds) else { return };
+        self.seek_to_seconds(fraction.clamp(0.0, 1.0) * duration_seconds);
+    }
+
+    /// Seeks to an absolute position — the primitive behind `seek_fraction`, and used directly by
+    /// the chapters sheet (tap-to-seek to a chapter's start) and MPRIS `Seek`/`SetPosition`.
+    pub fn seek_to_seconds(&self, seconds: f64) {
         let mut inner = self.inner.borrow_mut();
         let Some(now_playing) = &inner.now_playing else { return };
-        let target = fraction.clamp(0.0, 1.0) * now_playing.duration_seconds;
+        let target = seconds.clamp(0.0, now_playing.duration_seconds);
         let _ = inner.backend.seek(Duration::from_secs_f64(target));
         inner.publish();
     }
@@ -555,6 +604,39 @@ pub(crate) mod tests {
             .and(path(format!("/api/items/{item_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "media": { "audioFiles": [{ "ino": "1", "duration": f64::from(seconds) }] }
+            })))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}/file/1")))
+            .respond_with(ranged_response(silent_wav_bytes(seconds)))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/me/progress/{item_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// Like `mock_playable_item`, but the item detail response also carries a chapter list — for
+    /// tests exercising the chapters sheet, including tap-to-seek, which needs real, seekable
+    /// audio (not just a parsed `get_item_playback_info` response).
+    pub(crate) async fn mock_playable_item_with_chapters(
+        mock_server: &MockServer,
+        item_id: &str,
+        seconds: u32,
+        chapters: &[(&str, f64, f64)],
+    ) {
+        let chapters_json: Vec<_> = chapters
+            .iter()
+            .enumerate()
+            .map(|(index, (title, start, end))| serde_json::json!({ "id": index, "start": start, "end": end, "title": title }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": { "audioFiles": [{ "ino": "1", "duration": f64::from(seconds) }], "chapters": chapters_json }
             })))
             .mount(mock_server)
             .await;

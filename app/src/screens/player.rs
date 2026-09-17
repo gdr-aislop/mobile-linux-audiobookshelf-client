@@ -1,14 +1,14 @@
-//! The full player screen — `docs/design/ui-spec.md`'s "Player — full" section, core transport
-//! only this pass (no speed control, sleep timer, chapters sheet, or bookmarks yet). Opened by
-//! `main_window` swapping window content in (there's no `AdwNavigationView`/`AdwDialog` available
-//! at this crate's libadwaita ceiling, both v1.4+); the down-chevron header button calls
+//! The full player screen — `docs/design/ui-spec.md`'s "Player — full" section. Core transport
+//! plus a chapters sheet this pass; speed control, sleep timer, and bookmarks are still to come.
+//! Opened by `main_window` swapping window content in (there's no `AdwNavigationView`/`AdwDialog`
+//! available at this crate's libadwaita ceiling, both v1.4+); the down-chevron header button calls
 //! `on_collapse` to swap back.
 
 use adw::prelude::*;
 
 use abs_core::settings::PlaybackSettings;
 
-use crate::player::{PlayerController, PlayerSnapshot};
+use crate::player::{ChapterInfo, PlayerController, PlayerSnapshot};
 
 pub struct PlayerScreen {
     pub root: gtk4::Widget,
@@ -26,6 +26,9 @@ pub struct TestHooks {
     pub elapsed_label: gtk4::Label,
     pub remaining_label: gtk4::Label,
     pub multi_track_label: gtk4::Label,
+    pub chapters_button: gtk4::MenuButton,
+    pub chapters_popover: gtk4::Popover,
+    pub chapters_list: gtk4::ListBox,
 }
 
 #[cfg(test)]
@@ -102,6 +105,27 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .visible(false)
         .build();
 
+    // Secondary row: chapters this pass (speed control and sleep timer land here in later
+    // passes). `AdwBottomSheet` is v1.6+, unavailable at this crate's v1.2 ceiling, so the
+    // chapters sheet is a plain `GtkPopover` — a `GtkScrolledWindow` caps its height so a long
+    // chapter list scrolls instead of forcing the popover to fill the screen.
+    let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
+    let chapters_scroller = gtk4::ScrolledWindow::builder()
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&chapters_list)
+        .build();
+    let chapters_popover = gtk4::Popover::builder().child(&chapters_scroller).build();
+    let chapters_button = gtk4::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Chapters")
+        .popover(&chapters_popover)
+        .build();
+    let secondary_row =
+        gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).halign(gtk4::Align::Center).margin_top(10).build();
+    secondary_row.append(&chapters_button);
+
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .margin_start(28)
@@ -114,6 +138,7 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     content.append(&scrubber);
     content.append(&time_row);
     content.append(&transport);
+    content.append(&secondary_row);
     content.append(&multi_track_label);
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -134,6 +159,33 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     play_button.connect_clicked({
         let controller = controller.clone();
         move |_| controller.toggle_play_pause()
+    });
+
+    // Populated fresh every time the popover is about to open (not once at screen-build time), so
+    // "current chapter highlighted" always reflects the position at the moment it's opened.
+    chapters_popover.connect_show({
+        let controller = controller.clone();
+        let chapters_list = chapters_list.clone();
+        move |_| {
+            while let Some(child) = chapters_list.first_child() {
+                chapters_list.remove(&child);
+            }
+            let chapters = controller.chapters();
+            let position = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
+            for chapter in &chapters {
+                chapters_list.append(&build_chapter_row(chapter, position));
+            }
+        }
+    });
+    chapters_list.connect_row_activated({
+        let controller = controller.clone();
+        let chapters_popover = chapters_popover.clone();
+        move |_, row| {
+            if let Some(chapter) = controller.chapters().get(row.index() as usize) {
+                controller.seek_to_seconds(chapter.start_seconds);
+            }
+            chapters_popover.popdown();
+        }
     });
 
     // `value-changed` fires both for user drags and for our own `scrubber.set_value(...)` calls
@@ -210,8 +262,29 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             elapsed_label,
             remaining_label,
             multi_track_label,
+            chapters_button,
+            chapters_popover,
+            chapters_list,
         },
     }
+}
+
+/// One row in the chapters sheet: title on the left, start time on the right, highlighted (via a
+/// css class) if `position` currently falls within this chapter's range.
+fn build_chapter_row(chapter: &ChapterInfo, position: f64) -> gtk4::ListBoxRow {
+    let is_current = chapter.start_seconds <= position && position < chapter.end_seconds;
+
+    let title_label = gtk4::Label::builder().label(&chapter.title).xalign(0.0).hexpand(true).ellipsize(gtk4::pango::EllipsizeMode::End).build();
+    let time_label = gtk4::Label::builder().label(format_hms(chapter.start_seconds)).css_classes(["dim-label"]).build();
+    let row_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).margin_top(6).margin_bottom(6).build();
+    row_box.append(&title_label);
+    row_box.append(&time_label);
+
+    if is_current {
+        title_label.add_css_class("heading");
+    }
+
+    gtk4::ListBoxRow::builder().child(&row_box).build()
 }
 
 fn format_hms(total_seconds: f64) -> String {
@@ -314,5 +387,71 @@ pub(crate) mod tests {
         assert!(hooks.multi_track_label.is_visible());
         assert!(hooks.multi_track_label.label().contains('2'));
         controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Seeds a two-chapter item, opens the
+    /// chapters popover, checks both rows are listed with the right titles, then activates the
+    /// second row and checks the controller actually seeks to its start.
+    pub(crate) fn run_chapters_sheet_lists_and_seeks(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(
+            &mock_server,
+            "item-1",
+            10,
+            &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)],
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        // Tap-to-seek needs real, seekable audio — unlike the multi-track caveat test above,
+        // which only needs `get_item_playback_info`'s response, not real playback.
+        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+        // Give the pipeline a moment to actually become seekable (same "position() becomes Some"
+        // readiness signal `PlayerController::start` itself waits on for the resume-seek).
+        pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+        assert_eq!(hooks.chapters_button.popover().as_ref(), Some(&hooks.chapters_popover), "the chapters button should open the chapters popover");
+
+        // A `GtkPopover` needs a realized (mapped) toplevel ancestor to actually pop up — unlike
+        // every other widget this test suite checks, which only need to exist, not be shown.
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.chapters_popover.popup();
+        pump_until(|| hooks.chapters_list.row_at_index(1).is_some(), Duration::from_secs(2));
+
+        let row0 = hooks.chapters_list.row_at_index(0).expect("first chapter row");
+        let row1 = hooks.chapters_list.row_at_index(1).expect("second chapter row");
+        assert!(hooks.chapters_list.row_at_index(2).is_none(), "should list exactly the two chapters");
+        assert_eq!(row_title(&row0), "Intro");
+        assert_eq!(row_title(&row1), "Chapter One");
+
+        hooks.chapters_list.emit_by_name::<()>("row-activated", &[&row1]);
+        pump_until(|| controller.snapshot().unwrap().position_seconds >= 4.0, Duration::from_secs(5));
+        assert!(
+            controller.snapshot().unwrap().position_seconds >= 4.0,
+            "activating the second chapter's row should seek to its start"
+        );
+
+        window.destroy();
+        controller.stop();
+    }
+
+    /// Extracts the title label's text from a chapters-sheet row built by `build_chapter_row`.
+    fn row_title(row: &gtk4::ListBoxRow) -> adw::glib::GString {
+        let row_box = row.child().expect("row has a child box").downcast::<gtk4::Box>().unwrap();
+        let title_label = row_box.first_child().expect("row box has a title label").downcast::<gtk4::Label>().unwrap();
+        title_label.label()
     }
 }

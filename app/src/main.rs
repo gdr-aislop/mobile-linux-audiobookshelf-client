@@ -89,6 +89,7 @@ mod tests {
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
         crate::screens::player::tests::run(&runtime);
         crate::screens::player::tests::run_multi_track_caveat_is_shown(&runtime);
+        crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
     }
 
     #[test]
