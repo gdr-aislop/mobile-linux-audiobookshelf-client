@@ -45,6 +45,7 @@ mod keys {
     pub const GROUPING: &str = "library.grouping";
     pub const SORT_BY: &str = "library.sort_by";
     pub const VIEW_MODE: &str = "library.view_mode";
+    pub const OFFLINE_MODE: &str = "browse.offline_mode";
 }
 
 /// Parse a stored value, falling back to `default` (and logging) on a missing key or a value
@@ -256,6 +257,18 @@ pub async fn save_library_view_mode(pool: &SqlitePool, mode: LibraryViewMode) ->
     kv::set(pool, keys::VIEW_MODE, mode.as_str()).await
 }
 
+/// The Home/Library offline-mode toggle — per `docs/design/ui-spec.md`, "state shared with the
+/// equivalent toggle on Library browse, not a per-screen setting". Storage-only for now (the
+/// toggle UI itself is a later pass); persisting it here means the UI work just has to read/write
+/// this instead of also inventing where the shared state lives.
+pub async fn load_offline_mode(pool: &SqlitePool) -> Result<bool> {
+    parse_or_default(pool, keys::OFFLINE_MODE, false).await
+}
+
+pub async fn save_offline_mode(pool: &SqlitePool, enabled: bool) -> Result<()> {
+    kv::set(pool, keys::OFFLINE_MODE, &enabled.to_string()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +386,20 @@ mod tests {
         let pool = pool().await;
         kv::set(&pool, "library.view_mode", "masonry").await.unwrap();
         assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::Grid);
+    }
+
+    #[tokio::test]
+    async fn offline_mode_defaults_to_off() {
+        let pool = pool().await;
+        assert!(!load_offline_mode(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn offline_mode_round_trips() {
+        let pool = pool().await;
+        save_offline_mode(&pool, true).await.unwrap();
+        assert!(load_offline_mode(&pool).await.unwrap());
+        save_offline_mode(&pool, false).await.unwrap();
+        assert!(!load_offline_mode(&pool).await.unwrap());
     }
 }

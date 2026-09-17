@@ -62,17 +62,12 @@ impl AppPaths {
         self.downloads_dir().join(server_id).join(item_id)
     }
 
-    /// Path a given chapter of an item would be downloaded to. `chapter_index` is zero-based;
-    /// the on-disk filename is 1-based and zero-padded to sort correctly as plain text.
-    pub fn chapter_file_path(
-        &self,
-        server_id: &str,
-        item_id: &str,
-        chapter_index: u32,
-        title_slug: &str,
-    ) -> PathBuf {
-        self.item_downloads_dir(server_id, item_id)
-            .join(format!("{:03}-{}.mp3", chapter_index + 1, title_slug))
+    /// Path a given track (audio file, keyed by the server's own `ino`) of an item would be
+    /// downloaded to. `extension` must be the real extension for the track's content-type (e.g.
+    /// `"mp3"`, `"m4b"`, `"m4a"`) — Audiobookshelf items aren't always mp3, so callers must derive
+    /// it from the actual response the same way `cover_cache_path` already requires for covers.
+    pub fn track_file_path(&self, server_id: &str, item_id: &str, ino: &str, extension: &str) -> PathBuf {
+        self.item_downloads_dir(server_id, item_id).join(format!("{ino}.{extension}"))
     }
 
     pub fn covers_dir(&self) -> PathBuf {
@@ -127,32 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn chapter_file_path_is_one_indexed_and_zero_padded() {
+    fn track_file_path_is_named_after_the_ino_with_the_given_extension() {
         let (_tmp, paths) = test_paths();
-        let p0 = paths.chapter_file_path("s", "i", 0, "intro");
-        let p9 = paths.chapter_file_path("s", "i", 9, "tenth-chapter");
-        assert_eq!(p0.file_name().unwrap(), "001-intro.mp3");
-        assert_eq!(p9.file_name().unwrap(), "010-tenth-chapter.mp3");
-    }
-
-    #[test]
-    fn chapter_file_paths_sort_lexically_in_chapter_order() {
-        let (_tmp, paths) = test_paths();
-        let names: Vec<String> = (0..12)
-            .map(|i| {
-                paths
-                    .chapter_file_path("s", "i", i, "c")
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        // A naive (unpadded) "1-c.mp3", "10-c.mp3", "2-c.mp3", ... would reorder here; zero
-        // padding must keep insertion order == lexical order.
-        assert_eq!(names, sorted);
+        let mp3 = paths.track_file_path("s", "i", "12345", "mp3");
+        let m4b = paths.track_file_path("s", "i", "67890", "m4b");
+        assert_eq!(mp3.file_name().unwrap(), "12345.mp3");
+        assert_eq!(m4b.file_name().unwrap(), "67890.m4b");
+        assert!(mp3.starts_with(paths.item_downloads_dir("s", "i")));
     }
 
     #[test]

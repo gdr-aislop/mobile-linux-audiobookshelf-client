@@ -52,6 +52,8 @@ dependencies = [
  "abs-api",
  "abs-storage",
  "chrono",
+ "futures",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tempfile",

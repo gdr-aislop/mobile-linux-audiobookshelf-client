@@ -6,12 +6,15 @@
 pub mod accounts;
 pub mod chapters;
 pub mod covers;
+pub mod download_tracks;
 pub mod downloads;
 pub mod error;
+pub mod media_type;
 pub mod playback;
 pub mod progress_sync;
 pub mod settings;
 pub mod streaming;
 pub mod sync;
+pub mod tracks;
 
 pub use error::{CoreError, Result};

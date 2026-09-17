@@ -30,6 +30,11 @@ pub struct MainWindow {
     /// D-Bus signals. `None` when no system bus (or no ModemManager on it) was reachable; call
     /// interruption is simply unavailable in that case, never a fatal error.
     _call_watcher: Option<abs_player::call_watch::ModemManagerCallWatcher>,
+    /// Kept alive for the app's whole lifetime, same reasoning as `_call_watcher` — dropping it
+    /// would lose every in-flight track's cancel flag and listener. No UI wires into it yet (see
+    /// `crate::downloads`'s module doc); this pass only ensures one instance exists for a later
+    /// screen to be handed a clone of.
+    pub download_manager: crate::downloads::DownloadManager,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -88,6 +93,19 @@ pub fn build(
         }
     };
 
+    // Wi-Fi-only detection is best-effort in the same way as MPRIS/call-watching above: no system
+    // bus (or no NetworkManager on it) must never be fatal — it just means metered-connection
+    // detection is unavailable, and `UnknownNetworkMonitor` makes that read as "undeterminable"
+    // rather than silently guessing "not metered".
+    let network_monitor: Box<dyn abs_player::network_watch::NetworkMonitor> = match abs_player::network_watch::NetworkManagerMonitor::new() {
+        Ok(monitor) => Box::new(monitor),
+        Err(err) => {
+            tracing::warn!(%err, "couldn't watch NetworkManager for metered-connection detection; Wi-Fi-only downloads will be unavailable");
+            Box::new(abs_player::network_watch::UnknownNetworkMonitor)
+        }
+    };
+    let download_manager = crate::downloads::DownloadManager::new(pool.clone(), paths.clone(), network_monitor, playback_settings.wifi_only_downloads);
+
     let stack = adw::ViewStack::new();
 
     let on_play = {
@@ -144,6 +162,7 @@ pub fn build(
     MainWindow {
         root: root.upcast(),
         _call_watcher: call_watcher,
+        download_manager,
         #[cfg(test)]
         hooks: TestHooks { stack, switcher_bar, mini_bar: mini_bar.hooks },
     }

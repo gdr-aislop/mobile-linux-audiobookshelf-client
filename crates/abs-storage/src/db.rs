@@ -87,8 +87,8 @@ mod tests {
         .unwrap();
 
         for expected in [
-            "servers", "accounts", "libraries", "items", "chapters", "progress", "downloads",
-            "settings",
+            "servers", "accounts", "libraries", "items", "chapters", "progress", "tracks",
+            "download_tracks", "settings", "bookmarks",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),

@@ -1,4 +1,5 @@
 mod application;
+mod downloads;
 mod player;
 mod screens;
 #[cfg(test)]
@@ -125,6 +126,10 @@ mod tests {
         crate::screens::player::tests::run_mark_as_finished_button_updates_progress(&runtime);
         crate::screens::player::tests::run_reset_progress_button_resets_position_and_seeks(&runtime);
         crate::widgets::cover_image::tests::run();
+        crate::downloads::tests::run_start_download_fetches_only_the_needed_track_and_reaches_complete(&runtime);
+        crate::downloads::tests::run_cancel_item_stops_the_track_from_reaching_complete(&runtime);
+        crate::downloads::tests::run_wifi_only_blocks_a_download_on_a_metered_connection(&runtime);
+        crate::downloads::tests::run_clear_item_deletes_files_and_publishes_idle(&runtime);
     }
 
     #[test]

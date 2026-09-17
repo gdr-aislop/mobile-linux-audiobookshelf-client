@@ -25,6 +25,19 @@ pub async fn sync_item_chapters(
     Ok(())
 }
 
+/// Reads back whatever `sync_item_chapters` last persisted, in the shape download planning needs
+/// (`abs_api::ChapterRef`, not the storage-shaped `abs_storage::models::Chapter`) — so a caller
+/// like `DownloadManager` can resolve a download scope against locally cached chapters without a
+/// network call, the same "offline-first, network only to fill a gap" posture `tracks::cached_tracks`
+/// already established.
+pub async fn cached_chapters(pool: &SqlitePool, server_id: &str, item_id: &str) -> Result<Vec<abs_api::ChapterRef>> {
+    let chapters = abs_storage::repo::chapters::list_for_item(pool, server_id, item_id).await?;
+    Ok(chapters
+        .into_iter()
+        .map(|c| abs_api::ChapterRef { title: c.title, start_seconds: c.start_seconds, end_seconds: c.end_seconds })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +89,21 @@ mod tests {
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].title, "Intro");
         assert_eq!(stored[1].start_seconds, 60.0);
+    }
+
+    #[tokio::test]
+    async fn cached_chapters_reads_back_what_was_synced() {
+        let (pool, server_id) = pool_with_synced_item("item-1").await;
+        assert!(cached_chapters(&pool, &server_id, "item-1").await.unwrap().is_empty());
+
+        let chapters = vec![
+            abs_api::ChapterRef { title: "Intro".to_string(), start_seconds: 0.0, end_seconds: 60.0 },
+            abs_api::ChapterRef { title: "Chapter 1".to_string(), start_seconds: 60.0, end_seconds: 300.0 },
+        ];
+        sync_item_chapters(&pool, &server_id, "item-1", &chapters).await.unwrap();
+
+        let cached = cached_chapters(&pool, &server_id, "item-1").await.unwrap();
+        assert_eq!(cached, chapters);
     }
 
     #[tokio::test]

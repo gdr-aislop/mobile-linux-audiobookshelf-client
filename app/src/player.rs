@@ -23,6 +23,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
+use abs_core::streaming::locate_track;
 use abs_storage::models::{Account, Server};
 use abs_storage::AppPaths;
 
@@ -102,16 +103,6 @@ struct NowPlaying {
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
-
-/// Maps a book-level position to `(track index, seconds into that track)` — the inverse of
-/// `Inner::book_position`. A position exactly at a track boundary lands on the *later* track (a
-/// book position equal to a track's own start means "play this track from 0"), which is also what
-/// makes a boundary-adjacent resume pick up the next file instead of the previous one's final
-/// instant.
-fn locate_track(tracks: &[abs_core::streaming::StreamTrack], book_seconds: f64) -> (usize, f64) {
-    let index = tracks.iter().rposition(|t| t.offset_seconds <= book_seconds + 1e-6).unwrap_or(0);
-    (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
-}
 
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,

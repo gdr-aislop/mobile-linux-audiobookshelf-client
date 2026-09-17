@@ -61,6 +61,17 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
     Ok(StreamTarget { tracks, duration_seconds: offset_seconds, chapters: info.chapters })
 }
 
+/// Finds which track a book-level position falls into, and how far into that track it is.
+/// `rposition` (not `position`) matters at an exact track boundary: a position that lands exactly
+/// on the start of a later track must resolve to that later track, not linger on the end of the
+/// previous one. Shared by playback (mapping the resume position and seek targets onto the
+/// currently-loaded track) and downloads (mapping a chapter's `[start, end)` range onto the set of
+/// tracks it touches) — one definition, tested once.
+pub fn locate_track(tracks: &[StreamTrack], book_seconds: f64) -> (usize, f64) {
+    let index = tracks.iter().rposition(|t| t.offset_seconds <= book_seconds + 1e-6).unwrap_or(0);
+    (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
+}
+
 /// Pushes local playback progress up to the server, so it shows up in the official apps and
 /// survives a fresh install — not just recorded in this client's own local `progress` table.
 /// Callers are expected to treat a failure here as non-fatal: the local write (the source of
@@ -204,6 +215,29 @@ mod tests {
             .await;
 
         sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await.unwrap();
+    }
+
+    fn two_tracks() -> Vec<StreamTrack> {
+        vec![
+            StreamTrack { ino: "1".into(), url: "u1".into(), duration_seconds: 1800.0, offset_seconds: 0.0 },
+            StreamTrack { ino: "2".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 1800.0 },
+        ]
+    }
+
+    #[test]
+    fn locate_track_finds_the_containing_track() {
+        assert_eq!(locate_track(&two_tracks(), 900.0), (0, 900.0));
+        assert_eq!(locate_track(&two_tracks(), 2000.0), (1, 200.0));
+    }
+
+    #[test]
+    fn locate_track_at_an_exact_boundary_resolves_to_the_later_track() {
+        assert_eq!(locate_track(&two_tracks(), 1800.0), (1, 0.0));
+    }
+
+    #[test]
+    fn locate_track_before_the_first_track_clamps_to_it() {
+        assert_eq!(locate_track(&two_tracks(), -5.0), (0, 0.0));
     }
 
     #[tokio::test]
