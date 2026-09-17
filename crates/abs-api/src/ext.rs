@@ -241,6 +241,12 @@ pub struct ItemPlaybackInfo {
     pub chapters: Vec<ChapterRef>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverBytes {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UpdateProgressRequest {
     #[serde(rename = "currentTime")]
@@ -390,6 +396,32 @@ impl Client {
             .collect();
 
         Ok(ItemPlaybackInfo { audio_files, chapters })
+    }
+
+    /// Fetch an item's cover image. Hand-written, same `/api/items/*` gap as
+    /// `get_item_playback_info`. Confirmed live: `GET /api/items/:id/cover` with the bearer-token
+    /// client (no `?token=` query param needed, unlike `/file/:ino`) returns `200` and the raw
+    /// image bytes; the content-type varies by library (`image/webp` for the one checked live,
+    /// but Audiobookshelf may return jpeg/png depending on the source cover file), so callers must
+    /// not assume a fixed extension.
+    pub async fn get_item_cover(&self, item_id: &str) -> Result<CoverBytes, LibraryItemsError> {
+        let response = self.client().get(format!("{}/api/items/{item_id}/cover", self.baseurl())).send().await?;
+
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!(
+                "GET /api/items/{item_id}/cover returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = response.bytes().await?.to_vec();
+        Ok(CoverBytes { bytes, content_type })
     }
 
     /// Push local playback progress up to the server, so it shows up in the official apps and
@@ -951,6 +983,45 @@ mod tests {
         let client = Client::new(&server.uri());
         let info = client.get_item_playback_info("item-1").await.unwrap();
         assert!(info.chapters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_item_cover_returns_bytes_and_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/webp").set_body_bytes(vec![1, 2, 3, 4]))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let cover = client.get_item_cover("item-1").await.unwrap();
+        assert_eq!(cover.bytes, vec![1, 2, 3, 4]);
+        assert_eq!(cover.content_type, "image/webp");
+    }
+
+    #[tokio::test]
+    async fn get_item_cover_defaults_to_jpeg_when_no_content_type_is_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let cover = client.get_item_cover("item-1").await.unwrap();
+        assert_eq!(cover.content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn get_item_cover_propagates_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_item_cover("item-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
     }
 
     #[tokio::test]

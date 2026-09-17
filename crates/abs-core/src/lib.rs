@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod chapters;
+pub mod covers;
 pub mod downloads;
 pub mod error;
 pub mod playback;

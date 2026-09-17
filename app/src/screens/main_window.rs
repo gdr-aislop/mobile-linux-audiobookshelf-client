@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 
 use abs_core::settings::PlaybackSettings;
 use abs_storage::models::{Account, Server};
+use abs_storage::AppPaths;
 
 use crate::player::{self, PlayRequest};
 use crate::screens;
@@ -42,12 +43,13 @@ impl MainWindow {
 
 pub fn build(
     pool: SqlitePool,
+    paths: AppPaths,
     server: Server,
     account: Account,
     playback_settings: PlaybackSettings,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
-    let mini_bar = player::build_mini_bar(pool.clone(), player::real_backend());
+    let mini_bar = player::build_mini_bar(pool.clone(), paths, player::real_backend());
 
     let stack = adw::ViewStack::new();
 
@@ -130,7 +132,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let window = build(pool, server, account, abs_core::settings::PlaybackSettings::default(), app_window);
+        let window = build(pool, crate::test_support::test_paths(), server, account, abs_core::settings::PlaybackSettings::default(), app_window);
         let hooks = window.test_hooks();
 
         for name in ["home", "library", "downloads", "settings"] {

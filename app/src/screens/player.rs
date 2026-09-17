@@ -1,8 +1,8 @@
-//! The full player screen — `docs/design/ui-spec.md`'s "Player — full" section. Core transport
-//! plus a chapters sheet this pass; speed control, sleep timer, and bookmarks are still to come.
-//! Opened by `main_window` swapping window content in (there's no `AdwNavigationView`/`AdwDialog`
-//! available at this crate's libadwaita ceiling, both v1.4+); the down-chevron header button calls
-//! `on_collapse` to swap back.
+//! The full player screen — `docs/design/ui-spec.md`'s "Player — full" section: core transport,
+//! a secondary row of speed/sleep-timer/chapters controls, and a header `⋯` menu for "Add
+//! bookmark". Opened by `main_window` swapping window content in (there's no
+//! `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling, both v1.4+); the
+//! down-chevron header button calls `on_collapse` to swap back.
 
 use adw::prelude::*;
 
@@ -35,6 +35,9 @@ pub struct TestHooks {
     pub sleep_timer_button: gtk4::MenuButton,
     pub sleep_timer_popover: gtk4::Popover,
     pub sleep_timer_popover_box: gtk4::Box,
+    pub menu_button: gtk4::MenuButton,
+    pub add_bookmark_button: gtk4::Button,
+    pub toast_overlay: adw::ToastOverlay,
 }
 
 #[cfg(test)]
@@ -57,13 +60,20 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     header.pack_start(&collapse_button);
     header.set_title_widget(Some(&adw::WindowTitle::new("Now Playing", "")));
 
-    let cover = gtk4::Box::builder()
-        .css_classes(["card"])
-        .width_request(264)
-        .height_request(264)
-        .halign(gtk4::Align::Center)
-        .margin_top(14)
-        .build();
+    // The spec's `⋯` menu is dropped down to just "Add bookmark" — speed and sleep timer live as
+    // secondary-row buttons instead (see the scope decision in this plan). Plain
+    // `GtkMenuButton`/`GtkPopover`/`GtkButton`, same convention as the other popovers on this
+    // screen, not `GMenu`/`GAction`.
+    let add_bookmark_button = gtk4::Button::builder().label("Add bookmark").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+    let menu_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    menu_popover_box.append(&add_bookmark_button);
+    let menu_popover = gtk4::Popover::builder().child(&menu_popover_box).build();
+    let menu_button = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").popover(&menu_popover).build();
+    header.pack_end(&menu_button);
+
+    let cover = crate::widgets::cover_image::CoverImage::new(264);
+    cover.widget().set_halign(gtk4::Align::Center);
+    cover.widget().set_margin_top(14);
     let title_label = gtk4::Label::builder()
         .wrap(true)
         .justify(gtk4::Justification::Center)
@@ -188,7 +198,7 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .margin_end(28)
         .margin_bottom(24)
         .build();
-    content.append(&cover);
+    content.append(cover.widget());
     content.append(&title_label);
     content.append(&author_label);
     content.append(&scrubber);
@@ -200,6 +210,20 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&content);
+
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&root));
+
+    add_bookmark_button.connect_clicked({
+        let controller = controller.clone();
+        let menu_popover = menu_popover.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            controller.add_bookmark();
+            menu_popover.popdown();
+            toast_overlay.add_toast(adw::Toast::new("Bookmark added"));
+        }
+    });
 
     let skip_back_seconds = playback_settings.skip_back_seconds as f64;
     let skip_forward_seconds = playback_settings.skip_forward_seconds as f64;
@@ -270,10 +294,12 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         let multi_track_label = multi_track_label.clone();
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
+        let cover = cover.clone();
         move |snapshot: &PlayerSnapshot| {
             title_label.set_label(&snapshot.title);
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
             author_label.set_visible(snapshot.author.is_some());
+            cover.set_path(snapshot.cover_path.as_deref());
             play_button.set_child(Some(&gtk4::Image::from_icon_name(if snapshot.is_playing {
                 "media-playback-pause-symbolic"
             } else {
@@ -316,7 +342,7 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     controller.set_full_update(update);
 
     PlayerScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: TestHooks {
             title_label,
@@ -336,6 +362,9 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             sleep_timer_button,
             sleep_timer_popover,
             sleep_timer_popover_box,
+            menu_button,
+            add_bookmark_button,
+            toast_overlay,
         },
     }
 }
@@ -401,7 +430,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
             account,
@@ -456,7 +485,7 @@ pub(crate) mod tests {
 
         // No `/file/1` mock is needed for this test — the point is the caveat text, which is
         // computed from `get_item_playback_info`'s response alone, before any audio ever loads.
-        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
             account,
@@ -491,7 +520,7 @@ pub(crate) mod tests {
 
         // Tap-to-seek needs real, seekable audio — unlike the multi-track caveat test above,
         // which only needs `get_item_playback_info`'s response, not real playback.
-        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
             account,
@@ -544,7 +573,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
             account,
@@ -581,7 +610,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
             server,
             account,
@@ -606,6 +635,40 @@ pub(crate) mod tests {
         );
         assert!(!controller.snapshot().unwrap().sleep_timer_active, "firing should also disarm the timer");
 
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. `AdwToastOverlay` has no public way
+    /// to inspect a queued toast headless, so this checks the load-bearing effect instead: the
+    /// menu button opens a popover, and clicking "Add bookmark" in it writes a row to storage.
+    pub(crate) fn run_add_bookmark_button_persists_a_row(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+        assert!(hooks.menu_button.popover().is_some(), "the ... menu button should open a popover");
+
+        hooks.add_bookmark_button.emit_clicked();
+        pump_until(|| false, Duration::from_millis(300));
+
+        let count: i64 =
+            runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks").fetch_one(&pool)).unwrap();
+        assert_eq!(count, 1, "clicking Add bookmark should persist a row");
+        assert!(hooks.toast_overlay.child().is_some(), "the toast overlay should still be hosting the screen content");
         controller.stop();
     }
 

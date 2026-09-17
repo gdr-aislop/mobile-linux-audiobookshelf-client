@@ -79,10 +79,14 @@ impl AppPaths {
         self.cache_dir.join("covers")
     }
 
-    pub fn cover_cache_path(&self, server_id: &str, item_id: &str) -> PathBuf {
+    /// `extension` is the real extension for the cover bytes being cached (e.g. `"webp"`,
+    /// `"png"`, `"jpg"`) — Audiobookshelf serves covers in whatever format the source file is in,
+    /// not always JPEG, so callers must pass the actual content-type-derived extension rather
+    /// than assuming one.
+    pub fn cover_cache_path(&self, server_id: &str, item_id: &str, extension: &str) -> PathBuf {
         self.covers_dir()
             .join(server_id)
-            .join(format!("{item_id}.jpg"))
+            .join(format!("{item_id}.{extension}"))
     }
 
     /// Create every directory this `AppPaths` might write into. Idempotent.
@@ -154,9 +158,16 @@ mod tests {
     #[test]
     fn cover_cache_path_lives_under_cache_dir_not_data_dir() {
         let (_tmp, paths) = test_paths();
-        let cover = paths.cover_cache_path("server-a", "item-1");
+        let cover = paths.cover_cache_path("server-a", "item-1", "jpg");
         assert!(cover.starts_with(paths.cache_dir()));
         assert!(!cover.starts_with(paths.data_dir()));
+    }
+
+    #[test]
+    fn cover_cache_path_uses_the_given_extension() {
+        let (_tmp, paths) = test_paths();
+        let cover = paths.cover_cache_path("server-a", "item-1", "webp");
+        assert_eq!(cover.extension().unwrap(), "webp");
     }
 
     #[tokio::test]

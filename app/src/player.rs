@@ -24,6 +24,9 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use abs_storage::models::{Account, Server};
+use abs_storage::AppPaths;
+
+use crate::widgets::cover_image::CoverImage;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
@@ -45,6 +48,7 @@ pub struct PlayerSnapshot {
     pub multi_track_note: Option<String>,
     pub speed: f64,
     pub sleep_timer_active: bool,
+    pub cover_path: Option<std::path::PathBuf>,
 }
 
 /// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
@@ -87,6 +91,7 @@ struct NowPlaying {
     chapters: Vec<ChapterInfo>,
     speed: f64,
     sleep_timer: SleepTimerState,
+    cover_path: Option<std::path::PathBuf>,
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
@@ -94,6 +99,7 @@ type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
     pool: SqlitePool,
+    paths: AppPaths,
     now_playing: Option<NowPlaying>,
     /// Permanent listeners, notified on every published snapshot for the app's whole lifetime —
     /// the mini-player bar's closure is pushed here at construction, and MPRIS (once wired) is
@@ -116,6 +122,7 @@ impl Inner {
             multi_track_note: now_playing.multi_track_note.clone(),
             speed: now_playing.speed,
             sleep_timer_active: now_playing.sleep_timer != SleepTimerState::Off,
+            cover_path: now_playing.cover_path.clone(),
         })
     }
 
@@ -177,6 +184,7 @@ pub struct PlayerController {
 impl PlayerController {
     pub fn new(
         pool: SqlitePool,
+        paths: AppPaths,
         backend: Box<dyn abs_player::AudioBackend>,
         mini_update: impl Fn(&PlayerSnapshot) + 'static,
     ) -> Self {
@@ -184,6 +192,7 @@ impl PlayerController {
             inner: Rc::new(RefCell::new(Inner {
                 backend,
                 pool,
+                paths,
                 now_playing: None,
                 listeners: vec![Box::new(mini_update)],
                 full_update: None,
@@ -240,6 +249,26 @@ impl PlayerController {
         self.inner.borrow().now_playing.as_ref().map(|np| np.chapters.clone()).unwrap_or_default()
     }
 
+    /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
+    /// same precedent as `write_progress`'s local half: a plain repo write, no server sync, since
+    /// none is specified for bookmarks. A no-op if nothing is playing.
+    pub fn add_bookmark(&self) {
+        let inner = self.inner.borrow();
+        let Some(now_playing) = &inner.now_playing else { return };
+        let pool = inner.pool.clone();
+        let account_id = now_playing.account_id.clone();
+        let server_id = now_playing.server_id.clone();
+        let item_id = now_playing.item_id.clone();
+        let position = inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        drop(inner);
+
+        glib::spawn_future_local(async move {
+            if let Err(err) = abs_storage::repo::bookmarks::add(&pool, &account_id, &server_id, &item_id, position).await {
+                tracing::warn!(%err, "couldn't save bookmark");
+            }
+        });
+    }
+
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
     /// item/account rather than always starting over from position 0. `default_speed` is
     /// `PlaybackSettings::default_speed`, applied once at the start of every session (the user can
@@ -247,15 +276,19 @@ impl PlayerController {
     pub fn start(&self, server: Server, account: Account, item: PlayRequest, default_speed: f64) {
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
-            let pool = inner_rc.borrow().pool.clone();
+            let (pool, paths) = {
+                let inner = inner_rc.borrow();
+                (inner.pool.clone(), inner.paths.clone())
+            };
 
-            // Resolving the stream URL is required to proceed; reconciling progress against the
-            // server is a nice-to-have that must never add its own delay on top — run both
-            // concurrently (each already has its own bounded timeout) rather than one after the
-            // other, so a slow or unreachable server is only ever felt once, not twice.
-            let (target_result, reconcile_result) = tokio::join!(
+            // Resolving the stream URL is required to proceed; reconciling progress and fetching
+            // the cover are both nice-to-haves that must never add their own delay on top — run
+            // all three concurrently (each already has its own bounded timeout) rather than one
+            // after another, so a slow or unreachable server is only ever felt once, not thrice.
+            let (target_result, reconcile_result, cover_path) = tokio::join!(
                 abs_core::streaming::resolve_stream_target(&server.url, &account.token, &item.item_id),
                 abs_core::progress_sync::reconcile_item_progress(&pool, &server.url, &account.token, &account.id, &server.id, &item.item_id),
+                abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server.url, &account.token, &server.id, &item.item_id),
             );
             if let Err(err) = reconcile_result {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't reconcile progress with the server; using local progress");
@@ -355,6 +388,7 @@ impl PlayerController {
                 chapters,
                 speed: applied_speed,
                 sleep_timer: SleepTimerState::Off,
+                cover_path,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();
@@ -533,8 +567,8 @@ pub struct MiniPlayerHooks {
 
 /// The mini-player bar from `docs/design/ui-spec.md`'s "Player — mini" section: cover placeholder,
 /// title/author, play/pause, a thin progress line — hidden until something has actually played.
-pub fn build_mini_bar(pool: SqlitePool, backend: Box<dyn abs_player::AudioBackend>) -> MiniPlayerBar {
-    let cover = gtk4::Box::builder().css_classes(["card"]).width_request(40).height_request(40).build();
+pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_player::AudioBackend>) -> MiniPlayerBar {
+    let cover = CoverImage::new(40);
 
     let title_label = gtk4::Label::builder()
         .xalign(0.0)
@@ -554,7 +588,7 @@ pub fn build_mini_bar(pool: SqlitePool, backend: Box<dyn abs_player::AudioBacken
     let play_button = gtk4::Button::builder().css_classes(["circular", "flat"]).child(&play_icon).build();
 
     let content_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).margin_start(10).margin_end(10).margin_top(6).build();
-    content_row.append(&cover);
+    content_row.append(cover.widget());
     content_row.append(&text_box);
     content_row.append(&play_button);
 
@@ -564,17 +598,19 @@ pub fn build_mini_bar(pool: SqlitePool, backend: Box<dyn abs_player::AudioBacken
     bar.append(&content_row);
     bar.append(&progress);
 
-    let controller = PlayerController::new(pool, backend, {
+    let controller = PlayerController::new(pool, paths, backend, {
         let bar = bar.clone();
         let title_label = title_label.clone();
         let author_label = author_label.clone();
         let play_icon = play_icon.clone();
         let progress = progress.clone();
+        let cover = cover.clone();
         move |snapshot: &PlayerSnapshot| {
             bar.set_visible(true);
             title_label.set_label(&snapshot.title);
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
             author_label.set_visible(snapshot.author.is_some());
+            cover.set_path(snapshot.cover_path.as_deref());
             play_icon.set_icon_name(Some(if snapshot.is_playing {
                 "media-playback-pause-symbolic"
             } else {
@@ -816,7 +852,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool.clone(), test_backend(), {
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
@@ -858,6 +894,34 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// `add_bookmark` is a plain local repo write with no server sync and no readback anywhere in
+    /// the app yet — the only thing worth asserting is that the write actually lands.
+    pub(crate) fn run_add_bookmark_persists_a_row(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 10));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server.clone(),
+            account.clone(),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        controller.add_bookmark();
+        pump_until(|| false, Duration::from_millis(300));
+
+        let count: i64 =
+            runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks").fetch_one(&pool)).unwrap();
+        assert_eq!(count, 1, "add_bookmark should persist a row");
+        controller.stop();
+    }
+
     /// Regression test for a real bug caught in manual live testing (not by any prior test — this
     /// path had no coverage at all): `start()` requested a seek immediately after requesting
     /// `pause()`, but a seek needs the pipeline to have *reached* `PAUSED`, not just been asked to
@@ -875,7 +939,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 6.0, false)).unwrap();
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool, test_backend(), {
+        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
@@ -923,7 +987,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool, test_backend(), {
+        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
@@ -952,7 +1016,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool.clone(), test_backend(), {
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
@@ -994,7 +1058,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let mini_bar = build_mini_bar(pool, test_backend());
+        let mini_bar = build_mini_bar(pool, crate::test_support::test_paths(), test_backend());
         let hooks = &mini_bar.hooks;
         assert!(!hooks.bar.is_visible(), "the mini bar should stay hidden until something plays");
 

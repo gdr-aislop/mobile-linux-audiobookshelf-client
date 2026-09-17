@@ -57,7 +57,7 @@ async fn setup() -> AppState {
         "resolved startup screen"
     );
 
-    AppState { pool, active_account, playback_settings }
+    AppState { pool, paths, active_account, playback_settings }
 }
 
 /// Every GTK-touching test across `screens::*` funnels through exactly these two `#[test]` fns.
@@ -87,11 +87,14 @@ mod tests {
         crate::player::tests::run_multi_track_item_sets_a_caveat_note(&runtime);
         crate::player::tests::run_end_of_stream_pauses_and_marks_finished(&runtime);
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
+        crate::player::tests::run_add_bookmark_persists_a_row(&runtime);
         crate::screens::player::tests::run(&runtime);
         crate::screens::player::tests::run_multi_track_caveat_is_shown(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);
+        crate::screens::player::tests::run_add_bookmark_button_persists_a_row(&runtime);
+        crate::widgets::cover_image::tests::run();
     }
 
     #[test]

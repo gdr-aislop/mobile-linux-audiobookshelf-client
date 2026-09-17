@@ -19,6 +19,15 @@ pub async fn pool() -> SqlitePool {
     pool
 }
 
+/// A fresh, tempdir-rooted `AppPaths` for tests that construct a `PlayerController` directly
+/// (cover-art caching needs somewhere to write) — same leak-the-tempdir approach as `pool()`.
+pub fn test_paths() -> abs_storage::AppPaths {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = abs_storage::AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
+    std::mem::forget(tmp);
+    paths
+}
+
 /// Drains the default `MainContext` — the same one `glib::spawn_future_local` schedules onto —
 /// until `done()` returns true or `timeout` elapses. `iteration(false)` is non-blocking, so this
 /// is a plain poll loop, not a nested main loop.

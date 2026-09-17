@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod bookmarks;
 pub mod chapters;
 pub mod downloads;
 pub mod items;
