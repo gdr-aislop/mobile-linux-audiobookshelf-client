@@ -230,6 +230,8 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - Secondary row: playback speed button (cycles/opens popover with 0.8×–3.0× options), sleep-timer
   button (opens popover: off / 15 / 30 / 45 min / end-of-chapter), chapters button (opens a sheet
   listing chapters, current one highlighted).
+- This screen carries the app's only arrow-key bindings (skip back/forward), plus the speed,
+  chapters, and sleep-timer keys — all defined, with their scoping rationale, in § 6.
 
 ### Downloads
 - `AdwPreferencesPage`-style grouped list: a summary row (storage used / device free space), then
@@ -312,3 +314,53 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   covers/rows, and per-chapter offline markers in Item detail). The Home/Library offline-mode
   toggle (see those sections) lets a user deliberately narrow either screen to only such items
   even while online, e.g. before a trip.
+
+## 6. Keyboard shortcuts
+
+This is a phone-first app, but it runs on desktop GNOME and on phones with attached keyboards
+(Librem 5, PinePhone + keyboard case, Bluetooth), so basic keyboard support is part of the
+interface, not an afterthought. The bindings below follow GNOME conventions wherever one exists —
+`Space` for play/pause and arrow-key seeking match GNOME's own media players (Decibels' shortcuts
+dialog is the closest analogue; Totem agrees) — and each action maps 1:1 onto a control that
+already exists on-screen, so a keyboard user is never offered anything the touch UI can't do.
+
+| Keys | Action | Scope |
+|---|---|---|
+| `Space` | Play / pause | Global (no-op when nothing is loaded) |
+| `Alt+1` … `Alt+4` | Switch tab: Home / Library / Downloads / Settings | Global |
+| `Ctrl+F` | Focus the Library search field (switching to the Library tab first if needed) | Global |
+| `b` | Add bookmark at the current position | Global (no-op when nothing is playing) |
+| `Esc` | Collapse the full player back to the shell | Global |
+| `Ctrl+?` | Open the keyboard-shortcuts overlay (`GtkShortcutsWindow`) | Global |
+| `Ctrl+,` | Open the Settings tab | Global |
+| `Ctrl+Q` | Quit | Global |
+| `←` / `→` | Skip back / forward by the configured interval (Settings → Playback) | Full player |
+| `Ctrl+=` / `Ctrl+−` (also bare `+` / `−`) | Playback speed up / down through the popover's presets | Full player |
+| `Ctrl+0` / `0` | Reset playback speed to 1× | Full player |
+| `c` | Open the chapters list | Full player |
+| `t` | Open the sleep-timer popover | Full player |
+
+Rules, each of which constrains future changes to this table:
+
+- **Typing always wins.** While any text entry has focus (Library search, the Welcome form, the
+  Connection page's header editor), single-key bindings like `Space` and `b` must not fire —
+  they must type. GTK's shortcut resolution tries the focus widget before window/application
+  accelerators, which yields exactly this for free; the rule is stated so nobody later "fixes"
+  transport keys with a hand-rolled key controller that would break it.
+- **Arrows are deliberately not global.** Every other screen is grids and lists where arrow keys
+  are keyboard focus navigation (an accessibility surface) — globalizing skip would redefine
+  them out from under that. Hence skip is scoped to the full player, the one screen with nothing
+  to focus-navigate, matching Decibels/Totem. The interplay with the scrubber is benign either
+  way: if the `GtkScale` has focus, arrows move the slider (i.e. they seek); if nothing is
+  focused, the accelerator fires (i.e. it seeks too).
+- **No `XF86` media-key bindings.** Hardware play/skip/volume keys arrive through the shell via
+  the app's own MPRIS interface (see System media integration); binding them in-app as well
+  would double-handle each press. Volume is system-owned outright (see Hardware controls &
+  interruptions).
+- **Mechanics:** registered as named actions with `set_accels_for_action` (application-scope for
+  the global set; window-scope for the full-player set so they simply don't exist elsewhere) and
+  listed in a `GtkShortcutsWindow` opened by `Ctrl+?` — the standard GNOME discoverability pair.
+  These are the app's first `GAction`s: the existing "no `GMenu`/`GAction`" convention on the
+  player screen is about menu *buttons* (plain `GtkMenuButton`/`GtkButton` there), not about
+  accelerators, which in GTK only target actions — so this is an idiom extension, not a
+  contradiction.
