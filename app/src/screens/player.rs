@@ -29,6 +29,12 @@ pub struct TestHooks {
     pub chapters_button: gtk4::MenuButton,
     pub chapters_popover: gtk4::Popover,
     pub chapters_list: gtk4::ListBox,
+    pub speed_button: gtk4::MenuButton,
+    pub speed_label: gtk4::Label,
+    pub speed_popover_box: gtk4::Box,
+    pub sleep_timer_button: gtk4::MenuButton,
+    pub sleep_timer_popover: gtk4::Popover,
+    pub sleep_timer_popover_box: gtk4::Box,
 }
 
 #[cfg(test)]
@@ -105,10 +111,58 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .visible(false)
         .build();
 
-    // Secondary row: chapters this pass (speed control and sleep timer land here in later
-    // passes). `AdwBottomSheet` is v1.6+, unavailable at this crate's v1.2 ceiling, so the
-    // chapters sheet is a plain `GtkPopover` — a `GtkScrolledWindow` caps its height so a long
-    // chapter list scrolls instead of forcing the popover to fill the screen.
+    // Secondary row: speed, sleep timer, chapters. `AdwBottomSheet`/popover-menu widgets from
+    // libadwaita 1.4+ are unavailable at this crate's v1.2 ceiling, so every one of these is a
+    // plain `GtkMenuButton` + `GtkPopover` holding a `GtkBox` of buttons — matching this
+    // codebase's existing convention of wiring everything through direct `connect_clicked`
+    // closures rather than `GMenu`/`GAction` models.
+    const SPEED_PRESETS: [f64; 8] = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
+    let speed_label = gtk4::Label::new(Some("1.0×"));
+    let speed_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    let speed_popover = gtk4::Popover::builder().child(&speed_popover_box).build();
+    let speed_button = gtk4::MenuButton::builder().child(&speed_label).tooltip_text("Playback speed").popover(&speed_popover).build();
+    for speed in SPEED_PRESETS {
+        let button = gtk4::Button::builder().label(format_speed(speed)).css_classes(["flat"]).build();
+        button.connect_clicked({
+            let controller = controller.clone();
+            let speed_popover = speed_popover.clone();
+            move |_| {
+                controller.set_speed(speed);
+                speed_popover.popdown();
+            }
+        });
+        speed_popover_box.append(&button);
+    }
+
+    let sleep_timer_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    let sleep_timer_popover = gtk4::Popover::builder().child(&sleep_timer_popover_box).build();
+    let sleep_timer_button = gtk4::MenuButton::builder()
+        .icon_name("preferences-system-time-symbolic")
+        .tooltip_text("Sleep timer")
+        .popover(&sleep_timer_popover)
+        .build();
+    type SleepTimerAction = Box<dyn Fn(&PlayerController)>;
+    let sleep_timer_options: [(&str, SleepTimerAction); 5] = [
+        ("Off", Box::new(|c: &PlayerController| c.cancel_sleep_timer())),
+        ("15 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(15))),
+        ("30 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(30))),
+        ("45 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(45))),
+        ("End of chapter", Box::new(|c: &PlayerController| c.set_sleep_timer_end_of_chapter())),
+    ];
+    for (label, apply) in sleep_timer_options {
+        let button = gtk4::Button::builder().label(label).css_classes(["flat"]).build();
+        button.connect_clicked({
+            let controller = controller.clone();
+            let sleep_timer_popover = sleep_timer_popover.clone();
+            move |_| {
+                apply(&controller);
+                sleep_timer_popover.popdown();
+            }
+        });
+        sleep_timer_popover_box.append(&button);
+    }
+
     let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
     let chapters_scroller = gtk4::ScrolledWindow::builder()
         .max_content_height(320)
@@ -123,8 +177,9 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .tooltip_text("Chapters")
         .popover(&chapters_popover)
         .build();
-    let secondary_row =
-        gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).halign(gtk4::Align::Center).margin_top(10).build();
+    let secondary_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(18).halign(gtk4::Align::Center).margin_top(10).build();
+    secondary_row.append(&speed_button);
+    secondary_row.append(&sleep_timer_button);
     secondary_row.append(&chapters_button);
 
     let content = gtk4::Box::builder()
@@ -213,6 +268,8 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         let elapsed_label = elapsed_label.clone();
         let remaining_label = remaining_label.clone();
         let multi_track_label = multi_track_label.clone();
+        let speed_label = speed_label.clone();
+        let sleep_timer_button = sleep_timer_button.clone();
         move |snapshot: &PlayerSnapshot| {
             title_label.set_label(&snapshot.title);
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
@@ -242,6 +299,13 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
                 }
                 None => multi_track_label.set_visible(false),
             }
+
+            speed_label.set_label(&format_speed(snapshot.speed));
+            if snapshot.sleep_timer_active {
+                sleep_timer_button.add_css_class("accent");
+            } else {
+                sleep_timer_button.remove_css_class("accent");
+            }
         }
     };
 
@@ -266,6 +330,12 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             chapters_button,
             chapters_popover,
             chapters_list,
+            speed_button,
+            speed_label,
+            speed_popover_box,
+            sleep_timer_button,
+            sleep_timer_popover,
+            sleep_timer_popover_box,
         },
     }
 }
@@ -286,6 +356,17 @@ fn build_chapter_row(chapter: &ChapterInfo, position: f64) -> gtk4::ListBoxRow {
     }
 
     gtk4::ListBoxRow::builder().child(&row_box).build()
+}
+
+/// Formats a playback speed for the speed button/popover — trims a trailing `.0` (`"1×"` reads
+/// oddly for a speed control; `"1.0×"` is the convention every audiobook app uses) but keeps
+/// fractional speeds like `1.25×` intact.
+fn format_speed(speed: f64) -> String {
+    if (speed.fract()).abs() < f64::EPSILON {
+        format!("{speed:.1}×")
+    } else {
+        format!("{speed}×")
+    }
 }
 
 fn format_hms(total_seconds: f64) -> String {
@@ -325,6 +406,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
+            1.0,
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
@@ -379,6 +461,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
@@ -413,6 +496,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
         );
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
         // Give the pipeline a moment to actually become seekable (same "position() becomes Some"
@@ -447,6 +531,98 @@ pub(crate) mod tests {
 
         window.destroy();
         controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking a speed preset should call
+    /// through to the real backend and update both the controller's snapshot and the button's
+    /// label.
+    pub(crate) fn run_speed_popover_changes_playback_speed(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+        assert_eq!(hooks.speed_label.label(), "1.0×", "should start at the default speed");
+        assert!(hooks.speed_button.popover().is_some(), "the speed button should open a popover");
+
+        click_button_labeled(&hooks.speed_popover_box, "1.5×");
+        assert_eq!(controller.snapshot().unwrap().speed, 1.5, "clicking a preset should change the real controller's speed");
+        assert_eq!(hooks.speed_label.label(), "1.5×");
+
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Exercises the real end-of-chapter
+    /// deadline path (not a test-only backdoor): a very short first chapter, armed via the
+    /// popover, should pause playback once the position crosses the chapter boundary.
+    pub(crate) fn run_sleep_timer_end_of_chapter_pauses_at_the_boundary(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(
+            &mock_server,
+            "item-1",
+            5,
+            &[("Short Chapter", 0.0, 1.0), ("Rest", 1.0, 5.0)],
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool, test_backend(), |_| {});
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+
+        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let hooks = screen.test_hooks();
+        assert!(!hooks.sleep_timer_button.has_css_class("accent"), "no sleep timer armed yet");
+        assert_eq!(hooks.sleep_timer_button.popover().as_ref(), Some(&hooks.sleep_timer_popover));
+
+        click_button_labeled(&hooks.sleep_timer_popover_box, "End of chapter");
+        assert!(controller.snapshot().unwrap().sleep_timer_active);
+        assert!(hooks.sleep_timer_button.has_css_class("accent"), "the sleep timer button should show it's armed");
+
+        pump_until(|| !controller.snapshot().unwrap().is_playing, Duration::from_secs(10));
+        assert!(
+            !controller.snapshot().unwrap().is_playing,
+            "reaching the end of the current chapter should pause playback"
+        );
+        assert!(!controller.snapshot().unwrap().sleep_timer_active, "firing should also disarm the timer");
+
+        controller.stop();
+    }
+
+    /// Finds and clicks the button with the given label inside a popover's button box (speed or
+    /// sleep-timer presets), so tests can drive the popover the same way a user tapping it would.
+    fn click_button_labeled(container: &gtk4::Box, label: &str) {
+        let mut child = container.first_child();
+        while let Some(widget) = child {
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if button.label().as_deref() == Some(label) {
+                    button.emit_clicked();
+                    return;
+                }
+            }
+            child = widget.next_sibling();
+        }
+        panic!("no button labeled {label:?} found");
     }
 
     /// Extracts the title label's text from a chapters-sheet row built by `build_chapter_row`.

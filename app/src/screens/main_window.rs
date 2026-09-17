@@ -55,7 +55,8 @@ pub fn build(
         let controller = mini_bar.controller.clone();
         let server = server.clone();
         let account = account.clone();
-        move |request: PlayRequest| controller.start(server.clone(), account.clone(), request)
+        let default_speed = playback_settings.default_speed;
+        move |request: PlayRequest| controller.start(server.clone(), account.clone(), request, default_speed)
     };
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);

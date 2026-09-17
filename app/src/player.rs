@@ -43,6 +43,8 @@ pub struct PlayerSnapshot {
     pub duration_seconds: f64,
     pub is_playing: bool,
     pub multi_track_note: Option<String>,
+    pub speed: f64,
+    pub sleep_timer_active: bool,
 }
 
 /// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
@@ -52,6 +54,23 @@ pub struct ChapterInfo {
     pub title: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+}
+
+/// A sleep-timer deadline, checked once per `tick()` rather than driven by a second timer source
+/// — a wall-clock deadline (15/30/45 min) and an end-of-chapter deadline (a stream position) are
+/// otherwise different units entirely, but both reduce to "has `now` (real time, or playback
+/// position) reached this yet?".
+#[derive(Clone, Copy, PartialEq)]
+enum SleepTimerDeadline {
+    WallClock(Instant),
+    Position(f64),
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum SleepTimerState {
+    #[default]
+    Off,
+    Armed(SleepTimerDeadline),
 }
 
 struct NowPlaying {
@@ -66,6 +85,8 @@ struct NowPlaying {
     multi_track_note: Option<String>,
     is_playing: bool,
     chapters: Vec<ChapterInfo>,
+    speed: f64,
+    sleep_timer: SleepTimerState,
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
@@ -93,6 +114,8 @@ impl Inner {
             duration_seconds: now_playing.duration_seconds,
             is_playing: now_playing.is_playing,
             multi_track_note: now_playing.multi_track_note.clone(),
+            speed: now_playing.speed,
+            sleep_timer_active: now_playing.sleep_timer != SleepTimerState::Off,
         })
     }
 
@@ -218,8 +241,10 @@ impl PlayerController {
     }
 
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
-    /// item/account rather than always starting over from position 0.
-    pub fn start(&self, server: Server, account: Account, item: PlayRequest) {
+    /// item/account rather than always starting over from position 0. `default_speed` is
+    /// `PlaybackSettings::default_speed`, applied once at the start of every session (the user can
+    /// change it afterwards via `set_speed`).
+    pub fn start(&self, server: Server, account: Account, item: PlayRequest, default_speed: f64) {
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
@@ -283,7 +308,11 @@ impl PlayerController {
                 // which used to mean "resume mid-book" quietly resumed from 0 instead.
                 let _ = inner.backend.pause();
             }
-            if resume_at.is_some() {
+            // A non-default speed also needs a seek internally (`AudioBackend::set_speed` is
+            // implemented as a seek-with-rate, GStreamer having no rate-only call), so it has the
+            // same readiness requirement as the resume seek below.
+            let needs_seek_ready = resume_at.is_some() || (default_speed - 1.0).abs() > f64::EPSILON;
+            if needs_seek_ready {
                 // `duration()` can come back `Some` from container metadata alone, before the
                 // pipeline has actually finished prerolling into `PAUSED` — which is what seeking
                 // actually requires. `position()` only starts returning a value once preroll has
@@ -300,6 +329,16 @@ impl PlayerController {
             if let Some(resume_at) = resume_at {
                 let _ = inner.backend.seek(Duration::from_secs_f64(resume_at));
             }
+            // `set_speed` is itself a seek-with-rate (see `abs-player`'s own doc comment) — even
+            // setting it to the already-default 1.0 would perform a redundant seek that queries
+            // `position()` and re-seeks to it, which can race the resume seek just above (if the
+            // resume seek's position update hasn't propagated yet, this would re-seek back to the
+            // stale pre-resume position). Skip it entirely when there's nothing to change.
+            let applied_speed = if (default_speed - 1.0).abs() > f64::EPSILON {
+                if inner.backend.set_speed(default_speed).is_ok() { default_speed } else { 1.0 }
+            } else {
+                1.0
+            };
             let _ = inner.backend.play();
 
             inner.now_playing = Some(NowPlaying {
@@ -314,6 +353,8 @@ impl PlayerController {
                 multi_track_note,
                 is_playing: true,
                 chapters,
+                speed: applied_speed,
+                sleep_timer: SleepTimerState::Off,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();
@@ -375,6 +416,54 @@ impl PlayerController {
         inner.publish();
     }
 
+    /// Changes the playback rate. Only updates the reported speed if the backend actually
+    /// accepted it, matching `play()`/`pause()`'s existing "state reflects reality" pattern.
+    pub fn set_speed(&self, speed: f64) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.backend.set_speed(speed).is_ok() {
+            if let Some(now_playing) = &mut inner.now_playing {
+                now_playing.speed = speed;
+            }
+        }
+        inner.publish();
+    }
+
+    /// Arms a wall-clock sleep timer: playback pauses once `minutes` have passed, checked once
+    /// per tick rather than via a second timer source (see `SleepTimerDeadline`).
+    pub fn set_sleep_timer_minutes(&self, minutes: u32) {
+        let mut inner = self.inner.borrow_mut();
+        let deadline = SleepTimerDeadline::WallClock(Instant::now() + Duration::from_secs(u64::from(minutes) * 60));
+        if let Some(now_playing) = &mut inner.now_playing {
+            now_playing.sleep_timer = SleepTimerState::Armed(deadline);
+        }
+        inner.publish();
+    }
+
+    /// Arms a sleep timer that fires at the end of whatever chapter is currently playing, falling
+    /// back to the end of the item if there's no chapter data (or the position doesn't fall
+    /// inside any known chapter).
+    pub fn set_sleep_timer_end_of_chapter(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let position = inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let Some(now_playing) = &mut inner.now_playing else { return };
+        let end = now_playing
+            .chapters
+            .iter()
+            .find(|c| c.start_seconds <= position && position < c.end_seconds)
+            .map(|c| c.end_seconds)
+            .unwrap_or(now_playing.duration_seconds);
+        now_playing.sleep_timer = SleepTimerState::Armed(SleepTimerDeadline::Position(end));
+        inner.publish();
+    }
+
+    pub fn cancel_sleep_timer(&self) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(now_playing) = &mut inner.now_playing {
+            now_playing.sleep_timer = SleepTimerState::Off;
+        }
+        inner.publish();
+    }
+
     fn tick(&self) {
         let mut inner = self.inner.borrow_mut();
         if inner.now_playing.is_none() {
@@ -397,6 +486,23 @@ impl PlayerController {
                         now_playing.is_playing = false;
                     }
                 }
+            }
+        }
+
+        if let Some(SleepTimerState::Armed(deadline)) = inner.now_playing.as_ref().map(|n| n.sleep_timer) {
+            let reached = match deadline {
+                SleepTimerDeadline::WallClock(at) => Instant::now() >= at,
+                SleepTimerDeadline::Position(end) => {
+                    inner.backend.position().is_some_and(|p| p.as_secs_f64() >= end)
+                }
+            };
+            if reached {
+                let _ = inner.backend.pause();
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.is_playing = false;
+                    now_playing.sleep_timer = SleepTimerState::Off;
+                }
+                inner.write_progress(false);
             }
         }
 
@@ -719,6 +825,7 @@ pub(crate) mod tests {
             server.clone(),
             account.clone(),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
+            1.0,
         );
 
         pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
@@ -777,6 +884,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
         );
 
         pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
@@ -824,6 +932,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
         );
 
         pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
@@ -852,6 +961,7 @@ pub(crate) mod tests {
             server.clone(),
             account.clone(),
             PlayRequest { item_id: "item-1".to_string(), title: "Short Clip".to_string(), author: None },
+            1.0,
         );
 
         pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
@@ -892,6 +1002,7 @@ pub(crate) mod tests {
             server,
             account,
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
+            1.0,
         );
         pump_until(|| hooks.bar.is_visible(), Duration::from_secs(10));
 

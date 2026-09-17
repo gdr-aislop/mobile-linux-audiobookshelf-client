@@ -90,6 +90,8 @@ mod tests {
         crate::screens::player::tests::run(&runtime);
         crate::screens::player::tests::run_multi_track_caveat_is_shown(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
+        crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
+        crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);
     }
 
     #[test]
