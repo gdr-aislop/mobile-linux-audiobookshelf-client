@@ -21,9 +21,6 @@ on:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build-deb:
     name: Build .deb (${{ matrix.arch }})
@@ -40,6 +37,25 @@ jobs:
       image: debian:bookworm
 
     steps:
+      - uses: actions/checkout@v4
+
+      # Fails fast, before spending CI minutes on apt/rustup/the build itself: a tag push with a
+      # Cargo.toml the release-tagger forgot to bump would otherwise silently ship a mislabeled
+      # .deb (the whole point of centralizing the version in `[workspace.package]` is that it
+      # can't drift — this is the other half of that guarantee). Skipped for workflow_dispatch
+      # dry runs, which aren't tied to a version-bearing tag at all.
+      - name: Verify the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (version $tag_version) does not match the workspace version $cargo_version in Cargo.toml — bump [workspace.package].version before tagging a release."
+            exit 1
+          fi
+          echo "Tag version $tag_version matches workspace version $cargo_version."
+
       - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -51,8 +67,6 @@ jobs:
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libssl-dev
-
-      - uses: actions/checkout@v4
 
       - name: Install Rust (stable)
         run: |
@@ -136,6 +150,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-deb, build-appimage]
     runs-on: ubuntu-latest
+    # Only this job needs write access (to attach files to the release) — build-deb only
+    # checks out, builds, and uploads a workflow artifact, so it keeps the default read-only
+    # permissions.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

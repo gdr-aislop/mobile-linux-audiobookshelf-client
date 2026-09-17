@@ -6,3 +6,4 @@
 
 pub mod banner;
 pub mod cover_image;
+pub mod item_card;

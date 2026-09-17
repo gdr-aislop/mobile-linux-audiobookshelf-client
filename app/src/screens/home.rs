@@ -16,7 +16,7 @@ use abs_storage::models::{Account, Item, Library, Progress, Server};
 use abs_storage::AppPaths;
 
 use crate::player::PlayRequest;
-use crate::widgets::cover_image::CoverImage;
+use crate::widgets::item_card;
 
 pub struct HomeScreen {
     pub root: gtk4::Widget,
@@ -285,14 +285,14 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
             0.0
         };
         let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&cover_card(item, &subtitle, &widgets.on_play));
+        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
     }
     widgets.continue_section.set_visible(!data.continue_items.is_empty());
 
     clear_box(&widgets.recent_row);
     for item in &data.recent_items {
         let subtitle = item_subtitle(item);
-        widgets.recent_row.append(&cover_card(item, &subtitle, &widgets.on_play));
+        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
     }
 
     clear_listbox(&widgets.libraries_list);
@@ -339,58 +339,6 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
         .propagate_natural_height(true)
         .child(row)
         .build()
-}
-
-/// A tappable cover card — there's no Item Detail screen yet, so tapping directly starts
-/// playback rather than the ui-spec's real "tap -> Item detail -> Play" flow (same "skip screens
-/// not yet built" scoping already used for Library/Downloads/Settings' stub tabs).
-fn cover_card(item: &Item, subtitle: &str, on_play: &std::rc::Rc<dyn Fn(PlayRequest)>) -> gtk4::Widget {
-    const COVER_SIZE: i32 = 132;
-
-    // `hexpand` was set on the old placeholder's title label so long titles could wrap to fill
-    // it — but a `GtkBox`'s own hexpand is computed from its children unless overridden, so that
-    // one `true` propagated all the way up to this card's wrapping `GtkButton`. With only one
-    // sibling in the row (as "Continue Listening" usually has), nothing else claimed the leftover
-    // width, so the card visibly stretched across the whole shelf instead of staying square. Every
-    // widget in this card is explicitly `hexpand(false)` now so a single-item shelf can't do that.
-    let card = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).width_request(COVER_SIZE).hexpand(false).spacing(6).build();
-
-    let cover = CoverImage::new(COVER_SIZE);
-    cover.widget().set_hexpand(false);
-    cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
-
-    // Single-line + ellipsize for both labels, deliberately not `wrap`: a wrapped label combined
-    // with `ellipsize` asks Pango for a natural height that doesn't actually reserve room for the
-    // wrapped line count (confirmed live — the second line was rendering *underneath* whatever
-    // came next, not visible as "wrapped", since the box only reserved single-line height for it).
-    // Fixed single-line height per label keeps every card in a shelf the same height regardless
-    // of title/author length, which also avoids per-card height mismatches entirely.
-    let title_label = gtk4::Label::builder()
-        .label(&item.title)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .xalign(0.0)
-        .hexpand(false)
-        .css_classes(["heading"])
-        .build();
-
-    let meta = gtk4::Label::builder()
-        .label(subtitle)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .xalign(0.0)
-        .hexpand(false)
-        .css_classes(["caption", "dim-label"])
-        .build();
-
-    card.append(cover.widget());
-    card.append(&title_label);
-    card.append(&meta);
-
-    let button = gtk4::Button::builder().css_classes(["flat"]).hexpand(false).child(&card).build();
-    let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
-    let on_play = on_play.clone();
-    button.connect_clicked(move |_| on_play(request.clone()));
-
-    button.upcast()
 }
 
 fn library_row(library: &Library) -> adw::ActionRow {
