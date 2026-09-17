@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Audiobookshelf
+GenericName=Audiobook Player
+Comment=Listen to audiobooks and podcasts from your Audiobookshelf server
+Exec=abs-app
+Icon=abs-app
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audiobook;podcast;player;streaming;
+StartupNotify=true
+X-Purism-FormFactor=workstation;mobile;

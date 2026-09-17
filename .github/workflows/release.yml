@@ -1,0 +1,100 @@
+name: Release debs
+
+# Builds distribution .debs for every release tag:
+#   - arm64: PureOS Crimson on the Librem 5 (built against Debian bookworm
+#     libraries, Crimson's base — same libgtk-4 4.8 / libadwaita 1.2 the
+#     feature ceiling in app/Cargo.toml targets)
+#   - amd64: test build for Ubuntu 24.04 (Noble's GTK/adwaita are newer than
+#     the app's floor, so the same deb installs and runs there)
+# Both builds run inside a debian:bookworm container so the produced binaries
+# link against Crimson-era library versions, and so accidentally using a
+# newer-than-v4_8/v1_2 API fails the build instead of crashing on device.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: Build .deb (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
+    container:
+      image: debian:bookworm
+
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates \
+            libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libssl-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: cargo deb -p abs-app
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp -v target/debian/./*.deb dist/
+          cd dist
+          sha256sum ./*.deb > "SHA256SUMS-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Attach .debs to the GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./*.deb > SHA256SUMS
+          rm -f SHA256SUMS-*.txt
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS

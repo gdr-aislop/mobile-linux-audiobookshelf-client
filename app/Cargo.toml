@@ -3,6 +3,7 @@ name = "abs-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Client for an Audiobookshelf server, designed for mobile Linux"
 
 [[bin]]
 name = "abs-app"
@@ -32,6 +33,33 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
-wiremock.workspace = true
+wiremock = "0.6"
 hound = "3"
 chrono.workspace = true
+
+# Debian packaging for PureOS Crimson (Librem 5) and Ubuntu 24.04, built by
+# .github/workflows/release.yml via `cargo deb`. Depends is written against
+# bookworm (Crimson's base) package names; the libssl3 alternative keeps the
+# same deb installable on Ubuntu 24.04, which renamed the package to libssl3t64.
+[package.metadata.deb]
+maintainer = "gdr-aislop <gdr-aislop@users.noreply.github.com>"
+copyright = "GPL-3.0-or-later"
+section = "sound"
+priority = "optional"
+extended-description = """\
+GNOME-native client for an Audiobookshelf media server, designed for mobile \
+Linux (Phosh on the Librem 5, also usable on desktop).
+
+Browse your library, stream or play downloaded audiobooks and podcasts, \
+and keep listening progress in sync with the server. Integrates with the \
+desktop via MPRIS2 and pauses during phone calls."""
+depends = """\
+libgtk-4-1, libadwaita-1-0, \
+gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-libav, \
+glib-networking, libssl3 | libssl3t64"""
+assets = [
+    ["target/release/abs-app", "usr/bin/", "755"],
+    ["assets/abs-app.desktop", "usr/share/applications/", "644"],
+    ["assets/abs-app.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../LICENSE", "usr/share/doc/abs-app/", "644"],
+]
