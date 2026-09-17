@@ -121,6 +121,7 @@ mod tests {
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
         crate::player::tests::run_add_bookmark_persists_a_row(&runtime);
         crate::screens::player::tests::run(&runtime);
+        crate::screens::player::tests::run_keyboard_actions(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);

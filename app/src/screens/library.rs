@@ -41,6 +41,10 @@ const TILE_SIZE: i32 = 108;
 
 pub struct LibraryScreen {
     pub root: gtk4::Widget,
+    /// Public so the main window's `win.open-library-search` keyboard action (ui-spec §6) can
+    /// focus it — `TestHooks` is test-only by convention, and this is production wiring, not a
+    /// test hook.
+    pub search_entry: gtk4::SearchEntry,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -341,6 +345,7 @@ pub fn build(
 
     LibraryScreen {
         root: root.upcast(),
+        search_entry: search_entry.clone(),
         #[cfg(test)]
         hooks: TestHooks { status_page, flow_box, list_box, search_entry, banner, sort_buttons, view_toggle },
     }
