@@ -96,6 +96,7 @@ mod tests {
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
         crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
+        crate::player::tests::run_track_duration_correction_updates_the_book_total(&runtime);
         crate::player::tests::run_multi_track_advances_to_the_next_track(&runtime);
         crate::player::tests::run_multi_track_final_track_marks_finished(&runtime);
         crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file(&runtime);

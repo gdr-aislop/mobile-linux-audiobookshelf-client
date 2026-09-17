@@ -230,6 +230,13 @@ impl Inner {
                 for track in &mut now_playing.tracks[next..] {
                     track.offset_seconds += delta;
                 }
+                // The book-level total is exactly the last track's offset plus its own duration
+                // — shifting every later offset by `delta` shifts that sum by `delta` too, so the
+                // total has to move with it. Left stale, it would silently drift from the
+                // corrected timeline on every mismatch, throwing off `mark_as_finished`'s
+                // recorded position, `seek_to_seconds`/`skip`'s clamp bound, and the book-level
+                // duration shown in the scrubber and reported to MPRIS.
+                now_playing.duration_seconds += delta;
             }
         }
 
@@ -1229,6 +1236,75 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(mock_server)
             .await;
+    }
+
+    /// Regression test: `next_track_after_end_of_stream` corrects later tracks' offsets against
+    /// the pipeline's *actual* duration when the server-reported one for the file that just ended
+    /// was wrong — this seeds exactly that mismatch (server says 10s, the real WAV is 2s) and
+    /// checks the book-level *total* duration is corrected along with the offsets. It's the one
+    /// piece of that correction the original implementation missed: the offsets shifted, but
+    /// `NowPlaying.duration_seconds` (the total the scrubber, MPRIS, and `mark_as_finished`/
+    /// `seek_to_seconds`'s clamp all read) stayed at the stale, server-reported sum.
+    pub(crate) fn run_track_duration_correction_updates_the_book_total(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    // Track 1 is declared as 10s but the WAV actually served is only 2s — the
+                    // kind of inaccurate server metadata this correction exists to tolerate.
+                    "media": { "audioFiles": [
+                        { "ino": "1", "duration": 10.0 },
+                        { "ino": "2", "duration": 2.0 },
+                    ] }
+                })))
+                .mount(&mock_server)
+                .await;
+            for ino in ["1", "2"] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/items/item-1/file/{ino}")))
+                    .respond_with(ranged_response(silent_wav_bytes(2)))
+                    .mount(&mock_server)
+                    .await;
+            }
+            Mock::given(method("PATCH"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&mock_server)
+                .await;
+        });
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            server,
+            account,
+            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
+        );
+
+        // Before the first track ends, the book total is still the stale server-reported sum
+        // (10 + 2 = 12s) — nothing has had a reason to correct it yet.
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        assert_eq!(controller.snapshot().unwrap().duration_seconds, 12.0);
+
+        // Once the real (2s) first track ends and hands over to the second, the correction fires:
+        // the true book total is 2 (corrected track 1) + 2 (track 2) = 4s, not the stale 12s.
+        pump_until(
+            || {
+                let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+                requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2")
+            },
+            Duration::from_secs(15),
+        );
+        pump_until(|| false, Duration::from_millis(200));
+        let duration = controller.snapshot().unwrap().duration_seconds;
+        assert!((duration - 4.0).abs() < 0.5, "book total should be corrected to ~4s, got {duration}");
+
+        controller.stop();
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
