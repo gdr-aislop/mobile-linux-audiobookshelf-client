@@ -12,6 +12,9 @@ pub struct StreamTarget {
     /// book/podcast). Full multi-track sequencing isn't implemented — only the first file is ever
     /// played — so callers use this to show a caveat rather than silently truncating the book.
     pub track_count: usize,
+    /// The item's chapters, if any — comes free in the same `GET /api/items/:id` response used to
+    /// resolve the audio file, so no second network call is needed to get this.
+    pub chapters: Vec<abs_api::ChapterRef>,
 }
 
 /// Builds an authenticated `abs_api::Client` from `server_url`/`access_token` itself — the same
@@ -34,6 +37,7 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
         url: format!("{server_url}/api/items/{item_id}/file/{}?token={access_token}", first.ino),
         duration_seconds: first.duration_seconds,
         track_count: info.audio_files.len(),
+        chapters: info.chapters,
     })
 }
 
@@ -82,6 +86,31 @@ mod tests {
         );
         assert_eq!(target.duration_seconds, 3600.0);
         assert_eq!(target.track_count, 1);
+        assert!(target.chapters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_stream_target_includes_chapters() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [{ "ino": "12345", "duration": 3600.0 }],
+                    "chapters": [
+                        { "id": 0, "start": 0.0, "end": 1800.0, "title": "Part One" },
+                        { "id": 1, "start": 1800.0, "end": 3600.0, "title": "Part Two" },
+                    ]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let target = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await.unwrap();
+
+        assert_eq!(target.chapters.len(), 2);
+        assert_eq!(target.chapters[0].title, "Part One");
+        assert_eq!(target.chapters[1].start_seconds, 1800.0);
     }
 
     #[tokio::test]

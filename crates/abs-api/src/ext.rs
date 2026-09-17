@@ -205,12 +205,21 @@ struct ItemDetailResponseBody {
 struct RawItemMedia {
     #[serde(rename = "audioFiles", default)]
     audio_files: Vec<RawAudioFile>,
+    #[serde(default)]
+    chapters: Vec<RawChapter>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawAudioFile {
     ino: Option<String>,
     duration: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChapter {
+    title: Option<String>,
+    start: Option<f64>,
+    end: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,8 +229,16 @@ pub struct AudioFileRef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ChapterRef {
+    pub title: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ItemPlaybackInfo {
     pub audio_files: Vec<AudioFileRef>,
+    pub chapters: Vec<ChapterRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -354,17 +371,25 @@ impl Client {
         }
 
         let body: ItemDetailResponseBody = response.json().await?;
-        let audio_files = body
-            .media
-            .map(|m| m.audio_files)
-            .unwrap_or_default()
+        let (audio_files, chapters) = match body.media {
+            Some(media) => (media.audio_files, media.chapters),
+            None => (Vec::new(), Vec::new()),
+        };
+        let audio_files = audio_files
             .into_iter()
             .filter_map(|f| {
                 Some(AudioFileRef { ino: f.ino?, duration_seconds: f.duration.unwrap_or(0.0) })
             })
             .collect();
+        // A malformed chapter entry (missing title/start/end) is skipped rather than failing the
+        // whole call, same tolerance as audio files above — one bad chapter shouldn't take down
+        // playback or the chapters sheet for the rest of the book.
+        let chapters = chapters
+            .into_iter()
+            .filter_map(|c| Some(ChapterRef { title: c.title?, start_seconds: c.start?, end_seconds: c.end? }))
+            .collect();
 
-        Ok(ItemPlaybackInfo { audio_files })
+        Ok(ItemPlaybackInfo { audio_files, chapters })
     }
 
     /// Push local playback progress up to the server, so it shows up in the official apps and
@@ -647,6 +672,10 @@ mod tests {
         let audio_file = info.audio_files.first().expect("a real item should have at least one audio file");
         assert!(!audio_file.ino.is_empty());
         assert!(audio_file.duration_seconds > 0.0);
+        if let Some(chapter) = info.chapters.first() {
+            assert!(!chapter.title.is_empty());
+            assert!(chapter.end_seconds > chapter.start_seconds);
+        }
     }
 
     /// End-to-end against the real public demo server: logs in, updates progress for a real item,
@@ -855,6 +884,73 @@ mod tests {
         let client = Client::new(&server.uri());
         let err = client.get_item_playback_info("item-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_parses_chapters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [{ "ino": "1", "duration": 3600.0 }],
+                    "chapters": [
+                        { "id": 0, "start": 0.0, "end": 100.0, "title": "Introduction" },
+                        { "id": 1, "start": 100.0, "end": 3600.0, "title": "Chapter 1" },
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+
+        assert_eq!(info.chapters.len(), 2);
+        assert_eq!(info.chapters[0].title, "Introduction");
+        assert_eq!(info.chapters[0].start_seconds, 0.0);
+        assert_eq!(info.chapters[0].end_seconds, 100.0);
+        assert_eq!(info.chapters[1].title, "Chapter 1");
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_skips_malformed_chapters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [{ "ino": "1", "duration": 3600.0 }],
+                    "chapters": [
+                        { "id": 0, "start": 0.0, "title": "Missing end" },
+                        { "id": 1, "start": 10.0, "end": 20.0, "title": "Valid" },
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+
+        assert_eq!(info.chapters.len(), 1, "a chapter missing a required field should be skipped, not fail the call");
+        assert_eq!(info.chapters[0].title, "Valid");
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_with_no_chapters_is_an_empty_vec_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": { "audioFiles": [{ "ino": "1", "duration": 3600.0 }] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+        assert!(info.chapters.is_empty());
     }
 
     #[tokio::test]
