@@ -170,7 +170,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, "http://127.0.0.1:1")).unwrap();
         let account_id =
-            runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token")).unwrap();
+            runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token", None)).unwrap();
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 

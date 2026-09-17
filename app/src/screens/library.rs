@@ -451,7 +451,7 @@ pub(crate) mod tests {
 
     async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (Server, Account) {
         let server_id = abs_storage::repo::servers::add(pool, server_url).await.unwrap();
-        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123").await.unwrap();
+        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
         (
             abs_storage::repo::servers::get(pool, &server_id).await.unwrap(),
             abs_storage::repo::accounts::get(pool, &account_id).await.unwrap(),

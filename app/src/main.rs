@@ -63,6 +63,21 @@ async fn setup() -> AppState {
     let active_account = abs_storage::repo::accounts::get_active(&pool)
         .await
         .expect("check for an active account");
+
+    // JWT auth (server v2.26.0+): the stored access token may have expired since the last run
+    // (they live 1–12 hours). Refresh it now, before the token value is threaded into every
+    // screen — the Home sync, the player's stream URLs, and the Library tab all take the token
+    // from this one row. Best-effort: with an unreachable server this logs and carries on with
+    // the old token (see `abs_core::auth`).
+    let active_account = match active_account {
+        Some(account) => {
+            let server = abs_storage::repo::servers::get(&pool, &account.server_id)
+                .await
+                .expect("an active account's server must exist");
+            Some(abs_core::auth::ensure_fresh_token(&pool, &server.url, &account).await)
+        }
+        None => None,
+    };
     tracing::info!(
         has_active_account = active_account.is_some(),
         "resolved startup screen"

@@ -52,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "abs-api",
  "abs-storage",
+ "base64",
  "chrono",
  "serde_json",
  "sqlx",

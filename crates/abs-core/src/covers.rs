@@ -94,7 +94,7 @@ mod tests {
         std::mem::forget(tmp);
 
         let server_id = servers::add(&pool, "http://example.invalid").await.unwrap();
-        accounts::add(&pool, &server_id, "jane", "token").await.unwrap();
+        accounts::add(&pool, &server_id, "jane", "token", None).await.unwrap();
         libraries::upsert(
             &pool,
             libraries::UpsertLibrary { id: "lib-1", server_id: &server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 },
