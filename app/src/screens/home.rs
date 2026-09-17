@@ -394,7 +394,7 @@ fn cover_card(item: &Item, subtitle: &str, on_play: &std::rc::Rc<dyn Fn(PlayRequ
 }
 
 fn library_row(library: &Library) -> adw::ActionRow {
-    let icon_name = if library.media_type == "podcast" { "microphone-symbolic" } else { "system-file-manager-symbolic" };
+    let icon_name = if library.media_type == "podcast" { "audio-input-microphone-symbolic" } else { "system-file-manager-symbolic" };
     let row = adw::ActionRow::builder().title(library.name.as_str()).subtitle(library.media_type.as_str()).build();
     row.add_prefix(&gtk4::Image::from_icon_name(icon_name));
     row

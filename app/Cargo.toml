@@ -30,6 +30,12 @@ tracing-subscriber.workspace = true
 gtk4 = { version = "0.9", features = ["v4_8"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
 
+# Cover-art decoding fallback: gdk-pixbuf has no WebP support on the target
+# distros (no loader shipped in Debian bookworm, PureOS Crimson's base), while
+# Audiobookshelf serves many covers as WebP. Decoded in-process and turned
+# into a `gdk::MemoryTexture` when pixbuf can't handle a file.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
