@@ -30,6 +30,7 @@ dependencies = [
  "abs-core",
  "abs-player",
  "abs-storage",
+ "base64",
  "chrono",
  "futures",
  "gio",

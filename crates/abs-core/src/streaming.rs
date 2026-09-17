@@ -51,7 +51,7 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
     for file in &info.audio_files {
         tracks.push(StreamTrack {
             ino: file.ino.clone(),
-            url: format!("{server_url}/api/items/{item_id}/file/{}?token={access_token}", file.ino),
+            url: track_url(server_url, item_id, &file.ino, access_token),
             duration_seconds: file.duration_seconds,
             offset_seconds,
         });
@@ -59,6 +59,14 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
     }
 
     Ok(StreamTarget { tracks, duration_seconds: offset_seconds, chapters: info.chapters })
+}
+
+/// The authenticated stream URL for a single audio file. Exposed separately because track URLs
+/// are **baked into a loaded pipeline** for as long as that file plays — a caller holding a
+/// [`StreamTarget`] across a long session (multi-file books advance hours later) rebuilds the
+/// URL with a current token via this, instead of replaying the stale one baked at resolve time.
+pub fn track_url(server_url: &str, item_id: &str, ino: &str, access_token: &str) -> String {
+    format!("{server_url}/api/items/{item_id}/file/{ino}?token={access_token}")
 }
 
 /// Pushes local playback progress up to the server, so it shows up in the official apps and

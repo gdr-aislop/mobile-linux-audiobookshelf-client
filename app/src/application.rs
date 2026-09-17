@@ -66,11 +66,13 @@ fn build_window(app: &adw::Application, state: &AppState) {
                     let account = abs_storage::repo::accounts::get(&pool, &added.account_id)
                         .await
                         .expect("the account just created by add_server_and_login must exist");
+                    let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
                     let main_window = screens::main_window::build(
                         pool,
                         paths,
                         server,
                         account,
+                        session,
                         playback_settings,
                         window_for_callback.clone(),
                     );
@@ -89,11 +91,13 @@ fn build_window(app: &adw::Application, state: &AppState) {
                 let server = abs_storage::repo::servers::get(&pool, &account.server_id)
                     .await
                     .expect("an active account's server must exist");
+                let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
                 let main_window = screens::main_window::build(
                     pool,
                     paths,
                     server,
                     account,
+                    session,
                     playback_settings,
                     window_for_callback.clone(),
                 );

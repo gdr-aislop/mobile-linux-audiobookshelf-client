@@ -71,6 +71,7 @@ pub fn build(
     paths: AppPaths,
     server: Server,
     account: Account,
+    session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
 ) -> HomeScreen {
     let header = adw::HeaderBar::new();
@@ -186,11 +187,15 @@ pub fn build(
 
             let spawned_sync = tokio::spawn({
                 let pool = pool.clone();
+                let session = session.clone();
                 let server_url = server.url.clone();
                 let server_id = server_id.clone();
                 let account_id = account_id.clone();
-                let access_token = account.token.clone();
+                // Asked at call time, not captured at build time — a token captured here would
+                // be the one from whenever this screen was constructed, and on servers v2.26.0+
+                // it dies within hours while the app stays open.
                 async move {
+                    let access_token = session.access_token().await;
                     let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
 
                     // Reconciling "Continue Listening" against the server's progress runs after
@@ -231,11 +236,12 @@ pub fn build(
                 tokio::spawn({
                     let pool = pool.clone();
                     let paths = paths.clone();
+                    let session = session.clone();
                     let server_url = server.url.clone();
                     let server_id = server_id.clone();
                     let account_id = account_id.clone();
-                    let access_token = account.token.clone();
                     async move {
+                        let access_token = session.access_token().await;
                         let fetches = item_ids.into_iter().map(|item_id| {
                             let pool = pool.clone();
                             let paths = paths.clone();
@@ -451,7 +457,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         // `status_page` starts hidden (only shown for a confirmed-empty result), so waiting on
@@ -477,7 +484,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         // There's no "sync finished" signal to await directly here (an always-empty result looks
@@ -499,13 +507,76 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
 
         assert!(hooks.banner.widget().reveals_child(), "a sync failure should show the banner");
         assert!(hooks.status_page.is_visible(), "with nothing cached yet, the empty state stays up too");
+    }
+
+    /// The mid-session-expiry scenario that motivated `abs_core::auth::Session`: the stored access
+    /// token is already expired when the screen's pipeline runs (the app was opened well after the
+    /// last one died), and the server only accepts the token obtained via the refresh flow. The
+    /// sync must go through — transparently — rather than surfacing as a 401 "logout".
+    pub(crate) fn run_expired_token_is_refreshed_before_syncing(runtime: &tokio::runtime::Runtime) {
+        use base64::Engine;
+
+        let make_jwt = |exp: i64| {
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            format!("{}.{}.{}", encode(br#"{"alg":"HS256"}"#), encode(serde_json::json!({ "exp": exp }).to_string().as_bytes()), encode(b"sig"))
+        };
+
+        let mock_server = runtime.block_on(MockServer::start());
+        // Only the freshly-refreshed token gets data; the expired one (were it used) gets a 401.
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .and(wiremock::matchers::header("authorization", "Bearer brand-new-access"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .and(wiremock::matchers::header("x-refresh-token", "stored-refresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user": {
+                        "id": "user-1",
+                        "username": "jane",
+                        "accessToken": "brand-new-access",
+                        "refreshToken": "rotated-refresh",
+                    }
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // Re-record the account as it would look after the app sat closed past the token's life:
+        // an expired JWT plus the refresh token to fix it with.
+        runtime.block_on(abs_storage::repo::accounts::set_tokens(
+            &pool,
+            &account.id,
+            &make_jwt(chrono::Utc::now().timestamp() - 60),
+            Some("stored-refresh"),
+        )).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account.id)).unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
+
+        assert!(hooks.libraries_list.row_at_index(0).is_some(), "syncing through the refreshed token should render the library");
+        assert!(!hooks.banner.widget().reveals_child(), "a successful refresh must not look like a sync failure");
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.iter().any(|r| r.url.path() == "/auth/refresh"), "the refresh endpoint should have been used");
     }
 
     /// End-to-end against the real public demo server, mirroring `welcome.rs`'s live test tier.
@@ -523,7 +594,8 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));

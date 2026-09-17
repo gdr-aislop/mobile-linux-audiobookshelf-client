@@ -109,6 +109,7 @@ pub fn build(
     paths: AppPaths,
     server: Server,
     account: Account,
+    session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
 ) -> LibraryScreen {
     let header = adw::HeaderBar::new();
@@ -269,43 +270,62 @@ pub fn build(
     // progress, re-render, then fetch cover art concurrently for everything just rendered and
     // re-render once more. This is the only place this screen touches `abs_core`; it never
     // imports `abs_api` at all.
+    //
+    // As in home.rs, the network/DB pipeline runs inside `tokio::spawn` (worker threads) — the
+    // `spawn_future_local` future is polled on the GTK main thread, and doing HTTP body
+    // handling, statement building and cache writes directly there steals frames from the main
+    // loop. The main context only parks on the `JoinHandle`s and applies widget updates between
+    // stages.
     glib::spawn_future_local({
         let pool = pool.clone();
-        let paths = paths.clone();
         let widgets = widgets.clone();
+        let session = session.clone();
         let server_url = server.url.clone();
         let server_id = server.id.clone();
         let account_id = account.id.clone();
-        let access_token = account.token.clone();
         async move {
             if let Ok(data) = load(&pool, &server_id).await {
                 apply(data, &widgets);
             }
 
-            let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
+            let spawned = tokio::spawn({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let session = session.clone();
+                let server_url = server_url.clone();
+                let server_id = server_id.clone();
+                let account_id = account_id.clone();
+                async move {
+                    // Asked at call time, not captured at build time — see home.rs's pipeline note.
+                    let access_token = session.access_token().await;
+                    let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
 
-            if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
-            {
-                tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
-            }
+                    if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
+                    {
+                        tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
+                    }
 
-            let mut item_ids_after_sync: Vec<String> = Vec::new();
-            if let Ok(data) = load(&pool, &server_id).await {
-                item_ids_after_sync = data.iter().map(|item| item.id.clone()).collect();
-                apply(data, &widgets);
-            }
+                    let mut item_ids_after_sync: Vec<String> = Vec::new();
+                    if let Ok(data) = load(&pool, &server_id).await {
+                        item_ids_after_sync = data.iter().map(|item| item.id.clone()).collect();
+                    }
 
-            // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
-            // fetched concurrently for everything just rendered.
-            if !item_ids_after_sync.is_empty() {
-                let fetches = item_ids_after_sync
-                    .iter()
-                    .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
-                futures::future::join_all(fetches).await;
+                    // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
+                    // fetched concurrently for everything just rendered.
+                    if !item_ids_after_sync.is_empty() {
+                        let fetches = item_ids_after_sync
+                            .iter()
+                            .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
+                        futures::future::join_all(fetches).await;
+                    }
 
-                if let Ok(data) = load(&pool, &server_id).await {
-                    apply(data, &widgets);
+                    sync_result
                 }
+            });
+            let sync_result = spawned.await.expect("the Library sync task must not panic");
+
+            if let Ok(data) = load(&pool, &server_id).await {
+                apply(data, &widgets);
             }
 
             match sync_result {
@@ -535,7 +555,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -573,7 +594,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -613,7 +635,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -639,7 +662,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -660,7 +684,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| false, Duration::from_millis(500));
@@ -696,7 +721,8 @@ pub(crate) mod tests {
             move |request: PlayRequest| played.borrow_mut().push(request)
         };
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, on_play);
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play);
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -734,7 +760,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -776,7 +803,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -816,7 +844,8 @@ pub(crate) mod tests {
             move |request: PlayRequest| played.borrow_mut().push(request)
         };
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, on_play);
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play);
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -855,7 +884,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -896,7 +926,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), |_| {});
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account), |_| {});
         let first_hooks = first_screen.test_hooks();
         pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
         assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
@@ -925,7 +955,8 @@ pub(crate) mod tests {
         });
         pump_until(|| persisted.load(std::sync::atomic::Ordering::SeqCst), Duration::from_secs(5));
 
-        let second_screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let second_hooks = second_screen.test_hooks();
         pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
@@ -949,7 +980,8 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(20));

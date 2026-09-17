@@ -53,6 +53,7 @@ pub fn build(
     paths: AppPaths,
     server: Server,
     account: Account,
+    session: abs_core::auth::Session,
     playback_settings: PlaybackSettings,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
@@ -92,22 +93,21 @@ pub fn build(
 
     let on_play = {
         let controller = mini_bar.controller.clone();
-        let server = server.clone();
-        let account = account.clone();
+        let session = session.clone();
         let default_speed = playback_settings.default_speed;
-        move |request: PlayRequest| controller.start(server.clone(), account.clone(), request, default_speed)
+        move |request: PlayRequest| controller.start(session.clone(), request, default_speed)
     };
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     stack.add_titled_with_icon(
-        &screens::home::build(pool.clone(), paths.clone(), server.clone(), account.clone(), on_play.clone()).root,
+        &screens::home::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone()).root,
         Some("home"),
         "Home",
         "go-home-symbolic",
     );
     stack.add_titled_with_icon(
-        &screens::library::build(pool, paths, server, account, on_play).root,
+        &screens::library::build(pool, paths, server, account, session, on_play).root,
         Some("library"),
         "Library",
         "system-file-manager-symbolic",
@@ -175,7 +175,8 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let window = build(pool, crate::test_support::test_paths(), server, account, abs_core::settings::PlaybackSettings::default(), app_window);
+        let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let window = build(pool, crate::test_support::test_paths(), server, account, session, abs_core::settings::PlaybackSettings::default(), app_window);
         let hooks = window.test_hooks();
 
         for name in ["home", "library", "downloads", "settings"] {
@@ -202,8 +203,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
-        controller.start(server, account, PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
         crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
 
         let on_call_active: Box<dyn Fn()> = {

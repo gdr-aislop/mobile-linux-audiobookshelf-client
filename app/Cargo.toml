@@ -39,9 +39,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
-wiremock.workspace = true
+wiremock = "0.6"
 hound = "3"
 chrono.workspace = true
+# Crafting expired-JWT fixtures for the token-refresh tests (see home.rs's tests).
+base64 = "0.22"
 
 # Debian packaging for PureOS Crimson (Librem 5) and Ubuntu 24.04, built by
 # .github/workflows/release.yml via `cargo deb`. Depends is written against

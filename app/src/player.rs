@@ -23,7 +23,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
-use abs_storage::models::{Account, Server};
+
 use abs_storage::AppPaths;
 
 use crate::widgets::cover_image::CoverImage;
@@ -84,7 +84,9 @@ struct NowPlaying {
     server_id: String,
     account_id: String,
     server_url: String,
-    access_token: String,
+    /// The live token source — asked per use (progress writes, track loads) rather than a token
+    /// captured once, which dies within hours on servers v2.26.0+ while a book keeps playing.
+    session: abs_core::auth::Session,
     title: String,
     author: Option<String>,
     /// Book-level duration (the sum of every track's duration), as `StreamTarget` reports it.
@@ -185,7 +187,7 @@ impl Inner {
         let server_id = now_playing.server_id.clone();
         let item_id = now_playing.item_id.clone();
         let server_url = now_playing.server_url.clone();
-        let access_token = now_playing.access_token.clone();
+        let session = now_playing.session.clone();
         let duration_seconds = now_playing.duration_seconds;
         self.last_progress_write = Instant::now();
 
@@ -196,7 +198,9 @@ impl Inner {
             }
             // Best-effort: the local write above is this client's own source of truth (Home's
             // "Continue Listening" reads it), so a network hiccup syncing it up to the server
-            // must not be treated as a playback error.
+            // must not be treated as a playback error. The token is asked at write time — these
+            // writes happen for as long as the app is open, well past any single token's life.
+            let access_token = session.access_token().await;
             if let Err(err) =
                 abs_core::streaming::sync_progress_to_server(&server_url, &access_token, &item_id, position, duration_seconds, is_finished)
                     .await
@@ -256,15 +260,19 @@ impl Inner {
     /// pausing mid-transition is respected rather than overridden.
     fn spawn_load_track(inner_rc: Rc<RefCell<Inner>>, item_id: String, track_index: usize, within_seconds: f64) {
         glib::spawn_future_local(async move {
-            let (url, speed) = {
+            let (server_url, session, ino, speed) = {
                 let inner = inner_rc.borrow();
                 let Some(now_playing) = &inner.now_playing else { return };
                 if now_playing.item_id != item_id {
                     return;
                 }
                 let Some(track) = now_playing.tracks.get(track_index) else { return };
-                (track.url.clone(), now_playing.speed)
+                (now_playing.server_url.clone(), now_playing.session.clone(), track.ino.clone(), now_playing.speed)
             };
+            // The track URL baked at resolve time carried the token from back then — by the time
+            // a multi-file book advances (possibly hours later) it can be expired. Rebuild it
+            // with a current one; `ino` identifies the same file either way.
+            let url = abs_core::streaming::track_url(&server_url, &item_id, &ino, &session.access_token().await);
 
             {
                 let mut inner = inner_rc.borrow_mut();
@@ -443,7 +451,7 @@ impl PlayerController {
     /// item/account rather than always starting over from position 0. `default_speed` is
     /// `PlaybackSettings::default_speed`, applied once at the start of every session (the user can
     /// change it afterwards via `set_speed`).
-    pub fn start(&self, server: Server, account: Account, item: PlayRequest, default_speed: f64) {
+    pub fn start(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64) {
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let (pool, paths) = {
@@ -451,14 +459,17 @@ impl PlayerController {
                 (inner.pool.clone(), inner.paths.clone())
             };
 
+            // Asked at resolve time, not captured earlier — see `NowPlaying::session`.
+            let access_token = session.access_token().await;
+
             // Resolving the stream URL is required to proceed; reconciling progress and fetching
             // the cover are both nice-to-haves that must never add their own delay on top — run
             // all three concurrently (each already has its own bounded timeout) rather than one
             // after another, so a slow or unreachable server is only ever felt once, not thrice.
             let (target_result, reconcile_result, cover_path) = tokio::join!(
-                abs_core::streaming::resolve_stream_target(&server.url, &account.token, &item.item_id),
-                abs_core::progress_sync::reconcile_item_progress(&pool, &server.url, &account.token, &account.id, &server.id, &item.item_id),
-                abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server.url, &account.token, &server.id, &item.item_id),
+                abs_core::streaming::resolve_stream_target(session.server_url(), &access_token, &item.item_id),
+                abs_core::progress_sync::reconcile_item_progress(&pool, session.server_url(), &access_token, session.account_id(), session.server_id(), &item.item_id),
+                abs_core::covers::fetch_and_cache_cover(&paths, &pool, session.server_url(), &access_token, session.server_id(), &item.item_id),
             );
             if let Err(err) = reconcile_result {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't reconcile progress with the server; using local progress");
@@ -474,7 +485,7 @@ impl PlayerController {
             // Reads whatever `reconcile_item_progress` just wrote, if it succeeded — falling back
             // to this client's own last local write (or nothing) otherwise. Book-level, so it can
             // fall in any track of a multi-file item.
-            let resume_at = abs_storage::repo::progress::get(&pool, &account.id, &server.id, &item.item_id)
+            let resume_at = abs_storage::repo::progress::get(&pool, session.account_id(), session.server_id(), &item.item_id)
                 .await
                 .ok()
                 .flatten()
@@ -489,7 +500,7 @@ impl PlayerController {
 
             // Local DB write only, no network involved — inline rather than part of the
             // `tokio::join!` above, which is reserved for concurrent network calls.
-            if let Err(err) = abs_core::chapters::sync_item_chapters(&pool, &server.id, &item.item_id, &target.chapters).await {
+            if let Err(err) = abs_core::chapters::sync_item_chapters(&pool, session.server_id(), &item.item_id, &target.chapters).await {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't persist chapters locally");
             }
             let chapters = target
@@ -546,10 +557,10 @@ impl PlayerController {
 
             inner.now_playing = Some(NowPlaying {
                 item_id: item.item_id,
-                server_id: server.id,
-                account_id: account.id,
-                server_url: server.url,
-                access_token: account.token,
+                server_id: session.server_id().to_string(),
+                account_id: session.account_id().to_string(),
+                server_url: session.server_url().to_string(),
+                session,
                 title: item.title,
                 author: item.author,
                 duration_seconds: target.duration_seconds,
@@ -1043,7 +1054,7 @@ pub(crate) mod tests {
             .await;
     }
 
-    pub(crate) async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (Server, Account) {
+    pub(crate) async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (abs_storage::models::Server, abs_storage::models::Account) {
         let server_id = abs_storage::repo::servers::add(pool, server_url).await.unwrap();
         let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
         (
@@ -1107,8 +1118,7 @@ pub(crate) mod tests {
         });
 
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
             1.0,
         );
@@ -1154,8 +1164,7 @@ pub(crate) mod tests {
 
         let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -1187,14 +1196,13 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 6.0, false)).unwrap();
 
         let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), {
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), {
             let seen = seen.clone();
             move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
         });
 
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -1278,10 +1286,9 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
@@ -1326,8 +1333,7 @@ pub(crate) mod tests {
         });
 
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
@@ -1369,8 +1375,7 @@ pub(crate) mod tests {
         });
 
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
@@ -1406,8 +1411,7 @@ pub(crate) mod tests {
 
         let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
@@ -1443,8 +1447,7 @@ pub(crate) mod tests {
 
         let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
             1.0,
         );
@@ -1481,8 +1484,7 @@ pub(crate) mod tests {
         });
 
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Short Clip".to_string(), author: None },
             1.0,
         );
@@ -1517,13 +1519,12 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let mini_bar = build_mini_bar(pool, crate::test_support::test_paths(), test_backend());
+        let mini_bar = build_mini_bar(pool.clone(), crate::test_support::test_paths(), test_backend());
         let hooks = &mini_bar.hooks;
         assert!(!hooks.bar.is_visible(), "the mini bar should stay hidden until something plays");
 
         mini_bar.controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
             1.0,
         );
