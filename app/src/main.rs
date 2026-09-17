@@ -93,7 +93,8 @@ mod tests {
         crate::screens::welcome::tests::run(&runtime);
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
-        crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::home::tests::run_shows_a_retryable_error_when_the_first_sync_fails(&runtime);
+        crate::screens::home::tests::run_shows_a_spinner_while_the_first_sync_is_running(&runtime);
         crate::screens::home::tests::run_expired_token_is_refreshed_before_syncing(&runtime);
         crate::screens::library::tests::run_renders_all_synced_items(&runtime);
         crate::screens::library::tests::run_search_filters_by_title_and_author(&runtime);

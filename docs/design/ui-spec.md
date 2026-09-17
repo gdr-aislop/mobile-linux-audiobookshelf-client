@@ -82,7 +82,22 @@ Fractal) rather than copying Lissen's Material Design look.
 - `AdwToolbarView` with `AdwHeaderBar` (title "Home", avatar/account button on the right).
 - Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (progress ring overlay
   on cover), "Recently added". Each cover is a tappable card pushing Item detail.
-- Empty/offline state: `AdwStatusPage` ("No library synced yet").
+- Empty/offline states. While nothing is cached locally, Home shows a full-screen status view
+  whose content follows the sync lifecycle rather than a single static message — a fresh login
+  with the sync still running in the background must not read as a dead end:
+  - **Syncing** (no cached data, sync in flight): an indeterminate `GtkSpinner` above the title
+    "Syncing your libraries…", subline "This can take a moment on first sync." Animation-only
+    feedback; the sync pipeline doesn't report per-step progress.
+  - **Failed** (sync errored, nothing cached): a warning glyph, "Couldn't sync your libraries",
+    "Check your connection and try again.", the underlying error text in a small selectable
+    details line, and a **Try again** button that re-runs the sync cycle (returning to the
+    Syncing state first).
+  - **Empty** (sync succeeded but the server exposes no libraries): the folder-music glyph,
+    "No library synced yet", "This server doesn't have any libraries yet.", and Try again.
+  Once anything is cached, shelves render normally and a failed re-sync surfaces as the
+  "Couldn't sync — showing what's cached." banner instead; that banner sits below the header
+  bar, outside the shelves' scroller, so it's visible in every state. Try again is the only
+  user-triggerable sync until the Sync now menu item (below) is built.
 - **Offline-mode toggle**: a `GtkToggleButton` in the header bar (leading side, opposite the
   avatar), iconified with an airplane/cloud-off glyph and labeled "Offline". When active, an
   `AdwBanner`-style strip appears below the header ("Showing downloaded items only") and every
