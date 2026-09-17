@@ -4,6 +4,7 @@
 //! I/O — everything else in the workspace (including `abs-core`) stays testable without a sound
 //! device or a GLib main loop.
 
+pub mod call_watch;
 mod error;
 pub mod mpris;
 
@@ -74,16 +75,26 @@ impl GstBackend {
 
     fn build(sink_element_name: Option<&str>) -> Result<Self> {
         let pipeline = gst::ElementFactory::make("playbin").build()?;
-        if let Some(sink_name) = sink_element_name {
-            let sink = gst::ElementFactory::make(sink_name).build()?;
-            // Unlike most sinks, `fakesink` defaults `sync` to `false` — it would otherwise
-            // render as fast as the CPU/network allow instead of at the pipeline clock's real
-            // pace, which breaks any test that expects to observe mid-playback state (e.g.
-            // pausing partway through a clip) rather than an already-finished one. Real sinks
-            // (`autoaudiosink` et al.) already default `sync` to `true`, so this only changes
-            // behavior for the test backend.
-            sink.set_property("sync", true);
-            pipeline.set_property("audio-sink", &sink);
+        match sink_element_name {
+            Some(sink_name) => {
+                let sink = gst::ElementFactory::make(sink_name).build()?;
+                // Unlike most sinks, `fakesink` defaults `sync` to `false` — it would otherwise
+                // render as fast as the CPU/network allow instead of at the pipeline clock's real
+                // pace, which breaks any test that expects to observe mid-playback state (e.g.
+                // pausing partway through a clip) rather than an already-finished one. Real sinks
+                // (`autoaudiosink` et al.) already default `sync` to `true`, so this only changes
+                // behavior for the test backend.
+                sink.set_property("sync", true);
+                pipeline.set_property("audio-sink", &sink);
+            }
+            // Real playback only (never the test `fakesink` path): a fallback for phone-call
+            // interruption alongside ModemManager (see `docs/design/ui-spec.md`'s "Hardware
+            // controls & interruptions") — tag this app's audio stream so PipeWire/WirePlumber's
+            // own ducking policy can act on it even on a system with no ModemManager at all.
+            // `autoaudiosink` resolves to a real sink lazily, once the pipeline actually starts,
+            // so the property has to be set from `element-setup` (fired for every element it
+            // creates internally), not up front.
+            None => apply_stream_role_when_sink_is_ready(&pipeline),
         }
         Ok(Self { pipeline, current_speed: 1.0 })
     }
@@ -169,6 +180,29 @@ impl Drop for GstBackend {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// Tags this app's audio stream with PulseAudio's `media.role=music` once `playbin`'s internal
+/// `autoaudiosink` actually resolves to a real sink — confirmed via `gst-inspect-1.0 pulsesink`
+/// that `stream-properties` is the right property name (a `GstStructure`, not a plain string map).
+/// `pipewiresink` wasn't installed in the environment this was implemented in to cross-check
+/// against, so this only reaches PipeWire installs that route through `pulsesink`'s PulseAudio
+/// compatibility layer (the common case); a native `pipewiresink` deployment is unverified and
+/// should be checked with `gst-inspect-1.0 pipewiresink` on real target hardware.
+fn apply_stream_role_when_sink_is_ready(pipeline: &gst::Element) {
+    use glib::prelude::ObjectExt;
+    // `element-setup` fires from whichever internal GStreamer thread creates the element (caught
+    // live: a real run aborted with "thread caused non-unwinding panic" under `connect_local`,
+    // whose thread-guard requires same-thread emission) — this closure captures nothing, so the
+    // thread-safe `connect` costs nothing and is the only correct choice here.
+    pipeline.connect("element-setup", false, |values| {
+        let element = values.get(1)?.get::<gst::Element>().ok()?;
+        if element.factory().map(|f| f.name() == "pulsesink").unwrap_or(false) {
+            let props = gst::Structure::builder("props").field("media.role", "music").build();
+            element.set_property("stream-properties", &props);
+        }
+        None
+    });
 }
 
 #[cfg(test)]
@@ -331,5 +365,34 @@ mod tests {
     fn init_can_be_called_more_than_once() {
         init().unwrap();
         init().unwrap();
+    }
+
+    /// Confirms the `media.role=music` stream-role fallback actually reaches a real `pulsesink`
+    /// once `autoaudiosink` resolves to one — needs a real, running PulseAudio (or a PipeWire
+    /// install routing through its PulseAudio compatibility layer), which this sandbox doesn't
+    /// have (`pactl` isn't even installed here). Run explicitly once such an environment is
+    /// available: `cargo test -p abs-player -- --ignored stream_role`.
+    #[test]
+    #[ignore]
+    fn real_backend_tags_the_stream_with_a_music_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        init().unwrap();
+        let mut player = GstBackend::new().expect("build a real playbin");
+        player.load(&silent_wav_uri(&tmp, 2)).unwrap();
+        player.play().unwrap();
+        wait_for_state_change(&player);
+
+        // `element-setup` fires as soon as `autoaudiosink` picks its real child, which happens
+        // during the state change above — by now the sink (if it's `pulsesink`) should already
+        // carry `stream-properties`.
+        let bin = player.pipeline.clone().downcast::<gst::Bin>().unwrap();
+        let sink = bin
+            .iterate_recurse()
+            .into_iter()
+            .flatten()
+            .find(|e| e.factory().map(|f| f.name() == "pulsesink").unwrap_or(false))
+            .expect("expected a pulsesink somewhere in the pipeline");
+        let props = sink.property::<gst::Structure>("stream-properties");
+        assert_eq!(props.get::<String>("media.role").unwrap(), "music");
     }
 }

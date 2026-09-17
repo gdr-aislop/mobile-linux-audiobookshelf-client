@@ -82,6 +82,7 @@ mod tests {
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
         crate::screens::main_window::tests::run(&runtime);
+        crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
         crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
         crate::player::tests::run_multi_track_item_sets_a_caveat_note(&runtime);

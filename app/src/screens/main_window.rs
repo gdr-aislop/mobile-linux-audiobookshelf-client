@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use abs_player::call_watch::CallWatcher;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
@@ -25,6 +26,10 @@ use crate::screens;
 
 pub struct MainWindow {
     pub root: gtk4::Widget,
+    /// Kept alive for the app's whole lifetime — dropping it unsubscribes from ModemManager's
+    /// D-Bus signals. `None` when no system bus (or no ModemManager on it) was reachable; call
+    /// interruption is simply unavailable in that case, never a fatal error.
+    _call_watcher: Option<abs_player::call_watch::ModemManagerCallWatcher>,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -65,6 +70,23 @@ pub fn build(
         }
         Err(err) => tracing::warn!(%err, "couldn't register MPRIS media player; system media integration will be unavailable"),
     }
+
+    // Phone-call interruption is best-effort in the same way: no system bus, or no ModemManager
+    // on it, must never be fatal — it just means this feature is unavailable. There is
+    // deliberately no "call ended" handling anywhere (see `call_watch`'s module docs): a call
+    // going active only ever pauses, never auto-resumes. The watcher itself is retained on
+    // `MainWindow` (see its field doc) — dropping it would unsubscribe immediately.
+    let call_watcher = match abs_player::call_watch::ModemManagerCallWatcher::new() {
+        Ok(mut watcher) => {
+            let controller = mini_bar.controller.clone();
+            watcher.start(Box::new(move || controller.pause()));
+            Some(watcher)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "couldn't watch ModemManager for call interruptions; this feature will be unavailable");
+            None
+        }
+    };
 
     let stack = adw::ViewStack::new();
 
@@ -116,6 +138,7 @@ pub fn build(
 
     MainWindow {
         root: root.upcast(),
+        _call_watcher: call_watcher,
         #[cfg(test)]
         hooks: TestHooks { stack, switcher_bar, mini_bar: mini_bar.hooks },
     }
@@ -155,5 +178,36 @@ pub(crate) mod tests {
         }
         assert!(hooks.switcher_bar.reveals(), "the tab bar should always be shown");
         assert!(!hooks.mini_bar.bar.is_visible(), "the mini bar should stay hidden until something plays");
+    }
+
+    /// Covers the actual risk in the call-interruption wiring — the closure `build()` registers
+    /// with `ModemManagerCallWatcher` — without needing a real system bus or ModemManager (this
+    /// sandbox has neither; see `abs_player::call_watch`'s own tests for the D-Bus-level
+    /// coverage). `abs_player::call_watch::FakeCallWatcher` is `#[cfg(test)]`-only inside
+    /// `abs-player` and so isn't visible across the crate boundary from here, but the wiring
+    /// itself is just one line (`move || controller.pause()`) — reproducing and invoking that
+    /// exact closure is what actually needs checking, not the D-Bus plumbing around it.
+    pub(crate) fn run_call_interruption_wiring_pauses_playback(runtime: &tokio::runtime::Runtime) {
+        use crate::player::tests::{account_and_server, insert_synced_item, mock_playable_item, test_backend};
+        use crate::player::PlayRequest;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(server, account, PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+
+        let on_call_active: Box<dyn Fn()> = {
+            let controller = controller.clone();
+            Box::new(move || controller.pause())
+        };
+        on_call_active();
+
+        assert!(!controller.snapshot().unwrap().is_playing, "a call becoming active should pause playback");
+        controller.stop();
     }
 }
