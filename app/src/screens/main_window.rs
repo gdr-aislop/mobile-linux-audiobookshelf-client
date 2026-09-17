@@ -11,6 +11,8 @@
 //! wide-screen sidebar layout (`AdwNavigationSplitView`/`AdwBreakpoint`, both v1.4+) — phone-width
 //! single-pane only, left as a documented follow-up.
 
+use std::rc::Rc;
+
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
@@ -50,6 +52,19 @@ pub fn build(
     window: adw::ApplicationWindow,
 ) -> MainWindow {
     let mini_bar = player::build_mini_bar(pool.clone(), paths, player::real_backend());
+
+    // MPRIS registration is best-effort — no session bus (a bare console, a locked-down sandbox)
+    // must never be fatal to playback, so a failure here is just a warning. On success, the
+    // bridge becomes a permanent snapshot listener (via the foundation refactor's `add_listener`)
+    // so the lock-screen/Shell media card stays current for the app's whole lifetime.
+    let mpris_bridge: Rc<dyn abs_player::mpris::MprisCommands> =
+        Rc::new(player::MprisBridge::new(mini_bar.controller.clone(), playback_settings.skip_forward_seconds as f64, playback_settings.skip_back_seconds as f64));
+    match abs_player::mpris::register("Audiobookshelf", mpris_bridge) {
+        Ok(mpris_handle) => {
+            mini_bar.controller.add_listener(move |snapshot| mpris_handle.update(player::mpris_state_from_snapshot(snapshot)));
+        }
+        Err(err) => tracing::warn!(%err, "couldn't register MPRIS media player; system media integration will be unavailable"),
+    }
 
     let stack = adw::ViewStack::new();
 

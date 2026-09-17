@@ -13,6 +13,7 @@ abs-api.workspace = true
 abs-core.workspace = true
 abs-storage.workspace = true
 abs-player.workspace = true
+gio.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true

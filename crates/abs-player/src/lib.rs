@@ -5,6 +5,7 @@
 //! device or a GLib main loop.
 
 mod error;
+pub mod mpris;
 
 use std::time::Duration;
 

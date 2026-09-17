@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 gstreamer = "0.23"
+gio.workspace = true
+glib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

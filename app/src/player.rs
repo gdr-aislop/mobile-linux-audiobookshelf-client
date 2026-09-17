@@ -233,8 +233,7 @@ impl PlayerController {
 
     /// Registers a permanent snapshot listener, notified alongside the mini-player bar's for the
     /// app's whole lifetime — unlike `set_full_update`, this has no corresponding "clear" (nothing
-    /// currently needs to stop listening once registered; MPRIS, once wired, will use this).
-    #[allow(dead_code, reason = "unused until MPRIS wiring lands; part of this phase's foundation refactor")]
+    /// needs to stop listening once registered; MPRIS is the first user of this).
     pub fn add_listener(&self, listener: impl Fn(&PlayerSnapshot) + 'static) {
         self.inner.borrow_mut().listeners.push(Box::new(listener));
     }
@@ -635,6 +634,62 @@ pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_pl
         controller,
         #[cfg(test)]
         hooks: MiniPlayerHooks { bar, title_label, author_label, play_button, progress },
+    }
+}
+
+/// Implements `abs_player::mpris::MprisCommands` by calling back into a real `PlayerController`
+/// — this is the whole dependency-direction resolution for MPRIS: `abs-player`'s `mpris` module
+/// only ever calls this trait, never anything from `app` directly.
+pub struct MprisBridge {
+    controller: PlayerController,
+    skip_forward_seconds: f64,
+    skip_back_seconds: f64,
+}
+
+impl MprisBridge {
+    pub fn new(controller: PlayerController, skip_forward_seconds: f64, skip_back_seconds: f64) -> Self {
+        Self { controller, skip_forward_seconds, skip_back_seconds }
+    }
+}
+
+impl abs_player::mpris::MprisCommands for MprisBridge {
+    fn play_pause(&self) {
+        self.controller.toggle_play_pause();
+    }
+    fn play(&self) {
+        self.controller.play();
+    }
+    fn pause(&self) {
+        self.controller.pause();
+    }
+    fn seek(&self, offset_micros: i64) {
+        self.controller.skip(offset_micros as f64 / 1_000_000.0);
+    }
+    fn set_position(&self, position_micros: i64) {
+        self.controller.seek_to_seconds(position_micros as f64 / 1_000_000.0);
+    }
+    fn next(&self) {
+        self.controller.skip(self.skip_forward_seconds);
+    }
+    fn previous(&self) {
+        self.controller.skip(-self.skip_back_seconds);
+    }
+}
+
+/// Converts a snapshot into MPRIS's own state shape — the one place `PlayerSnapshot`'s fields get
+/// translated into `xesam:*`/`mpris:*` terms. `mpris:artUrl` needs a `file://` URI, not a plain
+/// path, hence `gio::File::for_path(..).uri()`.
+pub fn mpris_state_from_snapshot(snapshot: &PlayerSnapshot) -> abs_player::mpris::PlayerState {
+    abs_player::mpris::PlayerState {
+        status: if snapshot.is_playing { abs_player::mpris::PlaybackStatus::Playing } else { abs_player::mpris::PlaybackStatus::Paused },
+        metadata: abs_player::mpris::TrackMetadata {
+            title: snapshot.title.clone(),
+            artist: snapshot.author.clone(),
+            length_micros: (snapshot.duration_seconds * 1_000_000.0) as i64,
+            art_url: snapshot.cover_path.as_deref().map(|path| gio::File::for_path(path).uri().to_string()),
+        },
+        position_micros: (snapshot.position_seconds * 1_000_000.0) as i64,
+        rate: snapshot.speed,
     }
 }
 
