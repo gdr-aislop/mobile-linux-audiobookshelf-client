@@ -14,8 +14,10 @@ tracing.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 futures.workspace = true
+serde_json.workspace = true
+# JWT `exp` claims are base64url-encoded (see `auth::jwt_exp_seconds`); the only use in the crate.
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
-serde_json.workspace = true

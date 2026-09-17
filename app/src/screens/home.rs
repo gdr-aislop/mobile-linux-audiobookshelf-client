@@ -26,7 +26,7 @@ pub struct HomeScreen {
 
 #[cfg(test)]
 pub struct TestHooks {
-    pub status_page: adw::StatusPage,
+    pub(crate) empty_state: EmptyState,
     pub libraries_list: gtk4::ListBox,
     pub continue_section: gtk4::Box,
     pub recent_row: gtk4::Box,
@@ -40,12 +40,123 @@ impl HomeScreen {
     }
 }
 
+/// The full-screen view Home shows while it has no local data to render, standing in for the
+/// `AdwStatusPage` the screen launched with. That page couldn't host a spinner or a button, so a
+/// fresh login sat on a static "No library synced yet" dead end while the sync ran invisibly in
+/// the background — and a failed first sync couldn't even surface its error, because the banner
+/// lived inside the (then-hidden) scroller. This widget instead has one mode per sync-lifecycle
+/// state (see ui-spec.md's "Home" section): syncing, failed (with retry), genuinely-empty.
+///
+/// Fields are open to the same module (the tests read them directly); everything is a
+/// reference-counted handle, so the whole struct is cheap to clone.
+#[derive(Clone)]
+pub(crate) struct EmptyState {
+    root: gtk4::Box,
+    spinner: gtk4::Spinner,
+    icon: gtk4::Image,
+    title: gtk4::Label,
+    description: gtk4::Label,
+    details: gtk4::Label,
+    retry: gtk4::Button,
+}
+
+impl EmptyState {
+    /// Constructs in the syncing state — the right default, since the only way Home starts with
+    /// no visible data is a sync that hasn't landed yet.
+    fn build() -> Self {
+        let spinner = gtk4::Spinner::builder().spinning(true).visible(false).build();
+        let icon = gtk4::Image::builder().icon_name("folder-music-symbolic").visible(false).build();
+        let title = gtk4::Label::builder().css_classes(["title-2"]).build();
+        let description = gtk4::Label::builder()
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .css_classes(["dim-label"])
+            .build();
+        // Raw error text for the failed mode: a self-hosted user debugging TLS/proxy setups gets
+        // the real cause (selectable, so it can be copied), same posture as the ErrorBanner's
+        // details expander. Hidden unless `show_error` says otherwise.
+        let details = gtk4::Label::builder()
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .selectable(true)
+            .css_classes(["dim-label", "caption"])
+            .visible(false)
+            .build();
+        let retry = gtk4::Button::builder()
+            .label("Try again")
+            .css_classes(["pill", "suggested-action"])
+            .visible(false)
+            .build();
+
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(12)
+            .valign(gtk4::Align::Center)
+            .halign(gtk4::Align::Center)
+            .margin_start(24)
+            .margin_end(24)
+            .visible(false)
+            .build();
+        root.append(&spinner);
+        root.append(&icon);
+        root.append(&title);
+        root.append(&description);
+        root.append(&details);
+        root.append(&retry);
+
+        let state = Self { root, spinner, icon, title, description, details, retry };
+        state.show_syncing();
+        state
+    }
+
+    fn show_syncing(&self) {
+        self.spinner.set_visible(true);
+        self.spinner.start();
+        self.icon.set_visible(false);
+        self.title.set_label("Syncing your libraries…");
+        self.description.set_label("This can take a moment on first sync.");
+        self.details.set_visible(false);
+        self.retry.set_visible(false);
+        self.root.set_visible(true);
+    }
+
+    fn show_error(&self, error: &str) {
+        self.spinner.set_visible(false);
+        self.spinner.stop();
+        self.icon.set_visible(true);
+        self.icon.set_icon_name(Some("dialog-warning-symbolic"));
+        self.title.set_label("Couldn't sync your libraries");
+        self.description.set_label("Check your connection and try again.");
+        self.details.set_label(error);
+        self.details.set_visible(!error.is_empty());
+        self.retry.set_visible(true);
+        self.root.set_visible(true);
+    }
+
+    fn show_empty(&self) {
+        self.spinner.set_visible(false);
+        self.spinner.stop();
+        self.icon.set_visible(true);
+        self.icon.set_icon_name(Some("folder-music-symbolic"));
+        self.title.set_label("No library synced yet");
+        self.description.set_label("This server doesn't have any libraries yet.");
+        self.details.set_visible(false);
+        self.retry.set_visible(true);
+        self.root.set_visible(true);
+    }
+
+    fn hide(&self) {
+        self.root.set_visible(false);
+        self.spinner.stop();
+    }
+}
+
 /// Everything `apply` needs a handle to, cloned as a whole into the `spawn_future_local` block —
 /// every field is a reference-counted GTK/Adwaita widget handle, so cloning is cheap and shares
 /// the same underlying widgets, not copies.
 #[derive(Clone)]
 struct HomeWidgets {
-    status_page: adw::StatusPage,
+    empty_state: EmptyState,
     scroller: gtk4::ScrolledWindow,
     continue_section: gtk4::Box,
     continue_row: gtk4::Box,
@@ -53,6 +164,19 @@ struct HomeWidgets {
     libraries_list: gtk4::ListBox,
     banner: crate::widgets::banner::ErrorBanner,
     on_play: std::rc::Rc<dyn Fn(PlayRequest)>,
+}
+
+/// Everything one sync cycle needs, cloned as a whole so both the initial run and every
+/// "Try again" press can own an independent copy. `server`/`account` are full rows (resolved
+/// once by the caller, `main_window`) rather than bare ids so this module never has to fail on a
+/// missing row — that would be a caller bug, not a Home-screen concern.
+#[derive(Clone)]
+struct SyncCtx {
+    pool: SqlitePool,
+    paths: AppPaths,
+    server: Server,
+    account: Account,
+    session: abs_core::auth::Session,
 }
 
 struct HomeData {
@@ -71,6 +195,7 @@ pub fn build(
     paths: AppPaths,
     server: Server,
     account: Account,
+    session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
 ) -> HomeScreen {
     let header = adw::HeaderBar::new();
@@ -121,8 +246,9 @@ pub fn build(
     libraries_section.append(&section_heading("Your Libraries"));
     libraries_section.append(&libraries_list);
 
+    let empty_state = EmptyState::build();
+
     let scroll_content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    scroll_content.append(banner.widget());
     scroll_content.append(&continue_section);
     scroll_content.append(&recent_section);
     scroll_content.append(&libraries_section);
@@ -130,27 +256,24 @@ pub fn build(
     let scroller = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
+        .visible(false)
         .child(&scroll_content)
         .build();
 
-    let status_page = adw::StatusPage::builder()
-        .icon_name("folder-music-symbolic")
-        .title("No library synced yet")
-        .description("Check your connection and try again.")
-        .vexpand(true)
-        .visible(false)
-        .build();
-
+    // The banner lives directly under the header bar, outside the scroller, so a sync failure is
+    // visible in every state — when the shelves are empty the scroller is hidden, and a banner
+    // trapped inside it was exactly how the first-sync failure used to disappear without a trace.
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
+    body.append(banner.widget());
     body.append(&scroller);
-    body.append(&status_page);
+    body.append(&empty_state.root);
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&body);
 
     let widgets = HomeWidgets {
-        status_page: status_page.clone(),
+        empty_state: empty_state.clone(),
         scroller: scroller.clone(),
         continue_section: continue_section.clone(),
         continue_row: continue_row.clone(),
@@ -160,66 +283,161 @@ pub fn build(
         on_play: std::rc::Rc::new(on_play),
     };
 
-    // Render once immediately from whatever's already cached locally (so a returning session
-    // isn't blocked on network), then sync and re-render from local storage again regardless of
-    // whether the sync fully succeeded — a partial failure (e.g. libraries synced fine but one
-    // library's items didn't) should still show whatever did land rather than discarding it, with
-    // the banner surfaced separately. This is the only place this screen touches `abs_core`; it
-    // never imports `abs_api` at all.
-    glib::spawn_future_local({
-        let pool = pool.clone();
-        let paths = paths.clone();
+    // The screen starts in the syncing state (EmptyState's construction default): a returning
+    // session's cached render lands within the first few frames of the cycle below and takes
+    // over, while a fresh login keeps the spinner up for as long as the sync actually runs.
+    let ctx = SyncCtx {
+        pool: pool.clone(),
+        paths: paths.clone(),
+        server: server.clone(),
+        account: account.clone(),
+        session: session.clone(),
+    };
+    spawn_sync_cycle(ctx.clone(), widgets.clone());
+
+    // Try again re-runs the whole cycle: back to the spinner first, then the same
+    // sync → render → resolve pipeline the screen opened with.
+    {
+        let ctx = ctx.clone();
         let widgets = widgets.clone();
-        let server_url = server.url.clone();
+        empty_state.retry.connect_clicked(move |_| {
+            widgets.empty_state.show_syncing();
+            widgets.banner.set_revealed(false);
+            spawn_sync_cycle(ctx.clone(), widgets.clone());
+        });
+    }
+
+    HomeScreen {
+        root: root.upcast(),
+        #[cfg(test)]
+        hooks: TestHooks {
+            empty_state,
+            libraries_list,
+            continue_section,
+            recent_row,
+            banner,
+        },
+    }
+}
+
+/// Runs one full sync cycle on the main loop: render whatever's cached, sync against the server
+/// on worker threads, render again, then resolve the empty-state/banner from the outcome. Called
+/// once when the screen is built and again on every "Try again" press, so it must leave all
+/// widget state consistent no matter how many times it runs.
+///
+/// The network/DB pipeline runs inside `tokio::spawn` (worker threads), not directly in this
+/// `spawn_future_local` future: the latter is polled on the GTK main thread, so HTTP body chunk
+/// handling, statement building and cache-file writes done directly here steal frames from the
+/// main loop — visibly, when dozens of per-item cover fetches all poll at once (observed as a
+/// multi-second UI hang while scrolling the Continue Listening shelf). The main context only
+/// parks on the `JoinHandle`s, which costs nothing to await, and widget updates happen back on
+/// this thread between stages.
+///
+/// Rendering is gated on there being at least one library: shelves with nothing in them look
+/// broken, and the empty state below is the honest rendering of "nothing to show yet".
+fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
+    glib::spawn_future_local(async move {
+        let SyncCtx { pool, paths, server, account, session } = ctx;
         let server_id = server.id.clone();
         let account_id = account.id.clone();
-        let access_token = account.token.clone();
-        async move {
-            if let Ok(data) = load(&pool, &server_id, &account_id).await {
+
+        if let Ok(data) = load(&pool, &server_id, &account_id).await {
+            if !data.libraries.is_empty() {
                 apply(&data, &widgets);
             }
+        }
 
-            let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
+        let spawned_sync = tokio::spawn({
+            let pool = pool.clone();
+            let session = session.clone();
+            let server_url = server.url.clone();
+            let server_id = server_id.clone();
+            let account_id = account_id.clone();
+            // Asked at call time, not captured at build time — a token captured here would
+            // be the one from whenever this screen was constructed, and on servers v2.26.0+
+            // it dies within hours while the app stays open.
+            async move {
+                let access_token = session.access_token().await;
+                let sync_result = abs_core::sync::sync_all(&pool, &server_url, &server_id, &access_token).await;
 
-            // Reconciling "Continue Listening" against the server's progress runs after
-            // sync_all, not concurrently with it: an item's progress can only be attached once
-            // the item itself has been synced locally (a fresh login has no local items at all
-            // yet). It's still best-effort and bounded by its own short timeout — a failure here
-            // (offline, slow connection) is logged and never surfaced as this screen's sync
-            // banner, which is about library/item sync, not this.
-            if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
-            {
-                tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
+                // Reconciling "Continue Listening" against the server's progress runs after
+                // sync_all, not concurrently with it: an item's progress can only be attached
+                // once the item itself has been synced locally (a fresh login has no local
+                // items at all yet). It's still best-effort and bounded by its own short
+                // timeout — a failure here (offline, slow connection) is logged and never
+                // surfaced as this screen's sync banner, which is about library/item sync,
+                // not this.
+                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &server_url, &access_token, &account_id, &server_id).await
+                {
+                    tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
+                }
+
+                let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
+                (sync_result, data_after_sync)
             }
-
-            let mut data_after_sync = None;
-            if let Ok(data) = load(&pool, &server_id, &account_id).await {
-                apply(&data, &widgets);
-                data_after_sync = Some(data);
+        });
+        let (sync_result, data_after_sync) = spawned_sync
+            .await
+            .expect("the Home sync task must not panic");
+        if let Some(data) = &data_after_sync {
+            if !data.libraries.is_empty() {
+                apply(data, &widgets);
             }
+        }
 
-            // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
-            // uses for the player screen) — fetched concurrently for every item just rendered,
-            // after the rest of the screen is already showing, so a slow/offline server delays
-            // only the artwork, never the initial render. `fetch_and_cache_cover` itself no-ops
-            // once a cover is already cached on disk, so this is cheap on every subsequent visit.
-            if let Some(data) = &data_after_sync {
-                let item_ids: std::collections::BTreeSet<&str> = data
-                    .recent_items
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .chain(data.continue_items.iter().map(|(item, _)| item.id.as_str()))
-                    .collect();
-                let fetches = item_ids
-                    .into_iter()
-                    .map(|item_id| abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, item_id));
-                futures::future::join_all(fetches).await;
+        // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
+        // uses for the player screen) — fetched concurrently for every item just rendered,
+        // after the rest of the screen is already showing, so a slow/offline server delays
+        // only the artwork, never the initial render. `fetch_and_cache_cover` itself no-ops
+        // once a cover is already cached on disk, so this is cheap on every subsequent visit.
+        let spawned_covers = data_after_sync.as_ref().filter(|data| !data.libraries.is_empty()).map(|data| {
+            let item_ids: std::collections::BTreeSet<String> = data
+                .recent_items
+                .iter()
+                .map(|item| item.id.clone())
+                .chain(data.continue_items.iter().map(|(item, _)| item.id.clone()))
+                .collect();
+            tokio::spawn({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let session = session.clone();
+                let server_url = server.url.clone();
+                let server_id = server_id.clone();
+                let account_id = account_id.clone();
+                async move {
+                    let access_token = session.access_token().await;
+                    let fetches = item_ids.into_iter().map(|item_id| {
+                        let pool = pool.clone();
+                        let paths = paths.clone();
+                        let server_url = server_url.clone();
+                        let access_token = access_token.clone();
+                        let server_id = server_id.clone();
+                        async move {
+                            abs_core::covers::fetch_and_cache_cover(&paths, &pool, &server_url, &access_token, &server_id, &item_id).await
+                        }
+                    });
+                    futures::future::join_all(fetches).await;
 
-                if let Ok(data) = load(&pool, &server_id, &account_id).await {
+                    load(&pool, &server_id, &account_id).await.ok()
+                }
+            })
+        });
+        if let Some(spawned_covers) = spawned_covers {
+            let data_after_covers = spawned_covers.await.expect("the Home cover-fetch task must not panic");
+            if let Some(data) = data_after_covers {
+                if !data.libraries.is_empty() {
                     apply(&data, &widgets);
                 }
             }
+        }
 
+        // Resolve the screen's final state for this cycle from the sync outcome plus whatever
+        // actually landed in local storage. The two visible outcomes are mutually exclusive:
+        // with data, the banner (if anything, the partial-failure case); without, the empty
+        // state carries the whole story — which is why it, not the banner, owns the no-data
+        // failure mode.
+        if data_after_sync.as_ref().is_some_and(|data| !data.libraries.is_empty()) {
+            widgets.empty_state.hide();
             match sync_result {
                 Ok(()) => widgets.banner.set_revealed(false),
                 Err(err) => {
@@ -228,20 +446,14 @@ pub fn build(
                     widgets.banner.set_revealed(true);
                 }
             }
+        } else {
+            widgets.banner.set_revealed(false);
+            match sync_result {
+                Ok(()) => widgets.empty_state.show_empty(),
+                Err(err) => widgets.empty_state.show_error(&err.to_string()),
+            }
         }
     });
-
-    HomeScreen {
-        root: root.upcast(),
-        #[cfg(test)]
-        hooks: TestHooks {
-            status_page,
-            libraries_list,
-            continue_section,
-            recent_row,
-            banner,
-        },
-    }
 }
 
 /// Reads whatever's currently cached locally — never talks to the network. Called once before
@@ -273,9 +485,15 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
 /// children first, so this is a full re-render rather than an incremental diff (fine at this
 /// scale: a handful of shelf cards and library rows, not a large list needing virtualization).
 fn apply(data: &HomeData, widgets: &HomeWidgets) {
-    let has_any_library = !data.libraries.is_empty();
-    widgets.status_page.set_visible(!has_any_library);
-    widgets.scroller.set_visible(has_any_library);
+    // The empty state's *mode* is owned by the sync-cycle state machine, but its hiding happens
+    // here, the moment real content renders — not later in the cycle (after the best-effort
+    // cover fetches), so the spinner state never briefly coexists with the shelves.
+    if !data.libraries.is_empty() {
+        widgets.empty_state.hide();
+    }
+    // The empty state's visibility overall is owned by the sync-cycle state machine, not here —
+    // apply only ever has something (or nothing) to put in the scroller.
+    widgets.scroller.set_visible(!data.libraries.is_empty());
 
     clear_box(&widgets.continue_row);
     for (item, progress) in &data.continue_items {
@@ -342,7 +560,7 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
 }
 
 fn library_row(library: &Library) -> adw::ActionRow {
-    let icon_name = if library.media_type == "podcast" { "microphone-symbolic" } else { "system-file-manager-symbolic" };
+    let icon_name = if library.media_type == "podcast" { "audio-input-microphone-symbolic" } else { "system-file-manager-symbolic" };
     let row = adw::ActionRow::builder().title(library.name.as_str()).subtitle(library.media_type.as_str()).build();
     row.add_prefix(&gtk4::Image::from_icon_name(icon_name));
     row
@@ -370,7 +588,7 @@ pub(crate) mod tests {
 
     async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (Server, Account) {
         let server_id = abs_storage::repo::servers::add(pool, server_url).await.unwrap();
-        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123").await.unwrap();
+        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
         (
             abs_storage::repo::servers::get(pool, &server_id).await.unwrap(),
             abs_storage::repo::accounts::get(pool, &account_id).await.unwrap(),
@@ -412,15 +630,16 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
-        // `status_page` starts hidden (only shown for a confirmed-empty result), so waiting on
-        // its visibility can't distinguish "sync hasn't run yet" from "sync ran and found
-        // nothing" — wait on the actual data landing instead.
+        // `empty_state` starts in the syncing state (only shown while nothing is cached), so
+        // waiting on its *hiding* can't distinguish "sync hasn't run yet" from "sync ran and
+        // found nothing" — wait on the actual data landing instead.
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
 
-        assert!(!hooks.status_page.is_visible(), "should have left the empty state once a library synced");
+        assert!(!hooks.empty_state.root.is_visible(), "should have left the empty state once a library synced");
         assert!(hooks.libraries_list.row_at_index(0).is_some(), "the synced library should have a row");
         assert!(hooks.recent_row.first_child().is_some(), "the synced item should show under Recently Added");
         assert!(!hooks.continue_section.is_visible(), "no progress exists yet, so Continue Listening stays hidden");
@@ -438,35 +657,183 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
-        // There's no "sync finished" signal to await directly here (an always-empty result looks
-        // identical before and after sync), so just give the spawned future time to run.
-        pump_until(|| false, Duration::from_millis(500));
+        // An always-empty result looks identical before and after sync, but the state machine's
+        // final resolution flips the retry button on — that's the observable "sync finished".
+        pump_until(|| hooks.empty_state.retry.is_visible(), Duration::from_secs(10));
 
-        assert!(hooks.status_page.is_visible(), "no libraries at all should show the empty state");
+        assert!(hooks.empty_state.root.is_visible(), "no libraries at all should show the empty state");
+        assert_eq!(hooks.empty_state.title.label(), "No library synced yet", "a server with zero libraries is not an error");
+        assert!(!hooks.empty_state.details.is_visible(), "no error details for a genuinely empty server");
+        assert!(!hooks.banner.widget().reveals_child(), "no failure banner for a genuinely empty server");
     }
 
-    pub(crate) fn run_shows_a_banner_when_sync_fails(runtime: &tokio::runtime::Runtime) {
+    /// The first-sync failure path end to end. The original bug this guards against: the banner
+    /// lived inside the scroller, which `apply` hides whenever nothing is cached — so a failed
+    /// first sync revealed the banner into a hidden widget and the user saw only a static page.
+    /// Now the failure gets its own retryable state, and a later successful retry (mock: 500
+    /// once, then 200) clears it and lands the data.
+    pub(crate) fn run_shows_a_retryable_error_when_the_first_sync_fails(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(
             Mock::given(method("GET"))
                 .and(path("/api/libraries"))
                 .respond_with(ResponseTemplate::new(500))
+                .up_to_n_times(1)
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
                 .mount(&mock_server),
         );
 
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
+        pump_until(|| hooks.empty_state.retry.is_visible(), Duration::from_secs(10));
 
-        assert!(hooks.banner.widget().reveals_child(), "a sync failure should show the banner");
-        assert!(hooks.status_page.is_visible(), "with nothing cached yet, the empty state stays up too");
+        assert!(hooks.empty_state.root.is_visible(), "the failure state should replace the spinner");
+        assert_eq!(hooks.empty_state.title.label(), "Couldn't sync your libraries");
+        assert!(hooks.empty_state.details.is_visible(), "the underlying error should be shown for debugging");
+        assert!(
+            !hooks.banner.widget().reveals_child(),
+            "the 'showing what's cached' banner must not appear when nothing is cached"
+        );
+        assert!(!hooks.libraries_list.row_at_index(0).is_some());
+
+        hooks.empty_state.retry.emit_clicked();
+        // Wait on the state flip, not the rows: the cycle resolves the empty state only after
+        // its (best-effort) cover-fetch stage, which finishes after the rows are already up.
+        pump_until(|| !hooks.empty_state.root.is_visible(), Duration::from_secs(10));
+
+        assert!(hooks.libraries_list.row_at_index(0).is_some(), "a successful retry should land the data");
+        assert!(!hooks.banner.widget().reveals_child(), "a successful retry must not leave a failure banner up");
+    }
+
+    /// A fresh login with a slow server: the spinner state must be up — and animated — for as
+    /// long as the sync is in flight, instead of the old static "No library synced yet" page.
+    /// The mock delay guarantees the sync is still running when the assertions fire.
+    pub(crate) fn run_shows_a_spinner_while_the_first_sync_is_running(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                        }))
+                        .set_delay(Duration::from_millis(400)),
+                )
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let hooks = screen.test_hooks();
+
+        assert!(hooks.empty_state.root.is_visible(), "with nothing cached, the empty state should be up immediately");
+        assert!(hooks.empty_state.spinner.is_visible(), "the spinner should be visible while the sync runs");
+        assert!(hooks.empty_state.spinner.is_spinning(), "the spinner should be animated while the sync runs");
+        assert!(!hooks.empty_state.retry.is_visible(), "there is nothing to retry while the sync is still in flight");
+
+        pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
+
+        assert!(!hooks.empty_state.root.is_visible(), "the spinner state should clear once data lands");
+        assert!(!hooks.banner.widget().reveals_child(), "a successful sync must not look like a failure");
+    }
+
+    /// The mid-session-expiry scenario that motivated `abs_core::auth::Session`: the stored access
+    /// token is already expired when the screen's pipeline runs (the app was opened well after the
+    /// last one died), and the server only accepts the token obtained via the refresh flow. The
+    /// sync must go through — transparently — rather than surfacing as a 401 "logout".
+    pub(crate) fn run_expired_token_is_refreshed_before_syncing(runtime: &tokio::runtime::Runtime) {
+        use base64::Engine;
+
+        let make_jwt = |exp: i64| {
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            format!("{}.{}.{}", encode(br#"{"alg":"HS256"}"#), encode(serde_json::json!({ "exp": exp }).to_string().as_bytes()), encode(b"sig"))
+        };
+
+        let mock_server = runtime.block_on(MockServer::start());
+        // Only the freshly-refreshed token gets data; the expired one (were it used) gets a 401.
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .and(wiremock::matchers::header("authorization", "Bearer brand-new-access"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .and(wiremock::matchers::header("x-refresh-token", "stored-refresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user": {
+                        "id": "user-1",
+                        "username": "jane",
+                        "accessToken": "brand-new-access",
+                        "refreshToken": "rotated-refresh",
+                    }
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // Re-record the account as it would look after the app sat closed past the token's life:
+        // an expired JWT plus the refresh token to fix it with.
+        runtime.block_on(abs_storage::repo::accounts::set_tokens(
+            &pool,
+            &account.id,
+            &make_jwt(chrono::Utc::now().timestamp() - 60),
+            Some("stored-refresh"),
+        )).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account.id)).unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
+
+        assert!(hooks.libraries_list.row_at_index(0).is_some(), "syncing through the refreshed token should render the library");
+        assert!(!hooks.banner.widget().reveals_child(), "a successful refresh must not look like a sync failure");
+        assert!(!hooks.empty_state.root.is_visible(), "synced data should clear the empty state");
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.iter().any(|r| r.url.path() == "/auth/refresh"), "the refresh endpoint should have been used");
     }
 
     /// End-to-end against the real public demo server, mirroring `welcome.rs`'s live test tier.
@@ -484,13 +851,14 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
-        let screen = build(pool, crate::test_support::test_paths(), server, account, |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));
 
         assert!(
-            !hooks.status_page.is_visible(),
+            !hooks.empty_state.root.is_visible(),
             "the live demo server has at least one library, so the empty state should clear"
         );
         assert!(hooks.libraries_list.row_at_index(0).is_some());

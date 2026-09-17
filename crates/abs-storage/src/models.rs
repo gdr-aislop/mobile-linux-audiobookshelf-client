@@ -24,6 +24,10 @@ pub struct Account {
     pub server_id: String,
     pub username: String,
     pub token: String,
+    /// The JWT-auth refresh token (server v2.26.0+): long-lived, rotated on every refresh, and
+    /// what keeps a session alive past the access token's expiry. `None` for legacy servers
+    /// (permanent tokens that never expire).
+    pub refresh_token: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
 }

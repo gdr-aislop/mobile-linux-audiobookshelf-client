@@ -43,7 +43,7 @@ mod tests {
         let pool = connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
         std::mem::forget(tmp);
         let server_id = servers::add(&pool, "https://a.example").await.unwrap();
-        let account_id = accounts::add(&pool, &server_id, "jane", "tok").await.unwrap();
+        let account_id = accounts::add(&pool, &server_id, "jane", "tok", None).await.unwrap();
         libraries::upsert(
             &pool,
             libraries::UpsertLibrary {

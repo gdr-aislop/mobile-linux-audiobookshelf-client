@@ -3,6 +3,14 @@
 //! bookmark", "Mark as finished", and "Reset progress". Opened by `main_window` swapping window
 //! content in (there's no `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita
 //! ceiling, both v1.4+); the down-chevron header button calls `on_collapse` to swap back.
+//!
+//! The keyboard-only equivalents of the on-screen controls (ui-spec §6's full-player set:
+//! arrow-key skip, speed stepping, `c`/`t`/Escape) are registered into the `SimpleActionGroup`
+//! exposed on `PlayerScreen` — `main_window` merges it under the "player" action prefix for as
+//! long as this screen is open and removes it on collapse, so those accelerators are inert
+//! everywhere else.
+
+use std::rc::Rc;
 
 use adw::prelude::*;
 
@@ -12,6 +20,11 @@ use crate::player::{ChapterInfo, PlayerController, PlayerSnapshot};
 
 pub struct PlayerScreen {
     pub root: gtk4::Widget,
+    /// The screen's keyboard actions, named per ui-spec §6 (`skip-back`, `skip-forward`,
+    /// `speed-up`, `speed-down`, `speed-reset`, `chapters`, `sleep-timer`, `collapse`). The
+    /// window merges this group under the "player" prefix while the screen is open — see the
+    /// module docs.
+    pub actions: gtk4::gio::SimpleActionGroup,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -49,10 +62,13 @@ impl PlayerScreen {
 }
 
 pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, on_collapse: impl Fn() + 'static) -> PlayerScreen {
+    // Shared by the down-chevron header button and the Escape action below.
+    let on_collapse = Rc::new(on_collapse);
     let header = adw::HeaderBar::new();
     let collapse_button = gtk4::Button::from_icon_name("go-down-symbolic");
     collapse_button.connect_clicked({
         let controller = controller.clone();
+        let on_collapse = on_collapse.clone();
         move |_| {
             controller.clear_full_update();
             on_collapse();
@@ -267,6 +283,55 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         move |_| controller.toggle_play_pause()
     });
 
+    // Keyboard actions (ui-spec §6's full-player table), registered into the group the main
+    // window merges under the "player" prefix. Every action mirrors a button on this screen —
+    // the arrow keys reuse the transport buttons' skip intervals, the speed keys step through
+    // `SPEED_PRESETS` relative to the current speed, and `c`/`t` pop the same popovers their
+    // menu buttons open.
+    let actions = gtk4::gio::SimpleActionGroup::new();
+    add_action(&actions, "skip-back", { let controller = controller.clone(); move || controller.skip(-skip_back_seconds) });
+    add_action(&actions, "skip-forward", { let controller = controller.clone(); move || controller.skip(skip_forward_seconds) });
+
+    // Speed steps are relative to whatever is current, so they read as "next/previous preset" no
+    // matter where in the list the user is — including from a speed that came straight from the
+    // Settings default and isn't itself a preset. At either end of the list the step is a no-op.
+    let step_speed = {
+        let controller = controller.clone();
+        move |up: bool| {
+            let current = controller.snapshot().map(|s| s.speed).unwrap_or(1.0);
+            let target = if up {
+                SPEED_PRESETS.iter().copied().find(|p| *p > current + f64::EPSILON)
+            } else {
+                SPEED_PRESETS.iter().copied().rev().find(|p| *p < current - f64::EPSILON)
+            };
+            if let Some(speed) = target {
+                controller.set_speed(speed);
+            }
+        }
+    };
+    add_action(&actions, "speed-up", { let step_speed = step_speed.clone(); move || step_speed(true) });
+    add_action(&actions, "speed-down", move || step_speed(false));
+    add_action(&actions, "speed-reset", {
+        let controller = controller.clone();
+        move || {
+            // Guarding the already-at-1× case skips `set_speed`'s redundant seek-with-rate (the
+            // same reasoning `start()` applies before re-applying the default speed).
+            if controller.snapshot().is_some_and(|s| (s.speed - 1.0).abs() > f64::EPSILON) {
+                controller.set_speed(1.0);
+            }
+        }
+    });
+    add_action(&actions, "chapters", { let popover = chapters_popover.clone(); move || popover.popup() });
+    add_action(&actions, "sleep-timer", { let popover = sleep_timer_popover.clone(); move || popover.popup() });
+    add_action(&actions, "collapse", {
+        let controller = controller.clone();
+        let on_collapse = on_collapse.clone();
+        move || {
+            controller.clear_full_update();
+            on_collapse();
+        }
+    });
+
     // Populated fresh every time the popover is about to open (not once at screen-build time), so
     // "current chapter highlighted" always reflects the position at the moment it's opened.
     chapters_popover.connect_show({
@@ -360,6 +425,7 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
 
     PlayerScreen {
         root: toast_overlay.clone().upcast(),
+        actions,
         #[cfg(test)]
         hooks: TestHooks {
             title_label,
@@ -385,6 +451,14 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             toast_overlay,
         },
     }
+}
+
+/// Registers one of the full player's keyboard actions (ui-spec §6) as a stateless
+/// `SimpleAction` on the screen's action group, calling `run` on every activation.
+fn add_action(group: &gtk4::gio::SimpleActionGroup, name: &'static str, run: impl Fn() + 'static) {
+    let action = gtk4::gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| run());
+    group.add_action(&action);
 }
 
 /// One row in the chapters sheet: title on the left, start time on the right, highlighted (via a
@@ -448,10 +522,9 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
             1.0,
         );
@@ -500,10 +573,9 @@ pub(crate) mod tests {
 
         // Tap-to-seek needs real, seekable audio, not just a parsed `get_item_playback_info`
         // response — hence `mock_playable_item_with_chapters` and the readiness wait below.
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
             1.0,
         );
@@ -553,10 +625,9 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -571,6 +642,76 @@ pub(crate) mod tests {
         assert_eq!(controller.snapshot().unwrap().speed, 1.5, "clicking a preset should change the real controller's speed");
         assert_eq!(hooks.speed_label.label(), "1.5×");
 
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The full player's keyboard actions
+    /// (ui-spec §6's full-player table): speed steps relative to the current speed, arrow-key
+    /// skip against real (mock-served, seekable) audio, `c`/`t` popping their popovers, and
+    /// Escape's collapse. The accelerators themselves are GTK-level (set app-wide in
+    /// `application.rs`); what needs checking here is that the actions drive the same controller
+    /// state their buttons do.
+    pub(crate) fn run_keyboard_actions(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let screen = build(controller.clone(), PlaybackSettings::default(), {
+            let collapsed = collapsed.clone();
+            move || collapsed.set(true)
+        });
+        let actions = &screen.actions;
+
+        assert_eq!(controller.snapshot().unwrap().speed, 1.0);
+        actions.activate_action("speed-up", None);
+        assert_eq!(controller.snapshot().unwrap().speed, 1.25, "speed-up should step to the next preset");
+        actions.activate_action("speed-up", None);
+        assert_eq!(controller.snapshot().unwrap().speed, 1.5);
+        actions.activate_action("speed-down", None);
+        assert_eq!(controller.snapshot().unwrap().speed, 1.25, "speed-down should step back");
+        actions.activate_action("speed-reset", None);
+        assert_eq!(controller.snapshot().unwrap().speed, 1.0, "reset should return to 1×");
+        // At 1× already, reset is a no-op — no redundant seek-with-rate.
+        actions.activate_action("speed-reset", None);
+        assert_eq!(controller.snapshot().unwrap().speed, 1.0);
+
+        // Arrow-key skip against the real pipeline: forward clamps to the 5s item's end, back
+        // lands at (near) 0.
+        actions.activate_action("skip-forward", None);
+        pump_until(
+            || (controller.snapshot().unwrap().position_seconds - 5.0).abs() < 1.0,
+            Duration::from_secs(5),
+        );
+        actions.activate_action("skip-back", None);
+        pump_until(|| controller.snapshot().unwrap().position_seconds < 1.0, Duration::from_secs(5));
+
+        // `c`/`t` pop the same popovers their menu buttons open — which needs a mapped toplevel,
+        // per `run_chapters_sheet_lists_and_seeks`'s note.
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+        let hooks = screen.test_hooks();
+        actions.activate_action("chapters", None);
+        pump_until(|| hooks.chapters_popover.is_visible(), Duration::from_secs(2));
+        actions.activate_action("sleep-timer", None);
+        pump_until(|| hooks.sleep_timer_popover.is_visible(), Duration::from_secs(2));
+
+        actions.activate_action("collapse", None);
+        assert!(collapsed.get(), "Escape's action should call on_collapse");
+
+        window.destroy();
         controller.stop();
     }
 
@@ -590,10 +731,9 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
             1.0,
         );
@@ -631,8 +771,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server,
-            account,
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -665,8 +804,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -699,8 +837,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            server.clone(),
-            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );

@@ -22,10 +22,11 @@ use std::rc::Rc;
 use adw::glib;
 use sqlx::SqlitePool;
 
+use abs_core::auth::Session;
 use abs_core::download_tracks::TrackDownloadOutcome;
 use abs_core::downloads::DownloadScope;
 use abs_player::network_watch::NetworkMonitor;
-use abs_storage::models::{Account, DownloadStatus, Server};
+use abs_storage::models::DownloadStatus;
 use abs_storage::AppPaths;
 
 /// How many tracks may download concurrently across the whole app, regardless of how many items
@@ -126,17 +127,20 @@ impl DownloadManager {
     /// starts fetching whichever of them aren't already complete. Fetches and caches track/chapter
     /// metadata first if it isn't already cached locally (e.g. this item has never been played), so
     /// downloading never requires having played the item first.
-    pub fn start_download(&self, server: Server, account: Account, item_id: String, scope: DownloadScope, current_chapter_index: usize) {
+    pub fn start_download(&self, session: Session, item_id: String, scope: DownloadScope, current_chapter_index: usize) {
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
-            let server_id = server.id.clone();
+            let server_id = session.server_id().to_string();
 
             let mut tracks = abs_core::tracks::cached_tracks(&pool, &server_id, &item_id).await.unwrap_or_default();
             let mut chapters = abs_core::chapters::cached_chapters(&pool, &server_id, &item_id).await.unwrap_or_default();
 
             if tracks.is_empty() {
-                match abs_core::streaming::resolve_stream_target(&server.url, &account.token, &item_id).await {
+                // Asked at resolve time, not captured earlier — same "never let a captured token
+                // go stale across a long-running operation" posture as `PlayerController::start`.
+                let access_token = session.access_token().await;
+                match abs_core::streaming::resolve_stream_target(session.server_url(), &access_token, &item_id).await {
                     Ok(target) => {
                         if let Err(err) = abs_core::tracks::sync_item_tracks(&pool, &server_id, &item_id, &target.tracks).await {
                             tracing::warn!(%err, item_id, "couldn't persist tracks locally");
@@ -194,14 +198,14 @@ impl DownloadManager {
             }
 
             for (ino, cancel_flag) in pending_inos.into_iter().zip(cancel_flags) {
-                Self::spawn_track_download(inner_rc.clone(), server.clone(), account.clone(), item_id.clone(), ino, cancel_flag);
+                Self::spawn_track_download(inner_rc.clone(), session.clone(), item_id.clone(), ino, cancel_flag);
             }
         });
     }
 
     /// Runs one track's download under the shared concurrency semaphore. `cancel_flag` is this
     /// track's own slot in its batch's `cancel_flags`, flipped by `cancel_item`.
-    fn spawn_track_download(inner_rc: Rc<RefCell<Inner>>, server: Server, account: Account, item_id: String, ino: String, cancel_flag: Rc<Cell<bool>>) {
+    fn spawn_track_download(inner_rc: Rc<RefCell<Inner>>, session: Session, item_id: String, ino: String, cancel_flag: Rc<Cell<bool>>) {
         glib::spawn_future_local(async move {
             let semaphore = inner_rc.borrow().semaphore.clone();
             // A permit acquired before the metered check below matters: it's what actually bounds
@@ -214,13 +218,14 @@ impl DownloadManager {
                 let inner = inner_rc.borrow();
                 (inner.pool.clone(), inner.paths.clone(), inner.wifi_only, inner.network_monitor.is_metered())
             };
+            let server_id = session.server_id().to_string();
 
             // An unknown/undeterminable network type must never block a download — only a
             // *known* metered connection does, and only when the setting asks for it. This is
             // checked once per track start, not continuously (see this module's doc comment).
             if wifi_only && is_metered == Some(true) {
                 drop(permit);
-                Self::finish_track(&inner_rc, &server.id, &item_id, TrackDownloadOutcome::Failed("waiting for a non-metered connection".to_string()));
+                Self::finish_track(&inner_rc, &server_id, &item_id, TrackDownloadOutcome::Failed("waiting for a non-metered connection".to_string()));
                 return;
             }
 
@@ -241,7 +246,12 @@ impl DownloadManager {
                 });
             };
 
-            let outcome = abs_core::download_tracks::download_track(&paths, &pool, &server.url, &account.token, &server.id, &item_id, &ino, on_progress, &cancel_check)
+            // Asked fresh for each track, not carried over from `start_download`'s own call — a
+            // batch of many tracks (an "entire book" download) can easily outlast a short-lived
+            // access token, and `Session::access_token` is exactly the "refresh if needed"
+            // primitive `PlayerController` already relies on for the same reason.
+            let access_token = session.access_token().await;
+            let outcome = abs_core::download_tracks::download_track(&paths, &pool, session.server_url(), &access_token, &server_id, &item_id, &ino, on_progress, &cancel_check)
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(%err, item_id = %item_id, ino = %ino, "download_track returned an error");
@@ -249,7 +259,7 @@ impl DownloadManager {
                 });
 
             drop(permit);
-            Self::finish_track(&inner_rc, &server.id, &item_id, outcome);
+            Self::finish_track(&inner_rc, &server_id, &item_id, outcome);
         });
     }
 
@@ -351,10 +361,12 @@ pub(crate) mod tests {
         }
     }
 
-    async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (Server, Account) {
+    async fn session_for(pool: &SqlitePool, server_url: &str) -> (Session, abs_storage::models::Server) {
         let server_id = abs_storage::repo::servers::add(pool, server_url).await.unwrap();
-        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123").await.unwrap();
-        (abs_storage::repo::servers::get(pool, &server_id).await.unwrap(), abs_storage::repo::accounts::get(pool, &account_id).await.unwrap())
+        let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
+        let server = abs_storage::repo::servers::get(pool, &server_id).await.unwrap();
+        let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
+        (Session::new(pool.clone(), server_url, &server_id, &account), server)
     }
 
     async fn insert_synced_item(pool: &SqlitePool, server_id: &str, item_id: &str) {
@@ -429,7 +441,7 @@ pub(crate) mod tests {
         runtime.block_on(mock_two_track_item(&mock_server, "item-1"));
 
         let pool = runtime.block_on(pool());
-        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
 
         let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: None }), false);
@@ -440,7 +452,7 @@ pub(crate) mod tests {
             move |event| events.borrow_mut().push(event.clone())
         });
 
-        manager.start_download(server.clone(), account, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
+        manager.start_download(session, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
 
         pump_until(
             || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Complete, .. })),
@@ -466,7 +478,7 @@ pub(crate) mod tests {
         runtime.block_on(mock_slow_single_track_item(&mock_server, "item-1", Duration::from_secs(2)));
 
         let pool = runtime.block_on(pool());
-        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
 
         let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: None }), false);
@@ -477,7 +489,7 @@ pub(crate) mod tests {
             move |event| events.borrow_mut().push(event.clone())
         });
 
-        manager.start_download(server.clone(), account, "item-1".to_string(), DownloadScope::EntireBook, 0);
+        manager.start_download(session, "item-1".to_string(), DownloadScope::EntireBook, 0);
 
         // Give the manager a moment to actually issue the request before canceling — waiting for
         // `Downloading` (published synchronously once the batch is set up) rather than a fixed
@@ -506,7 +518,7 @@ pub(crate) mod tests {
         runtime.block_on(mock_two_track_item(&mock_server, "item-1"));
 
         let pool = runtime.block_on(pool());
-        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
 
         let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: Some(true) }), true);
@@ -517,7 +529,7 @@ pub(crate) mod tests {
             move |event| events.borrow_mut().push(event.clone())
         });
 
-        manager.start_download(server.clone(), account, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
+        manager.start_download(session, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
 
         pump_until(
             || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Failed, .. })),
@@ -537,11 +549,11 @@ pub(crate) mod tests {
         runtime.block_on(mock_two_track_item(&mock_server, "item-1"));
 
         let pool = runtime.block_on(pool());
-        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
 
         let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: None }), false);
-        manager.start_download(server.clone(), account, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
+        manager.start_download(session, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
         pump_until(
             || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == DownloadStatus::Complete).unwrap_or(false),
             Duration::from_secs(10),

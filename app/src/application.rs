@@ -46,6 +46,8 @@ fn build_window(app: &adw::Application, state: &AppState) {
         .default_height(760)
         .build();
 
+    add_keyboard_support(app, &window);
+
     match &state.active_account {
         None => {
             let pool = state.pool.clone();
@@ -66,11 +68,13 @@ fn build_window(app: &adw::Application, state: &AppState) {
                     let account = abs_storage::repo::accounts::get(&pool, &added.account_id)
                         .await
                         .expect("the account just created by add_server_and_login must exist");
+                    let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
                     let main_window = screens::main_window::build(
                         pool,
                         paths,
                         server,
                         account,
+                        session,
                         playback_settings,
                         window_for_callback.clone(),
                     );
@@ -89,11 +93,13 @@ fn build_window(app: &adw::Application, state: &AppState) {
                 let server = abs_storage::repo::servers::get(&pool, &account.server_id)
                     .await
                     .expect("an active account's server must exist");
+                let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
                 let main_window = screens::main_window::build(
                     pool,
                     paths,
                     server,
                     account,
+                    session,
                     playback_settings,
                     window_for_callback.clone(),
                 );
@@ -103,6 +109,185 @@ fn build_window(app: &adw::Application, state: &AppState) {
     }
 
     window.present();
+}
+
+/// The keyboard half of ui-spec §6: the accelerators (app-wide — they only fire when the matching
+/// action actually exists, so `player.*` accels are inert until the full player merges its action
+/// group, and `win.*` ones don't exist before login) and the `Ctrl+?` shortcuts overlay. The
+/// actions themselves live where their state is: `win.*` in `screens::main_window`, `player.*` on
+/// the full player screen.
+fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow) {
+    let quit_action = adw::gio::SimpleAction::new("quit", None);
+    quit_action.connect_activate({
+        let app = app.clone();
+        move |_, _| app.quit()
+    });
+    app.add_action(&quit_action);
+
+    window.set_help_overlay(Some(&build_shortcuts_overlay()));
+
+    for (action, accels) in [
+        ("app.quit", vec!["<Control>q"]),
+        // GtkApplicationWindow also wires this action itself; stating the accel keeps the
+        // binding visible and independent of that internal default.
+        ("win.show-help-overlay", vec!["<Control>question"]),
+        ("win.switch-tab('home')", vec!["<Alt>1"]),
+        ("win.switch-tab('library')", vec!["<Alt>2"]),
+        ("win.switch-tab('downloads')", vec!["<Alt>3"]),
+        ("win.switch-tab('settings')", vec!["<Alt>4", "<Control>comma"]),
+        ("win.open-library-search", vec!["<Control>f"]),
+        ("win.play-pause", vec!["space"]),
+        ("win.bookmark", vec!["b"]),
+        ("player.skip-back", vec!["Left"]),
+        ("player.skip-forward", vec!["Right"]),
+        // Dual bindings (with and without Ctrl) match Decibels, GNOME's own audio player and
+        // the closest analogue for these controls.
+        ("player.speed-up", vec!["<Control>plus", "plus"]),
+        ("player.speed-down", vec!["<Control>minus", "minus"]),
+        ("player.speed-reset", vec!["<Control>0", "0"]),
+        ("player.chapters", vec!["c"]),
+        ("player.sleep-timer", vec!["t"]),
+        ("player.collapse", vec!["Escape"]),
+    ] {
+        app.set_accels_for_action(action, &accels);
+    }
+}
+
+/// The `GtkShortcutsWindow` behind `Ctrl+?` — one item per row of ui-spec §6's tables, grouped
+/// the same way.
+///
+/// Built from an inline `GtkBuilder` definition rather than the Rust widget bindings: the
+/// `ShortcutsWindow` family's `add_section`/`add_group`/`add_shortcut` methods are gated behind
+/// gtk4-rs's `v4_14` feature, and this crate deliberately pins `v4_8` as its API ceiling (see
+/// `app/Cargo.toml` — loosening it for three methods would let future code reach real 4.14-only
+/// APIs by accident). The underlying C symbols are ancient (GTK 4.0), so the runtime library on
+/// PureOS Crimson handles this fine; a declarative definition is also the form upstream apps
+/// themselves use for this widget (Decibels ships its shortcuts dialog as a `.ui` file).
+fn build_shortcuts_overlay() -> gtk4::ShortcutsWindow {
+    const DEFINITION: &str = r#"
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkShortcutsWindow" id="overlay">
+    <child>
+      <object class="GtkShortcutsSection">
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">General</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Show shortcuts</property>
+                <property name="accelerator">&lt;Control&gt;question</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Quit</property>
+                <property name="accelerator">&lt;Control&gt;q</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Navigation</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Go to Home</property>
+                <property name="accelerator">&lt;Alt&gt;1</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Go to Library</property>
+                <property name="accelerator">&lt;Alt&gt;2</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Go to Downloads</property>
+                <property name="accelerator">&lt;Alt&gt;3</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Go to Settings</property>
+                <property name="accelerator">&lt;Alt&gt;4 / &lt;Control&gt;comma</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Search the library</property>
+                <property name="accelerator">&lt;Control&gt;f</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Playback</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Play / pause</property>
+                <property name="accelerator">space</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Add bookmark</property>
+                <property name="accelerator">b</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Full player</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Skip back / forward</property>
+                <property name="accelerator">Left / Right</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Speed up / down</property>
+                <property name="accelerator">&lt;Control&gt;plus / &lt;Control&gt;minus</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Reset speed to 1×</property>
+                <property name="accelerator">&lt;Control&gt;0</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Open chapters</property>
+                <property name="accelerator">c</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Open sleep timer</property>
+                <property name="accelerator">t</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Collapse player</property>
+                <property name="accelerator">Escape</property>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>
+"#;
+
+    let builder = gtk4::Builder::from_string(DEFINITION);
+    builder.object::<gtk4::ShortcutsWindow>("overlay").expect("the shortcuts overlay definition must contain its root object")
 }
 
 #[cfg(test)]

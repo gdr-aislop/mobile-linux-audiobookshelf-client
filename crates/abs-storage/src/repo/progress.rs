@@ -96,7 +96,7 @@ mod tests {
             .unwrap();
         std::mem::forget(tmp);
         let server_id = servers::add(&pool, "https://a.example").await.unwrap();
-        let account_id = accounts::add(&pool, &server_id, "jane", "tok").await.unwrap();
+        let account_id = accounts::add(&pool, &server_id, "jane", "tok", None).await.unwrap();
         libraries::upsert(
             &pool,
             libraries::UpsertLibrary {
@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn progress_is_scoped_per_account() {
         let (pool, server_id, account_a, item_id) = pool_with_item_and_account().await;
-        let account_b = accounts::add(&pool, &server_id, "jack", "tok2").await.unwrap();
+        let account_b = accounts::add(&pool, &server_id, "jack", "tok2", None).await.unwrap();
 
         set(&pool, &account_a, &server_id, &item_id, 100.0, false).await.unwrap();
         set(&pool, &account_b, &server_id, &item_id, 2000.0, false).await.unwrap();

@@ -68,6 +68,8 @@ async fn setup() -> AppState {
         has_active_account = active_account.is_some(),
         "resolved startup screen"
     );
+    // Token freshness is handled lazily by `abs_core::auth::Session` — screens ask it for a
+    // token at call time, and its first use refreshes an expired one (server v2.26.0+ JWTs).
 
     AppState { pool, paths, active_account, playback_settings }
 }
@@ -92,7 +94,9 @@ mod tests {
         crate::screens::welcome::tests::run(&runtime);
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
-        crate::screens::home::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::home::tests::run_shows_a_retryable_error_when_the_first_sync_fails(&runtime);
+        crate::screens::home::tests::run_shows_a_spinner_while_the_first_sync_is_running(&runtime);
+        crate::screens::home::tests::run_expired_token_is_refreshed_before_syncing(&runtime);
         crate::screens::library::tests::run_renders_all_synced_items(&runtime);
         crate::screens::library::tests::run_search_filters_by_title_and_author(&runtime);
         crate::screens::library::tests::run_sort_changes_order(&runtime);
@@ -119,6 +123,7 @@ mod tests {
         crate::player::tests::run_mini_bar_reflects_playback_state(&runtime);
         crate::player::tests::run_add_bookmark_persists_a_row(&runtime);
         crate::screens::player::tests::run(&runtime);
+        crate::screens::player::tests::run_keyboard_actions(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);

@@ -1,0 +1,5 @@
+# The bookworm builder image (scripts/appimage-builder-bookworm.Dockerfile)
+# needs nothing from the repo, so keep the build context minimal — target/
+# alone is multiple GB.
+*
+!scripts/appimage-builder-bookworm.Dockerfile

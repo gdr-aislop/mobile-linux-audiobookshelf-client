@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata, bundled into the AppImage by scripts/build-appimage.sh -->
+<component type="desktop-application">
+  <id>io.github.gdr-aislop.abs-app</id>
+
+  <name>Audiobookshelf</name>
+  <summary>Client for an Audiobookshelf server, designed for mobile Linux</summary>
+
+  <metadata_license>GPL-3.0-or-later</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      GNOME-native client for an Audiobookshelf media server, designed for
+      mobile Linux (Phosh on the Librem 5, also usable on desktop).
+    </p>
+    <p>
+      Browse your library, stream or play downloaded audiobooks and podcasts,
+      and keep listening progress in sync with the server. Integrates with the
+      desktop via MPRIS2 and pauses during phone calls.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">abs-app.desktop</launchable>
+
+  <url type="homepage">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client</url>
+  <url type="bugtracker">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues</url>
+
+  <provides>
+    <binary>abs-app</binary>
+  </provides>
+</component>

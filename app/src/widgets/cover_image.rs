@@ -20,9 +20,8 @@ impl CoverImage {
     /// `size` is both width and height — every cover slot in this app is square.
     pub fn new(size: i32) -> Self {
         // Every widget here is pinned to a fixed, non-expanding, non-stretching `size`x`size` box.
-        // This was only ever exercised with the placeholder showing (no `gdk-pixbuf` WebP loader
-        // was available in this session's sandbox until late in testing) — once a real decoded
-        // image loaded, two real bugs surfaced live, one after the other:
+        // The sizing discipline below was learned the hard way once real covers actually started
+        // loading (WebP took until the in-process decoder landed; see `set_path`):
         // 1. `GtkPicture` defaults to `hexpand`/`vexpand: true`, and with only one sibling in a
         //    shelf row (as Home's "Continue Listening" often has), nothing else claimed the
         //    leftover space, so the whole card stretched into a short, wide rectangle instead of
@@ -75,23 +74,54 @@ impl CoverImage {
             self.show_placeholder();
             return;
         };
+        // Fast path: gdk-pixbuf (via `Texture::from_filename`). Covers only the formats the
+        // host's pixbuf loaders support. Fallback path: decode in-process with the `image`
+        // crate — needed for WebP, which gdk-pixbuf has no loader for on the target distros
+        // (no WebP loader ships in Debian bookworm, PureOS Crimson's base, and Audiobookshelf
+        // serves plenty of WebP covers).
         match gtk4::gdk::Texture::from_filename(path) {
             Ok(texture) => {
-                self.picture.set_paintable(Some(&texture));
-                self.picture.set_visible(true);
-                self.placeholder.set_visible(false);
+                self.show_texture(texture);
             }
-            Err(err) => {
-                tracing::warn!(%err, ?path, "couldn't decode the cached cover image");
-                self.show_placeholder();
-            }
+            Err(pixbuf_err) => match decode_texture_in_process(path) {
+                Ok(texture) => {
+                    self.show_texture(texture);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, ?path, "couldn't decode the cached cover image");
+                    self.show_placeholder();
+                    let _ = pixbuf_err; // both errors are interesting; the fallback's is logged
+                }
+            },
         }
+    }
+
+    fn show_texture(&self, texture: gtk4::gdk::Texture) {
+        self.picture.set_paintable(Some(&texture));
+        self.picture.set_visible(true);
+        self.placeholder.set_visible(false);
     }
 
     fn show_placeholder(&self) {
         self.picture.set_visible(false);
         self.placeholder.set_visible(true);
     }
+}
+
+/// Decodes an image file in-process (format sniffed from the content, so the cached file's
+/// extension can't lie) and wraps the pixels in a `gdk::MemoryTexture`.
+fn decode_texture_in_process(path: &Path) -> Result<gtk4::gdk::Texture, image::ImageError> {
+    let bytes = std::fs::read(path)?;
+    let decoded = image::load_from_memory(&bytes)?.into_rgba8();
+    let (width, height) = decoded.dimensions();
+    Ok(gtk4::gdk::MemoryTexture::new(
+        width as i32,
+        height as i32,
+        gtk4::gdk::MemoryFormat::R8g8b8a8,
+        &gtk4::glib::Bytes::from_owned(decoded.into_raw()),
+        (width * 4) as usize,
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -121,8 +151,28 @@ pub(crate) mod tests {
         assert!(cover.picture.is_visible(), "a valid image should show the picture");
         assert!(!cover.placeholder.is_visible());
 
+        // WebP has no gdk-pixbuf loader on the target distros — the in-process fallback must
+        // pick it up (regression guard for the audiobookshelf-client cover pipeline).
+        let webp = tmp.path().join("real.webp");
+        write_1x1_webp(&webp);
+        cover.set_path(Some(&webp));
+        assert!(cover.picture.is_visible(), "a WebP cover should decode via the image-crate fallback");
+        assert!(!cover.placeholder.is_visible());
+
         cover.set_path(None);
         assert!(cover.placeholder.is_visible(), "clearing the path restores the placeholder");
+    }
+
+    /// The smallest possible valid WebP (1x1, lossy VP8) — generated once with `cwebp`, so no
+    /// WebP encoder is needed at test time.
+    fn write_1x1_webp(path: &std::path::Path) {
+        const WEBP_1X1: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x3c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20, 0x30, 0x00, 0x00, 0x00, 0xd0,
+            0x01, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x00, 0x03,
+            0xb0, 0x00, 0xfe, 0xf0, 0xc4, 0x0b, 0xff, 0x20, 0xb9, 0x61, 0x75, 0xc8, 0xd7, 0xff, 0x20, 0x3f, 0xe4, 0x07, 0xfc, 0x80, 0xff,
+            0xf8, 0xf2, 0x00, 0x00, 0x00,
+        ];
+        std::fs::write(path, WEBP_1X1).unwrap();
     }
 
     /// The smallest possible valid PNG (1x1, black pixel) — enough for `gdk::Texture::from_filename`

@@ -37,7 +37,14 @@ pub async fn add_server_and_login(
         }
     };
 
-    let account_id = accounts::add(pool, &server_id, &login_result.username, &login_result.access_token).await?;
+    let account_id = accounts::add(
+        pool,
+        &server_id,
+        &login_result.username,
+        &login_result.access_token,
+        login_result.refresh_token.as_deref(),
+    )
+    .await?;
     accounts::set_active(pool, &account_id).await?;
 
     Ok(AddedAccount { server_id, account_id })
@@ -106,6 +113,7 @@ mod tests {
         let stored_account = accounts::get(&pool, &added.account_id).await.unwrap();
         assert_eq!(stored_account.username, "jane");
         assert_eq!(stored_account.token, "abc123");
+        assert_eq!(stored_account.refresh_token.as_deref(), Some("refresh456"), "the refresh token must be persisted — it's what keeps the session alive past the access token's expiry");
         assert!(stored_account.is_active, "the newly added account should become active");
     }
 

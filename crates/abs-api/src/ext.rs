@@ -42,6 +42,8 @@ pub struct LoginResult {
 pub enum LoginError {
     #[error("invalid username or password")]
     InvalidCredentials,
+    #[error("this session's login has expired — sign in again")]
+    SessionExpired,
     #[error("couldn't verify this server's TLS certificate: {0}")]
     Tls(reqwest::Error),
     #[error("couldn't connect to this server: {0}")]
@@ -62,7 +64,7 @@ impl LoginError {
     pub fn details(&self) -> Option<String> {
         let err: &(dyn std::error::Error + 'static) = match self {
             LoginError::Tls(e) | LoginError::Connect(e) | LoginError::Timeout(e) | LoginError::Network(e) => e,
-            LoginError::InvalidCredentials | LoginError::UnexpectedResponse(_) => return None,
+            LoginError::InvalidCredentials | LoginError::SessionExpired | LoginError::UnexpectedResponse(_) => return None,
         };
         let mut parts = vec![err.to_string()];
         let mut current = err.source();
@@ -606,6 +608,49 @@ impl Client {
             LoginError::UnexpectedResponse(
                 "login succeeded but response carried no accessToken (was x-return-tokens sent?)"
                     .into(),
+            )
+        })?;
+
+        Ok(LoginResult {
+            user_id: body.user.id,
+            username: body.user.username,
+            access_token,
+            refresh_token: body.user.refresh_token,
+        })
+    }
+
+    /// Exchange a refresh token for a fresh token pair. Hand-written (no auth endpoints are in the
+    /// vendored spec — same as `login`), against the JWT auth system's documented shape (server
+    /// v2.26.0+, github.com/advplyr/audiobookshelf discussion #4460): `POST {baseurl}/auth/refresh`
+    /// with the refresh token in the `x-refresh-token` header (mobile clients don't get cookies),
+    /// responding with the same body shape as `/login`. The refresh token **rotates on every
+    /// use** — the new pair from the response must replace the old one in storage, and a 401 here
+    /// means the server no longer knows this session at all (expired, revoked, or the server lost
+    /// its session store), so the only way back in is signing in again.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<LoginResult, LoginError> {
+        let response = self
+            .client()
+            .post(format!("{}/auth/refresh", self.baseurl()))
+            .header("x-return-tokens", "true")
+            .header("x-refresh-token", refresh_token)
+            .send()
+            .await
+            .map_err(classify_transport_error)?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(LoginError::SessionExpired);
+        }
+        if !response.status().is_success() {
+            return Err(LoginError::UnexpectedResponse(format!(
+                "token refresh returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let body: LoginResponseBody = response.json().await.map_err(classify_transport_error)?;
+        let access_token = body.user.access_token.ok_or_else(|| {
+            LoginError::UnexpectedResponse(
+                "token refresh succeeded but response carried no accessToken (was x-return-tokens sent?)".into(),
             )
         })?;
 

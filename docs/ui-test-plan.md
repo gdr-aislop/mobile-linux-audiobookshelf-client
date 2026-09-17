@@ -126,8 +126,10 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 
 - [ ] **HT-2 — Empty server state.** Point the app at a server with no libraries / nothing
       synced (or first sync failing).
-      *Expected:* a status page "No library synced yet — Check your connection and try again."
-      instead of empty shelves.
+      *Expected:* while the first sync runs, a spinner with "Syncing your libraries…" instead of
+      empty shelves; if the sync fails, "Couldn't sync your libraries" with the error in a
+      details line and a Try again button that restarts the sync; if the server genuinely has no
+      libraries, "No library synced yet" with Try again.
 
 - [ ] **HT-3 — Tapping a cover starts playback.** Tap any cover card in Continue Listening or
       Recently Added.
@@ -138,7 +140,9 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 - [ ] **HT-4 — Sync failure banner.** Load Home with the server unreachable (kill the server /
       turn off Wi-Fi, then switch to the Home tab so it re-syncs).
       *Expected:* banner "Couldn't sync — showing what's cached." and the previously cached
-      shelves still render. No crash, no blank page.
+      shelves still render. With nothing cached, the retryable failure state shows instead
+      ("Couldn't sync your libraries" + Try again) — the error is never hidden behind an empty
+      state. No crash, no blank page.
 
 - [ ] **HT-5 — Cached render beats the network.** With Wi-Fi off but a previously synced Home,
       launch the app.

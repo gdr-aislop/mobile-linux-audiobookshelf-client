@@ -267,6 +267,47 @@ pub fn build(pool: SqlitePool, on_success: impl Fn(AddedAccount) + 'static) -> W
         }
     });
 
+    // --- Keyboard flow: Enter in the password/token field submits the form, Enter in the other
+    // fields advances focus to the next one — the Connect button must not be reachable by pointer
+    // only. `entry-activated` fires when Enter is pressed inside an entry row; submission routes
+    // through the same production handler as a click (and only when the form is complete, i.e.
+    // the button is sensitive — the handler reads the fields itself and has no empty-form guard). ---
+    let try_connect: Rc<dyn Fn()> = Rc::new({
+        let connect_button = connect_button.clone();
+        move || {
+            if connect_button.is_sensitive() {
+                connect_button.emit_clicked();
+            }
+        }
+    });
+
+    url_row.connect_entry_activated({
+        let mode_password = mode_password.clone();
+        let username_row = username_row.clone();
+        let token_row = token_row.clone();
+        move |_| {
+            if mode_password.is_active() {
+                username_row.grab_focus();
+            } else {
+                token_row.grab_focus();
+            }
+        }
+    });
+    username_row.connect_entry_activated({
+        let password_row = password_row.clone();
+        move |_| {
+            password_row.grab_focus();
+        }
+    });
+    password_row.connect_entry_activated({
+        let try_connect = try_connect.clone();
+        move |_| try_connect()
+    });
+    token_row.connect_entry_activated({
+        let try_connect = try_connect.clone();
+        move |_| try_connect()
+    });
+
     #[cfg(test)]
     let hooks = TestHooks {
         url_row: url_row.clone(),
@@ -469,6 +510,40 @@ pub(crate) mod tests {
             assert!(
                 !hooks.banner.details_text().is_empty(),
                 "the details disclosure should carry the raw transport error text"
+            );
+        }
+
+        // Pressing Enter in the password field must submit the form — exactly the same production
+        // handler as a Connect click (see the `try_connect` wiring), simulated here by emitting
+        // the row's `entry-activated` signal, which is what the Enter key triggers. Points at the
+        // same nothing-listening address, so it stays fast and network-free.
+        {
+            let pool = runtime.block_on(pool());
+            let screen = build(pool, |_| {});
+            let hooks = screen.test_hooks();
+
+            hooks.url_row.set_text("http://127.0.0.1:1");
+            hooks.username_row.set_text("demo");
+            hooks.password_row.set_text("demo");
+            assert!(
+                hooks.connect_button.is_sensitive(),
+                "the form must be complete before Enter-submit can fire"
+            );
+            hooks
+                .password_row
+                .emit_by_name::<()>("entry-activated", &[]);
+
+            pump_until(
+                || hooks.banner.widget().reveals_child(),
+                Duration::from_secs(15),
+            );
+            assert!(
+                hooks.banner.widget().reveals_child(),
+                "pressing Enter in the password field should submit the form"
+            );
+            assert_eq!(
+                hooks.banner.title(),
+                "Can't reach this server — check the URL and your connection."
             );
         }
     }

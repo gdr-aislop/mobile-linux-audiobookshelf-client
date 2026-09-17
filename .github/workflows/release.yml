@@ -1,6 +1,6 @@
-name: Release debs
+name: Release debs and AppImages
 
-# Builds distribution .debs for every release tag:
+# Builds distribution artifacts for every release tag:
 #   - arm64: PureOS Crimson on the Librem 5 (built against Debian bookworm
 #     libraries, Crimson's base — same libgtk-4 4.8 / libadwaita 1.2 the
 #     feature ceiling in app/Cargo.toml targets)
@@ -9,6 +9,11 @@ name: Release debs
 # Both builds run inside a debian:bookworm container so the produced binaries
 # link against Crimson-era library versions, and so accidentally using a
 # newer-than-v4_8/v1_2 API fails the build instead of crashing on device.
+#
+# Two artifact types per architecture:
+#   - .deb (cargo deb)
+#   - .AppImage (scripts/build-appimage.sh; bundles GTK4/GStreamer itself, so
+#     it runs on systems without them installed)
 
 on:
   push:
@@ -88,10 +93,63 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-appimage:
+    name: Build AppImage (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    container:
+      image: debian:bookworm
+
+    steps:
+      # Same compiler/toolchain set as the deb job, plus the runtime pieces
+      # (GStreamer plugins, gio modules, pixbuf loaders, icon theme) that get
+      # bundled into the AppImage, and the tools to assemble it.
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates file patchelf \
+            libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libssl-dev \
+            libgdk-pixbuf-2.0-dev \
+            glib-networking dconf-gsettings-backend gsettings-desktop-schemas \
+            librsvg2-common adwaita-icon-theme \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-libav gstreamer1.0-pulseaudio \
+            libsoup-3.0-0
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build AppImage
+        run: ./scripts/build-appimage.sh --version "${GITHUB_REF_NAME#v}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: build/appimage/*.AppImage
+          if-no-files-found: error
+
   release:
-    name: Attach .debs to the GitHub release
+    name: Attach artifacts to the GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-deb
+    needs: [build-deb, build-appimage]
     runs-on: ubuntu-latest
     # Only this job needs write access (to attach files to the release) — build-deb only
     # checks out, builds, and uploads a workflow artifact, so it keeps the default read-only
@@ -101,14 +159,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: deb-*
+          pattern: "{deb-*,appimage-*}"
           merge-multiple: true
           path: dist
 
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum ./*.deb > SHA256SUMS
+          sha256sum ./*.deb ./*.AppImage > SHA256SUMS
           rm -f SHA256SUMS-*.txt
           cat SHA256SUMS
 
@@ -116,4 +174,5 @@ jobs:
         with:
           files: |
             dist/*.deb
+            dist/*.AppImage
             dist/SHA256SUMS
