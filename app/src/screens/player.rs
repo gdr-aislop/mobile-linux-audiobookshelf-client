@@ -210,9 +210,13 @@ pub fn build(
     }
 
     let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
-    // "● downloaded" legend (ui-spec: sits in the Chapters section header so the offline glyph's
-    // meaning doesn't need to be inferred from a single unlabeled icon on the active chapters).
-    let chapters_legend = gtk4::Label::builder().label("● downloaded").css_classes(["caption", "dim-label"]).xalign(0.0).margin_bottom(4).build();
+    // "downloaded" legend (ui-spec: sits in the Chapters section header so the downloaded
+    // glyph's meaning doesn't need to be inferred from a single unlabeled icon on the active
+    // chapters) — the same folder-download glyph the chapter rows and the covers' downloaded
+    // badge use, so the icon itself is the legend.
+    let chapters_legend = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).margin_bottom(4).build();
+    chapters_legend.append(&gtk4::Image::builder().icon_name("folder-download-symbolic").css_classes(["dim-label"]).build());
+    chapters_legend.append(&gtk4::Label::builder().label("downloaded").css_classes(["caption", "dim-label"]).build());
     let chapters_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     chapters_box.append(&chapters_legend);
     chapters_box.append(&chapters_list);
@@ -647,7 +651,9 @@ fn build_chapter_row(chapter: &ChapterInfo, position: f64, is_downloaded: bool) 
     row_box.append(&title_label);
     row_box.append(&time_label);
     if is_downloaded {
-        row_box.append(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+        // Same glyph as the covers' downloaded badge — a "this is on disk and playable offline"
+        // marker, not a completion checkmark (which is the download *button's* state icon).
+        row_box.append(&gtk4::Image::builder().icon_name("folder-download-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
     }
 
     if is_current {
