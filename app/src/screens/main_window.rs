@@ -78,6 +78,7 @@ pub fn build(
     session: abs_core::auth::Session,
     playback_settings: PlaybackSettings,
     theme: Theme,
+    servers_with_accounts: Vec<(Server, Vec<Account>)>,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
     let mini_bar = player::build_mini_bar(pool.clone(), paths.clone(), player::real_backend());
@@ -232,9 +233,18 @@ pub fn build(
         "go-home-symbolic",
     );
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
+    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
-    let settings_screen = screens::settings::build(pool.clone(), mini_bar.controller.clone(), download_manager.clone(), playback_settings, theme, window.clone());
+    let settings_screen = screens::settings::build(
+        pool.clone(),
+        mini_bar.controller.clone(),
+        download_manager.clone(),
+        playback_settings,
+        theme,
+        paths,
+        servers_with_accounts,
+        window.clone(),
+    );
     stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
@@ -353,11 +363,13 @@ pub(crate) mod tests {
         let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, "http://127.0.0.1:1")).unwrap();
         let account_id =
             runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
         let app_window = adw::ApplicationWindow::builder().build();
         let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
         let window = build(
             pool,
             crate::test_support::test_paths(),
@@ -366,6 +378,7 @@ pub(crate) mod tests {
             session,
             abs_core::settings::PlaybackSettings::default(),
             abs_core::settings::Theme::default(),
+            servers_with_accounts,
             app_window.clone(),
         );
         let hooks = window.test_hooks();

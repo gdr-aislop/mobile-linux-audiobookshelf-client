@@ -146,14 +146,15 @@ pub fn build(
         .build();
     content.append(&connect_button);
 
-    // Re-login flow only: a way back to the (cached) app. Without it, "Log in again" would be a
-    // trap — a typo'd URL or a changed mind would leave the user stuck on this screen with no
-    // route back to their libraries.
+    // A way back to the (cached) app — the re-login flow ("Log in again") and the Add-Server
+    // flow from Settings both provide one; only the true first run has nothing to return to.
+    // Without it, "Log in again" would be a trap — a typo'd URL or a changed mind would leave
+    // the user stuck on this screen with no route back to their libraries.
     let cancel_button = gtk4::Button::builder()
         .label("Cancel")
         .css_classes(["pill"])
         .hexpand(true)
-        .visible(previous.is_some())
+        .visible(on_cancel.is_some())
         .margin_top(8)
         .height_request(44)
         .build();

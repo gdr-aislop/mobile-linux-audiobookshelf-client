@@ -1,9 +1,13 @@
 //! The Settings destination — per `docs/design/ui-spec.md`'s "Settings" section, an
-//! `AdwPreferencesPage` under the tab bar. **Partially built**: the Playback group (headphone
-//! switches, default speed, skip intervals, Wi-Fi-only downloads), the Appearance group (Theme)
-//! and the About row are real; Account, Servers, the Connection page and Playback's
-//! sleep-timer-default row are yet to come — each arrives with its own feature, since every row
-//! is live wiring (session management, popover integration) rather than decoration.
+//! `AdwPreferencesPage` under the tab bar. The **Account** group (the active server/account)
+//! and the **Servers** group (one row per configured server with a Switch/Sign Out/Remove
+//! menu, plus Add Server — which reuses the Welcome flow, the only way a second server can
+//! ever enter the database) are real; the **Playback** group (headphone switches, default
+//! speed, skip intervals, Wi-Fi-only downloads), the **Appearance** group (Theme) and the
+//! **About** row are too. Still to come: the per-server Connection page the server rows
+//! navigate to, and Playback's sleep-timer-default row — each arrives with its own feature,
+//! since every row is live wiring (session management, popover integration) rather than
+//! decoration.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -14,6 +18,8 @@ use sqlx::SqlitePool;
 
 use abs_core::playback::SPEED_PRESETS;
 use abs_core::settings::{PlaybackSettings, Theme};
+use abs_storage::models::{Account, Server};
+use abs_storage::AppPaths;
 
 use crate::downloads::DownloadManager;
 use crate::player::PlayerController;
@@ -38,6 +44,17 @@ pub struct SettingsHooks {
     pub wifi_only_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
+    pub account_row: adw::ActionRow,
+    pub server_rows: Vec<ServerRowHooks>,
+    pub add_server_row: adw::ActionRow,
+}
+
+#[cfg(test)]
+pub struct ServerRowHooks {
+    pub row: adw::ActionRow,
+    pub switch_item: gtk4::Button,
+    pub sign_out_item: gtk4::Button,
+    pub remove_item: gtk4::Button,
 }
 
 pub fn build(
@@ -46,6 +63,8 @@ pub fn build(
     download_manager: DownloadManager,
     playback_settings: PlaybackSettings,
     theme: Theme,
+    paths: AppPaths,
+    servers_with_accounts: Vec<(Server, Vec<Account>)>,
     window: adw::ApplicationWindow,
 ) -> SettingsScreen {
     // The one shared copy of the settings this page edits: each row mutates its own field, then
@@ -62,6 +81,212 @@ pub fn build(
     header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
 
     let page = adw::PreferencesPage::new();
+
+    // --- Account: the one session the shell was built for. The DB enforces at most one active
+    // account across all servers (`accounts_one_active_idx`), and the signed-in shell exists by
+    // that grace — so this row is a fact, not a picker; switching happens per server below.
+    // (The mockup's "Switch or manage servers" row is deliberately absent: both groups scroll on
+    // one page, so the Servers list *is* that surface — no second row can add anything.) ---
+    let (active_server, active_account) = servers_with_accounts
+        .iter()
+        .find_map(|(server, accounts)| {
+            accounts.iter().find(|account| account.is_active).map(|account| (server, account))
+        })
+        .expect("the signed-in shell requires an active account");
+
+    let account_group = adw::PreferencesGroup::new();
+    account_group.set_title("Account");
+    let account_row = adw::ActionRow::builder()
+        .title(&active_account.username)
+        .subtitle(format!("{} · active", host_of(&active_server.url)))
+        .build();
+    account_group.add(&account_row);
+    page.add(&account_group);
+
+    // --- Servers: one row per configured server — host as title, its logged-in username (with
+    // an "active" marker on the active server's row) as subtitle — each with a trailing ⋯ menu.
+    // The menu button is its own ≥44px hit target, spaced from the row body's tap target (the
+    // spec's touch-target note). This is where sign-out actually lives — scoped to one
+    // server/account at a time, since a global "Sign Out" would be ambiguous with multiple
+    // servers supported. ---
+    let servers_group = adw::PreferencesGroup::new();
+    servers_group.set_title("Servers");
+
+    #[cfg(test)]
+    let mut server_rows_hooks = Vec::new();
+    for (server, accounts) in &servers_with_accounts {
+        let is_active_server = accounts.iter().any(|account| account.is_active);
+        let subtitle = match accounts.first() {
+            Some(account) if is_active_server => format!("{} · active", account.username),
+            Some(account) => account.username.clone(),
+            None => "No signed-in account".to_string(),
+        };
+        let row = adw::ActionRow::builder().title(host_of(&server.url)).subtitle(&subtitle).build();
+
+        let menu_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+
+        // "Switch to this server" flips the DB's active account to this server's and rebuilds
+        // the shell around it — pointless when this server's account is already the active one,
+        // and impossible when the server has none.
+        let switch_item = gtk4::Button::builder()
+            .label("Switch to this server")
+            .css_classes(["flat"])
+            .height_request(44)
+            .build();
+        switch_item.set_sensitive(!is_active_server && accounts.first().is_some());
+        menu_box.append(&switch_item);
+
+        let sign_out_item = gtk4::Button::builder()
+            .label("Sign Out")
+            .css_classes(["flat"])
+            .height_request(44)
+            .build();
+        sign_out_item.set_sensitive(accounts.first().is_some());
+        menu_box.append(&sign_out_item);
+
+        let remove_item = gtk4::Button::builder()
+            .label("Remove Server")
+            .css_classes(["flat", "destructive-action"])
+            .height_request(44)
+            .build();
+        menu_box.append(&remove_item);
+
+        let menu_button = gtk4::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .css_classes(["flat"])
+            .width_request(44)
+            .height_request(44)
+            .valign(gtk4::Align::Center)
+            .build();
+        menu_button.set_popover(Some(&gtk4::Popover::builder().child(&menu_box).build()));
+        row.add_suffix(&menu_button);
+        servers_group.add(&row);
+
+        if let Some(account) = accounts.first() {
+            switch_item.connect_clicked({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let window = window.clone();
+                let account_id = account.id.clone();
+                move |_| {
+                    let pool = pool.clone();
+                    let paths = paths.clone();
+                    let window = window.clone();
+                    let account_id = account_id.clone();
+                    glib::spawn_future_local(async move {
+                        if let Err(err) = abs_core::accounts::switch_active_account(&pool, &account_id).await {
+                            tracing::warn!(%err, "couldn't switch the active account");
+                            return;
+                        }
+                        crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
+                    });
+                }
+            });
+
+            // Sign-out removes the account row — its local progress and bookmarks cascade away
+            // with it (per-account data, keyed by FK). The server and its cached
+            // libraries/items/downloads survive. Destructive enough to confirm first.
+            sign_out_item.connect_clicked({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let window = window.clone();
+                let account_id = account.id.clone();
+                let username = account.username.clone();
+                move |_| {
+                    let dialog_window = window.clone();
+                    let pool = pool.clone();
+                    let paths = paths.clone();
+                    let window = window.clone();
+                    let account_id = account_id.clone();
+                    confirm(
+                        &dialog_window,
+                        &format!("Sign out of {username}?"),
+                        &format!(
+                            "{username}'s listening progress and bookmarks stored on this device will be \
+                             removed — everything on the server stays where it is."
+                        ),
+                        "Sign Out",
+                        Rc::new(move || {
+                            let pool = pool.clone();
+                            let paths = paths.clone();
+                            let window = window.clone();
+                            let account_id = account_id.clone();
+                            glib::spawn_future_local(async move {
+                                if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
+                                    tracing::warn!(%err, "couldn't sign out");
+                                    return;
+                                }
+                                crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
+                            });
+                        }),
+                    );
+                }
+            });
+        }
+
+        // Removing the server cascades every account/library/item/download record for it
+        // (abs_core::accounts::remove_server) and — unlike sign-out — also purges the server's
+        // on-disk cover/download files, the same cleanup a server switch via relogin performs.
+        remove_item.connect_clicked({
+            let pool = pool.clone();
+            let paths = paths.clone();
+            let window = window.clone();
+            let server_id = server.id.clone();
+            let server_host = host_of(&server.url).to_string();
+            move |_| {
+                let dialog_window = window.clone();
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let window = window.clone();
+                let server_id = server_id.clone();
+                confirm(
+                    &dialog_window,
+                    &format!("Remove {server_host}?"),
+                    "Every account, cached library, item and downloaded file for this server will be \
+                     removed from this device. Everything on the server itself stays untouched.",
+                    "Remove Server",
+                    Rc::new(move || {
+                        let pool = pool.clone();
+                        let paths = paths.clone();
+                        let window = window.clone();
+                        let server_id = server_id.clone();
+                        glib::spawn_future_local(async move {
+                            if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
+                                tracing::warn!(%err, "couldn't remove the server");
+                                return;
+                            }
+                            if let Err(err) = paths.purge_server_data(&server_id).await {
+                                tracing::warn!(%err, server_id = %server_id, "couldn't purge the removed server's on-disk files; they are orphaned but harmless");
+                            }
+                            crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
+                        });
+                    }),
+                );
+            }
+        });
+
+        #[cfg(test)]
+        server_rows_hooks.push(ServerRowHooks {
+            row: row.clone(),
+            switch_item,
+            sign_out_item,
+            remove_item,
+        });
+    }
+
+    // "Add Server" — the only way a second server can ever enter the database: the Welcome flow
+    // it reuses is otherwise only reachable when no account is active at all.
+    let add_server_row = adw::ActionRow::builder().title("Add Server").build();
+    add_server_row.add_prefix(&gtk4::Image::from_icon_name("list-add-symbolic"));
+    add_server_row.set_activatable(true);
+    add_server_row.connect_activated({
+        let pool = pool.clone();
+        let paths = paths.clone();
+        let window = window.clone();
+        move |_| crate::application::show_add_server(&window, pool.clone(), paths.clone(), playback_settings)
+    });
+    servers_group.add(&add_server_row);
+    page.add(&servers_group);
 
     let playback_group = adw::PreferencesGroup::new();
     playback_group.set_title("Playback");
@@ -266,8 +491,47 @@ pub fn build(
             wifi_only_switch,
             theme_row,
             about_row,
+            account_row,
+            server_rows: server_rows_hooks,
+            add_server_row,
         },
     }
+}
+
+/// The `host[:port]` part of a server URL — what Account/Servers rows show instead of the full
+/// scheme-and-path form (the URL in full stays on the server's Connection page).
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// A modal Ok/Cancel confirmation for a destructive session change — the same
+/// `GtkMessageDialog` pattern the Welcome screen's replace-data confirmation uses. Cancel just
+/// destroys the dialog; the confirmed action runs only on the affirmative response.
+fn confirm(
+    window: &adw::ApplicationWindow,
+    heading: &str,
+    body: &str,
+    confirm_label: &str,
+    on_confirm: Rc<dyn Fn()>,
+) {
+    let dialog = gtk4::MessageDialog::builder()
+        .message_type(gtk4::MessageType::Warning)
+        .text(heading)
+        .secondary_text(body)
+        .modal(true)
+        .transient_for(window)
+        .build();
+    dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
+    let confirm_button = dialog.add_button(confirm_label, gtk4::ResponseType::Ok);
+    confirm_button.add_css_class("destructive-action");
+    dialog.connect_response(move |dialog, response| {
+        dialog.destroy();
+        if response == gtk4::ResponseType::Ok {
+            on_confirm();
+        }
+    });
+    dialog.present();
 }
 
 /// An `AdwComboRow` over a plain list of option labels — the string expression is what makes the
@@ -391,10 +655,54 @@ pub(crate) mod tests {
         )
     }
 
+    /// One active server/account — the minimum the signed-in shell (and therefore the Account
+    /// group) requires. Returns the data `build` threads into the screen, in its shape.
+    fn seed_active_session(
+        runtime: &tokio::runtime::Runtime,
+        pool: &sqlx::SqlitePool,
+        url: &str,
+        username: &str,
+    ) -> (abs_storage::models::Server, Vec<abs_storage::models::Account>) {
+        runtime.block_on(async {
+            let server_id = abs_storage::repo::servers::add(pool, url).await.unwrap();
+            let account_id = abs_storage::repo::accounts::add(pool, &server_id, username, "token", None).await.unwrap();
+            abs_storage::repo::accounts::set_active(pool, &account_id).await.unwrap();
+            let server = abs_storage::repo::servers::get(pool, &server_id).await.unwrap();
+            let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
+            (server, vec![account])
+        })
+    }
+
+    fn find_message_dialog() -> Option<gtk4::MessageDialog> {
+        gtk4::Window::list_toplevels()
+            .into_iter()
+            .find_map(|window| window.downcast::<gtk4::MessageDialog>().ok())
+    }
+
+    /// Depth-first search for a button by label — how the Add-Server scenario reaches the
+    /// Welcome screen's Cancel button, which belongs to a screen built inside
+    /// `application::show_add_server` (no hooks cross that boundary).
+    fn find_button_with_label(widget: &gtk4::Widget, label: &str) -> Option<gtk4::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+            if button.label().is_some_and(|text| text == label) {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_button_with_label(&current, label) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
     /// scenario in this binary has to run from one single entry point.
     pub(crate) fn run(runtime: &tokio::runtime::Runtime) {
         let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         let screen = build(
             pool.clone(),
@@ -402,6 +710,8 @@ pub(crate) mod tests {
             test_download_manager(pool.clone()),
             abs_core::settings::PlaybackSettings::default(),
             abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
             adw::ApplicationWindow::builder().build(),
         );
 
@@ -434,6 +744,7 @@ pub(crate) mod tests {
     /// change, persist (including the theme's own key), and the About row opens an about window.
     pub(crate) fn run_playback_defaults_theme_and_about(runtime: &tokio::runtime::Runtime) {
         let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         let download_manager = test_download_manager(pool.clone());
         let screen = build(
@@ -442,6 +753,8 @@ pub(crate) mod tests {
             download_manager.clone(),
             abs_core::settings::PlaybackSettings::default(),
             abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
             adw::ApplicationWindow::builder().build(),
         );
 
@@ -492,5 +805,228 @@ pub(crate) mod tests {
             || gtk4::Window::list_toplevels().iter().any(|w| w.is::<adw::AboutWindow>()),
             Duration::from_secs(2),
         );
+    }
+
+    /// The Account and Servers groups mirror the database: the active account's row (username,
+    /// host · active), one row per server with its username and active marker, and per-server
+    /// menu items whose sensitivity follows who's active. Includes the one action that doesn't
+    /// destroy data — switching the active server — end to end.
+    pub(crate) fn run_account_and_servers_rows_reflect_the_database(runtime: &tokio::runtime::Runtime) {
+        // Two pools on one file: the rebuilt shell's background tasks (home/library syncs against
+        // unreachable servers) hold the main pool's connections for a long time, so post-rebuild
+        // asserts go through their own idle pool instead of contending with them.
+        let (pool, assert_pool) = runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("db.sqlite3");
+            std::mem::forget(tmp);
+            let pool = abs_storage::connect_and_migrate(&db_path).await.unwrap();
+            let assert_pool = abs_storage::connect_and_migrate(&db_path).await.unwrap();
+            (pool, assert_pool)
+        });
+        let mut servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        servers.push(seed_active_session_but_inactive(runtime, &pool, "http://127.0.0.1:2", "bob"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(
+            pool.clone(),
+            controller,
+            test_download_manager(pool.clone()),
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            app_window.clone(),
+        );
+        let hooks = &screen.hooks;
+
+        assert_eq!(hooks.account_row.title(), "jane");
+        assert_eq!(hooks.account_row.subtitle().as_deref(), Some("127.0.0.1:1 · active"));
+
+        assert_eq!(hooks.server_rows.len(), 2, "one row per configured server");
+        assert_eq!(hooks.server_rows[0].row.title(), "127.0.0.1:1");
+        assert_eq!(hooks.server_rows[0].row.subtitle().as_deref(), Some("jane · active"));
+        assert_eq!(hooks.server_rows[1].row.title(), "127.0.0.1:2");
+        assert_eq!(hooks.server_rows[1].row.subtitle().as_deref(), Some("bob"));
+
+        assert!(
+            !hooks.server_rows[0].switch_item.is_sensitive(),
+            "the active server can't be switched to — it's already active"
+        );
+        assert!(hooks.server_rows[0].sign_out_item.is_sensitive() && hooks.server_rows[0].remove_item.is_sensitive());
+
+        // Switching to the second server: the DB's active account flips, and the shell the
+        // settings screen lives in is rebuilt around the new session (here observed as the
+        // window's content being swapped off the screen this build returned).
+        let old_root = screen.root.clone();
+        app_window.set_content(Some(&old_root));
+        hooks.server_rows[1].switch_item.emit_clicked();
+        pump_until(
+            {
+                let old_root = old_root.clone();
+                let app_window = app_window.clone();
+                move || app_window.content().as_ref() != Some(&old_root)
+            },
+            Duration::from_secs(10),
+        );
+        let active = runtime.block_on(abs_storage::repo::accounts::get_active(&assert_pool)).unwrap().unwrap();
+        assert_eq!(active.username, "bob", "switching must make the second server's account active");
+    }
+
+    /// The two destructive menu actions, end to end: confirmed via the same MessageDialog
+    /// pattern the Welcome screen's replacement confirmation uses, and both hand control back
+    /// to `application::show_main_or_welcome` — signing out the only account lands on the
+    /// first-run Welcome screen, and removing the server also purges its on-disk files.
+    pub(crate) fn run_servers_menu_actions_rebuild_the_shell(runtime: &tokio::runtime::Runtime) {
+        // --- Sign out: confirmed, then the account (and its local progress) is gone. ---
+        {
+            let pool = runtime.block_on(crate::test_support::pool());
+            let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+            let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+            let app_window = adw::ApplicationWindow::builder().build();
+            let screen = build(
+                pool.clone(),
+                controller,
+                test_download_manager(pool.clone()),
+                abs_core::settings::PlaybackSettings::default(),
+                abs_core::settings::Theme::default(),
+                crate::test_support::test_paths(),
+                servers,
+                app_window.clone(),
+            );
+            let old_root = screen.root.clone();
+            app_window.set_content(Some(&old_root));
+
+            screen.hooks.server_rows[0].sign_out_item.emit_clicked();
+            pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+            find_message_dialog().unwrap().response(gtk4::ResponseType::Cancel);
+            pump_until(|| find_message_dialog().is_none(), Duration::from_secs(5));
+            assert!(
+                runtime.block_on(abs_storage::repo::accounts::get_active(&pool)).unwrap().is_some(),
+                "a cancelled sign-out must leave the session intact"
+            );
+
+            screen.hooks.server_rows[0].sign_out_item.emit_clicked();
+            pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+            find_message_dialog().unwrap().response(gtk4::ResponseType::Ok);
+            pump_until(
+                {
+                    let old_root = old_root.clone();
+                    let app_window = app_window.clone();
+                    move || app_window.content().as_ref() != Some(&old_root)
+                },
+                Duration::from_secs(10),
+            );
+            assert!(
+                runtime.block_on(abs_storage::repo::accounts::get_active(&pool)).unwrap().is_none(),
+                "a confirmed sign-out must remove the account — with no account left, the shell hands over to Welcome"
+            );
+        }
+
+        // --- Remove server: confirmed, then rows cascade and the on-disk cache is purged. ---
+        {
+            let pool = runtime.block_on(crate::test_support::pool());
+            let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+            let paths = crate::test_support::test_paths();
+            let cover = paths.cover_cache_path(&servers[0].0.id, "item-1", "jpg");
+            std::fs::create_dir_all(cover.parent().unwrap()).unwrap();
+            std::fs::write(&cover, b"bytes").unwrap();
+
+            let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+            let app_window = adw::ApplicationWindow::builder().build();
+            let screen = build(
+                pool.clone(),
+                controller,
+                test_download_manager(pool.clone()),
+                abs_core::settings::PlaybackSettings::default(),
+                abs_core::settings::Theme::default(),
+                paths,
+                servers,
+                app_window.clone(),
+            );
+            let old_root = screen.root.clone();
+            app_window.set_content(Some(&old_root));
+
+            screen.hooks.server_rows[0].remove_item.emit_clicked();
+            pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+            find_message_dialog().unwrap().response(gtk4::ResponseType::Ok);
+            pump_until(
+                {
+                    let old_root = old_root.clone();
+                    let app_window = app_window.clone();
+                    move || app_window.content().as_ref() != Some(&old_root)
+                },
+                Duration::from_secs(10),
+            );
+            assert!(runtime.block_on(abs_storage::repo::servers::list(&pool)).unwrap().is_empty(), "the server row must be gone");
+            assert!(!cover.exists(), "the server's on-disk cover cache must be purged, not orphaned");
+        }
+    }
+
+    /// "Add Server" reuses the Welcome flow over the signed-in shell — and, unlike the first
+    /// run, it must offer a way back: Cancel restores the shell exactly as it was (the captured
+    /// root widget, not a rebuild).
+    pub(crate) fn run_add_server_row_opens_welcome_and_cancels_back(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(
+            pool.clone(),
+            controller,
+            test_download_manager(pool.clone()),
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            app_window.clone(),
+        );
+        let old_root = screen.root.clone();
+        app_window.set_content(Some(&old_root));
+
+        adw::prelude::ActionRowExt::activate(&screen.hooks.add_server_row);
+        pump_until(
+            {
+                let old_root = old_root.clone();
+                let app_window = app_window.clone();
+                move || app_window.content().as_ref() != Some(&old_root)
+            },
+            Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("the Add-Server flow swaps the window's content");
+        // `is_visible` walks up to the toplevel — an unpresented window would make everything
+        // report invisible, so map it first (same as the shell scenario's Ctrl+F focus check).
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+        let cancel = find_button_with_label(&content, "Cancel")
+            .expect("an Add-Server flow started from Settings must be cancelable — the shell is still behind it");
+        assert!(cancel.is_visible());
+
+        cancel.emit_clicked();
+        pump_until(
+            {
+                let old_root = old_root.clone();
+                let app_window = app_window.clone();
+                move || app_window.content().as_ref() == Some(&old_root)
+            },
+            Duration::from_secs(10),
+        );
+    }
+
+    /// `seed_active_session` for a *second* server: its account is created but never activated, the
+    /// shape the Servers group must render for a server you're not currently using.
+    fn seed_active_session_but_inactive(
+        runtime: &tokio::runtime::Runtime,
+        pool: &sqlx::SqlitePool,
+        url: &str,
+        username: &str,
+    ) -> (abs_storage::models::Server, Vec<abs_storage::models::Account>) {
+        runtime.block_on(async {
+            let server_id = abs_storage::repo::servers::add(pool, url).await.unwrap();
+            let account_id = abs_storage::repo::accounts::add(pool, &server_id, username, "token", None).await.unwrap();
+            let server = abs_storage::repo::servers::get(pool, &server_id).await.unwrap();
+            let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
+            (server, vec![account])
+        })
     }
 }

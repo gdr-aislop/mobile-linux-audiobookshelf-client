@@ -107,18 +107,80 @@ pub(crate) fn show_welcome(
             // The just-logged-in account is the active one by the time on_success fires, so
             // resolving the main window from the DB's active account (rather than the callback's
             // ids) builds the identical shell — and doubles as the Cancel flow's entry point.
-            let pool = on_success_pool.clone();
-            let paths = on_success_paths.clone();
-            let window = window_for_callback.clone();
-            glib::spawn_future_local(async move {
-                let main_window =
-                    build_main_window(pool, paths, playback_settings, window.clone()).await;
-                window.set_content(Some(&main_window.root));
-            });
+            show_main(&window_for_callback, on_success_pool.clone(), on_success_paths.clone(), playback_settings);
         },
         on_cancel,
     );
     window.set_content(Some(&screen.root));
+}
+
+/// "Add Server" from Settings' Servers group: the plain first-run login flow (`previous=None`
+/// runs `add_server_and_login`), shown over the signed-in shell with a Cancel affordance back
+/// to it — the Welcome screen only drops its Cancel button when no way back exists, so one is
+/// provided here. A successful connect makes the new account the active one and rebuilds the
+/// shell from the database exactly like every other session change.
+pub(crate) fn show_add_server(
+    window: &adw::ApplicationWindow,
+    pool: SqlitePool,
+    paths: abs_storage::AppPaths,
+    playback_settings: abs_core::settings::PlaybackSettings,
+) {
+    // Captured before the swap: Cancel restores this exact widget, so the shell keeps its state
+    // (open tab, scroll positions) — the same policy as collapsing the full player. A successful
+    // connect, by contrast, rebuilds: the new account is the active one and the old shell's
+    // session is stale.
+    let on_cancel: std::rc::Rc<dyn Fn()> = match window.content() {
+        Some(previous_root) => {
+            let window = window.clone();
+            std::rc::Rc::new(move || window.set_content(Some(&previous_root)))
+        }
+        None => {
+            let pool = pool.clone();
+            let paths = paths.clone();
+            let window = window.clone();
+            std::rc::Rc::new(move || show_main(&window, pool.clone(), paths.clone(), playback_settings))
+        }
+    };
+    let on_success_pool = pool.clone();
+    let on_success_paths = paths.clone();
+    let on_success_window = window.clone();
+    let screen = screens::welcome::build(
+        pool,
+        paths,
+        None,
+        move |_added| show_main(&on_success_window, on_success_pool.clone(), on_success_paths.clone(), playback_settings),
+        Some(on_cancel),
+    );
+    window.set_content(Some(&screen.root));
+}
+
+/// The single entry point after any session mutation from Settings (switch server, sign out,
+/// remove server): resolves the database's active account and swaps the window's content for
+/// the main shell when one exists, or the plain first-run Welcome screen when none does (the
+/// last account signed out or the last server removed). The old shell — and with it any
+/// ongoing playback — is dropped by the swap; ending the session that was playing is the
+/// point of signing out, not a side effect to engineer around.
+pub(crate) fn show_main_or_welcome(
+    window: &adw::ApplicationWindow,
+    pool: SqlitePool,
+    paths: abs_storage::AppPaths,
+    playback_settings: abs_core::settings::PlaybackSettings,
+) {
+    let window_for_callback = window.clone();
+    glib::spawn_future_local(async move {
+        let active = abs_storage::repo::accounts::get_active(&pool)
+            .await
+            .expect("checking for an active account must not fail");
+        match active {
+            Some(_) => {
+                let main_window =
+                    build_main_window(pool, paths, playback_settings, window_for_callback.clone())
+                        .await;
+                window_for_callback.set_content(Some(&main_window.root));
+            }
+            None => show_welcome(&window_for_callback, pool, paths, playback_settings, None),
+        }
+    });
 }
 
 /// Swaps the window's content for the main shell, resolved from the database's active account —
@@ -157,7 +219,33 @@ async fn build_main_window(
         .expect("an active account's server must exist");
     let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
     let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-    screens::main_window::build(pool, paths, server, account, session, playback_settings, theme, window)
+    let servers_with_accounts = fetch_servers_with_accounts(&pool).await;
+    screens::main_window::build(
+        pool,
+        paths,
+        server,
+        account,
+        session,
+        playback_settings,
+        theme,
+        servers_with_accounts,
+        window,
+    )
+}
+
+/// Every configured server with its accounts, in creation order — the data behind Settings'
+/// Account and Servers groups. Each server's account list is fetched separately (a join would
+/// hand back flat rows to regroup anyway).
+pub(crate) async fn fetch_servers_with_accounts(pool: &SqlitePool) -> Vec<(abs_storage::models::Server, Vec<abs_storage::models::Account>)> {
+    let servers = abs_storage::repo::servers::list(pool).await.expect("listing servers must not fail");
+    let mut result = Vec::with_capacity(servers.len());
+    for server in servers {
+        let accounts = abs_storage::repo::accounts::list_for_server(pool, &server.id)
+            .await
+            .expect("listing a server's accounts must not fail");
+        result.push((server, accounts));
+    }
+    result
 }
 
 /// The keyboard half of ui-spec §6: the accelerators (app-wide — they only fire when the matching
