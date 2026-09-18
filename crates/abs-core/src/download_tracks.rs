@@ -18,7 +18,7 @@ use futures::StreamExt;
 use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 
-use abs_storage::models::DownloadStatus;
+use abs_storage::models::{DownloadStatus, DownloadTrack};
 use abs_storage::AppPaths;
 
 use crate::error::Result;
@@ -141,6 +141,32 @@ pub async fn chapter_offline_markers_for_item(pool: &SqlitePool, server_id: &str
     Ok(chapter_offline_markers(&tracks, &chapters, &complete))
 }
 
+/// A `Complete` row is only trustworthy if its file still exists on disk with the size recorded at
+/// download time — a size mismatch (or a missing file, e.g. deleted externally) means the row is
+/// stale, and callers must treat it the same as "not downloaded" rather than crash or play/report a
+/// corrupt file. Shared by `download_track`'s own idempotency check (skip a re-download) and
+/// `local_track_path` below (prefer a local file over streaming) — one definition of "trustworthy",
+/// not two copies that could quietly drift apart.
+async fn verified_complete_path(row: &DownloadTrack) -> Option<PathBuf> {
+    if row.status != DownloadStatus::Complete {
+        return None;
+    }
+    let metadata = tokio::fs::metadata(&row.file_path).await.ok()?;
+    let size_matches = row.expected_size_bytes.map(|expected| expected as u64 == metadata.len()).unwrap_or(true);
+    size_matches.then(|| PathBuf::from(&row.file_path))
+}
+
+/// The on-disk path for a track, if — and only if — it's verifiably safe to play from: a `Complete`
+/// row whose file still matches its recorded size. `None` covers every other case (never downloaded,
+/// still in progress, failed, or a stale/corrupted row) uniformly, so callers (playback, preferring
+/// a local file over streaming) never have to distinguish "why not" — they just fall back to
+/// streaming. Never fails the caller: a DB read error is treated the same as "not downloaded",
+/// matching this module's existing best-effort posture (`covers`, `item_offline_availability`).
+pub async fn local_track_path(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str) -> Option<PathBuf> {
+    let row = abs_storage::repo::download_tracks::get(pool, server_id, item_id, ino).await.ok()??;
+    verified_complete_path(&row).await
+}
+
 /// Which of an item's tracks are fully downloaded — what `chapter_offline_markers` needs to turn
 /// into per-chapter glyphs, without the Player screen having to reach into `abs_storage` directly
 /// (the same boundary `item_offline_availability` above already respects).
@@ -209,13 +235,8 @@ pub async fn download_track(
     let existing = abs_storage::repo::download_tracks::get(pool, server_id, item_id, ino).await?;
 
     if let Some(row) = &existing {
-        if row.status == DownloadStatus::Complete {
-            if let Ok(metadata) = tokio::fs::metadata(&row.file_path).await {
-                let size_matches = row.expected_size_bytes.map(|expected| expected as u64 == metadata.len()).unwrap_or(true);
-                if size_matches {
-                    return Ok(TrackDownloadOutcome::Completed);
-                }
-            }
+        if verified_complete_path(row).await.is_some() {
+            return Ok(TrackDownloadOutcome::Completed);
         }
     }
 
@@ -521,6 +542,32 @@ mod tests {
 
         abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 10).await.unwrap();
         assert_eq!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap(), BTreeSet::from(["a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn local_track_path_is_none_unless_complete_and_verified() {
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["a"]).await;
+        assert!(local_track_path(&pool, &server_id, "item-1", "a").await.is_none(), "never downloaded");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.mp3");
+        tokio::fs::write(&file_path, b"hello").await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "a", file_path.to_str().unwrap()).await.unwrap();
+        assert!(local_track_path(&pool, &server_id, "item-1", "a").await.is_none(), "pending, not yet complete");
+
+        abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "a", 5, Some(10)).await.unwrap();
+        assert!(local_track_path(&pool, &server_id, "item-1", "a").await.is_none(), "downloading, not yet complete");
+
+        // Mark complete claiming a size that doesn't match the real 5-byte file — a stale/corrupt
+        // row must not be trusted.
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 999).await.unwrap();
+        assert!(local_track_path(&pool, &server_id, "item-1", "a").await.is_none(), "complete but size mismatch");
+
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 5).await.unwrap();
+        assert_eq!(local_track_path(&pool, &server_id, "item-1", "a").await, Some(file_path.clone()));
+
+        tokio::fs::remove_file(&file_path).await.unwrap();
+        assert!(local_track_path(&pool, &server_id, "item-1", "a").await.is_none(), "complete row whose file is gone must not be trusted");
     }
 
     #[tokio::test]

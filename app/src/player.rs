@@ -28,6 +28,19 @@ use abs_storage::AppPaths;
 
 use crate::widgets::cover_image::CoverImage;
 
+/// The URL/URI to actually load for a track: a local `file://` path when it's been verifiably
+/// downloaded (see `abs_core::download_tracks::local_track_path` — never a stale/corrupt row), a
+/// streaming URL otherwise. `gio::File::for_path(..).uri()` is the same correctly-percent-encoded
+/// pattern this file already uses for MPRIS album-art URLs, not a raw `format!("file://{}", ..)`.
+/// The access token is only fetched in the streaming branch — pointless (and, if genuinely
+/// offline, noisy) to refresh a token for a track that's about to play from disk anyway.
+async fn resolve_playable_url(pool: &SqlitePool, server_url: &str, server_id: &str, item_id: &str, ino: &str, session: &abs_core::auth::Session) -> String {
+    if let Some(path) = abs_core::download_tracks::local_track_path(pool, server_id, item_id, ino).await {
+        return gio::File::for_path(&path).uri().to_string();
+    }
+    abs_core::streaming::track_url(server_url, item_id, ino, &session.access_token().await)
+}
+
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -250,19 +263,20 @@ impl Inner {
     /// pausing mid-transition is respected rather than overridden.
     fn spawn_load_track(inner_rc: Rc<RefCell<Inner>>, item_id: String, track_index: usize, within_seconds: f64) {
         glib::spawn_future_local(async move {
-            let (server_url, session, ino, speed) = {
+            let (pool, server_url, server_id, session, ino, speed) = {
                 let inner = inner_rc.borrow();
                 let Some(now_playing) = &inner.now_playing else { return };
                 if now_playing.item_id != item_id {
                     return;
                 }
                 let Some(track) = now_playing.tracks.get(track_index) else { return };
-                (now_playing.server_url.clone(), now_playing.session.clone(), track.ino.clone(), now_playing.speed)
+                (inner.pool.clone(), now_playing.server_url.clone(), now_playing.server_id.clone(), now_playing.session.clone(), track.ino.clone(), now_playing.speed)
             };
-            // The track URL baked at resolve time carried the token from back then — by the time
-            // a multi-file book advances (possibly hours later) it can be expired. Rebuild it
-            // with a current one; `ino` identifies the same file either way.
-            let url = abs_core::streaming::track_url(&server_url, &item_id, &ino, &session.access_token().await);
+            // Prefers a verifiably-downloaded local file over streaming; the streaming URL, when
+            // used, is rebuilt with a current token rather than reusing whatever `resolve_stream_target`
+            // baked in at resolve time — by the time a multi-file book advances (possibly hours
+            // later) that one can be expired.
+            let url = resolve_playable_url(&pool, &server_url, &server_id, &item_id, &ino, &session).await;
 
             {
                 let mut inner = inner_rc.borrow_mut();
@@ -526,9 +540,11 @@ impl PlayerController {
                 .map(|c| ChapterInfo { title: c.title.clone(), start_seconds: c.start_seconds, end_seconds: c.end_seconds })
                 .collect();
 
+            let start_url = resolve_playable_url(&pool, session.server_url(), session.server_id(), &item.item_id, &target.tracks[start_track].ino, &session).await;
+
             {
                 let mut inner = inner_rc.borrow_mut();
-                if let Err(err) = inner.backend.load(&target.tracks[start_track].url) {
+                if let Err(err) = inner.backend.load(&start_url) {
                     tracing::warn!(%err, "couldn't load the audio stream");
                     return;
                 }
@@ -728,6 +744,17 @@ impl PlayerController {
                         // The next file exists — keep going. The load happens on the main loop
                         // (see `spawn_load_track`); the state machine has already moved on.
                         Inner::spawn_load_track(self.inner.clone(), item_id, next_track, 0.0);
+                        // `spawn_load_track` hasn't run `backend.load()` yet — the backend still
+                        // reports the *old* pipeline's position, which `book_position()` would
+                        // now misattribute to the new (already-bumped) `current_track`'s offset,
+                        // producing a bogus overshot position (old-track offset's worth of extra
+                        // seconds) for one tick. Returning here instead of falling through to the
+                        // unconditional `publish()` below skips that one bad snapshot; the reload
+                        // publishes its own correct one (`backend_pos: None` right after `load()`)
+                        // moments later. Caught via a real timing-dependent test failure once an
+                        // async DB check (`resolve_playable_url`) widened this race's window
+                        // enough to make it land inside a test's polling loop.
+                        return;
                     } else {
                         let _ = inner.backend.pause();
                         if let Some(now_playing) = &mut inner.now_playing {
@@ -1328,6 +1355,127 @@ pub(crate) mod tests {
         let duration = controller.snapshot().unwrap().duration_seconds;
         assert!((duration - 4.0).abs() < 0.5, "book total should be corrected to ~4s, got {duration}");
 
+        controller.stop();
+    }
+
+    /// Seeds a `Complete` `download_tracks` row for `ino` pointing at a real file written with
+    /// `bytes` — the exact "trustworthy" shape `local_track_path`/`verified_complete_path` require
+    /// (status `Complete`, on-disk size matching `expected_size_bytes`).
+    async fn seed_downloaded_track(pool: &SqlitePool, paths: &AppPaths, server_id: &str, item_id: &str, ino: &str, bytes: &[u8]) {
+        // `download_tracks` has a foreign key on `(server_id, item_id, ino)` referencing `tracks`
+        // — a row must exist there first (normally written by `sync_item_tracks` after resolving
+        // the stream target); a fixed `offset_seconds: 0.0` is fine since these tests don't
+        // exercise chapter/track-offset mapping.
+        abs_storage::repo::tracks::upsert_all(pool, server_id, item_id, &[abs_storage::repo::tracks::NewTrack { ino, duration_seconds: 0.0, offset_seconds: 0.0 }]).await.unwrap();
+
+        let path = paths.track_file_path(server_id, item_id, ino, "wav");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, bytes).await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(pool, server_id, item_id, ino, path.to_str().unwrap()).await.unwrap();
+        abs_storage::repo::download_tracks::mark_complete(pool, server_id, item_id, ino, bytes.len() as i64).await.unwrap();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A track that's already been
+    /// downloaded (a `Complete` row with a real, correctly-sized file on disk) must be played from
+    /// that local file instead of streaming it again — asserted by checking the file endpoint was
+    /// never actually requested, not just that playback worked.
+    pub(crate) fn run_downloaded_track_is_preferred_over_streaming(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+
+        let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool, &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.duration_seconds > 0.0), Duration::from_secs(10));
+        // Give playback a real moment to run — long enough that a streamed track would definitely
+        // have issued its HTTP request by now.
+        pump_until(|| false, Duration::from_millis(500));
+
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            !requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/1"),
+            "a downloaded track must be played from disk, not re-streamed"
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A `Complete` row whose file has gone
+    /// missing (deleted externally after the row was written) must not be trusted — playback falls
+    /// back to streaming rather than failing to load anything.
+    pub(crate) fn run_untrustworthy_complete_row_falls_back_to_streaming(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+        // Delete the file after the row was written — the row still says `Complete`, but it's a
+        // lie now.
+        let stale_path = paths.track_file_path(&server.id, "item-1", "1", "wav");
+        runtime.block_on(tokio::fs::remove_file(&stale_path)).unwrap();
+
+        let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool, &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(
+            || runtime.block_on(mock_server.received_requests()).unwrap().iter().any(|r| r.url.path() == "/api/items/item-1/file/1"),
+            Duration::from_secs(10),
+        );
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/1"),
+            "an untrustworthy Complete row (missing file) must fall back to streaming"
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Mixed state across a two-track item:
+    /// the first track is downloaded, the second isn't. Starting plays the first from disk (no
+    /// request), and crossing into the second (via `spawn_load_track`) streams it (a request).
+    pub(crate) fn run_multi_track_mixed_downloaded_and_streamed(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item(&mock_server, 2));
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(2)));
+
+        let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool, &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Multi-track Book".to_string(), author: None },
+            1.0,
+        );
+
+        // The first track plays from disk — give it a real moment, then confirm no request for
+        // its file landed, before letting it run on into the second (streamed) track.
+        pump_until(|| controller.snapshot().is_some_and(|s| s.duration_seconds > 0.0), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(!requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/1"), "the downloaded first track must not be streamed");
+
+        pump_until(
+            || runtime.block_on(mock_server.received_requests()).unwrap().iter().any(|r| r.url.path() == "/api/items/item-1/file/2"),
+            Duration::from_secs(15),
+        );
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/2"), "the not-yet-downloaded second track must be streamed");
         controller.stop();
     }
 

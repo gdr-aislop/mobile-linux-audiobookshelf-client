@@ -116,6 +116,9 @@ mod tests {
         crate::screens::main_window::tests::run(&runtime);
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
+        crate::player::tests::run_downloaded_track_is_preferred_over_streaming(&runtime);
+        crate::player::tests::run_untrustworthy_complete_row_falls_back_to_streaming(&runtime);
+        crate::player::tests::run_multi_track_mixed_downloaded_and_streamed(&runtime);
         crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
         crate::player::tests::run_track_duration_correction_updates_the_book_total(&runtime);
         crate::player::tests::run_multi_track_advances_to_the_next_track(&runtime);
