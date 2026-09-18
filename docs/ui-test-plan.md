@@ -699,10 +699,14 @@ built (the tests below define the target behavior).
 
 - [ ] **DS-4 — Mid-download row.** While a large download runs, look at the Downloads tab.
       *Expected:* that item's row shows a progress indicator in place of the remove button, plus
-      a separate, well-spaced (≥ 44×44 px) cancel action.
+      a separate, well-spaced (≥ 44×44 px) stop action; the gray subtitle below the title shows
+      live progress — "3/10 chapters · 18.2 MB · 2.1 MB/s" (chapter fraction, bytes, smoothed
+      speed) — while the spinner stays as the at-a-glance cue.
 
-- [ ] **DS-5 — Cancel keeps completed chapters.** Cancel an in-progress download from here.
-      *Expected:* the transfer stops but completed chapters remain valid offline content —
+- [ ] **DS-5 — Stop keeps completed chapters.** Press Stop on an in-progress download (Downloads
+      tab row, or the "Stop download" row in the player's download dropdown while it's running).
+      *Expected:* the transfer stops but completed chapters remain valid offline content and the
+      row settles into their "N chapters, size" summary — never shown as a failure —
       matching Item detail's resumable behavior.
 
 - [ ] **DS-6 — Empty state.** Remove every download (or fresh install).

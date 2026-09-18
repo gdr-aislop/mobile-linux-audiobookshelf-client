@@ -195,6 +195,7 @@ mod tests {
         (downloads_screen_empty_state_renders_when_nothing_is_downloaded, crate::screens::downloads::tests::run_empty_state_renders_when_nothing_is_downloaded),
         (downloads_screen_in_progress_download_shows_a_cancel_row, crate::screens::downloads::tests::run_in_progress_download_shows_a_cancel_row),
         (downloads_screen_in_progress_download_shows_progress_and_speed, crate::screens::downloads::tests::run_in_progress_download_shows_progress_and_speed),
+        (downloads_screen_stop_keeps_completed_chapters_and_stops_the_job, crate::screens::downloads::tests::run_stop_keeps_completed_chapters_and_stops_the_job),
         (downloads_screen_completed_download_can_be_removed, crate::screens::downloads::tests::run_completed_download_can_be_removed),
     }
 

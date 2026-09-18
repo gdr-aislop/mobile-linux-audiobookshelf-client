@@ -41,6 +41,10 @@ pub enum ItemDownloadState {
     Idle,
     Downloading,
     Complete,
+    /// The user pressed Stop on an in-flight download: in-flight tracks were canceled and the
+    /// chapters that had already completed stay downloaded (their files and rows are untouched) —
+    /// a user-driven end, deliberately distinct from `Failed` (where a track itself errored).
+    Stopped,
     Failed,
 }
 
@@ -127,6 +131,12 @@ impl DownloadManager {
         let inner = self.inner.borrow();
         let batch = inner.batches.get(&(server_id.to_string(), item_id.to_string()))?;
         Some((batch.finished(), batch.total))
+    }
+
+    /// Whether a download batch is currently in flight for this item — the player's download
+    /// dropdown uses this to offer Stop exactly while there's something to stop.
+    pub fn is_downloading(&self, server_id: &str, item_id: &str) -> bool {
+        self.inner.borrow().batches.contains_key(&(server_id.to_string(), item_id.to_string()))
     }
 
     pub fn set_wifi_only(&self, value: bool) {
@@ -290,21 +300,17 @@ impl DownloadManager {
             return;
         }
 
-        let (failed, canceled, completed) = (batch.failed, batch.canceled, batch.completed);
+        let (failed, canceled) = (batch.failed, batch.canceled);
         inner.batches.remove(&key);
 
         let state = if failed > 0 {
             ItemDownloadState::Failed
-        } else if canceled > 0 && completed == 0 {
-            // Every remaining track was canceled and none of them ever succeeded — a user-driven
-            // stop, not a failure. A batch that's a mix of completed and canceled tracks (the user
-            // canceled partway through) still counts as a failure to finish the *requested* scope,
-            // surfaced as `Failed` so the caller knows the scope wasn't fully satisfied — a later
-            // pass can query `abs_core::download_tracks::item_offline_availability` for the exact
-            // partial picture.
-            ItemDownloadState::Idle
         } else if canceled > 0 {
-            ItemDownloadState::Failed
+            // The user stopped the job — whatever completed chapters exist are kept (their files
+            // and rows were never touched by cancellation), and a stop with nothing completed
+            // simply leaves nothing behind. Never surfaced as a failure: pressing Stop isn't an
+            // error, and the completed part is exactly what was asked to be saved.
+            ItemDownloadState::Stopped
         } else {
             ItemDownloadState::Complete
         };
@@ -531,12 +537,12 @@ pub(crate) mod tests {
         manager.cancel_item(&server.id, "item-1");
 
         pump_until(
-            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Idle, .. })),
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Stopped, .. })),
             Duration::from_secs(10),
         );
         assert!(
-            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Idle, .. })),
-            "a fully-canceled batch with nothing completed should settle on Idle"
+            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Stopped, .. })),
+            "a fully-canceled batch with nothing completed should settle on Stopped — the user's stop, not a failure"
         );
 
         let row = runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap();

@@ -134,7 +134,7 @@ pub fn build(
                     ItemDownloadState::Downloading => {
                         widgets.downloading.borrow_mut().insert(item_id.clone());
                     }
-                    ItemDownloadState::Idle | ItemDownloadState::Complete | ItemDownloadState::Failed => {
+                    ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Complete | ItemDownloadState::Failed => {
                         widgets.downloading.borrow_mut().remove(item_id);
                     }
                 }
@@ -267,8 +267,10 @@ fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download
 
     if is_downloading {
         let spinner = gtk4::Spinner::builder().spinning(true).valign(gtk4::Align::Center).build();
-        let cancel_button = gtk4::Button::builder().icon_name("process-stop-symbolic").tooltip_text("Cancel").css_classes(["flat"]).valign(gtk4::Align::Center).build();
-        cancel_button.connect_clicked({
+        // Stop, not cancel-delete: chapters that already completed stay downloaded (the row's own
+        // subtitle switches to their "N chapters, size" summary once the batch winds down).
+        let stop_button = gtk4::Button::builder().icon_name("process-stop-symbolic").tooltip_text("Stop").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+        stop_button.connect_clicked({
             let download_manager = download_manager.clone();
             let server_id = server_id.to_string();
             let item_id = item.id.clone();
@@ -276,7 +278,7 @@ fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download
         });
         let box_ = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).build();
         box_.append(&spinner);
-        box_.append(&cancel_button);
+        box_.append(&stop_button);
         row.add_suffix(&box_);
     } else {
         let remove_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Remove").css_classes(["flat"]).valign(gtk4::Align::Center).build();
@@ -381,6 +383,34 @@ pub(crate) mod tests {
             .await;
     }
 
+    /// Two one-chapter-per-file tracks where the first completes immediately and the second is
+    /// deliberately slow — the window a Stop press lands in after chapter 1 is already saved.
+    async fn mock_two_track_item_slow_second(mock_server: &MockServer, item_id: &str, delay: Duration) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [{ "ino": "1", "duration": 5.0 }, { "ino": "2", "duration": 5.0 }],
+                    "chapters": [
+                        { "id": 0, "start": 0.0, "end": 5.0, "title": "Chapter 1" },
+                        { "id": 1, "start": 5.0, "end": 10.0, "title": "Chapter 2" },
+                    ],
+                }
+            })))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}/file/1")))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "5").set_body_bytes(b"hello".to_vec()))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}/file/2")))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "5").set_delay(delay).set_body_bytes(b"hello".to_vec()))
+            .mount(mock_server)
+            .await;
+    }
+
     fn test_download_manager(pool: SqlitePool) -> DownloadManager {
         DownloadManager::new(pool, test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false)
     }
@@ -464,6 +494,57 @@ pub(crate) mod tests {
         );
         let subtitle = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap().subtitle().unwrap();
         assert_eq!(subtitle, "1 chapter, 5 B", "completed subtitle is the static chapters+size summary");
+    }
+
+    /// Pressing Stop mid-batch is a graceful end: the chapters that already completed stay
+    /// downloaded (the row settles into their summary), the job winds down, and the state is
+    /// `Stopped` — deliberately not a failure.
+    pub(crate) fn run_stop_keeps_completed_chapters_and_stops_the_job(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item_slow_second(&mock_server, "item-1", Duration::from_secs(3)));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone());
+        let hooks = screen.test_hooks();
+
+        let events: Rc<RefCell<Vec<DownloadEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        manager.add_listener({
+            let events = events.clone();
+            move |event| events.borrow_mut().push(event.clone())
+        });
+
+        manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+
+        // Wait until chapter 1's track is fully downloaded, then stop while chapter 2 lags.
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|row| row.status == DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+        manager.cancel_item(&server.id, "item-1");
+
+        pump_until(
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Stopped, .. })),
+            Duration::from_secs(10),
+        );
+
+        // The completed chapter survived the stop…
+        let track_1 = runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().unwrap();
+        assert_eq!(track_1.status, DownloadStatus::Complete, "a stopped download keeps its completed chapters");
+        // …and the row settles into the completed-summary view instead of disappearing.
+        pump_until(
+            || {
+                hooks
+                    .list_box
+                    .row_at_index(0)
+                    .and_then(|row| row.downcast::<adw::ActionRow>().ok())
+                    .and_then(|row| row.subtitle())
+                    .is_some_and(|subtitle| subtitle == "1 chapter, 5 B")
+            },
+            Duration::from_secs(10),
+        );
     }
 
     /// A completed download shows a row with a remove button; removing it deletes the row and the

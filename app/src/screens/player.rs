@@ -350,7 +350,9 @@ pub fn build(
             download_button.set_icon_name(match state {
                 ItemDownloadState::Downloading => "content-loading-symbolic",
                 ItemDownloadState::Complete => "emblem-ok-symbolic",
-                ItemDownloadState::Idle | ItemDownloadState::Failed => "folder-download-symbolic",
+                // A stopped download kept its completed chapters — the button returns to its
+                // "can start/continue a download" state, same as idle.
+                ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Failed => "folder-download-symbolic",
             });
         }
     });
@@ -590,6 +592,27 @@ fn populate_download_popover_rows(
 
     let scopes: [(&str, DownloadScope); 4] =
         [("Current chapter", DownloadScope::CurrentChapter), ("Next 10 chapters", DownloadScope::NextChapters(10)), ("Remaining chapters", DownloadScope::RemainingChapters), ("Entire book", DownloadScope::EntireBook)];
+
+    // While a download is in flight for this item, Stop is the first action — it ends the job
+    // keeping the chapters that already completed (same semantics as the Downloads screen's
+    // stop button), whereas "Clear downloaded chapters" at the bottom deletes everything.
+    if download_manager.is_downloading(session.server_id(), item_id) {
+        let stop_button = gtk4::Button::builder().label("Stop download").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        stop_button.connect_clicked({
+            let download_manager = download_manager.clone();
+            let popover = popover.clone();
+            let server_id = session.server_id().to_string();
+            let item_id = item_id.to_string();
+            let toast_overlay = toast_overlay.clone();
+            move |_| {
+                download_manager.cancel_item(&server_id, &item_id);
+                popover.popdown();
+                toast_overlay.add_toast(adw::Toast::new("Download stopped"));
+            }
+        });
+        popover_box.append(&stop_button);
+    }
+
     for (label, scope) in scopes {
         let button = gtk4::Button::builder().label(label).css_classes(["flat"]).halign(gtk4::Align::Start).build();
         button.connect_clicked({
