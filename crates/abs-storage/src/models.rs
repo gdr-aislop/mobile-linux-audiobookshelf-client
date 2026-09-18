@@ -78,22 +78,64 @@ pub struct Progress {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Cached per-item track metadata — mirrors `abs_core::streaming::StreamTrack`, persisted so
+/// downloads (and, later, offline-availability checks) don't need a network call to know what a
+/// book's tracks are.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
-pub struct Download {
+pub struct Track {
     pub server_id: String,
     pub item_id: String,
-    pub chapter_index: i64,
-    pub file_path: String,
-    pub file_size_bytes: i64,
-    pub downloaded_at: DateTime<Utc>,
+    pub ino: String,
+    pub track_index: i64,
+    pub duration_seconds: f64,
+    pub offset_seconds: f64,
 }
 
-/// A download is "fully" downloaded when every chapter of the item has a row; "partially" when
-/// at least one chapter does — matching the offline-mode toggle's "fully or partially downloaded"
-/// filter from `docs/design/ui-spec.md`.
+/// A track download's lifecycle. `Downloading` and `Failed` both retain whatever
+/// `bytes_downloaded` was reached, so a `Downloading` row left behind by an ungraceful app exit is
+/// just as resumable as a `Failed` one — the status only reflects "what happened last", not
+/// whether resuming is possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadCompleteness {
-    None,
-    Partial,
-    Full,
+pub enum DownloadStatus {
+    Pending,
+    Downloading,
+    Complete,
+    Failed,
+}
+
+impl DownloadStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DownloadStatus::Pending => "pending",
+            DownloadStatus::Downloading => "downloading",
+            DownloadStatus::Complete => "complete",
+            DownloadStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for DownloadStatus {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(DownloadStatus::Pending),
+            "downloading" => Ok(DownloadStatus::Downloading),
+            "complete" => Ok(DownloadStatus::Complete),
+            "failed" => Ok(DownloadStatus::Failed),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadTrack {
+    pub server_id: String,
+    pub item_id: String,
+    pub ino: String,
+    pub file_path: String,
+    pub expected_size_bytes: Option<i64>,
+    pub bytes_downloaded: i64,
+    pub status: DownloadStatus,
+    pub error_reason: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }

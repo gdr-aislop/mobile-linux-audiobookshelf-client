@@ -37,7 +37,7 @@ pub async fn fetch_and_cache_cover(
         }
     };
 
-    let extension = extension_for_content_type(&cover.content_type);
+    let extension = crate::media_type::extension_for(&cover.content_type, "jpg");
     let dir = paths.covers_dir().join(server_id);
     if let Err(err) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(%err, item_id, "couldn't create the covers cache directory");
@@ -64,29 +64,12 @@ async fn already_cached(pool: &SqlitePool, server_id: &str, item_id: &str) -> Op
     Some(existing)
 }
 
-fn extension_for_content_type(content_type: &str) -> &'static str {
-    match content_type.split(';').next().unwrap_or("").trim() {
-        "image/png" => "png",
-        "image/webp" => "webp",
-        _ => "jpg",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use abs_storage::repo::{accounts, items, libraries, servers};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[test]
-    fn extension_for_content_type_covers_the_known_formats() {
-        assert_eq!(extension_for_content_type("image/webp"), "webp");
-        assert_eq!(extension_for_content_type("image/png"), "png");
-        assert_eq!(extension_for_content_type("image/jpeg"), "jpg");
-        assert_eq!(extension_for_content_type("application/octet-stream"), "jpg");
-        assert_eq!(extension_for_content_type("image/webp; charset=binary"), "webp");
-    }
 
     async fn pool_with_synced_item(item_id: &str) -> (SqlitePool, String) {
         let tmp = tempfile::tempdir().unwrap();

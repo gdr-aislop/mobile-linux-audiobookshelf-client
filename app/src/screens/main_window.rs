@@ -30,6 +30,11 @@ pub struct MainWindow {
     /// D-Bus signals. `None` when no system bus (or no ModemManager on it) was reachable; call
     /// interruption is simply unavailable in that case, never a fatal error.
     _call_watcher: Option<abs_player::call_watch::ModemManagerCallWatcher>,
+    /// Kept alive for the app's whole lifetime, same reasoning as `_call_watcher` — dropping it
+    /// would lose every in-flight track's cancel flag and listener. No UI wires into it yet (see
+    /// `crate::downloads`'s module doc); this pass only ensures one instance exists for a later
+    /// screen to be handed a clone of.
+    pub download_manager: crate::downloads::DownloadManager,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -97,6 +102,19 @@ pub fn build(
         }
     };
 
+    // Wi-Fi-only detection is best-effort in the same way as MPRIS/call-watching above: no system
+    // bus (or no NetworkManager on it) must never be fatal — it just means metered-connection
+    // detection is unavailable, and `UnknownNetworkMonitor` makes that read as "undeterminable"
+    // rather than silently guessing "not metered".
+    let network_monitor: Box<dyn abs_player::network_watch::NetworkMonitor> = match abs_player::network_watch::NetworkManagerMonitor::new() {
+        Ok(monitor) => Box::new(monitor),
+        Err(err) => {
+            tracing::warn!(%err, "couldn't watch NetworkManager for metered-connection detection; Wi-Fi-only downloads will be unavailable");
+            Box::new(abs_player::network_watch::UnknownNetworkMonitor)
+        }
+    };
+    let download_manager = crate::downloads::DownloadManager::new(pool.clone(), paths.clone(), network_monitor, playback_settings.wifi_only_downloads);
+
     let stack = adw::ViewStack::new();
 
     let on_play = {
@@ -149,9 +167,10 @@ pub fn build(
         "Home",
         "go-home-symbolic",
     );
-    let library_screen = screens::library::build(pool, paths, server, account, session, on_play, on_relogin);
+    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone(), on_relogin);
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    stack.add_titled_with_icon(&stub_page("folder-download-symbolic", "Downloads"), Some("downloads"), "Downloads", "folder-download-symbolic");
+    let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
+    stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
     stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
@@ -217,8 +236,10 @@ pub fn build(
         let controller = mini_bar.controller.clone();
         let window = window.clone();
         let root = root.clone();
+        let pool = pool.clone();
+        let download_manager = download_manager.clone();
         move |_, _, _, _| {
-            let player_screen = screens::player::build(controller.clone(), playback_settings, {
+            let player_screen = screens::player::build(pool.clone(), controller.clone(), playback_settings, download_manager.clone(), {
                 let window = window.clone();
                 let root = root.clone();
                 move || {
@@ -235,6 +256,7 @@ pub fn build(
     MainWindow {
         root: root.upcast(),
         _call_watcher: call_watcher,
+        download_manager,
         #[cfg(test)]
         hooks: TestHooks {
             stack,

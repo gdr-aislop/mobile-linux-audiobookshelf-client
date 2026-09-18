@@ -319,6 +319,40 @@ pub fn is_auth_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
 }
 
+/// A dedicated error type for [`Client::get_item_file_response`] rather than reusing
+/// [`LibraryItemsError`] — a download pipeline needs to tell a 4xx (bad request/auth/not found,
+/// never worth retrying) apart from a 5xx or a network error (worth retrying with backoff), which
+/// `LibraryItemsError::UnexpectedResponse`'s plain `String` throws away.
+#[derive(Debug, thiserror::Error)]
+pub enum TrackFileError {
+    #[error("network error: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("server returned HTTP {0}")]
+    Status(reqwest::StatusCode),
+}
+
+impl TrackFileError {
+    /// A 4xx means the request itself is wrong (bad token, item/track no longer exists) — retrying
+    /// the exact same request will never succeed, unlike a `5xx`/network blip.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            TrackFileError::Network(_) => true,
+            TrackFileError::Status(status) => !status.is_client_error(),
+        }
+    }
+}
+
+/// A track's audio file response, ready to be streamed to disk. See
+/// [`Client::get_item_file_response`] for why this exposes the live [`reqwest::Response`] instead
+/// of pre-collecting its body.
+#[derive(Debug)]
+pub struct TrackFileResponse {
+    pub resumed: bool,
+    pub total_size: Option<u64>,
+    pub content_type: Option<String>,
+    pub response: reqwest::Response,
+}
+
 impl Client {
     /// Fetch a library's items with their media metadata (title, author, narrator, description,
     /// duration). Hand-written rather than using the generated `get_library_items`: that call's
@@ -443,6 +477,51 @@ impl Client {
             .to_string();
         let bytes = response.bytes().await?.to_vec();
         Ok(CoverBytes { bytes, content_type })
+    }
+
+    /// Fetch a track's audio file, optionally resuming with an HTTP `Range` request — the raw
+    /// per-track byte source a download pipeline streams to disk (as opposed to `StreamTarget`'s
+    /// URL, which is handed to GStreamer for playback and never fetched as bytes in Rust). Same
+    /// `/api/items/*` gap as the other hand-written extensions above; confirmed live: the file
+    /// endpoint sends `accept-ranges: bytes` and honors `Range: bytes=N-` with a `206` and a
+    /// matching `Content-Range`, exactly like a normal HTTP file server.
+    ///
+    /// Returns the live `reqwest::Response` unconsumed (not `.bytes()`-collected) so the caller can
+    /// stream it in chunks — collecting a whole audiobook track into memory before writing it out
+    /// would defeat the point of a resumable, progress-reporting download. `resumed` distinguishes
+    /// a server that actually honored the `Range` request (`206`) from one that ignored it and sent
+    /// the full body from byte 0 (`200`) — callers must check this rather than assuming a `Some`
+    /// `range_start` was respected, since blindly appending a full-body response onto existing
+    /// partial bytes would corrupt the file. `total_size` is always the *whole file's* size (parsed
+    /// from `Content-Range`'s `.../total` suffix when resumed, since a `206`'s `Content-Length` is
+    /// only the remaining-bytes count, not the file's total size) — never the size of just this
+    /// response's body, so callers can report accurate progress against the true track size
+    /// regardless of where a resume started from.
+    pub async fn get_item_file_response(&self, item_id: &str, ino: &str, range_start: Option<u64>) -> Result<TrackFileResponse, TrackFileError> {
+        let mut request = self.client().get(format!("{}/api/items/{item_id}/file/{ino}", self.baseurl()));
+        if let Some(start) = range_start {
+            request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
+        }
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            return Err(TrackFileError::Status(response.status()));
+        }
+
+        let resumed = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        let total_size = if resumed {
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.rsplit('/').next())
+                .and_then(|s| s.parse::<u64>().ok())
+        } else {
+            response.content_length()
+        };
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+
+        Ok(TrackFileResponse { resumed, total_size, content_type, response })
     }
 
     /// Push local playback progress up to the server, so it shows up in the official apps and
@@ -1095,6 +1174,79 @@ mod tests {
         let client = Client::new(&server.uri());
         let err = client.get_item_cover("item-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_file_response_without_range_returns_the_full_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "4").insert_header("Content-Type", "audio/mpeg").set_body_bytes(vec![1, 2, 3, 4]))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let file = client.get_item_file_response("item-1", "ino-1", None).await.unwrap();
+        assert!(!file.resumed, "a plain 200 response was not a resumed range");
+        assert_eq!(file.total_size, Some(4));
+        assert_eq!(file.content_type.as_deref(), Some("audio/mpeg"));
+        let bytes = file.response.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn get_item_file_response_sends_a_range_header_and_recognizes_206() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header("Range", "bytes=100-"))
+            .respond_with(ResponseTemplate::new(206).insert_header("Content-Range", "bytes 100-103/104").set_body_bytes(vec![9, 9, 9, 9]))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let file = client.get_item_file_response("item-1", "ino-1", Some(100)).await.unwrap();
+        assert!(file.resumed, "a 206 response means the server actually honored the Range request");
+        assert_eq!(file.total_size, Some(104), "total_size must be the whole file's size, not just this response's 4-byte body");
+    }
+
+    #[tokio::test]
+    async fn get_item_file_response_detects_a_server_that_ignores_range() {
+        let server = MockServer::start().await;
+        // Some servers reply 200 with the *full* body even when a Range header was sent — the
+        // caller must be able to tell this apart from a real 206 resume, or it would corrupt a
+        // partially-downloaded file by blindly appending onto it.
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header("Range", "bytes=100-"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 104]))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let file = client.get_item_file_response("item-1", "ino-1", Some(100)).await.unwrap();
+        assert!(!file.resumed, "a 200 in response to a Range request must not be treated as resumed");
+    }
+
+    #[tokio::test]
+    async fn get_item_file_response_surfaces_the_status_on_a_client_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/file/ino-1")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_item_file_response("item-1", "ino-1", None).await.unwrap_err();
+        assert!(!err.is_retryable(), "a 404 should never be retried");
+        assert!(matches!(err, TrackFileError::Status(status) if status == reqwest::StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn get_item_file_response_a_server_error_is_retryable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/file/ino-1")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_item_file_response("item-1", "ino-1", None).await.unwrap_err();
+        assert!(err.is_retryable(), "a 5xx should be retried");
     }
 
     #[tokio::test]

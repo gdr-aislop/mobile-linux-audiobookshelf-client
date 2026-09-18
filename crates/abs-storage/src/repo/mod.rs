@@ -1,9 +1,10 @@
 pub mod accounts;
 pub mod bookmarks;
 pub mod chapters;
-pub mod downloads;
+pub mod download_tracks;
 pub mod items;
 pub mod libraries;
 pub mod progress;
 pub mod servers;
 pub mod settings;
+pub mod tracks;
