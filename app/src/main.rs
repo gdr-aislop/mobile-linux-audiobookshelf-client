@@ -94,6 +94,7 @@ mod tests {
         crate::screens::welcome::tests::run(&runtime);
         crate::screens::welcome::tests::run_relogin_flow(&runtime);
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
+        crate::screens::home::tests::run_finished_books_dont_show_under_continue_listening(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_retryable_error_when_the_first_sync_fails(&runtime);
         crate::screens::home::tests::run_offline_mode_toggle_filters_recently_added(&runtime);

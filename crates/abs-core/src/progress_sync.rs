@@ -84,13 +84,17 @@ async fn apply_if_newer(
         return Ok(());
     }
 
-    abs_storage::repo::progress::set(
+    // The server's own last-update time is preserved, not "now" — Home's "Continue Listening"
+    // shelf orders by `updated_at`, and an imported record stamped with the import time would
+    // make an item last listened to years ago look more recent than one listened to today.
+    abs_storage::repo::progress::set_at(
         pool,
         account_id,
         server_id,
         item_id,
         server_progress.current_time_seconds,
         server_progress.is_finished,
+        server_updated_at,
     )
     .await?;
     Ok(())
@@ -138,6 +142,10 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_item_progress_pulls_a_fresh_server_record_when_nothing_local_exists() {
+        // Deliberately in the past: the imported row must carry the server's last-update time
+        // (what "Continue Listening" orders by), not the moment of the import itself. Millis
+        // precision, matching what `lastUpdate` can express over the wire.
+        let last_update = chrono::DateTime::from_timestamp_millis(chrono::Utc::now().timestamp_millis() - 30 * 86_400_000).unwrap();
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/me/progress/item-1"))
@@ -146,7 +154,7 @@ mod tests {
                 "currentTime": 55.0,
                 "duration": 100.0,
                 "isFinished": false,
-                "lastUpdate": chrono::Utc::now().timestamp_millis(),
+                "lastUpdate": last_update.timestamp_millis(),
             })))
             .mount(&mock_server)
             .await;
@@ -155,7 +163,9 @@ mod tests {
         reconcile_item_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id, "item-1").await.unwrap();
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
-        assert_eq!(progress.unwrap().current_time_seconds, 55.0);
+        let progress = progress.unwrap();
+        assert_eq!(progress.current_time_seconds, 55.0);
+        assert_eq!(progress.updated_at, last_update, "the server's last-update time must be kept, not the import time");
     }
 
     #[tokio::test]

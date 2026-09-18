@@ -29,6 +29,7 @@ pub struct TestHooks {
     pub(crate) empty_state: EmptyState,
     pub libraries_list: gtk4::ListBox,
     pub continue_section: gtk4::Box,
+    pub continue_row: gtk4::Box,
     pub recent_row: gtk4::Box,
     pub banner: crate::widgets::banner::ErrorBanner,
     pub offline_toggle: gtk4::ToggleButton,
@@ -454,6 +455,7 @@ pub fn build(
             empty_state,
             libraries_list,
             continue_section,
+            continue_row,
             recent_row,
             banner,
             offline_toggle,
@@ -626,6 +628,11 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
 
     let mut continue_items = Vec::new();
     for progress in abs_storage::repo::progress::list_recent_for_account(pool, account_id, 10).await? {
+        // Finished books aren't "continue" listening — a book completed years ago would
+        // otherwise squat on the shelf forever. It stays visible in the library, with progress.
+        if progress.is_finished {
+            continue;
+        }
         // A progress row can outlive the item it points at (e.g. removed from the server between
         // syncs) — skip it rather than failing the whole Home screen over one stale row.
         if let Ok(item) = abs_storage::repo::items::get(pool, server_id, &progress.item_id).await {
@@ -819,6 +826,53 @@ pub(crate) mod tests {
             child = widget.next_sibling();
         }
         count
+    }
+
+    /// A finished book must not claim a Continue Listening slot, even when its progress row is
+    /// the most recently updated one — the shelf is for picking up where you left off.
+    pub(crate) fn run_finished_books_dont_show_under_continue_listening(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        // The progress table's foreign key needs the items to exist locally before the first
+        // sync populates them, so seed the same ids the mock server will return.
+        let library_id = "e4bb1afb-4a4f-4dd6-8be0-e615d233185b";
+        runtime.block_on(abs_storage::repo::libraries::upsert(&pool, UpsertLibrary { id: library_id, server_id: &server.id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 })).unwrap();
+        for (id, title) in [("item-1", "Project Hail Mary"), ("item-2", "Dune")] {
+            runtime.block_on(abs_storage::repo::items::upsert(&pool, abs_storage::repo::items::UpsertItem { id, server_id: &server.id, library_id, title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::Utc::now() })).unwrap();
+        }
+
+        // The finished book's row is the *newer* one, so without the finished filter it would be
+        // the first card on the shelf.
+        let now = chrono::Utc::now();
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
+        runtime.block_on(abs_storage::repo::progress::set_at(&pool, &account.id, &server.id, "item-2", 3600.0, true, now)).unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| count_children(&hooks.continue_row) == 1, Duration::from_secs(10));
+        assert!(hooks.continue_section.is_visible(), "the in-progress book should keep the shelf alive");
+        assert!(count_children(&hooks.recent_row) == 2, "the finished book still belongs under Recently Added");
     }
 
     /// Toggling offline mode should narrow "Recently Added" to items with at least one completed

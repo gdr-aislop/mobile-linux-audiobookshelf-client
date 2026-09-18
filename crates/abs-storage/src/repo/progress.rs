@@ -15,7 +15,23 @@ pub async fn set(
     current_time_seconds: f64,
     is_finished: bool,
 ) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
+    set_at(pool, account_id, server_id, item_id, current_time_seconds, is_finished, Utc::now()).await
+}
+
+/// Like [`set`], but stamps the row with an explicit time instead of "now". The server
+/// reconciliation path uses this to keep the server's own last-update time — otherwise an
+/// imported record looks as recent as the moment it was imported, and Home's "Continue
+/// Listening" shelf (which orders by `updated_at`) would rank a book last touched years
+/// ago above one listened to this morning.
+pub async fn set_at(
+    pool: &SqlitePool,
+    account_id: &str,
+    server_id: &str,
+    item_id: &str,
+    current_time_seconds: f64,
+    is_finished: bool,
+    updated_at: chrono::DateTime<Utc>,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO progress (account_id, server_id, item_id, current_time_seconds, is_finished, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -29,7 +45,7 @@ pub async fn set(
     .bind(item_id)
     .bind(current_time_seconds)
     .bind(is_finished)
-    .bind(now)
+    .bind(updated_at.to_rfc3339())
     .execute(pool)
     .await?;
     Ok(())
@@ -172,6 +188,17 @@ mod tests {
             get(&pool, &account_b, &server_id, &item_id).await.unwrap().unwrap().current_time_seconds,
             2000.0
         );
+    }
+
+    #[tokio::test]
+    async fn set_at_stamps_the_given_time_rather_than_now() {
+        let (pool, server_id, account_id, item_id) = pool_with_item_and_account().await;
+        let stamped = Utc::now() - chrono::Duration::days(3);
+
+        set_at(&pool, &account_id, &server_id, &item_id, 100.0, false, stamped).await.unwrap();
+
+        let progress = get(&pool, &account_id, &server_id, &item_id).await.unwrap().unwrap();
+        assert_eq!(progress.updated_at, stamped, "the caller's timestamp must survive the round trip — Continue Listening orders by it");
     }
 
     #[tokio::test]
