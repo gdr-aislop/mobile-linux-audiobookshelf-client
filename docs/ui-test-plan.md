@@ -811,7 +811,7 @@ built (the tests below define the target behavior).
 
 ---
 
-## 16. Connection page (CN) — 🚧 partially implemented (Server connection row, Disconnect)
+## 16. Connection page (CN) — ✅ implemented (Server connection row, Advanced group, Disconnect)
 
 Reached from Settings → a server row's body. One instance per configured server. Shown as a
 window content swap (no `AdwNavigationView` at the libadwaita `v1_2` ceiling) with a back
@@ -824,15 +824,22 @@ button restoring the shell.
       *Automated:* `connection_page_url_info_disconnect_and_back` asserts title/subtitle, the
       monospace stylesheet flag, and the popover opening.
 
-- [ ] **CN-2 — Advanced group present.** 🚧 Deliberately deferred: the `servers` table has the
-      columns, but applying them to real traffic needs an HTTP-client factory threaded through
-      every server call — its own feature batch. Look below.
+- [ ] **CN-2 — Advanced group present.** Open the group below the Server connection row.
       *Expected:* rows for Custom Headers, Disable SSL verification (switch), Client
-      certificate, Local network server address, and Change User Agent — all chevron rows except
-      the switch.
+      certificate, Local network server address, and Change User Agent — chevron rows with
+      value-as-subtitle ("None"/"Default" when unset) except the switch; each opens an editor
+      dialog that validates inline and persists to the server's row on Save.
+      *Automated:* `connection_advanced_rows_persist_and_edit` drives all five rows (initial
+      subtitles, the SSL switch persisting, valid + invalid header saves, the no-file cert
+      save error, user-agent set/clear, and each row's subtitle following the database).
 
 - [ ] **CN-3 — SSL verification off by default.** Check the switch.
-      *Expected:* off; toggling it on persists per-server and takes effect without reinstalling.
+      *Expected:* off; toggling it on persists per-server and takes effect without
+      reinstalling.
+      *Automated:* the switch's initial state and immediate persistence in
+      `connection_advanced_rows_persist_and_edit`; the wire-level effect in abs-api's
+      `#[ignore]`d live tests against self-signed.badssl.com (verification off connects, on
+      fails).
 
 - [ ] **CN-4 — Self-signed cert flow.** Point a server at a self-signed host. With verification
       on, connect; then enable "Disable SSL verification" and connect again.
@@ -841,21 +848,39 @@ button restoring the shell.
 
 - [ ] **CN-5 — Custom headers.** Add a request header (e.g. `X-Auth: secret`) via the Custom
       Headers page, with a logging proxy in front of the server.
-      *Expected:* the header appears on every request the app sends to that server; removing it
-      stops it being sent.
+      *Expected:* the header appears on every request the app sends to that server (sync,
+      downloads, playback metadata, token refresh); removing it stops it being sent. Invalid
+      input (no colon, a bad name/value, or `authorization`) is rejected inline and changes
+      nothing.
+      *Automated:* the editor's valid/invalid/rejected-`authorization` paths in
+      `connection_advanced_rows_persist_and_edit`; the header reaching the wire (and token
+      refresh specifically) in abs-api's and abs-core's mocked tests.
 
 - [ ] **CN-6 — User-Agent override.** Set a custom User-Agent and check the proxy/server logs.
       *Expected:* requests carry the overridden value; clearing it restores the default.
+      *Automated:* the user-agent editor's set/clear paths in
+      `connection_advanced_rows_persist_and_edit`; the override reaching the wire in abs-api's
+      mocked test.
 
 - [ ] **CN-7 — Client certificate (mTLS).** Import a client certificate for a server that
       requires one.
       *Expected:* connection succeeds only with the cert; the page shows the imported cert's
-      identity.
+      file name as the row subtitle, and Remove Certificate clears it. Applies to reqwest
+      traffic (sync/downloads/refresh) — playback via GStreamer is a documented gap. A save
+      with no file chosen is an inline error.
+      *Automated:* the no-file save error in `connection_advanced_rows_persist_and_edit` and
+      the same read+parse at save and mint time in abs-core/abs-api's tests (a real .p12 can't
+      be produced hermetically; the chooser itself stays manual).
 
 - [ ] **CN-8 — Local network address.** Set a LAN address (e.g. `http://192.168.1.50:13378`) and
       join the server's home Wi-Fi.
       *Expected:* the app talks to the LAN address (visible in server logs as the LAN IP),
-      avoiding the public route; off that network it falls back to the public URL automatically.
+      avoiding the public route; off that network it falls back to the public URL automatically
+      (a short reachability probe, cached per session for a minute). Stream URLs follow the
+      same resolution.
+      *Automated:* the editor's normalize/persist path in
+      `connection_advanced_rows_persist_and_edit`; the prefer-when-reachable/fallback policy,
+      the probe itself, and track-URL resolution in abs-core's `connection` tests.
 
 - [ ] **CN-9 — Disconnect from the Server.** Tap the destructive "Disconnect from the Server"
       action at the bottom.

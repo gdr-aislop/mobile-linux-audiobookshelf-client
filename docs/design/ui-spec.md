@@ -327,8 +327,8 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   keys and MPRIS next/previous read live), and the Wi-Fi-only downloads switch (applied live to
   the download manager). The **Appearance** group (Theme: system/light/dark, applied via
   `AdwStyleManager` immediately and at startup), the **About** row, and the **Account** and
-  **Servers** groups (below) are real too. Still stubs: Playback's sleep-timer-default row, and
-  the Connection page's Advanced group (see §Connection).
+  **Servers** groups (below) are real too. The one remaining stub: Playback's
+  sleep-timer-default row.
 - **Account** group: one row showing the *active* server/account — username as title,
   `host · active` as subtitle — with a chevron; tapping it pushes the active server's
   **Connection** page. The mockup's second row ("Switch or manage servers") is deliberately
@@ -371,12 +371,23 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   subtitle label, since it's a literal value being confirmed rather than a label) with a
   trailing info-button opening a popover explaining what this connection is used for (every
   server call — syncing, streaming, downloads — goes through it).
-- **Advanced** group (deliberately not built yet): **Custom Headers**, **Disable SSL
-  verification**, **Client certificate**, **Local network server address**, and **Change User
-  Agent**. The `servers` table already carries a column for each, but applying any of them to
-  real traffic needs an HTTP-client factory threaded through every server call (library sync,
-  token refresh, covers, downloads, streaming) — a feature batch of its own; each row is added
-  when it can be live wiring, not decoration.
+- **Advanced** group (real): **Custom Headers** (a save-time-validated `Name: Value` list,
+  shown as a count), **Disable SSL verification** (a switch; self-hosted servers behind
+  self-signed certificates), **Client certificate** (a PKCS#12 bundle + export password picked
+  from disk and validated at save time with the exact read+parse a connection mint performs —
+  PKCS#12 rather than combined PEM because this workspace's TLS backend is native-tls, whose
+  PEM identity loader rejects the widespread RSA PKCS#1 key encoding), **Local network server
+  address** (used instead of the public URL whenever a short reachability probe — cached for a
+  minute per session — finds it listening, so home-Wi-Fi traffic stays local and everything
+  else falls back cleanly), and **Change User Agent** (empty restores the default). Each row
+  persists to the server's table row the moment it's saved and is picked up by the next
+  connection mint — sync, downloads, playback — without any rebuild; the editors show a
+  value-as-subtitle (or "None"/"Default") where the mockup showed a static description, and
+  each saves through the same validation the actual connection uses, so what the dialog
+  accepts cannot then fail the connection. Two transport scopes are documented honestly: the
+  client certificate applies to reqwest traffic only (GStreamer's souphttpsrc handles mTLS
+  through a separate mechanism), and `authorization` is rejected as a custom header — it would
+  clobber the app's own login token.
 - A destructive **"Disconnect from the Server"** plain-text action (real; styled like
   `AdwButton`'s `destructive-action` but flat, not a filled button, since it's an infrequent,
   page-level action rather than a primary one) sits below the groups, vertically separated

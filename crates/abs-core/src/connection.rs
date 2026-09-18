@@ -247,6 +247,29 @@ pub async fn probe_reachable(base_url: &str) -> bool {
     tokio::time::timeout(PROBE_TIMEOUT, attempt).await.is_ok_and(|result| result.is_ok())
 }
 
+/// Save-time validation for the Connection page's local-address row: trims and normalizes
+/// (trailing slash) like every other user-typed address in this app, allows an empty input
+/// (clearing the address), and requires an absolute http(s) URL with a host for anything else —
+/// the same shape `accounts`' login flow accepts for the public URL. Returns the canonical
+/// form to store; the error is the dialog's user-facing message.
+pub fn validate_local_address(address: &str) -> Result<String, String> {
+    let trimmed = address.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    match reqwest::Url::parse(trimmed) {
+        Ok(url) if url.has_host() && matches!(url.scheme(), "http" | "https") => Ok(trimmed.to_string()),
+        _ => Err(format!("{trimmed:?} is not an http(s) address — e.g. http://192.168.1.50:13378")),
+    }
+}
+
+/// Save-time validation for the Connection page's client-certificate row — the exact same
+/// read+parse a mint performs, so a certificate the dialog accepts cannot then fail at mint
+/// time (and vice versa). The error is the dialog's user-facing message.
+pub fn validate_client_cert(path: &std::path::Path, password: Option<&str>) -> Result<(), String> {
+    abs_api::validate_client_cert_file(path, password).map_err(|err| err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +415,20 @@ mod tests {
 
         assert!(!probe_reachable("http://127.0.0.1:1").await, "a closed port is not");
         assert!(!probe_reachable("not a url").await, "an unparseable address can't be probed");
+    }
+
+    #[test]
+    fn validate_local_address_accepts_normalizes_and_allows_clearing() {
+        assert_eq!(validate_local_address("  http://192.168.1.50:13378/ ").unwrap(), "http://192.168.1.50:13378");
+        assert_eq!(validate_local_address("   ").unwrap(), "", "empty input clears the address");
+        assert!(validate_local_address("192.168.1.50").is_err(), "a bare host is not a URL");
+        assert!(validate_local_address("ftp://192.168.1.50").is_err(), "non-http schemes are rejected");
+        assert!(validate_local_address("https://").is_err(), "a scheme with no host at all is rejected");
+    }
+
+    #[test]
+    fn validate_client_cert_reports_a_missing_file() {
+        let err = validate_client_cert(std::path::Path::new("/nonexistent/cert.p12"), Some("pw")).unwrap_err();
+        assert!(err.contains("/nonexistent/cert.p12"), "the message names the file: {err}");
     }
 }
