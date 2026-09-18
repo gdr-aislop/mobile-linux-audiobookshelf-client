@@ -136,23 +136,114 @@ struct RawMetadata {
     description: Option<String>,
 }
 
+/// Connection-level options applied to every request a minted [`Client`] sends — the transport
+/// side of the `servers` table's per-server settings (custom headers, TLS verification, client
+/// certificate, user agent). Deliberately plain std types: this crate is the only one that
+/// converts them into reqwest primitives (`HeaderMap`, `Identity`, TLS flags), so no other crate
+/// ever names a reqwest type to describe connection settings.
+///
+/// `ConnectionOptions::default()` is exactly the behavior [`Client::with_bearer_token`] always
+/// had: no extra headers, certificate verification on, no client certificate, no user-agent
+/// override.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConnectionOptions {
+    /// Headers attached to every request, on top of the generated client's own. The
+    /// `authorization` header is rejected at mint time — it would clobber the bearer token
+    /// (callers validate this earlier, where a user can be told; see `abs-core`'s save-time
+    /// validation).
+    pub extra_headers: Vec<(String, String)>,
+    /// Skip certificate verification entirely — for self-hosted servers behind self-signed
+    /// certificates. Applies to HTTPS traffic only.
+    pub disable_ssl_verify: bool,
+    /// Path to a PKCS#12 (`#12`/`.pfx`) bundle holding the client certificate + private key,
+    /// for servers requiring mTLS, decrypted with [`ConnectionOptions::client_cert_password`].
+    /// PKCS#12 rather than a combined PEM file because this workspace's TLS backend is
+    /// native-tls (reqwest default features), where reqwest offers only `from_pkcs12_der` and
+    /// `from_pkcs8_pem` — and the latter rejects the widespread `BEGIN RSA PRIVATE KEY`
+    /// (PKCS#1) key encoding (native-tls's own `from_pkcs8_rejects_rsa_key` test), so a
+    /// hand-rolled PEM splitter would silently fail on the most common real-world key format.
+    /// Read at mint time (not baked into the builder earlier) so a file that has changed or
+    /// disappeared on disk is a mint-time error, never a silent fallback.
+    pub client_cert_path: Option<std::path::PathBuf>,
+    /// The PKCS#12 bundle's export password, if it has one.
+    pub client_cert_password: Option<String>,
+    /// Replaces reqwest's default `User-Agent` when set.
+    pub user_agent: Option<String>,
+}
+
+/// Why minting a [`Client`] with connection options failed. Unlike the plain
+/// headers/timeout-only constructors (which cannot fail beyond an invalid token), honoring a
+/// server's full connection settings touches the filesystem (client certificate) and the TLS
+/// backend, so failure is a normal, reportable outcome — surfaced through the same error paths
+/// as any other network failure, never silently ignored.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionBuildError {
+    #[error("access token contains characters that aren't valid in an HTTP header")]
+    InvalidBearerToken,
+    #[error("invalid custom header {0:?}: not a valid HTTP header name or value")]
+    InvalidHeader(String),
+    #[error("couldn't load the client certificate from {path:?}: {source}")]
+    ClientCertificate {
+        path: std::path::PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("couldn't build the HTTP client: {0}")]
+    Build(reqwest::Error),
+}
+
+/// Reads and parses a PKCS#12 client-certificate bundle exactly as minting would, discarding
+/// the loaded identity. The single source of truth for "is this client certificate usable" —
+/// used by the mint itself and by save-time validation (`abs-core`), so the two can never
+/// disagree about what counts as valid.
+pub fn validate_client_cert_file(
+    path: &std::path::Path,
+    password: Option<&str>,
+) -> Result<(), ConnectionBuildError> {
+    load_client_identity(path, password).map(|_| ())
+}
+
+/// Whether `name` is a valid HTTP header name — exactly what minting would accept. Lets
+/// save-time validation (`abs-core`) apply the real rule instead of a hand-rolled copy that
+/// could drift from the mint's.
+pub fn is_valid_header_name(name: &str) -> bool {
+    reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+}
+
+/// Whether `value` is a valid HTTP header value — see [`is_valid_header_name`].
+pub fn is_valid_header_value(value: &str) -> bool {
+    reqwest::header::HeaderValue::from_str(value).is_ok()
+}
+
+fn load_client_identity(
+    path: &std::path::Path,
+    password: Option<&str>,
+) -> Result<reqwest::Identity, ConnectionBuildError> {
+    let der = std::fs::read(path).map_err(|source| ConnectionBuildError::ClientCertificate {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    reqwest::Identity::from_pkcs12_der(&der, password.unwrap_or(""))
+        .map_err(|source| ConnectionBuildError::ClientCertificate {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+}
+
 /// The vendored spec declares `BearerAuth` as a security scheme on its authenticated operations,
 /// but `progenitor` doesn't generate a per-call header parameter for it — confirmed by grepping
 /// the generated `client.rs` for "Authorization"/"bearer" (no matches at all). So every
-/// authenticated call (everything except `login`) needs a client built with this constructor
-/// rather than the plain `Client::new`, which sends no auth at all and gets `401`s back (caught
-/// live against `https://audiobooks.dev/audiobookshelf`, not just in theory).
-#[derive(Debug, thiserror::Error)]
-#[error("access token contains characters that aren't valid in an HTTP header")]
-pub struct InvalidBearerToken;
-
+/// authenticated call (everything except `login`) needs a client built with one of the
+/// `with_bearer_token*` constructors rather than the plain `Client::new`, which sends no auth at
+/// all and gets `401`s back (caught live against `https://audiobooks.dev/audiobookshelf`, not
+/// just in theory).
 impl Client {
     /// Builds a client that attaches `Authorization: Bearer <token>` to every request it sends.
     /// `token` is normally `LoginResult::access_token` fresh from `login`, or an already-persisted
     /// account's stored token. Uses a 15s connect/request timeout — long enough to tolerate a slow
     /// mobile connection, short enough that a call never hangs indefinitely when the server or
     /// network is simply gone (offline, airplane mode, etc.).
-    pub fn with_bearer_token(baseurl: &str, token: &str) -> Result<Self, InvalidBearerToken> {
+    pub fn with_bearer_token(baseurl: &str, token: &str) -> Result<Self, ConnectionBuildError> {
         Self::with_bearer_token_and_timeout(baseurl, token, std::time::Duration::from_secs(15))
     }
 
@@ -165,20 +256,71 @@ impl Client {
         baseurl: &str,
         token: &str,
         timeout: std::time::Duration,
-    ) -> Result<Self, InvalidBearerToken> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| InvalidBearerToken)?;
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+    ) -> Result<Self, ConnectionBuildError> {
+        Self::with_bearer_token_and_options(baseurl, token, timeout, &ConnectionOptions::default())
+    }
 
-        let http = reqwest::Client::builder()
+    /// The full mint: bearer token plus a server's connection options. Every other
+    /// `with_bearer_token*` constructor delegates here with default options — this is the one
+    /// place reqwest primitives are assembled (headers, TLS behavior, identity, user agent).
+    pub fn with_bearer_token_and_options(
+        baseurl: &str,
+        token: &str,
+        timeout: std::time::Duration,
+        options: &ConnectionOptions,
+    ) -> Result<Self, ConnectionBuildError> {
+        Self::with_options_and_headers(baseurl, options, Some(token), timeout)
+    }
+
+    /// An unauthenticated client with a server's connection options — for the one call that runs
+    /// before any token exists but must still honor the connection's transport settings (token
+    /// refresh, which carries the refresh token in a header).
+    pub fn with_options(baseurl: &str, options: &ConnectionOptions) -> Result<Self, ConnectionBuildError> {
+        Self::with_options_and_headers(baseurl, options, None, std::time::Duration::from_secs(15))
+    }
+
+    fn with_options_and_headers(
+        baseurl: &str,
+        options: &ConnectionOptions,
+        bearer_token: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ConnectionBuildError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = bearer_token {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| ConnectionBuildError::InvalidBearerToken)?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        for (name, value) in &options.extra_headers {
+            // `HeaderMap::insert` would silently *replace* the bearer token — caught by test.
+            // Callers reject this at save time (where a user can be told); this is the last
+            // line of defense for settings that bypassed that check (hand-edited DB).
+            if name.eq_ignore_ascii_case("authorization") {
+                return Err(ConnectionBuildError::InvalidHeader(name.clone()));
+            }
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ConnectionBuildError::InvalidHeader(name.clone()))?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| ConnectionBuildError::InvalidHeader(name.to_string()))?;
+            headers.insert(name, value);
+        }
+
+        let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()
-            .expect("a reqwest::Client with only headers/timeouts set should never fail to build");
+            .timeout(timeout);
+        if options.disable_ssl_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(user_agent) = &options.user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        if let Some(path) = &options.client_cert_path {
+            builder = builder.identity(load_client_identity(path, options.client_cert_password.as_deref())?);
+        }
 
+        let http = builder.build().map_err(ConnectionBuildError::Build)?;
         Ok(Self::new_with_client(baseurl, http))
     }
 }
@@ -735,6 +877,87 @@ mod tests {
         let result = client.get_media_progress("item-1").await;
         assert!(result.is_err(), "a request to a server that never responds must time out, not succeed");
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "the timeout should cut this off in ~200ms, not hang");
+    }
+
+    /// A server's custom headers and user-agent override must reach the actual wire — this is
+    /// the whole point of the Connection page's Advanced settings (e.g. a reverse proxy keyed
+    /// on a header). Mocked end-to-end: the mock only answers when both arrive.
+    #[tokio::test]
+    async fn custom_headers_and_user_agent_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries"))
+            .and(header("x-custom-header", "secret-value"))
+            .and(header("user-agent", "MyAgent/1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "libraries": [] })))
+            .mount(&server)
+            .await;
+
+        let options = ConnectionOptions {
+            extra_headers: vec![("X-Custom-Header".to_string(), "secret-value".to_string())],
+            user_agent: Some("MyAgent/1.0".to_string()),
+            ..ConnectionOptions::default()
+        };
+        let client = Client::with_bearer_token_and_options(&server.uri(), "token", std::time::Duration::from_secs(5), &options).unwrap();
+
+        let response = client.get_libraries().await.expect("the mock matched custom header and user-agent");
+        assert!(response.into_inner().libraries.is_empty());
+    }
+
+    /// Defense in depth behind `abs-core`'s save-time validation: even if an `authorization`
+    /// custom header ever reached minting (hand-edited DB), it must be rejected rather than
+    /// silently clobbering the bearer token the client exists to send.
+    #[tokio::test]
+    async fn an_authorization_custom_header_is_rejected_at_mint() {
+        let options = ConnectionOptions {
+            extra_headers: vec![("Authorization".to_string(), "Bearer stolen".to_string())],
+            ..ConnectionOptions::default()
+        };
+        let err = Client::with_bearer_token_and_options("http://localhost:1", "token", std::time::Duration::from_secs(5), &options).unwrap_err();
+        assert!(matches!(err, ConnectionBuildError::InvalidHeader(ref name) if name.eq_ignore_ascii_case("authorization")), "got {err:?}");
+    }
+
+    /// A configured client certificate that's missing from disk (deleted after save, unmounted
+    /// path) is a mint-time error — never a silent fallback to a cert-less client that would
+    /// then fail the request itself with a confusing server-side rejection.
+    #[tokio::test]
+    async fn a_missing_client_certificate_file_is_a_mint_error() {
+        let options = ConnectionOptions {
+            client_cert_path: Some(std::path::PathBuf::from("/nonexistent/cert.p12")),
+            client_cert_password: Some("secret".to_string()),
+            ..ConnectionOptions::default()
+        };
+        let err = Client::with_bearer_token_and_options("http://localhost:1", "token", std::time::Duration::from_secs(5), &options).unwrap_err();
+        assert!(matches!(err, ConnectionBuildError::ClientCertificate { ref path, .. } if path == std::path::Path::new("/nonexistent/cert.p12")), "got {err:?}");
+    }
+
+    /// Certificate verification off must actually connect to a host whose certificate can't be
+    /// verified — the exact scenario the Connection page's "Disable SSL verification" switch
+    /// exists for (self-hosted servers behind self-signed certificates). `#[ignore]`d so the
+    /// workspace suite stays hermetic; run explicitly with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn ssl_verification_disabled_connects_to_a_self_signed_host() {
+        let options = ConnectionOptions { disable_ssl_verify: true, ..ConnectionOptions::default() };
+        let client = Client::with_options("https://self-signed.badssl.com", &options).unwrap();
+
+        let response = client
+            .client()
+            .get("https://self-signed.badssl.com")
+            .send()
+            .await
+            .expect("with verification disabled, a self-signed certificate must not be a TLS error");
+        let _ = response.status(); // any HTTP status at all proves the TLS handshake succeeded
+    }
+
+    /// The same host with verification on (the default) must fail the handshake — proving the
+    /// test above is meaningful and not just "the network was down". `#[ignore]`d likewise.
+    #[tokio::test]
+    #[ignore]
+    async fn ssl_verification_enabled_fails_on_a_self_signed_host() {
+        let client = Client::with_options("https://self-signed.badssl.com", &ConnectionOptions::default()).unwrap();
+        let result = client.client().get("https://self-signed.badssl.com").send().await;
+        assert!(result.is_err(), "a self-signed certificate must be rejected by default");
     }
 
     #[tokio::test]

@@ -218,7 +218,7 @@ async fn build_main_window(
         .await
         .expect("an active account's server must exist");
     let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
-    let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+    let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
     let servers_with_accounts = fetch_servers_with_accounts(&pool).await;
     screens::main_window::build(
         pool,

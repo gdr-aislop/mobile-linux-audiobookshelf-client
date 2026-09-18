@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod auth;
 pub mod chapters;
+pub mod connection;
 pub mod covers;
 pub mod download_tracks;
 pub mod downloads;

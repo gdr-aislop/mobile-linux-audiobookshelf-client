@@ -122,7 +122,16 @@ pub async fn relogin(
     // comparison, the new server row) sees the same canonical form, so a user-typed trailing
     // slash can't fork the flow.
     let url = normalize_url(url);
-    let client = abs_api::Client::new(url);
+    // A same-server re-login honors the server's saved connection settings — a self-signed
+    // server must be reachable through its own TLS policy, or "sign in again" would be the one
+    // flow that breaks exactly where every other call works. Any other case (a different
+    // server) has no settings to honor yet: defaults apply, and connection settings can only
+    // be configured once a server exists.
+    let options = match servers::get(pool, &previous.server_id).await {
+        Ok(row) if normalize_url(&row.url) == url => crate::connection::ConnectionTarget::resolve(&row, None).options,
+        _ => abs_api::ConnectionOptions::default(),
+    };
+    let client = abs_api::Client::with_options(url, &options).map_err(|e| crate::error::CoreError::UnexpectedResponse(e.to_string()))?;
     let login_result = client.login(username, password).await?;
 
     let same_server = url == normalize_url(&previous.url);

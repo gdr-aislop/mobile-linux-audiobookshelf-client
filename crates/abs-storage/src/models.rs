@@ -13,6 +13,9 @@ pub struct Server {
     pub custom_headers_json: String,
     pub disable_ssl_verify: bool,
     pub client_cert_path: Option<String>,
+    /// The PKCS#12 bundle's export password (see `repo::servers`). Plaintext, like the account
+    /// tokens this database already holds.
+    pub client_cert_password: Option<String>,
     pub local_network_address: Option<String>,
     pub user_agent: Option<String>,
     pub created_at: DateTime<Utc>,

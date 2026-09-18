@@ -24,13 +24,14 @@ const RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
 /// client's own last local write.
 pub async fn reconcile_item_progress(
     pool: &sqlx::SqlitePool,
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     account_id: &str,
     server_id: &str,
     item_id: &str,
 ) -> Result<()> {
-    let api = abs_api::Client::with_bearer_token_and_timeout(server_url, access_token, RECONCILE_TIMEOUT)
+    let api = connection
+        .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
     let Some(server_progress) =
         api.get_media_progress(item_id).await.map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?
@@ -48,12 +49,13 @@ pub async fn reconcile_item_progress(
 /// an item Home doesn't otherwise know about.
 pub async fn reconcile_all_progress(
     pool: &sqlx::SqlitePool,
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     account_id: &str,
     server_id: &str,
 ) -> Result<()> {
-    let api = abs_api::Client::with_bearer_token_and_timeout(server_url, access_token, RECONCILE_TIMEOUT)
+    let api = connection
+        .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
     let all_progress = api.get_all_media_progress().await.map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
 
@@ -103,6 +105,7 @@ async fn apply_if_newer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionTarget;
     use abs_storage::repo::{accounts, items, libraries, servers};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -160,7 +163,7 @@ mod tests {
             .await;
 
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
-        reconcile_item_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id, "item-1").await.unwrap();
+        reconcile_item_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, "item-1").await.unwrap();
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         let progress = progress.unwrap();
@@ -176,7 +179,7 @@ mod tests {
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
         abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 12.0, false).await.unwrap();
 
-        reconcile_item_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id, "item-1").await.unwrap();
+        reconcile_item_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, "item-1").await.unwrap();
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         assert_eq!(progress.unwrap().current_time_seconds, 12.0, "no server record means nothing to reconcile");
@@ -201,7 +204,7 @@ mod tests {
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
         abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 90.0, false).await.unwrap();
 
-        reconcile_item_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id, "item-1").await.unwrap();
+        reconcile_item_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, "item-1").await.unwrap();
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         assert_eq!(progress.unwrap().current_time_seconds, 90.0, "a stale server record must not clobber a newer local write");
@@ -225,7 +228,7 @@ mod tests {
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
         abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 10.0, false).await.unwrap();
 
-        reconcile_item_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id, "item-1").await.unwrap();
+        reconcile_item_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, "item-1").await.unwrap();
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         assert_eq!(progress.unwrap().current_time_seconds, 200.0, "a newer server record should win over a stale local write");
@@ -235,7 +238,7 @@ mod tests {
     async fn reconcile_item_progress_fails_fast_when_the_server_is_unreachable() {
         // No mock server at all — a closed port refuses immediately rather than hanging, so this
         // also verifies the call doesn't silently succeed against nothing.
-        let result = reconcile_item_progress(&sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(), "http://127.0.0.1:1", "token", "acc-1", "srv-1", "item-1").await;
+        let result = reconcile_item_progress(&sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(), &ConnectionTarget::direct("http://127.0.0.1:1"), "token", "acc-1", "srv-1", "item-1").await;
         assert!(result.is_err());
     }
 
@@ -254,7 +257,7 @@ mod tests {
             .await;
 
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
-        reconcile_all_progress(&pool, &mock_server.uri(), "token", &account_id, &server_id).await.unwrap();
+        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id).await.unwrap();
 
         let known = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         assert_eq!(known.unwrap().current_time_seconds, 42.0);

@@ -23,9 +23,14 @@ syn = "2"
 prettyplease = "0.2"
 
 # Shared runtime/data deps
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+# `net` backs `abs_core::connection::probe_reachable`'s TCP reachability check (the Connection
+# page's local-network-address policy); everything else is runtime/macros/fs as before.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net"] }
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# `native-tls` is the backend already in use via reqwest's default features; naming it
+# explicitly additionally unlocks the client-certificate API (`ClientBuilder::identity`,
+# `Identity::from_pkcs12_der`) the Connection page's mTLS setting needs.
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["serde", "v4"] }

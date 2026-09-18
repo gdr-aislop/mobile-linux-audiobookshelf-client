@@ -105,14 +105,15 @@ pub async fn sync_items_for_library(
 
 /// One network round-trip's worth of work for a freshly-opened Home screen: sync this server's
 /// libraries, then every library's items. Builds its own authenticated `abs_api::Client` from
-/// `server_url`/`access_token` so callers (the `app` crate) never construct one themselves — the
-/// same boundary `accounts::add_server_and_login` already draws. `access_token` is the account's
-/// stored token; every one of these calls is authenticated (unlike `login`), and
-/// `Client::with_bearer_token` is what actually attaches it — a plain `Client::new` sends no auth
-/// at all and every call comes back `401` (caught live against the real demo server, not just in
-/// theory).
-pub async fn sync_all(pool: &SqlitePool, server_url: &str, server_id: &str, access_token: &str) -> Result<()> {
-    let api = abs_api::Client::with_bearer_token(server_url, access_token)
+/// `connection` so callers (the `app` crate) never construct one themselves — the same boundary
+/// `accounts::add_server_and_login` already draws. `access_token` is the account's stored token;
+/// every one of these calls is authenticated (unlike `login`), and minting via `connection` is
+/// what actually attaches it *and* honors the server's connection settings — a plain
+/// `Client::new` sends no auth at all and every call comes back `401` (caught live against the
+/// real demo server, not just in theory).
+pub async fn sync_all(pool: &SqlitePool, connection: &crate::connection::ConnectionTarget, server_id: &str, access_token: &str) -> Result<()> {
+    let api = connection
+        .api_client(access_token)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
     sync_libraries(pool, &api, server_id).await?;
     for library in libraries::list_for_server(pool, server_id).await? {
@@ -124,6 +125,7 @@ pub async fn sync_all(pool: &SqlitePool, server_url: &str, server_id: &str, acce
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionTarget;
     use abs_storage::connect_and_migrate;
     use abs_storage::repo::servers;
     use wiremock::matchers::{header, method, path};
@@ -481,7 +483,7 @@ mod tests {
         // Regression coverage: `sync_all` used to build an unauthenticated `abs_api::Client`,
         // which every one of these mocks (each requiring the Authorization header) would reject —
         // caught live against the real demo server as a blanket 401, not just here.
-        sync_all(&pool, &mock_server.uri(), &server_id, "test-token").await.unwrap();
+        sync_all(&pool, &ConnectionTarget::direct(&mock_server.uri()), &server_id, "test-token").await.unwrap();
 
         assert_eq!(libraries::list_for_server(&pool, &server_id).await.unwrap().len(), 2);
         assert_eq!(

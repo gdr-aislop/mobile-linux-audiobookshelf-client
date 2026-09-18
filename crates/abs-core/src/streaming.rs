@@ -31,11 +31,13 @@ pub struct StreamTrack {
     pub offset_seconds: f64,
 }
 
-/// Builds an authenticated `abs_api::Client` from `server_url`/`access_token` itself — the same
-/// boundary `abs_core::sync::sync_all` already draws — so callers (the `app` crate) never
-/// construct one themselves.
-pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id: &str) -> Result<StreamTarget> {
-    let api = abs_api::Client::with_bearer_token(server_url, access_token)
+/// Resolves a playable stream for an item through the server connection `connection` describes
+/// (base URL after local-address resolution, plus the connection's transport options) — the
+/// same boundary `abs_core::sync::sync_all` already draws, so callers (the `app` crate) never
+/// construct a client themselves.
+pub async fn resolve_stream_target(connection: &crate::connection::ConnectionTarget, access_token: &str, item_id: &str) -> Result<StreamTarget> {
+    let api = connection
+        .api_client(access_token)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
     let info = api
         .get_item_playback_info(item_id)
@@ -51,7 +53,7 @@ pub async fn resolve_stream_target(server_url: &str, access_token: &str, item_id
     for file in &info.audio_files {
         tracks.push(StreamTrack {
             ino: file.ino.clone(),
-            url: track_url(server_url, item_id, &file.ino, access_token),
+            url: connection.track_url(item_id, &file.ino, access_token),
             duration_seconds: file.duration_seconds,
             offset_seconds,
         });
@@ -72,14 +74,6 @@ pub fn locate_track(tracks: &[StreamTrack], book_seconds: f64) -> (usize, f64) {
     (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
 }
 
-/// The authenticated stream URL for a single audio file. Exposed separately because track URLs
-/// are **baked into a loaded pipeline** for as long as that file plays — a caller holding a
-/// [`StreamTarget`] across a long session (multi-file books advance hours later) rebuilds the
-/// URL with a current token via this, instead of replaying the stale one baked at resolve time.
-pub fn track_url(server_url: &str, item_id: &str, ino: &str, access_token: &str) -> String {
-    format!("{server_url}/api/items/{item_id}/file/{ino}?token={access_token}")
-}
-
 /// Builds a [`StreamTarget`] entirely from locally cached state — the offline fallback for
 /// callers whose `resolve_stream_target` failed. Tracks come from `tracks::cached_tracks`
 /// (synced as a side effect of every resolve and download run), chapters from
@@ -95,7 +89,7 @@ pub async fn offline_stream_target(
     pool: &sqlx::SqlitePool,
     server_id: &str,
     item_id: &str,
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
 ) -> Result<StreamTarget> {
     let cached = crate::tracks::cached_tracks(pool, server_id, item_id).await?;
@@ -107,7 +101,7 @@ pub async fn offline_stream_target(
     for track in &cached {
         tracks.push(StreamTrack {
             ino: track.ino.clone(),
-            url: track_url(server_url, item_id, &track.ino, access_token),
+            url: connection.track_url(item_id, &track.ino, access_token),
             duration_seconds: track.duration_seconds,
             offset_seconds: track.offset_seconds,
         });
@@ -123,14 +117,15 @@ pub async fn offline_stream_target(
 /// truth for this client's own "Continue Listening") already happened by the time this runs, and
 /// a transient network failure syncing it up shouldn't be surfaced as a playback error.
 pub async fn sync_progress_to_server(
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     item_id: &str,
     current_time_seconds: f64,
     duration_seconds: f64,
     is_finished: bool,
 ) -> Result<()> {
-    let api = abs_api::Client::with_bearer_token(server_url, access_token)
+    let api = connection
+        .api_client(access_token)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
     api.update_media_progress(item_id, current_time_seconds, duration_seconds, is_finished)
         .await
@@ -140,6 +135,7 @@ pub async fn sync_progress_to_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionTarget;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -154,7 +150,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let target = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await.unwrap();
+        let target = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await.unwrap();
 
         assert_eq!(target.tracks.len(), 1);
         assert_eq!(
@@ -184,7 +180,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let target = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await.unwrap();
+        let target = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await.unwrap();
 
         assert_eq!(target.chapters.len(), 2);
         assert_eq!(target.chapters[0].title, "Part One");
@@ -207,7 +203,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let target = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await.unwrap();
+        let target = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await.unwrap();
 
         assert_eq!(target.tracks.len(), 2, "should list every audio file, not just the first");
         assert!(target.tracks[0].url.contains("/file/111"), "first track's URL: {}", target.tracks[0].url);
@@ -228,7 +224,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await;
+        let result = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await;
         assert!(result.is_err(), "an item with no audio files at all can't be played");
     }
 
@@ -241,8 +237,40 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = resolve_stream_target(&mock_server.uri(), "test-token", "item-1").await;
+        let result = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await;
         assert!(result.is_err());
+    }
+
+    /// Track URLs are built from the connection's *resolved* base URL — when the server's
+    /// local network address is configured and probed reachable, playback streams from the LAN
+    /// address, since that's the URL GStreamer will actually load.
+    #[test]
+    fn track_urls_follow_the_resolved_base_url() {
+        let row = abs_storage::models::Server {
+            url: "https://remote.example.org".to_string(),
+            local_network_address: Some("http://192.168.1.50:13378".to_string()),
+            ..server_row_for("https://remote.example.org")
+        };
+        let connection = ConnectionTarget::resolve(&row, Some(true));
+        assert_eq!(
+            connection.track_url("item-1", "12345", "t"),
+            "http://192.168.1.50:13378/api/items/item-1/file/12345?token=t"
+        );
+    }
+
+    /// A minimal `Server` row for connection-resolution tests.
+    fn server_row_for(url: &str) -> abs_storage::models::Server {
+        abs_storage::models::Server {
+            id: "server-1".to_string(),
+            url: url.to_string(),
+            custom_headers_json: "{}".to_string(),
+            disable_ssl_verify: false,
+            client_cert_path: None,
+            client_cert_password: None,
+            local_network_address: None,
+            user_agent: None,
+            created_at: chrono::Utc::now(),
+        }
     }
 
     #[tokio::test]
@@ -259,7 +287,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await.unwrap();
+        sync_progress_to_server(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1", 42.5, 100.0, false).await.unwrap();
     }
 
     /// Same shape `tracks.rs`'s own tests need: a migrated pool plus the server/library/item rows
@@ -310,7 +338,7 @@ mod tests {
 
         // Deliberately no download rows: the offline target is built from cached *metadata*
         // alone — whether a file is actually on disk is decided per track at load time, not here.
-        let target = offline_stream_target(&pool, &server_id, "item-1", "https://a.example", "tok").await.unwrap();
+        let target = offline_stream_target(&pool, &server_id, "item-1", &ConnectionTarget::direct("https://a.example"), "tok").await.unwrap();
 
         assert_eq!(target.tracks.len(), 2);
         assert_eq!(target.tracks[0].ino, "1");
@@ -326,7 +354,7 @@ mod tests {
     async fn offline_stream_target_errors_without_cached_tracks() {
         let (pool, server_id) = pool_with_synced_item().await;
 
-        let result = offline_stream_target(&pool, &server_id, "item-1", "https://a.example", "tok").await;
+        let result = offline_stream_target(&pool, &server_id, "item-1", &ConnectionTarget::direct("https://a.example"), "tok").await;
 
         assert!(result.is_err(), "an item never resolved or downloaded on this device can't be played offline");
     }
@@ -363,7 +391,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await;
+        let result = sync_progress_to_server(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1", 42.5, 100.0, false).await;
         assert!(result.is_err());
     }
 }

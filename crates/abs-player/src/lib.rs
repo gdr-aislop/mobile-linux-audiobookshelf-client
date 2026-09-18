@@ -34,11 +34,31 @@ pub enum PlayerEvent {
     Error(String),
 }
 
+/// Transport properties for HTTP(S) playback URIs — the playback-side mirror of the Connection
+/// page's Advanced settings (custom headers, user agent, TLS verification). Plain data, no
+/// reqwest: `abs-player` never touches the HTTP stack, it only hands these to GStreamer's HTTP
+/// source (`souphttpsrc`) when the pipeline's source is being set up. Defaults describe the
+/// behavior before connection settings existed: no extra headers, no override, verification on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConnectionProperties {
+    /// Headers attached to every playback request (e.g. a reverse proxy's auth header).
+    pub extra_headers: Vec<(String, String)>,
+    /// Replaces souphttpsrc's default `User-Agent` when set.
+    pub user_agent: Option<String>,
+    /// `true` (the default) enforces certificate validation; the Connection page's
+    /// "Disable SSL verification" setting maps to `false`.
+    pub ssl_strict: bool,
+}
+
 /// The playback engine's public surface — implemented by [`GstBackend`] for real playback, and
 /// mockable in `abs-core`'s own tests (as a trait object or a hand-rolled fake) without linking
 /// GStreamer at all.
 pub trait AudioBackend {
     fn load(&mut self, uri: &str) -> Result<()>;
+    /// Sets the connection properties used by the **next** `load()` of an HTTP(S) URI. Local
+    /// files are unaffected. Called before every streaming load so a settings change is picked
+    /// up by the next track without rebuilding the backend.
+    fn apply_connection(&mut self, properties: &ConnectionProperties);
     fn play(&mut self) -> Result<()>;
     fn pause(&mut self) -> Result<()>;
     /// Requires the pipeline to have already reached at least `PAUSED` (i.e. `play()` or
@@ -62,6 +82,10 @@ pub trait AudioBackend {
 pub struct GstBackend {
     pipeline: gst::Element,
     current_speed: f64,
+    /// Shared with the `source-setup` handler, which reads whatever was last applied here.
+    /// GStreamer creates (and hands over) a fresh HTTP source per `load()`, so the properties
+    /// can't be set on an element once — they have to be re-read at each source setup.
+    connection_properties: std::sync::Arc<std::sync::Mutex<ConnectionProperties>>,
 }
 
 impl GstBackend {
@@ -77,6 +101,8 @@ impl GstBackend {
 
     fn build(sink_element_name: Option<&str>) -> Result<Self> {
         let pipeline = gst::ElementFactory::make("playbin").build()?;
+        let connection_properties = std::sync::Arc::new(std::sync::Mutex::new(ConnectionProperties::default()));
+        connect_source_setup(&pipeline, connection_properties.clone());
         match sink_element_name {
             Some(sink_name) => {
                 let sink = gst::ElementFactory::make(sink_name).build()?;
@@ -98,12 +124,42 @@ impl GstBackend {
             // creates internally), not up front.
             None => apply_stream_role_when_sink_is_ready(&pipeline),
         }
-        Ok(Self { pipeline, current_speed: 1.0 })
+        Ok(Self { pipeline, current_speed: 1.0, connection_properties })
     }
 
     fn bus(&self) -> gst::Bus {
         self.pipeline.bus().expect("a playbin pipeline always has a bus")
     }
+}
+
+/// Wires `playbin`'s `source-setup` signal: whatever HTTP source GStreamer creates for the next
+/// `load()` gets the connection's transport properties applied — but only the properties that
+/// source actually has, so a local `file://` source (no `user-agent`, no `ssl-strict`) is never
+/// touched. Client certificates are a documented limitation: souphttpsrc's mTLS support is a
+/// separate mechanism from these properties, and a server requiring it fails the request
+/// visibly rather than silently.
+fn connect_source_setup(pipeline: &gst::Element, properties: std::sync::Arc<std::sync::Mutex<ConnectionProperties>>) {
+    pipeline.connect("source-setup", false, move |values| {
+        let source = values[1].get::<gst::Element>().expect("source-setup signal carries the source element");
+        let properties = properties.lock().expect("connection properties mutex");
+
+        if source.has_property("ssl-strict", Some(glib::Type::BOOL)) {
+            source.set_property("ssl-strict", properties.ssl_strict);
+        }
+        if let Some(user_agent) = &properties.user_agent {
+            if source.has_property("user-agent", Some(glib::Type::STRING)) {
+                source.set_property("user-agent", user_agent.as_str());
+            }
+        }
+        if !properties.extra_headers.is_empty() && source.has_property("http-headers", Some(gst::Structure::static_type())) {
+            let mut headers = gst::Structure::new_empty("extra-headers");
+            for (name, value) in &properties.extra_headers {
+                headers.set(name.as_str(), value.as_str());
+            }
+            source.set_property("http-headers", headers);
+        }
+        None
+    });
 }
 
 impl AudioBackend for GstBackend {
@@ -112,6 +168,10 @@ impl AudioBackend for GstBackend {
         self.pipeline.set_property("uri", uri);
         self.current_speed = 1.0;
         Ok(())
+    }
+
+    fn apply_connection(&mut self, properties: &ConnectionProperties) {
+        *self.connection_properties.lock().expect("connection properties mutex") = properties.clone();
     }
 
     fn play(&mut self) -> Result<()> {

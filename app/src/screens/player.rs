@@ -734,7 +734,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
             1.0,
         );
@@ -785,7 +785,7 @@ pub(crate) mod tests {
         // response — hence `mock_playable_item_with_chapters` and the readiness wait below.
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
             1.0,
         );
@@ -838,7 +838,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
             1.0,
         );
@@ -880,7 +880,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -914,7 +914,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -986,7 +986,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
             1.0,
         );
@@ -1024,7 +1024,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -1057,7 +1057,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
@@ -1090,7 +1090,7 @@ pub(crate) mod tests {
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(
-            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );

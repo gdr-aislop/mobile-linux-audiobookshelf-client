@@ -224,7 +224,7 @@ async fn backoff(attempt: u32) {
 pub async fn download_track(
     paths: &AppPaths,
     pool: &SqlitePool,
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     server_id: &str,
     item_id: &str,
@@ -254,10 +254,13 @@ pub async fn download_track(
             return Ok(TrackDownloadOutcome::Canceled);
         }
 
-        let client = match abs_api::Client::with_bearer_token_and_timeout(server_url, access_token, REQUEST_TIMEOUT) {
+        let client = match connection.api_client_with_timeout(access_token, REQUEST_TIMEOUT) {
             Ok(client) => client,
-            Err(_) => {
-                let reason = "invalid access token".to_string();
+            Err(err) => {
+                // A mint failure with a configured connection is a concrete, user-fixable
+                // problem (missing/unreadable client certificate) — reported as the download's
+                // failure reason rather than crashing the download worker.
+                let reason = format!("couldn't set up the connection: {err}");
                 abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
@@ -384,6 +387,7 @@ pub async fn download_track(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionTarget;
     use std::cell::Cell;
     use std::rc::Rc;
     use wiremock::matchers::{header, method, path};
@@ -628,7 +632,7 @@ mod tests {
         let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
 
         let mut progress_calls = Vec::new();
-        let outcome = download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |downloaded, total| progress_calls.push((downloaded, total)), &no_cancel())
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |downloaded, total| progress_calls.push((downloaded, total)), &no_cancel())
             .await
             .unwrap();
 
@@ -654,8 +658,8 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
 
-        download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
-        download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "a second call should be a cache hit, not a second HTTP request");
@@ -669,7 +673,7 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
 
-        let outcome = download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
 
         assert!(matches!(outcome, TrackDownloadOutcome::Failed(_)));
         let requests = mock_server.received_requests().await.unwrap();
@@ -694,7 +698,7 @@ mod tests {
         // Cancel on the very first check, before any bytes are read at all.
         let canceled = Rc::new(Cell::new(true));
         let cancel_flag = canceled.clone();
-        let outcome = download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &move || cancel_flag.get()).await.unwrap();
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &move || cancel_flag.get()).await.unwrap();
 
         assert_eq!(outcome, TrackDownloadOutcome::Canceled);
         assert!(abs_storage::repo::download_tracks::get(&pool, &server_id, "item-1", "ino-1").await.unwrap().is_none(), "canceling before any row exists must not fabricate one");
@@ -730,7 +734,7 @@ mod tests {
         abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "ino-1", file_path.to_str().unwrap()).await.unwrap();
         abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "ino-1", 5, Some(10)).await.unwrap();
 
-        let outcome = download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
 
         assert_eq!(outcome, TrackDownloadOutcome::Completed);
         assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"helloworld", "resumed bytes must be appended, not overwrite what was already there");
@@ -761,7 +765,7 @@ mod tests {
         abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "ino-1", file_path.to_str().unwrap()).await.unwrap();
         abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "ino-1", 5, Some(10)).await.unwrap();
 
-        let outcome = download_track(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
 
         assert_eq!(outcome, TrackDownloadOutcome::Completed);
         assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"full-bytes", "must restart fresh, not append the full body onto the old partial bytes");

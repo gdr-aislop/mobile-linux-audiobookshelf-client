@@ -17,6 +17,7 @@
 //! only logged — the next 401 is no worse than what would happen without this module.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 
@@ -39,6 +40,11 @@ pub fn jwt_exp_seconds(token: &str) -> Option<i64> {
     json.get("exp")?.as_i64()
 }
 
+/// How long a local-address probe result stays trusted. Long enough that a sync cycle or a
+/// multi-track download doesn't re-probe per call; short enough that switching networks (leaving
+/// home Wi-Fi) is noticed on the next probe after the TTL lapses.
+const PROBE_TTL: Duration = Duration::from_secs(60);
+
 /// One logged-in session's live token pair: seeded from the persisted [`Account`], refreshed
 /// (and persisted back) whenever a caller asks for a token that is expired or about to be.
 /// Cheap to clone — every holder sees the same refreshed pair, and a tokio mutex makes
@@ -54,6 +60,11 @@ struct SessionInner {
     server_id: String,
     account_id: String,
     tokens: tokio::sync::Mutex<Tokens>,
+    /// Last local-address probe result for this session's server — address, verdict, when.
+    /// Scoped to the session (not a process-global) so a probe can never outlive the
+    /// connection it was made for, and so tests sharing a process can't leak verdicts to each
+    /// other through a global cache.
+    probe_cache: tokio::sync::Mutex<Option<CachedProbe>>,
 }
 
 #[derive(Clone)]
@@ -62,18 +73,30 @@ struct Tokens {
     refresh_token: Option<String>,
 }
 
+struct CachedProbe {
+    address: String,
+    reachable: bool,
+    at: std::time::Instant,
+}
+
 impl Session {
-    pub fn new(pool: SqlitePool, server_url: &str, server_id: &str, account: &Account) -> Self {
+    /// Builds a session for an account on its server. `server` is the row the account belongs
+    /// to — its URL is the base every call goes through, and its connection settings (custom
+    /// headers, TLS, ...) are honored by everything minted through this session. Holding the
+    /// row rather than a bare URL keeps one source of truth: there is no second "server URL"
+    /// that could drift from what the database says.
+    pub fn new(pool: SqlitePool, server: &abs_storage::models::Server, account: &Account) -> Self {
         Self {
             inner: Arc::new(SessionInner {
                 pool,
-                server_url: server_url.to_string(),
-                server_id: server_id.to_string(),
+                server_url: server.url.clone(),
+                server_id: server.id.clone(),
                 account_id: account.id.clone(),
                 tokens: tokio::sync::Mutex::new(Tokens {
                     access_token: account.token.clone(),
                     refresh_token: account.refresh_token.clone(),
                 }),
+                probe_cache: tokio::sync::Mutex::new(None),
             }),
         }
     }
@@ -86,8 +109,41 @@ impl Session {
         &self.inner.server_id
     }
 
-    pub fn server_url(&self) -> &str {
-        &self.inner.server_url
+    /// The connection every server-facing call for this session's server should go through.
+    /// Fetched fresh from the database, so a settings change made on the Connection page is
+    /// picked up by the next sync, download or playback without any rebuild — the same
+    /// ask-at-call-time posture this module applies to tokens. The local-address reachability
+    /// probe (when a local address is configured) runs through a short-lived per-session cache:
+    /// concurrent callers share one probe, the way they share one token refresh.
+    pub async fn connection_target(&self) -> crate::error::Result<crate::connection::ConnectionTarget> {
+        let server = abs_storage::repo::servers::get(&self.inner.pool, &self.inner.server_id).await?;
+
+        let Some(local_address) = server
+            .local_network_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(crate::connection::ConnectionTarget::resolve(&server, None));
+        };
+
+        let mut cache = self.inner.probe_cache.lock().await;
+        let cached_reachable = cache
+            .as_ref()
+            .filter(|probe| probe.address == local_address && probe.at.elapsed() < PROBE_TTL)
+            .map(|probe| probe.reachable);
+        let reachable = match cached_reachable {
+            Some(reachable) => reachable,
+            None => {
+                // Holding the lock across the probe (a tokio mutex, so this is legal) makes
+                // concurrent callers wait for — and then reuse — one shared probe result.
+                let reachable = crate::connection::probe_reachable(&local_address).await;
+                *cache = Some(CachedProbe { address: local_address.clone(), reachable, at: std::time::Instant::now() });
+                reachable
+            }
+        };
+        Ok(crate::connection::ConnectionTarget::resolve(&server, Some(reachable)))
     }
 
     /// A current access token, refreshing first when the stored one is expired or within
@@ -114,7 +170,22 @@ impl Session {
             }
         };
 
-        let client = abs_api::Client::new(&self.inner.server_url);
+        // The refresh call must reach the server the same way everything else does — a
+        // self-signed server's refresh can't be verified against the system CA store any more
+        // than its sync calls can. Both resolve steps are best-effort here (this function is
+        // infallible by design): if the connection can't be resolved or minted, the refresh
+        // falls back to a default client, the same posture as every other failed refresh —
+        // the failure is logged and the next 401 is no worse than before this module existed.
+        let client = match self.connection_target().await {
+            Ok(target) => target.plain_client().unwrap_or_else(|err| {
+                tracing::warn!(%err, "couldn't mint a client honoring the connection settings; token refresh will use the defaults");
+                abs_api::Client::new(&self.inner.server_url)
+            }),
+            Err(err) => {
+                tracing::warn!(%err, "couldn't load the server's connection settings; token refresh will use the defaults");
+                abs_api::Client::new(&self.inner.server_url)
+            }
+        };
         match client.refresh(&refresh_token).await {
             Ok(result) => {
                 // Rotation: the response's refresh token replaces the old one. Servers that
@@ -169,18 +240,24 @@ mod tests {
         )
     }
 
-    async fn pool_with_account(token: &str, refresh_token: Option<&str>) -> (SqlitePool, Account, String) {
+    /// A migrated pool plus one server row pointing at `server_url` (the mock the test is
+    /// about to talk to) and one account on it.
+    async fn pool_with_account(server_url: &str, token: &str, refresh_token: Option<&str>) -> (SqlitePool, Account, String) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
         std::mem::forget(tmp);
-        let server_id = abs_storage::repo::servers::add(&pool, "https://example.invalid").await.unwrap();
+        let server_id = abs_storage::repo::servers::add(&pool, server_url).await.unwrap();
         let account_id = abs_storage::repo::accounts::add(&pool, &server_id, "jane", token, refresh_token).await.unwrap();
         let account = abs_storage::repo::accounts::get(&pool, &account_id).await.unwrap();
         (pool, account, server_id)
     }
 
-    fn session_for(mock_url: &str, pool: &SqlitePool, account: &Account) -> Session {
-        Session::new(pool.clone(), mock_url, &account.server_id, account)
+    /// Builds the session from the server row the pool already holds — Session reads its
+    /// server data from the row (fresh, at call time), so the row is what must point at the
+    /// mock, and this helper asserts that invariant.
+    async fn session_for(pool: &SqlitePool, account: &Account) -> Session {
+        let server = abs_storage::repo::servers::get(pool, &account.server_id).await.unwrap();
+        Session::new(pool.clone(), &server, account)
     }
 
     #[test]
@@ -198,10 +275,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_token_is_returned_unchanged_without_any_network_call() {
-        let exp = chrono::Utc::now().timestamp() + 3600;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(exp), Some("refresh")).await;
         let mock_server = MockServer::start().await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(exp), Some("refresh")).await;
+        let session = session_for(&pool, &account).await;
 
         let token = session.access_token().await;
 
@@ -211,9 +288,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_expiring_token_is_refreshed_and_both_rotated_tokens_persisted() {
-        let expired = chrono::Utc::now().timestamp() - 10;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(expired), Some("old-refresh")).await;
         let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .and(header("x-refresh-token", "old-refresh"))
@@ -228,7 +305,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let session = session_for(&pool, &account).await;
 
         let token = session.access_token().await;
 
@@ -240,9 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_callers_share_one_refresh() {
-        let expired = chrono::Utc::now().timestamp() - 10;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(expired), Some("old-refresh")).await;
         let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -250,7 +327,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let session = session_for(&pool, &account).await;
 
         let fetched = {
             let (a, b, c, d, e) = tokio::join!(session.access_token(), session.access_token(), session.access_token(), session.access_token(), session.access_token());
@@ -267,9 +344,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_refresh_response_without_a_new_refresh_token_keeps_the_old_one() {
-        let expired = chrono::Utc::now().timestamp() - 10;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(expired), Some("old-refresh")).await;
         let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -277,7 +354,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let session = session_for(&pool, &account).await;
 
         let token = session.access_token().await;
 
@@ -288,11 +365,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_refresh_returns_the_current_token_gracefully() {
-        let expired = chrono::Utc::now().timestamp() - 10;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(expired), Some("revoked-refresh")).await;
         let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("revoked-refresh")).await;
         Mock::given(method("POST")).and(path("/auth/refresh")).respond_with(ResponseTemplate::new(401)).mount(&mock_server).await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let session = session_for(&pool, &account).await;
 
         let token = session.access_token().await;
 
@@ -304,14 +381,40 @@ mod tests {
     #[tokio::test]
     async fn an_expired_token_with_no_refresh_token_is_left_alone() {
         // Legacy server case: no refresh token to exchange — the call must not hit the network.
-        let expired = chrono::Utc::now().timestamp() - 10;
-        let (pool, account, _) = pool_with_account(&jwt_with_exp(expired), None).await;
         let mock_server = MockServer::start().await;
-        let session = session_for(&mock_server.uri(), &pool, &account);
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), None).await;
+        let session = session_for(&pool, &account).await;
 
         let token = session.access_token().await;
 
         assert_eq!(token, account.token);
         assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The token refresh must reach the server the way *everything* does — through the
+    /// server's connection settings. A custom header saved on the Connection page has to ride
+    /// along on `/auth/refresh` too, or a reverse-proxy-fronted server would accept syncs but
+    /// silently drop every refresh (and with it, the session an hour in).
+    #[tokio::test]
+    async fn the_refresh_request_honors_the_server_s_connection_settings() {
+        let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, server_id) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
+        abs_storage::repo::servers::set_custom_headers_json(&pool, &server_id, r#"{"X-Auth":"secret"}"#).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .and(header("x-refresh-token", "old-refresh"))
+            .and(header("x-auth", "secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user": { "id": "user-1", "username": "jane", "accessToken": "new-access", "refreshToken": "new-refresh" }
+            })))
+            .mount(&mock_server)
+            .await;
+        let session = session_for(&pool, &account).await;
+
+        let token = session.access_token().await;
+
+        assert_eq!(token, "new-access", "the refresh went through only if the custom header was sent");
     }
 }

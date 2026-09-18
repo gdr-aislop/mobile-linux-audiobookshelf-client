@@ -340,7 +340,7 @@ pub(crate) mod tests {
         let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
         let server = abs_storage::repo::servers::get(pool, &server_id).await.unwrap();
         let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
-        (abs_core::auth::Session::new(pool.clone(), server_url, &server_id, &account), server, account)
+        (abs_core::auth::Session::new(pool.clone(), &server, &account), server, account)
     }
 
     async fn insert_synced_item(pool: &SqlitePool, server_id: &str, item_id: &str, title: &str) {

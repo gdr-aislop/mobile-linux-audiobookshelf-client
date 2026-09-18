@@ -19,8 +19,9 @@ pub use client::*;
 
 mod ext;
 pub use ext::{
-    AudioFileRef, ChapterRef, CoverBytes, InvalidBearerToken, ItemPlaybackInfo, LibraryItemSummary,
-    LibraryItemsError, LoginError, LoginResult, ServerProgress, TrackFileError, TrackFileResponse,
+    AudioFileRef, ChapterRef, ConnectionBuildError, ConnectionOptions, CoverBytes, ItemPlaybackInfo,
+    LibraryItemSummary, LibraryItemsError, LoginError, LoginResult, ServerProgress, TrackFileError,
+    TrackFileResponse, is_valid_header_name, is_valid_header_value, validate_client_cert_file,
 };
 
 #[cfg(test)]

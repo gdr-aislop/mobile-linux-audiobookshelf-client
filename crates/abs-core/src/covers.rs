@@ -19,7 +19,7 @@ const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn fetch_and_cache_cover(
     paths: &AppPaths,
     pool: &SqlitePool,
-    server_url: &str,
+    connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     server_id: &str,
     item_id: &str,
@@ -28,7 +28,7 @@ pub async fn fetch_and_cache_cover(
         return Some(cached);
     }
 
-    let api = abs_api::Client::with_bearer_token_and_timeout(server_url, access_token, COVER_FETCH_TIMEOUT).ok()?;
+    let api = connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT).ok()?;
     let cover = match api.get_item_cover(item_id).await {
         Ok(cover) => cover,
         Err(err) => {
@@ -67,6 +67,7 @@ async fn already_cached(pool: &SqlitePool, server_id: &str, item_id: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::ConnectionTarget;
     use abs_storage::repo::{accounts, items, libraries, servers};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -121,7 +122,7 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_item("item-1").await;
 
-        let cached = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await;
+        let cached = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
         let cached = cached.expect("fetch should succeed");
 
         assert_eq!(cached.extension().unwrap(), "webp");
@@ -142,8 +143,8 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_item("item-1").await;
 
-        let first = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await.unwrap();
-        let second = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await.unwrap();
+        let first = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
+        let second = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
         assert_eq!(first, second);
 
         let requests = mock_server.received_requests().await.unwrap();
@@ -158,7 +159,7 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_item("item-1").await;
 
-        let result = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await;
+        let result = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
         assert!(result.is_none());
     }
 
@@ -174,10 +175,10 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_item("item-1").await;
 
-        let cached = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await.unwrap();
+        let cached = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
         tokio::fs::remove_file(&cached).await.unwrap();
 
-        let refetched = fetch_and_cache_cover(&paths, &pool, &mock_server.uri(), "token", &server_id, "item-1").await;
+        let refetched = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
         assert!(refetched.is_some(), "a deleted cache file must not be trusted as a hit");
 
         let requests = mock_server.received_requests().await.unwrap();

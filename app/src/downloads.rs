@@ -165,9 +165,18 @@ impl DownloadManager {
 
             if tracks.is_empty() {
                 // Asked at resolve time, not captured earlier — same "never let a captured token
-                // go stale across a long-running operation" posture as `PlayerController::start`.
+                // (or connection) go stale across a long-running operation" posture as
+                // `PlayerController::start`.
                 let access_token = session.access_token().await;
-                match abs_core::streaming::resolve_stream_target(session.server_url(), &access_token, &item_id).await {
+                let connection = match session.connection_target().await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        tracing::warn!(%err, item_id, "couldn't load the server's connection settings");
+                        inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed });
+                        return;
+                    }
+                };
+                match abs_core::streaming::resolve_stream_target(&connection, &access_token, &item_id).await {
                     Ok(target) => {
                         if let Err(err) = abs_core::tracks::sync_item_tracks(&pool, &server_id, &item_id, &target.tracks).await {
                             tracing::warn!(%err, item_id, "couldn't persist tracks locally");
@@ -276,9 +285,19 @@ impl DownloadManager {
             // Asked fresh for each track, not carried over from `start_download`'s own call — a
             // batch of many tracks (an "entire book" download) can easily outlast a short-lived
             // access token, and `Session::access_token` is exactly the "refresh if needed"
-            // primitive `PlayerController` already relies on for the same reason.
+            // primitive `PlayerController` already relies on for the same reason. The
+            // connection is asked the same way: a settings change applies to the next track.
             let access_token = session.access_token().await;
-            let outcome = abs_core::download_tracks::download_track(&paths, &pool, session.server_url(), &access_token, &server_id, &item_id, &ino, on_progress, &cancel_check)
+            let connection = match session.connection_target().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    let reason = format!("the server's connection settings are gone: {err}");
+                    abs_storage::repo::download_tracks::mark_failed(&pool, &server_id, &item_id, &ino, &reason).await.ok();
+                    Self::finish_track(&inner_rc, &server_id, &item_id, TrackDownloadOutcome::Failed(reason));
+                    return;
+                }
+            };
+            let outcome = abs_core::download_tracks::download_track(&paths, &pool, &connection, &access_token, &server_id, &item_id, &ino, on_progress, &cancel_check)
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(%err, item_id = %item_id, ino = %ino, "download_track returned an error");
@@ -389,7 +408,7 @@ pub(crate) mod tests {
         let account_id = abs_storage::repo::accounts::add(pool, &server_id, "jane", "token123", None).await.unwrap();
         let server = abs_storage::repo::servers::get(pool, &server_id).await.unwrap();
         let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
-        (Session::new(pool.clone(), server_url, &server_id, &account), server)
+        (Session::new(pool.clone(), &server, &account), server)
     }
 
     async fn insert_synced_item(pool: &SqlitePool, server_id: &str, item_id: &str) {

@@ -26,7 +26,7 @@ pub async fn add(pool: &SqlitePool, url: &str) -> Result<String> {
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Server> {
     sqlx::query_as(
         "SELECT id, url, custom_headers_json, disable_ssl_verify, client_cert_path,
-                local_network_address, user_agent, created_at
+                client_cert_password, local_network_address, user_agent, created_at
          FROM servers WHERE id = ?",
     )
     .bind(id)
@@ -38,7 +38,7 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Server> {
 pub async fn list(pool: &SqlitePool) -> Result<Vec<Server>> {
     let servers = sqlx::query_as(
         "SELECT id, url, custom_headers_json, disable_ssl_verify, client_cert_path,
-                local_network_address, user_agent, created_at
+                client_cert_password, local_network_address, user_agent, created_at
          FROM servers ORDER BY created_at ASC",
     )
     .fetch_all(pool)
@@ -77,6 +77,58 @@ pub async fn set_local_network_address(
 ) -> Result<()> {
     let result = sqlx::query("UPDATE servers SET local_network_address = ? WHERE id = ?")
         .bind(address)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound(format!("server {id}")));
+    }
+    Ok(())
+}
+
+pub async fn set_custom_headers_json(pool: &SqlitePool, id: &str, json: &str) -> Result<()> {
+    let result = sqlx::query("UPDATE servers SET custom_headers_json = ? WHERE id = ?")
+        .bind(json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound(format!("server {id}")));
+    }
+    Ok(())
+}
+
+pub async fn set_client_cert_path(pool: &SqlitePool, id: &str, path: Option<&str>) -> Result<()> {
+    let result = sqlx::query("UPDATE servers SET client_cert_path = ? WHERE id = ?")
+        .bind(path)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound(format!("server {id}")));
+    }
+    Ok(())
+}
+
+pub async fn set_client_cert_password(
+    pool: &SqlitePool,
+    id: &str,
+    password: Option<&str>,
+) -> Result<()> {
+    let result = sqlx::query("UPDATE servers SET client_cert_password = ? WHERE id = ?")
+        .bind(password)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound(format!("server {id}")));
+    }
+    Ok(())
+}
+
+pub async fn set_user_agent(pool: &SqlitePool, id: &str, user_agent: Option<&str>) -> Result<()> {
+    let result = sqlx::query("UPDATE servers SET user_agent = ? WHERE id = ?")
+        .bind(user_agent)
         .bind(id)
         .execute(pool)
         .await?;
@@ -172,5 +224,67 @@ mod tests {
 
         set_local_network_address(&pool, &id, None).await.unwrap();
         assert_eq!(get(&pool, &id).await.unwrap().local_network_address, None);
+    }
+
+    #[tokio::test]
+    async fn set_custom_headers_json_round_trips() {
+        let pool = pool().await;
+        let id = add(&pool, "https://a.example").await.unwrap();
+        // `add` seeds an empty JSON object — a server starts with no custom headers, not NULL.
+        assert_eq!(get(&pool, &id).await.unwrap().custom_headers_json, "{}");
+
+        set_custom_headers_json(&pool, &id, r#"{"X-Auth":"secret"}"#).await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().custom_headers_json, r#"{"X-Auth":"secret"}"#);
+
+        set_custom_headers_json(&pool, &id, "{}").await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().custom_headers_json, "{}");
+    }
+
+    #[tokio::test]
+    async fn set_client_cert_path_and_password_round_trip_and_clear() {
+        let pool = pool().await;
+        let id = add(&pool, "https://a.example").await.unwrap();
+
+        set_client_cert_path(&pool, &id, Some("/certs/client.p12")).await.unwrap();
+        set_client_cert_password(&pool, &id, Some("export-password")).await.unwrap();
+        let server = get(&pool, &id).await.unwrap();
+        assert_eq!(server.client_cert_path.as_deref(), Some("/certs/client.p12"));
+        assert_eq!(server.client_cert_password.as_deref(), Some("export-password"));
+
+        // Clearing the path clears the password too in normal use (the UI clears both
+        // together), but the setters are independent — clearing the password alone is legal.
+        set_client_cert_password(&pool, &id, None).await.unwrap();
+        let server = get(&pool, &id).await.unwrap();
+        assert_eq!(server.client_cert_path.as_deref(), Some("/certs/client.p12"));
+        assert_eq!(server.client_cert_password, None);
+
+        set_client_cert_path(&pool, &id, None).await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().client_cert_path, None);
+    }
+
+    #[tokio::test]
+    async fn set_user_agent_round_trips() {
+        let pool = pool().await;
+        let id = add(&pool, "https://a.example").await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().user_agent, None);
+
+        set_user_agent(&pool, &id, Some("MyAgent/1.0")).await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().user_agent.as_deref(), Some("MyAgent/1.0"));
+
+        set_user_agent(&pool, &id, None).await.unwrap();
+        assert_eq!(get(&pool, &id).await.unwrap().user_agent, None);
+    }
+
+    #[tokio::test]
+    async fn setters_on_a_missing_server_are_an_error() {
+        let pool = pool().await;
+        for error in [
+            set_custom_headers_json(&pool, "nope", "{}").await.unwrap_err(),
+            set_client_cert_path(&pool, "nope", None).await.unwrap_err(),
+            set_client_cert_password(&pool, "nope", None).await.unwrap_err(),
+            set_user_agent(&pool, "nope", None).await.unwrap_err(),
+        ] {
+            assert!(matches!(error, StorageError::NotFound(_)));
+        }
     }
 }
