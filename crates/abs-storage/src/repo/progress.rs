@@ -88,6 +88,21 @@ pub async fn list_recent_for_account(
     Ok(progress)
 }
 
+/// Every progress row for an account, unordered — backs the Library screen's "Last listened"
+/// sort and "In progress only" filter, which need a position/finish-time lookup per item rather
+/// than a ranked list. One query for the whole screen (Home's ranked variant above is the
+/// `LIMIT`ed shape of the same read).
+pub async fn list_for_account(pool: &SqlitePool, account_id: &str) -> Result<Vec<Progress>> {
+    let progress = sqlx::query_as(
+        "SELECT account_id, server_id, item_id, current_time_seconds, is_finished, updated_at
+         FROM progress WHERE account_id = ?",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(progress)
+}
+
 pub async fn remove(pool: &SqlitePool, account_id: &str, server_id: &str, item_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM progress WHERE account_id = ? AND server_id = ? AND item_id = ?")
         .bind(account_id)

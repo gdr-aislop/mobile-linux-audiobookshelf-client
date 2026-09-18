@@ -168,6 +168,23 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       through to an Item detail page (§6); until that's built, the card plays directly — that's
       the current intended behavior.
 
+- [ ] **HT-3a — Tapping a shelf heading opens the Library pre-sorted.** Tap the "Recently
+      Added" heading.
+      *Expected:* switches to the Library tab sorted by date added (newest first), no filter.
+
+- [ ] **HT-3b — Continue Listening heading lands filtered.** Tap the "Continue Listening"
+      heading.
+      *Expected:* switches to the Library tab sorted by last listened (newest last-listen first,
+      never-played books last) and filtered to in-progress books: the filter banner ("Showing
+      books in progress", with a Show all button) is visible and the sort dropdown's icon is a
+      funnel. Show all (or unticking the dropdown's "In progress only") restores the full library.
+
+- [ ] **HT-3c — "Last listened" sort works from the dropdown.** Open the Library's "Sort &
+      filter" dropdown, pick "Last listened"; enable "In progress only" manually.
+      *Expected:* books order by when you last listened to them (per the server's own listening
+      times); the filter hides finished and never-played books and shows the banner. Neither the
+      sort nor the filter survives an app restart (session-transient).
+
 - [ ] **HT-4 — Sync failure banner.** Load Home with the server unreachable (kill the server /
       turn off Wi-Fi, then switch to the Home tab so it re-syncs).
       *Expected:* banner "Couldn't sync — showing what's cached." and the previously cached

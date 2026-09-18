@@ -26,7 +26,7 @@ use sqlx::SqlitePool;
 
 use abs_core::error::{CoreError, Result as CoreResult};
 use abs_core::settings::LibraryViewMode;
-use abs_storage::models::{Account, Item, Server};
+use abs_storage::models::{Account, Item, Progress, Server};
 use abs_storage::AppPaths;
 
 use crate::player::PlayRequest;
@@ -39,17 +39,42 @@ use crate::widgets::item_card;
 // enough to push the cell's natural width just past half the available content width.
 const TILE_SIZE: i32 = 108;
 
+/// The header dropdown's indicator icons: the plain sort glyph, and the funnel that (Nautilus
+/// style) signals "a filter is active" while the popover is closed.
+const SORT_ICON: &str = "view-sort-descending-symbolic";
+const FILTER_ACTIVE_ICON: &str = "funnel-symbolic";
+
+#[derive(Clone)]
 pub struct LibraryScreen {
     pub root: gtk4::Widget,
     /// Public so the main window's `win.open-library-search` keyboard action (ui-spec §6) can
     /// focus it — `TestHooks` is test-only by convention, and this is production wiring, not a
     /// test hook.
     pub search_entry: gtk4::SearchEntry,
+    /// Kept on the screen so navigation-with-intent can land here pre-sorted/pre-filtered —
+    /// Home's shelf headers call [`Self::apply_view`] through the shell. Same shared-handle
+    /// posture as every other widget field: `LibraryWidgets` is cheap-clone, and the async
+    /// pipeline already holds its own clone.
+    widgets: LibraryWidgets,
     #[cfg(test)]
     hooks: TestHooks,
 }
 
+impl LibraryScreen {
+    /// Navigation-with-intent entry point (docs/design/ui-spec.md, Home tap-through): Home's
+    /// shelf headers switch to this screen pre-sorted — and, for Continue Listening,
+    /// pre-filtered to in-progress books — without persisting anything, exactly like a manual
+    /// sort/filter change (both are session-transient by the same reasoning: a view that
+    /// silently hides books across restarts is a trap, not a convenience).
+    pub(crate) fn apply_view(&self, key: SortKey, in_progress_only: bool) {
+        self.widgets.sort.set(key);
+        // `set_in_progress_only` re-renders with both the new sort and the new filter.
+        set_in_progress_only(&self.widgets, in_progress_only);
+    }
+}
+
 #[cfg(test)]
+#[derive(Clone)]
 pub struct TestHooks {
     pub status_page: adw::StatusPage,
     pub flow_box: gtk4::FlowBox,
@@ -57,6 +82,10 @@ pub struct TestHooks {
     pub search_entry: gtk4::SearchEntry,
     pub banner: crate::widgets::banner::ErrorBanner,
     pub sort_buttons: SortButtons,
+    pub sort_menu_button: gtk4::MenuButton,
+    pub in_progress_check: gtk4::CheckButton,
+    pub progress_banner: gtk4::Revealer,
+    pub progress_show_all: gtk4::Button,
     pub view_toggle: gtk4::ToggleButton,
     pub offline_toggle: gtk4::ToggleButton,
     pub offline_banner: gtk4::Revealer,
@@ -70,11 +99,16 @@ impl LibraryScreen {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SortKey {
+pub(crate) enum SortKey {
     DateAdded,
     Title,
     Author,
     Duration,
+    /// Not a metadata field but a playback one: items with a progress row first, newest
+    /// last-listen first (`progress.updated_at` — the server's own last-update time on import),
+    /// never-played items after them in stable order. Backs Home's "Continue Listening"
+    /// tap-through and the popover's "Last listened" entry.
+    LastListened,
 }
 
 #[derive(Clone)]
@@ -83,6 +117,7 @@ pub struct SortButtons {
     pub title: gtk4::Button,
     pub author: gtk4::Button,
     pub duration: gtk4::Button,
+    pub last_listened: gtk4::Button,
 }
 
 /// Everything `render` needs a handle to, cloned as a whole into the `spawn_future_local` block —
@@ -97,6 +132,10 @@ struct LibraryWidgets {
     banner: crate::widgets::banner::ErrorBanner,
     search_entry: gtk4::SearchEntry,
     sort: Rc<Cell<SortKey>>,
+    /// The one knob behind every "in progress only" surface — the popover's CheckButton, the
+    /// header button's funnel indicator, and the in-view banner all read/write it through
+    /// [`set_in_progress_only`] so they can't drift apart. Session-transient like `sort`.
+    in_progress_only: Rc<Cell<bool>>,
     view_mode: Rc<Cell<LibraryViewMode>>,
     /// Shared state per `docs/design/ui-spec.md` ("not a per-screen setting") — this screen and
     /// Home each load/save the same `abs_core::settings::{load,save}_offline_mode` key, same
@@ -104,6 +143,11 @@ struct LibraryWidgets {
     offline_mode: Rc<Cell<bool>>,
     data: Rc<std::cell::RefCell<LibraryData>>,
     on_play: Rc<dyn Fn(PlayRequest)>,
+    /// Header dropdown button — mutated only to reflect the filter state (funnel icon while a
+    /// filter is active, Nautilus-style), never to *own* it.
+    sort_menu_button: gtk4::MenuButton,
+    in_progress_check: gtk4::CheckButton,
+    progress_banner: gtk4::Revealer,
 }
 
 struct LibraryData {
@@ -111,6 +155,10 @@ struct LibraryData {
     /// Ids of items downloaded fully or partially — loaded once alongside `items` (one query, not
     /// one per card). Feeds `item_card::build`'s read-only download badge.
     downloaded: std::collections::HashSet<String>,
+    /// Every progress row for the account, keyed by item id — backs the `LastListened` sort and
+    /// the "In progress only" filter. Loaded in the same one-query-per-concern pass as
+    /// `downloaded`, never per card.
+    last_listened: std::collections::HashMap<String, Progress>,
 }
 
 /// Builds the screen. Signature mirrors `home::build`'s exactly — same reasoning: `server`/
@@ -141,15 +189,43 @@ pub fn build(
         title: gtk4::Button::builder().label("Title").build(),
         author: gtk4::Button::builder().label("Author").build(),
         duration: gtk4::Button::builder().label("Duration").build(),
+        last_listened: gtk4::Button::builder().label("Last listened").build(),
+    };
+    // HIG popovers: group same-type controls under section headings — this popover holds two
+    // kinds of view option (sort entries vs. filter toggles), so each gets its own caption
+    // rather than one ambiguous list.
+    let popover_section_label = |text: &str| {
+        gtk4::Label::builder().label(text).xalign(0.0).css_classes(["caption", "dim-label"]).margin_top(6).margin_bottom(2).margin_start(6).margin_end(6).build()
     };
     let sort_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).build();
+    sort_box.append(&popover_section_label("Sort"));
     sort_box.append(&sort_buttons.date_added);
     sort_box.append(&sort_buttons.title);
     sort_box.append(&sort_buttons.author);
     sort_box.append(&sort_buttons.duration);
+    sort_box.append(&sort_buttons.last_listened);
+
+    // The one manual home of the "In progress only" filter — the same state Home's Continue
+    // Listening header sets on tap-through (see `apply_view`). All state surfaces (this check,
+    // the banner below, the header icon) funnel through `set_in_progress_only`.
+    let in_progress_check = gtk4::CheckButton::builder().label("In progress only").margin_top(4).margin_bottom(4).margin_start(6).margin_end(6).build();
+    sort_box.append(&popover_section_label("Filter"));
+    sort_box.append(&in_progress_check);
+
     let sort_popover = gtk4::Popover::builder().child(&sort_box).build();
-    let sort_menu_button = gtk4::MenuButton::builder().icon_name("view-sort-descending-symbolic").tooltip_text("Sort by").popover(&sort_popover).build();
+    let sort_menu_button = gtk4::MenuButton::builder().icon_name(SORT_ICON).tooltip_text("Sort & filter").popover(&sort_popover).build();
     header.pack_end(&sort_menu_button);
+
+    // The filter's ambient indicator while the popover is closed (the funnel icon on the header
+    // button is only a hint) — an in-view "why are books hidden" banner with a one-tap escape,
+    // mirroring the offline banner's placement and idiom. `ErrorBanner` is wrong here: this is a
+    // neutral filter notice, not a failure.
+    let progress_banner_label = gtk4::Label::builder().label("Showing books in progress").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+    let progress_show_all = gtk4::Button::builder().label("Show all").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+    let progress_banner_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).margin_start(12).margin_end(12).margin_top(4).margin_bottom(4).build();
+    progress_banner_row.append(&progress_banner_label);
+    progress_banner_row.append(&progress_show_all);
+    let progress_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&progress_banner_row).reveal_child(false).build();
 
     // The spec's real toggle lives inside a not-yet-built "view options" bottom sheet (see this
     // module's doc comment) — matching how sort was already implemented as a plain popover instead
@@ -222,6 +298,7 @@ pub fn build(
     // is visible in every state.
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
     body.append(&offline_banner);
+    body.append(&progress_banner);
     body.append(banner.widget());
     body.append(&scroller);
     body.append(&status_page);
@@ -238,11 +315,28 @@ pub fn build(
         banner: banner.clone(),
         search_entry: search_entry.clone(),
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
+        in_progress_only: Rc::new(Cell::new(false)),
         view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
         offline_mode: Rc::new(Cell::new(false)),
-        data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new(), downloaded: std::collections::HashSet::new() })),
+        data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new(), downloaded: std::collections::HashSet::new(), last_listened: std::collections::HashMap::new() })),
         on_play: Rc::new(on_play),
+        sort_menu_button: sort_menu_button.clone(),
+        in_progress_check: in_progress_check.clone(),
+        progress_banner: progress_banner.clone(),
     };
+
+    // The filter's two manual entry points: the popover's check and the banner's "Show all".
+    // Both funnel through `set_in_progress_only`; no signal-blocking is needed when it writes
+    // the check back — `set_active` to the value it already holds doesn't re-emit `toggled`,
+    // so the write-back terminates immediately (and re-syncs rather than fights).
+    in_progress_check.connect_toggled({
+        let widgets = widgets.clone();
+        move |check| set_in_progress_only(&widgets, check.is_active())
+    });
+    progress_show_all.connect_clicked({
+        let widgets = widgets.clone();
+        move |_| set_in_progress_only(&widgets, false)
+    });
 
     search_entry.connect_search_changed({
         let widgets = widgets.clone();
@@ -356,6 +450,7 @@ pub fn build(
         (&sort_buttons.title, SortKey::Title),
         (&sort_buttons.author, SortKey::Author),
         (&sort_buttons.duration, SortKey::Duration),
+        (&sort_buttons.last_listened, SortKey::LastListened),
     ] {
         button.connect_clicked({
             let widgets = widgets.clone();
@@ -386,7 +481,7 @@ pub fn build(
         let server_id = server.id.clone();
         let account_id = account.id.clone();
         async move {
-            if let Ok(data) = load(&pool, &server_id).await {
+            if let Ok(data) = load(&pool, &server_id, &account_id).await {
                 apply(data, &widgets);
             }
 
@@ -411,7 +506,7 @@ pub fn build(
             });
             let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
 
-            let data_after_sync = load(&pool, &server_id).await.ok();
+            let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
             let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.items.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
             if let Some(data) = data_after_sync {
                 apply(data, &widgets);
@@ -457,7 +552,7 @@ pub fn build(
                 });
                 spawned_covers.await.expect("the Library cover-fetch task must not panic");
 
-                if let Ok(data) = load(&pool, &server_id).await {
+                if let Ok(data) = load(&pool, &server_id, &account_id).await {
                     apply(data, &widgets);
                 }
             }
@@ -467,22 +562,57 @@ pub fn build(
     LibraryScreen {
         root: root.upcast(),
         search_entry: search_entry.clone(),
+        widgets: widgets.clone(),
         #[cfg(test)]
-        hooks: TestHooks { status_page, flow_box, list_box, search_entry, banner, sort_buttons, view_toggle, offline_toggle, offline_banner },
+        hooks: TestHooks {
+            status_page,
+            flow_box,
+            list_box,
+            search_entry,
+            banner,
+            sort_buttons,
+            sort_menu_button,
+            in_progress_check,
+            progress_banner,
+            progress_show_all,
+            view_toggle,
+            offline_toggle,
+            offline_banner,
+        },
     }
+}
+
+/// The single writer behind every "in progress only" surface — the popover's check, the header
+/// button's funnel indicator + tooltip, and the in-view banner all change here, from the one
+/// `Cell`, so the four can't drift apart — and the visible list re-renders, since this is the
+/// only place the `Cell` changes. Writing the check back is loop-safe: `set_active` to the
+/// value it already holds doesn't re-emit `toggled` (and the toggled handler routes back here,
+/// where the second write is a no-op).
+fn set_in_progress_only(widgets: &LibraryWidgets, active: bool) {
+    widgets.in_progress_only.set(active);
+    widgets.progress_banner.set_reveal_child(active);
+    widgets.sort_menu_button.set_icon_name(if active { FILTER_ACTIVE_ICON } else { SORT_ICON });
+    widgets.sort_menu_button.set_tooltip_text(Some(if active { "Filter active — sort & filter" } else { "Sort & filter" }));
+    if widgets.in_progress_check.is_active() != active {
+        widgets.in_progress_check.set_active(active);
+    }
+    render_from_current_data(widgets);
 }
 
 /// Reads whatever's currently cached locally across every synced library — never talks to the
 /// network. Unlike Home's `load()`, nothing is truncated or pre-sorted here: filtering/sorting for
-/// display happens in `render_visible` against the search text and chosen `SortKey`.
-async fn load(pool: &SqlitePool, server_id: &str) -> CoreResult<LibraryData> {
+/// display happens in `render_visible` against the search text, the filter and the chosen
+/// `SortKey`. The account's progress rows ride along in the same pass — they back the
+/// `LastListened` sort and the "In progress only" filter.
+async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResult<LibraryData> {
     let libraries = abs_storage::repo::libraries::list_for_server(pool, server_id).await?;
     let mut items = Vec::new();
     for library in &libraries {
         items.extend(abs_storage::repo::items::list_for_library(pool, server_id, &library.id).await?);
     }
     let downloaded = abs_core::download_tracks::downloaded_item_ids(pool, server_id).await?.into_iter().collect();
-    Ok(LibraryData { items, downloaded })
+    let last_listened = abs_storage::repo::progress::list_for_account(pool, account_id).await?.into_iter().map(|progress| (progress.item_id.clone(), progress)).collect();
+    Ok(LibraryData { items, downloaded, last_listened })
 }
 
 fn apply(data: LibraryData, widgets: &LibraryWidgets) {
@@ -522,6 +652,13 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
                 || item.author.as_deref().is_some_and(|author| author.to_lowercase().contains(&query))
         })
         .filter(|item| !offline_mode || data.downloaded.contains(&item.id))
+        // "In progress only" (Home's Continue Listening tap-through, or the popover's check):
+        // needs a progress row that exists *and* isn't finished — a completed book has both,
+        // a never-played one has neither.
+        .filter(|item| {
+            !widgets.in_progress_only.get()
+                || data.last_listened.get(&item.id).is_some_and(|progress| !progress.is_finished)
+        })
         .collect();
 
     match sort {
@@ -531,6 +668,15 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
             a.author.as_deref().unwrap_or("").to_lowercase().cmp(&b.author.as_deref().unwrap_or("").to_lowercase())
         }),
         SortKey::Duration => visible.sort_by(|a, b| b.duration_seconds.total_cmp(&a.duration_seconds)),
+        // Played before never-played; within played, newest last-listen first. `updated_at`
+        // carries the *true* last-listened time (the server's own `lastUpdate` on import), so
+        // this reads as "what was I listening to lately", not "what got imported lately".
+        SortKey::LastListened => visible.sort_by(|a, b| match (data.last_listened.get(&a.id), data.last_listened.get(&b.id)) {
+            (Some(a_progress), Some(b_progress)) => b_progress.updated_at.cmp(&a_progress.updated_at),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
     }
 
     let has_visible = !visible.is_empty();
@@ -611,6 +757,28 @@ pub(crate) mod tests {
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Seeds the library/items/progress rows a scenario's progress-dependent assertions read,
+    /// before `build`'s first cached load — the progress table's foreign key needs the items to
+    /// exist first. Every write is an idempotent upsert (the sync re-runs the same ones against
+    /// the mock server's identical ids), and the library id matches the mock's.
+    async fn seed_item_with_progress(pool: &SqlitePool, server_id: &str, account_id: &str, item_id: &str, title: &str, added_at_ms: i64, progress: Option<(f64, bool, chrono::DateTime<chrono::Utc>)>) {
+        abs_storage::repo::libraries::upsert(
+            pool,
+            abs_storage::repo::libraries::UpsertLibrary { id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 },
+        )
+        .await
+        .unwrap();
+        abs_storage::repo::items::upsert(
+            pool,
+            abs_storage::repo::items::UpsertItem { id: item_id, server_id, library_id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::DateTime::from_timestamp_millis(added_at_ms).unwrap() },
+        )
+        .await
+        .unwrap();
+        if let Some((position, is_finished, updated_at)) = progress {
+            abs_storage::repo::progress::set_at(pool, account_id, server_id, item_id, position, is_finished, updated_at).await.unwrap();
+        }
+    }
 
     async fn account_and_server(pool: &SqlitePool, server_url: &str) -> (Server, Account) {
         let server_id = abs_storage::repo::servers::add(pool, server_url).await.unwrap();
@@ -838,6 +1006,120 @@ pub(crate) mod tests {
 
         hooks.sort_buttons.date_added.emit_clicked();
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Zed Book".to_string(), "Alpha Book".to_string()], Duration::from_secs(5));
+    }
+
+    /// "Last listened" orders by actual listening recency — played items newest-listen first,
+    /// never-played items after them in stable order — independent of when items were *added*
+    /// to the server.
+    pub(crate) fn run_sorts_by_last_listened(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Zed Book", "Author A", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Alpha Book", "Author B", 1_600_000_000_000, 3600.0),
+                        item_json("item-3", "Middle Book", "Author C", 1_500_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let now = chrono::Utc::now();
+        // Added newest-first (the default sort's order), but listened to in the opposite order —
+        // plus one item never played at all.
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-1", "Zed Book", 1_700_000_000_000, Some((600.0, false, now - chrono::Duration::days(30)))));
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-2", "Alpha Book", 1_600_000_000_000, Some((600.0, false, now - chrono::Duration::days(1)))));
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-3", "Middle Book", 1_500_000_000_000, None));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Zed Book", "Alpha Book", "Middle Book"], "default sort is date-added descending");
+
+        hooks.sort_buttons.last_listened.emit_clicked();
+        pump_until(
+            || flow_box_titles(&hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string(), "Middle Book".to_string()],
+            Duration::from_secs(5),
+        );
+    }
+
+    /// The "In progress only" filter, driven through both of its manual entry points (the
+    /// popover's check and the banner's "Show all") plus the navigation path (`apply_view`,
+    /// what Home's Continue Listening header triggers): every surface — banner, funnel icon,
+    /// the check itself — must reflect the one shared state, whichever of them changed it.
+    pub(crate) fn run_in_progress_filter_is_manually_toggleable(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Reading Now", "Author A", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Finished Book", "Author B", 1_600_000_000_000, 3600.0),
+                        item_json("item-3", "Untouched Book", "Author C", 1_500_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let now = chrono::Utc::now();
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-1", "Reading Now", 1_700_000_000_000, Some((600.0, false, now))));
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-2", "Finished Book", 1_600_000_000_000, Some((3600.0, true, now - chrono::Duration::days(2)))));
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-3", "Untouched Book", 1_500_000_000_000, None));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 3, "no filter is active initially");
+        assert!(!hooks.progress_banner.reveals_child(), "the filter banner stays hidden while no filter is active");
+        assert!(!hooks.in_progress_check.is_active());
+
+        // Via the popover's check — the manual path.
+        hooks.in_progress_check.set_active(true);
+        pump_until(|| hooks.progress_banner.reveals_child(), Duration::from_secs(5));
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Reading Now"], "only the unfinished item with progress survives the filter");
+        assert!(hooks.in_progress_check.is_active());
+        assert_eq!(hooks.sort_menu_button.icon_name().as_deref(), Some("funnel-symbolic"), "the header button signals the active filter, Nautilus-style");
+
+        // Via the banner's "Show all" — the escape hatch.
+        hooks.progress_show_all.emit_clicked();
+        pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(5));
+        assert!(!hooks.progress_banner.reveals_child());
+        assert!(!hooks.in_progress_check.is_active(), "the check reflects the shared state, not just the banner");
+        assert_eq!(hooks.sort_menu_button.icon_name().as_deref(), Some("view-sort-descending-symbolic"));
+
+        // Via navigation (`apply_view`) — the Continue Listening header's path. The externally-
+        // set state must sync the check back the other way: check → state, state → check.
+        screen.apply_view(SortKey::LastListened, true);
+        pump_until(|| hooks.progress_banner.reveals_child(), Duration::from_secs(5));
+        assert!(hooks.in_progress_check.is_active(), "apply_view must sync the popover's check to the externally-set state");
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Reading Now"]);
     }
 
     pub(crate) fn run_shows_a_banner_when_sync_fails(runtime: &tokio::runtime::Runtime) {

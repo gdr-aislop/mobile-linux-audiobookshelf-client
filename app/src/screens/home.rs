@@ -18,6 +18,15 @@ use abs_storage::AppPaths;
 use crate::player::PlayRequest;
 use crate::widgets::item_card;
 
+/// Which shelf's heading was tapped — the shell translates this into a Library navigation with
+/// the matching sort (and, for Continue Listening, the in-progress filter). See
+/// `docs/design/ui-spec.md`'s Home tap-through behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Shelf {
+    RecentlyAdded,
+    ContinueListening,
+}
+
 pub struct HomeScreen {
     pub root: gtk4::Widget,
     #[cfg(test)]
@@ -29,8 +38,10 @@ pub struct TestHooks {
     pub(crate) empty_state: EmptyState,
     pub libraries_list: gtk4::ListBox,
     pub continue_section: gtk4::Box,
+    pub continue_heading: gtk4::Button,
     pub continue_row: gtk4::Box,
     pub recent_row: gtk4::Box,
+    pub recent_heading: gtk4::Button,
     pub banner: crate::widgets::banner::ErrorBanner,
     pub offline_toggle: gtk4::ToggleButton,
     pub offline_banner: gtk4::Revealer,
@@ -249,7 +260,10 @@ struct HomeData {
 /// itself, matching the `on_success`-callback pattern `welcome.rs` already uses. `on_relogin` is
 /// how the authorization-failure states hand control back to the shell: it swaps the window's
 /// content for a pre-filled login screen (the session that just died is the shell's knowledge,
-/// not Home's).
+/// not Home's). `on_open_shelf` is the shelf headings' tap-through: it navigates to the Library
+/// pre-sorted (and pre-filtered, for Continue Listening) — the shell owns that navigation, Home
+/// only reports which shelf was tapped.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     paths: AppPaths,
@@ -258,6 +272,7 @@ pub fn build(
     session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
     on_relogin: impl Fn() + Clone + 'static,
+    on_open_shelf: impl Fn(Shelf) + Clone + 'static,
 ) -> HomeScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Home", "")));
@@ -295,12 +310,24 @@ pub fn build(
         .orientation(gtk4::Orientation::Vertical)
         .visible(false)
         .build();
-    continue_section.append(&section_heading("Continue Listening"));
+    let continue_heading = section_heading_button(
+        "Continue Listening",
+        "Show in-progress books in the Library",
+        {
+            let on_open_shelf = on_open_shelf.clone();
+            move || on_open_shelf(Shelf::ContinueListening)
+        },
+    );
+    continue_section.append(&continue_heading);
     continue_section.append(&shelf_scroller(&continue_row));
 
     let recent_row = shelf_row();
     let recent_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    recent_section.append(&section_heading("Recently Added"));
+    let recent_heading = section_heading_button("Recently Added", "Show the Library by date added", {
+        let on_open_shelf = on_open_shelf.clone();
+        move || on_open_shelf(Shelf::RecentlyAdded)
+    });
+    recent_section.append(&recent_heading);
     recent_section.append(&shelf_scroller(&recent_row));
 
     let libraries_list = gtk4::ListBox::builder()
@@ -455,8 +482,10 @@ pub fn build(
             empty_state,
             libraries_list,
             continue_section,
+            continue_heading,
             continue_row,
             recent_row,
+            recent_heading,
             banner,
             offline_toggle,
             offline_banner,
@@ -708,6 +737,24 @@ fn section_heading(text: &str) -> gtk4::Label {
         .build()
 }
 
+/// A shelf heading that's also tappable (ui-spec Home tap-through): visually the same heading
+/// (`flat` chrome over an identically-styled label, full row width so the touch target isn't
+/// just the text), with a tooltip explaining where it goes.
+fn section_heading_button(text: &str, tooltip: &str, on_open: impl Fn() + 'static) -> gtk4::Button {
+    let label = gtk4::Label::builder().label(text).xalign(0.0).css_classes(["heading"]).build();
+    let button = gtk4::Button::builder()
+        .child(&label)
+        .tooltip_text(tooltip)
+        .css_classes(["flat"])
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(18)
+        .margin_bottom(8)
+        .build();
+    button.connect_clicked(move |_| on_open());
+    button
+}
+
 fn shelf_row() -> gtk4::Box {
     gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -804,7 +851,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         // `empty_state` starts in the syncing state (only shown while nothing is cached), so
@@ -867,12 +914,30 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set_at(&pool, &account.id, &server.id, "item-2", 3600.0, true, now)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| count_children(&hooks.continue_row) == 1, Duration::from_secs(10));
         assert!(hooks.continue_section.is_visible(), "the in-progress book should keep the shelf alive");
         assert!(count_children(&hooks.recent_row) == 2, "the finished book still belongs under Recently Added");
+    }
+
+    /// The shelf headings' tap-through contract: each heading reports its shelf through
+    /// `on_open_shelf` — the shell (not Home) owns the actual Library navigation.
+    pub(crate) fn run_shelf_headers_invoke_on_open_shelf(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, "http://127.0.0.1:1"));
+
+        let tapped: std::rc::Rc<std::cell::RefCell<Vec<Shelf>>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let session = abs_core::auth::Session::new(pool.clone(), "http://127.0.0.1:1", &server.id, &account);
+        let tapped_for_closure = tapped.clone();
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, move |shelf: Shelf| tapped_for_closure.borrow_mut().push(shelf));
+        let hooks = screen.test_hooks();
+
+        hooks.continue_heading.emit_clicked();
+        hooks.recent_heading.emit_clicked();
+
+        assert_eq!(*tapped.borrow(), vec![Shelf::ContinueListening, Shelf::RecentlyAdded], "each heading reports its own shelf, in tap order");
     }
 
     /// Toggling offline mode should narrow "Recently Added" to items with at least one completed
@@ -899,7 +964,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {}, || {});
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
         pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
 
@@ -929,7 +994,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         // An always-empty result looks identical before and after sync, but the state machine's
@@ -977,7 +1042,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.empty_state.retry.is_visible(), Duration::from_secs(10));
@@ -1024,7 +1089,7 @@ pub(crate) mod tests {
             move || relogin_requested.set(true)
         };
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.empty_state.login_again.is_visible(), Duration::from_secs(10));
@@ -1076,7 +1141,7 @@ pub(crate) mod tests {
             move || relogin_requested.set(true)
         };
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -1120,7 +1185,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         assert!(hooks.empty_state.root.is_visible(), "with nothing cached, the empty state should be up immediately");
@@ -1185,7 +1250,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account.id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
@@ -1213,7 +1278,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));

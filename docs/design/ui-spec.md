@@ -87,6 +87,11 @@ Fractal) rather than copying Lissen's Material Design look.
 - `AdwToolbarView` with `AdwHeaderBar` (title "Home", avatar/account button on the right).
 - Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (progress ring overlay
   on cover), "Recently added". Each cover is a tappable card pushing Item detail.
+- **Shelf headings are tappable** (tap-through): "Recently added" opens the Library tab pre-sorted
+  by date added; "Continue listening" opens it pre-sorted by **last listened** (newest last-listen
+  first) and filtered to **in-progress** books — the Library's own "Sort & filter" dropdown and
+  banner reflect that state, and both are session-transient (navigation-with-intent, not a
+  preference).
 - Empty/offline states. While nothing is cached locally, Home shows a full-screen status view
   whose content follows the sync lifecycle rather than a single static message — a fresh login
   with the sync still running in the background must not read as a dead end:
@@ -148,7 +153,12 @@ Fractal) rather than copying Lissen's Material Design look.
 - Header bar with a **persistent, always-visible `GtkSearchEntry`** — not revealed behind a search
   button — since search is a high-frequency action in a large library and worth the permanent
   header-bar space on a device where reaching a reveal-then-tap-then-type sequence one-handed is
-  already awkward. Also a filter/sort `GtkMenuButton` and a trailing **view-options button**
+  already awkward. Also a **"Sort & filter" `GtkMenuButton`** — one popover, two caption-labelled
+  sections: **Sort** (Date added / Title / Author / Duration / **Last listened**) and **Filter**
+  ("In progress only" check). While the filter is active the header button swaps to a funnel icon
+  (Nautilus-style active-filter hint), and an in-view banner ("Showing books in progress ·
+  **Show all**") is the ambient indicator plus one-tap clear — same placement/idiom as the offline
+  banner. Also a trailing **view-options button**
   (three-line "adjustments" icon) that opens the view options sheet described below; these two stay
   compact icon-buttons since they're used less often than search.
 - **Sync now**: same header-bar `⋯` menu item as Home (see above), forcing an immediate resync of

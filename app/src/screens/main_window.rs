@@ -183,6 +183,27 @@ pub fn build(
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
+    // Library is built before Home only so the tap-through closure below can capture the
+    // already-built screen; the `add_titled_with_icon` calls (not build order) fix the
+    // switcher's tab order — Home stays first.
+    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone(), on_relogin.clone());
+
+    // Home's shelf headings' tap-through (ui-spec Home section): switch to Library and land on
+    // the shelf's view — Recently Added pre-sorted by date added; Continue Listening pre-sorted
+    // by last listened and filtered to in-progress books. Session-transient both, exactly like
+    // manual sort/filter changes — navigation-with-intent, not a preference.
+    let on_open_shelf = {
+        let stack = stack.clone();
+        let library_screen = library_screen.clone();
+        move |shelf| {
+            stack.set_visible_child_name("library");
+            match shelf {
+                crate::screens::home::Shelf::RecentlyAdded => library_screen.apply_view(crate::screens::library::SortKey::DateAdded, false),
+                crate::screens::home::Shelf::ContinueListening => library_screen.apply_view(crate::screens::library::SortKey::LastListened, true),
+            }
+        }
+    };
+
     stack.add_titled_with_icon(
         &screens::home::build(
             pool.clone(),
@@ -191,14 +212,14 @@ pub fn build(
             account.clone(),
             session.clone(),
             on_play.clone(),
-            on_relogin.clone(),
+            on_relogin,
+            on_open_shelf,
         )
         .root,
         Some("home"),
         "Home",
         "go-home-symbolic",
     );
-    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone(), on_relogin);
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
