@@ -18,7 +18,7 @@ use abs_player::route_watch::RouteWatcher;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
-use abs_core::settings::PlaybackSettings;
+use abs_core::settings::{PlaybackSettings, Theme};
 use abs_storage::models::{Account, Server};
 use abs_storage::AppPaths;
 
@@ -77,6 +77,7 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     playback_settings: PlaybackSettings,
+    theme: Theme,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
     let mini_bar = player::build_mini_bar(pool.clone(), paths.clone(), player::real_backend());
@@ -85,8 +86,7 @@ pub fn build(
     // must never be fatal to playback, so a failure here is just a warning. On success, the
     // bridge becomes a permanent snapshot listener (via the foundation refactor's `add_listener`)
     // so the lock-screen/Shell media card stays current for the app's whole lifetime.
-    let mpris_bridge: Rc<dyn abs_player::mpris::MprisCommands> =
-        Rc::new(player::MprisBridge::new(mini_bar.controller.clone(), playback_settings.skip_forward_seconds as f64, playback_settings.skip_back_seconds as f64));
+    let mpris_bridge: Rc<dyn abs_player::mpris::MprisCommands> = Rc::new(player::MprisBridge::new(mini_bar.controller.clone()));
     match abs_player::mpris::register("Audiobookshelf", mpris_bridge) {
         Ok(mpris_handle) => {
             mini_bar.controller.add_listener(move |snapshot| mpris_handle.update(player::mpris_state_from_snapshot(snapshot)));
@@ -121,6 +121,14 @@ pub fn build(
         playback_settings.pause_on_headphone_unplug,
         playback_settings.resume_on_headphone_replug,
     );
+    // Same story for the playback config: the start-of-session speed and skip intervals live on
+    // the controller, and the consumers read them at call time — a Settings edit reaches even
+    // MPRIS's next/previous without rebuilding any screen.
+    mini_bar.controller.set_playback_config(
+        playback_settings.default_speed,
+        playback_settings.skip_back_seconds as f64,
+        playback_settings.skip_forward_seconds as f64,
+    );
     let route_watcher = match abs_player::route_watch::PulseRouteWatcher::new() {
         Ok(mut watcher) => {
             let controller = mini_bar.controller.clone();
@@ -151,8 +159,11 @@ pub fn build(
     let on_play = {
         let controller = mini_bar.controller.clone();
         let session = session.clone();
-        let default_speed = playback_settings.default_speed;
-        move |request: PlayRequest| controller.start(session.clone(), request, default_speed)
+        move |request: PlayRequest| {
+            // The default speed is read at call time, not captured — a "Default speed" change in
+            // Settings applies to the next playback without rebuilding the shell.
+            controller.start(session.clone(), request, controller.default_speed())
+        }
     };
 
     // "Log in again" (Home/Library's authorization-failure states) hands control back to the
@@ -223,7 +234,7 @@ pub fn build(
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
-    let settings_screen = screens::settings::build(pool.clone(), mini_bar.controller.clone(), playback_settings);
+    let settings_screen = screens::settings::build(pool.clone(), mini_bar.controller.clone(), download_manager.clone(), playback_settings, theme, window.clone());
     stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
@@ -292,7 +303,7 @@ pub fn build(
         let pool = pool.clone();
         let download_manager = download_manager.clone();
         move |_, _, _, _| {
-            let player_screen = screens::player::build(pool.clone(), controller.clone(), playback_settings, download_manager.clone(), {
+            let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
                 let window = window.clone();
                 let root = root.clone();
                 move || {
@@ -347,7 +358,16 @@ pub(crate) mod tests {
 
         let app_window = adw::ApplicationWindow::builder().build();
         let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-        let window = build(pool, crate::test_support::test_paths(), server, account, session, abs_core::settings::PlaybackSettings::default(), app_window.clone());
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            app_window.clone(),
+        );
         let hooks = window.test_hooks();
 
         for name in ["home", "library", "downloads", "settings"] {

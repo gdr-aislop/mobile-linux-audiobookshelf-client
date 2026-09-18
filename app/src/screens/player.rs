@@ -17,7 +17,7 @@ use adw::prelude::*;
 
 use abs_core::download_tracks::OfflineAvailability;
 use abs_core::downloads::DownloadScope;
-use abs_core::settings::PlaybackSettings;
+use abs_core::playback::SPEED_PRESETS;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
 use crate::player::{ChapterInfo, PlayerController, PlayerSnapshot};
@@ -71,7 +71,6 @@ impl PlayerScreen {
 pub fn build(
     pool: sqlx::SqlitePool,
     controller: PlayerController,
-    playback_settings: PlaybackSettings,
     download_manager: crate::downloads::DownloadManager,
     on_collapse: impl Fn() + 'static,
 ) -> PlayerScreen {
@@ -162,7 +161,6 @@ pub fn build(
     // plain `GtkMenuButton` + `GtkPopover` holding a `GtkBox` of buttons — matching this
     // codebase's existing convention of wiring everything through direct `connect_clicked`
     // closures rather than `GMenu`/`GAction` models.
-    const SPEED_PRESETS: [f64; 8] = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
     let speed_label = gtk4::Label::new(Some("1.0×"));
     let speed_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
@@ -357,16 +355,16 @@ pub fn build(
         }
     });
 
-    let skip_back_seconds = playback_settings.skip_back_seconds as f64;
-    let skip_forward_seconds = playback_settings.skip_forward_seconds as f64;
-
+    // The skip intervals are read at click time from the controller (Settings → Playback's live
+    // config) rather than captured from `playback_settings` at build — a Settings edit applies to
+    // the very next skip, here and in the keyboard actions below.
     skip_back.connect_clicked({
         let controller = controller.clone();
-        move |_| controller.skip(-skip_back_seconds)
+        move |_| controller.skip(-controller.skip_intervals().0)
     });
     skip_forward.connect_clicked({
         let controller = controller.clone();
-        move |_| controller.skip(skip_forward_seconds)
+        move |_| controller.skip(controller.skip_intervals().1)
     });
     play_button.connect_clicked({
         let controller = controller.clone();
@@ -379,8 +377,8 @@ pub fn build(
     // `SPEED_PRESETS` relative to the current speed, and `c`/`t` pop the same popovers their
     // menu buttons open.
     let actions = gtk4::gio::SimpleActionGroup::new();
-    add_action(&actions, "skip-back", { let controller = controller.clone(); move || controller.skip(-skip_back_seconds) });
-    add_action(&actions, "skip-forward", { let controller = controller.clone(); move || controller.skip(skip_forward_seconds) });
+    add_action(&actions, "skip-back", { let controller = controller.clone(); move || controller.skip(-controller.skip_intervals().0) });
+    add_action(&actions, "skip-forward", { let controller = controller.clone(); move || controller.skip(controller.skip_intervals().1) });
 
     // Speed steps are relative to whatever is current, so they read as "next/previous preset" no
     // matter where in the list the user is — including from a speed that came straight from the
@@ -688,8 +686,9 @@ fn build_chapter_row(chapter: &ChapterInfo, position: f64, is_downloaded: bool) 
 
 /// Formats a playback speed for the speed button/popover — trims a trailing `.0` (`"1×"` reads
 /// oddly for a speed control; `"1.0×"` is the convention every audiobook app uses) but keeps
-/// fractional speeds like `1.25×` intact.
-fn format_speed(speed: f64) -> String {
+/// fractional speeds like `1.25×` intact. Shared with Settings' "Default speed" row, which lists
+/// the same presets.
+pub(crate) fn format_speed(speed: f64) -> String {
     if (speed.fract()).abs() < f64::EPSILON {
         format!("{speed:.1}×")
     } else {
@@ -742,7 +741,7 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), {
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
         });
@@ -795,7 +794,7 @@ pub(crate) mod tests {
         // readiness signal `PlayerController::start` itself waits on for the resume-seek).
         pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.chapters_button.popover().as_ref(), Some(&hooks.chapters_popover), "the chapters button should open the chapters popover");
 
@@ -846,7 +845,7 @@ pub(crate) mod tests {
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
 
         let download_manager = test_download_manager(pool.clone());
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), download_manager, || {});
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
@@ -887,7 +886,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.speed_label.label(), "1.0×", "should start at the default speed");
         assert!(hooks.speed_button.popover().is_some(), "the speed button should open a popover");
@@ -922,7 +921,7 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), {
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
         });
@@ -993,7 +992,7 @@ pub(crate) mod tests {
         );
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert!(!hooks.sleep_timer_button.has_css_class("accent"), "no sleep timer armed yet");
         assert_eq!(hooks.sleep_timer_button.popover().as_ref(), Some(&hooks.sleep_timer_popover));
@@ -1031,7 +1030,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert!(hooks.menu_button.popover().is_some(), "the ... menu button should open a popover");
 
@@ -1064,7 +1063,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
 
         hooks.mark_as_finished_button.emit_clicked();
@@ -1099,7 +1098,7 @@ pub(crate) mod tests {
         controller.skip(2.0);
         pump_until(|| controller.snapshot().unwrap().position_seconds > 1.0, Duration::from_secs(5));
 
-        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
 
         hooks.reset_progress_button.emit_clicked();

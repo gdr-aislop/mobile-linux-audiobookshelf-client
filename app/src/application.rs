@@ -17,6 +17,7 @@ pub struct AppState {
     pub paths: abs_storage::AppPaths,
     pub active_account: Option<abs_storage::models::Account>,
     pub playback_settings: abs_core::settings::PlaybackSettings,
+    pub theme: abs_core::settings::Theme,
 }
 
 /// The user-facing version string. Sourced at compile time from this crate's manifest, which
@@ -26,6 +27,18 @@ pub struct AppState {
 /// (docs/design/ui-spec.md).
 pub fn version_line() -> String {
     format!("Audiobookshelf {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Applies a Theme to libadwaita's global style manager — the one place that knows the
+/// setting-to-scheme mapping. Called once at startup (before the first window builds) and live
+/// from the Settings screen's Theme row.
+pub fn apply_theme(theme: abs_core::settings::Theme) {
+    let scheme = match theme {
+        abs_core::settings::Theme::System => adw::ColorScheme::Default,
+        abs_core::settings::Theme::Light => adw::ColorScheme::ForceLight,
+        abs_core::settings::Theme::Dark => adw::ColorScheme::ForceDark,
+    };
+    adw::StyleManager::default().set_color_scheme(scheme);
 }
 
 pub fn build_application(state: AppState) -> adw::Application {
@@ -39,6 +52,10 @@ pub fn build_application(state: AppState) -> adw::Application {
 }
 
 fn build_window(app: &adw::Application, state: &AppState) {
+    // Before any window content builds — the theme is a global, so the Welcome screen (and every
+    // sheet/popover) gets it too, not just the signed-in shell.
+    apply_theme(state.theme);
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Audiobookshelf")
@@ -138,8 +155,9 @@ async fn build_main_window(
     let server = abs_storage::repo::servers::get(&pool, &account.server_id)
         .await
         .expect("an active account's server must exist");
+    let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
     let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-    screens::main_window::build(pool, paths, server, account, session, playback_settings, window)
+    screens::main_window::build(pool, paths, server, account, session, playback_settings, theme, window)
 }
 
 /// The keyboard half of ui-spec §6: the accelerators (app-wide — they only fire when the matching

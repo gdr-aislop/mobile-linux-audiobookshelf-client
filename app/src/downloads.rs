@@ -143,6 +143,13 @@ impl DownloadManager {
         self.inner.borrow_mut().wifi_only = value;
     }
 
+    /// What `set_wifi_only` last applied — for asserting that the Settings screen's switch
+    /// actually reaches the manager.
+    #[cfg(test)]
+    pub(crate) fn wifi_only(&self) -> bool {
+        self.inner.borrow().wifi_only
+    }
+
     /// Resolves `scope` (relative to `current_chapter_index`) into the set of tracks it touches and
     /// starts fetching whichever of them aren't already complete. Fetches and caches track/chapter
     /// metadata first if it isn't already cached locally (e.g. this item has never been played), so

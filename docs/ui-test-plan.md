@@ -724,11 +724,13 @@ built (the tests below define the target behavior).
 
 ---
 
-## 15. Settings (SE) — 🚧 not yet built
+## 15. Settings (SE) — 🚧 partially implemented (Playback, Appearance, About)
 
 - [ ] **SE-1 — Groups exist.** Open the Settings tab.
       *Expected:* `AdwPreferencesPage`-style groups: Account, Servers, Playback, Appearance,
-      About.
+      About. (Account and Servers are still missing.)
+      *Automated:* `settings_persistence` + `settings_playback_defaults_theme_and_about` check
+      the built groups.
 
 - [ ] **SE-2 — Account group.** Inspect it.
       *Expected:* one row for the active server/account (username, server host, "active"
@@ -763,19 +765,27 @@ built (the tests below define the target behavior).
       Settings → Playback, then start a book.
       *Expected:* playback starts at the configured default speed; the player's skip buttons
       jump by the configured intervals (check FP-3 uses these values).
+      *Automated:* `settings_playback_defaults_theme_and_about` asserts the live controller and
+      persistence; the next-start application rides `start()`'s default-speed parameter.
 
 - [ ] **SE-10 — Sleep-timer default.** Set a sleep-timer default in Settings, then start a book
       and open the sleep-timer popover.
       *Expected:* the default is what the app presents/applies as configured (per spec's
-      "sleep-timer default" playback setting).
+      "sleep-timer default" playback setting). (Row deliberately deferred — nothing consumes the
+      value yet.)
 
 - [ ] **SE-11 — Appearance.** Cycle Appearance through Follow system / Light / Dark.
       *Expected:* the whole app (all tabs, player, sheets, popovers) switches theme immediately;
       "Follow system" tracks the OS setting.
+      *Automated:* `settings_playback_defaults_theme_and_about` asserts the immediate
+      `AdwStyleManager` application and persistence (the "follow system" tracking itself needs
+      eyes).
 
 - [ ] **SE-12 — About.** Tap the About row.
       *Expected:* an about dialog with app name, version, website, and license. The version
       matches the app's `--version` output exactly.
+      *Automated:* `settings_playback_defaults_theme_and_about` asserts the row opens an
+      `AdwAboutWindow`; the version match is guaranteed by both reading `CARGO_PKG_VERSION`.
 
 ---
 

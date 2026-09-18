@@ -320,10 +320,14 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   skip-forward/back intervals, sleep-timer default), **Appearance** (follow system / light /
   dark), **About** (version, license, links).
 - **Partially built** (this is a living spec; the screen grows group by group): the **Playback**
-  group is real, currently holding the headphone-behavior switches from "Hardware controls &
-  interruptions" (pause-on-disconnect on, resume-on-reconnect off, the latter insensitive while
-  the former is off). Account, Servers, Appearance and About, plus Playback's speed/skip/
-  sleep-timer rows, are still stubs.
+  group is real — the headphone-behavior switches from "Hardware controls & interruptions"
+  (pause-on-disconnect on, resume-on-reconnect off, the latter insensitive while the former is
+  off), the default-speed combo (the same preset list as the player's speed popover, applied to
+  every new playback), the skip-back/forward interval combos (which the transport buttons, arrow
+  keys and MPRIS next/previous read live), and the Wi-Fi-only downloads switch (applied live to
+  the download manager). The **Appearance** group (Theme: system/light/dark, applied via
+  `AdwStyleManager` immediately and at startup) and the **About** row are real too. Account,
+  Servers, the Connection page and Playback's sleep-timer-default row are still stubs.
 - **Account** group: one row showing the *active* server/account (username, server host,
   "active" subtitle) with a chevron, and one "Switch or manage servers" row that opens the
   Servers list below. There is deliberately no top-level "Sign Out" action here — with multiple

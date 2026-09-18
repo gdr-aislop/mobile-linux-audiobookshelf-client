@@ -20,6 +20,11 @@ pub const MIN_SPEED: f64 = 0.8;
 pub const MAX_SPEED: f64 = 3.0;
 pub const DEFAULT_SPEED: f64 = 1.0;
 
+/// The discrete speeds every speed UI offers — the full player's popover (and the speed keys'
+/// stepping) and Settings → Playback's "Default speed" row all build their options from this one
+/// constant, so the lists can never drift apart.
+pub const SPEED_PRESETS: [f64; 8] = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
 impl PlaybackState {
     pub fn new(duration_seconds: f64) -> Self {
         Self {

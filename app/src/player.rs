@@ -134,6 +134,14 @@ struct Inner {
     /// `handle_route_event`.
     pause_on_unplug: bool,
     resume_on_replug: bool,
+    /// Live playback config, also from `PlaybackSettings` (Settings → Playback): the speed every
+    /// `start()` begins a session at, and the skip intervals the transport buttons, keyboard
+    /// actions and MPRIS next/previous use. Held here rather than captured by the various
+    /// closures at build time, so a Settings edit takes effect immediately (see
+    /// `set_playback_config`).
+    default_speed: f64,
+    skip_back_seconds: f64,
+    skip_forward_seconds: f64,
     /// Whether the current pause was caused by `handle_route_event`'s unplug handling (as opposed
     /// to a manual pause, a phone call, a sleep timer or end-of-book). Only a pause this specific
     /// may ever be lifted by a replug. Cleared by every other pause path.
@@ -353,11 +361,15 @@ impl PlayerController {
                     listeners: vec![Box::new(mini_update)],
                     full_update: None,
                     last_progress_write: Instant::now(),
-                    // Overridden right after construction via `set_headphone_behavior` (the
-                    // settings aren't known to `new()`'s signature) — false/false is the safe
-                    // "do nothing automatically" middle.
+                    // Overridden right after construction via `set_headphone_behavior` and
+                    // `set_playback_config` (the settings aren't known to `new()`'s signature)
+                    // — false/false is the safe "do nothing automatically" middle, and the
+                    // playback defaults below are `PlaybackSettings`' own defaults.
                     pause_on_unplug: false,
                     resume_on_replug: false,
+                    default_speed: abs_core::playback::DEFAULT_SPEED,
+                    skip_back_seconds: 15.0,
+                    skip_forward_seconds: 30.0,
                     paused_by_unplug: false,
                 })),
                 tick_source: Rc::new(RefCell::new(None)),
@@ -676,6 +688,29 @@ impl PlayerController {
         (inner.pause_on_unplug, inner.resume_on_replug)
     }
 
+    /// Applies Settings → Playback's start-of-session speed and skip intervals (persisted; the
+    /// live controller must follow immediately, not on the next app start). Same story as
+    /// `set_headphone_behavior` — the consumers that used to capture these values at build time
+    /// (the play closure in `main_window`, the player screen's skip buttons and actions,
+    /// `MprisBridge`) read the getters below at call time instead.
+    pub fn set_playback_config(&self, default_speed: f64, skip_back_seconds: f64, skip_forward_seconds: f64) {
+        let mut inner = self.inner.borrow_mut();
+        inner.default_speed = default_speed;
+        inner.skip_back_seconds = skip_back_seconds;
+        inner.skip_forward_seconds = skip_forward_seconds;
+    }
+
+    /// The speed every `start()` begins a session at — Settings → Playback's "Default speed".
+    pub fn default_speed(&self) -> f64 {
+        self.inner.borrow().default_speed
+    }
+
+    /// The skip intervals as `(back, forward)` seconds — Settings → Playback's skip rows.
+    pub fn skip_intervals(&self) -> (f64, f64) {
+        let inner = self.inner.borrow();
+        (inner.skip_back_seconds, inner.skip_forward_seconds)
+    }
+
     /// Reacts to `abs_player::route_watch` events: an unplug pauses (when enabled, and only if
     /// something is actually playing — that is the pause a replug may later lift), a replug
     /// resumes **only** that kind of pause, and only when enabled. A manual pause, phone call,
@@ -975,13 +1010,11 @@ pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_pl
 /// only ever calls this trait, never anything from `app` directly.
 pub struct MprisBridge {
     controller: PlayerController,
-    skip_forward_seconds: f64,
-    skip_back_seconds: f64,
 }
 
 impl MprisBridge {
-    pub fn new(controller: PlayerController, skip_forward_seconds: f64, skip_back_seconds: f64) -> Self {
-        Self { controller, skip_forward_seconds, skip_back_seconds }
+    pub fn new(controller: PlayerController) -> Self {
+        Self { controller }
     }
 }
 
@@ -1002,10 +1035,10 @@ impl abs_player::mpris::MprisCommands for MprisBridge {
         self.controller.seek_to_seconds(position_micros as f64 / 1_000_000.0);
     }
     fn next(&self) {
-        self.controller.skip(self.skip_forward_seconds);
+        self.controller.skip(self.controller.skip_intervals().1);
     }
     fn previous(&self) {
-        self.controller.skip(-self.skip_back_seconds);
+        self.controller.skip(-self.controller.skip_intervals().0);
     }
 }
 

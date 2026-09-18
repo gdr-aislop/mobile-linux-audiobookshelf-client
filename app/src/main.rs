@@ -60,6 +60,7 @@ async fn setup() -> AppState {
         .await
         .expect("load playback settings");
     tracing::info!(?playback_settings, "loaded playback settings");
+    let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
 
     let active_account = abs_storage::repo::accounts::get_active(&pool)
         .await
@@ -71,7 +72,7 @@ async fn setup() -> AppState {
     // Token freshness is handled lazily by `abs_core::auth::Session` — screens ask it for a
     // token at call time, and its first use refreshes an expired one (server v2.26.0+ JWTs).
 
-    AppState { pool, paths, active_account, playback_settings }
+    AppState { pool, paths, active_account, playback_settings, theme }
 }
 
 /// Every GTK-touching test across `screens::*` funnels through this module. `gtk4::init()` binds
@@ -163,6 +164,7 @@ mod tests {
         (main_window_call_interruption_wiring_pauses_playback, crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback),
         (main_window_headphone_route_events_follow_the_settings, crate::screens::main_window::tests::run_headphone_route_events_follow_the_settings),
         (settings_persistence, crate::screens::settings::tests::run),
+        (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
         (playback_start_and_pause_persists_progress, crate::player::tests::run_start_and_pause_persists_progress),
         (playback_downloaded_track_is_preferred_over_streaming, crate::player::tests::run_downloaded_track_is_preferred_over_streaming),
         (playback_untrustworthy_complete_row_falls_back_to_streaming, crate::player::tests::run_untrustworthy_complete_row_falls_back_to_streaming),
