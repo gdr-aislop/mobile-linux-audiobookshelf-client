@@ -128,6 +128,27 @@ pub async fn item_offline_availability(pool: &SqlitePool, server_id: &str, item_
     })
 }
 
+/// One-call version of the tracks-fetch + complete-tracks-fetch + `chapter_offline_markers`
+/// pipeline, taking chapters as plain `(start_seconds, end_seconds)` pairs rather than
+/// `abs_api::ChapterRef` — so a caller (the Player screen) that only has its own in-memory chapter
+/// list (`app::player::ChapterInfo`, not an `abs_api` type) never has to construct one just to call
+/// this, keeping `app`'s "never imports `abs_api` directly" rule intact.
+pub async fn chapter_offline_markers_for_item(pool: &SqlitePool, server_id: &str, item_id: &str, chapter_ranges: &[(f64, f64)]) -> Result<Vec<bool>> {
+    let tracks = crate::tracks::cached_tracks(pool, server_id, item_id).await?;
+    let complete = complete_inos_for_item(pool, server_id, item_id).await?;
+    let chapters: Vec<abs_api::ChapterRef> =
+        chapter_ranges.iter().map(|&(start_seconds, end_seconds)| abs_api::ChapterRef { title: String::new(), start_seconds, end_seconds }).collect();
+    Ok(chapter_offline_markers(&tracks, &chapters, &complete))
+}
+
+/// Which of an item's tracks are fully downloaded — what `chapter_offline_markers` needs to turn
+/// into per-chapter glyphs, without the Player screen having to reach into `abs_storage` directly
+/// (the same boundary `item_offline_availability` above already respects).
+pub async fn complete_inos_for_item(pool: &SqlitePool, server_id: &str, item_id: &str) -> Result<BTreeSet<String>> {
+    let downloads = abs_storage::repo::download_tracks::list_for_item(pool, server_id, item_id).await?;
+    Ok(downloads.into_iter().filter(|d| d.status == DownloadStatus::Complete).map(|d| d.ino).collect())
+}
+
 /// Item ids (scoped to one server) downloaded fully or partially — the query behind the
 /// Home/Library offline-mode toggle's filtered view. Thin pass-through to the storage repo; kept
 /// here (rather than calling the repo directly from `app`) so `app` never has to know the offline
@@ -409,6 +430,40 @@ mod tests {
         assert_eq!(chapter_offline_markers(&tracks, &chapters, &complete), vec![false]);
     }
 
+    #[tokio::test]
+    async fn chapter_offline_markers_for_item_matches_the_pure_function() {
+        // `pool_with_synced_tracks` gives every track the same offset (0.0) — fine for the tests
+        // that use it, but this one needs two tracks at distinct offsets to tell them apart, so it
+        // sets its own up directly via `abs_core::tracks::sync_item_tracks`.
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
+        std::mem::forget(tmp);
+        let server_id = abs_storage::repo::servers::add(&pool, "http://example.invalid").await.unwrap();
+        abs_storage::repo::libraries::upsert(&pool, abs_storage::repo::libraries::UpsertLibrary { id: "lib-1", server_id: &server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 }).await.unwrap();
+        abs_storage::repo::items::upsert(
+            &pool,
+            abs_storage::repo::items::UpsertItem { id: "item-1", server_id: &server_id, library_id: "lib-1", title: "Test Item", author: None, narrator: None, description: None, duration_seconds: 0.0, added_at: chrono::Utc::now() },
+        )
+        .await
+        .unwrap();
+        crate::tracks::sync_item_tracks(
+            &pool,
+            &server_id,
+            "item-1",
+            &[
+                crate::streaming::StreamTrack { ino: "a".to_string(), url: "u1".to_string(), duration_seconds: 50.0, offset_seconds: 0.0 },
+                crate::streaming::StreamTrack { ino: "b".to_string(), url: "u2".to_string(), duration_seconds: 50.0, offset_seconds: 50.0 },
+            ],
+        )
+        .await
+        .unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "a", "/p/a.mp3").await.unwrap();
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 10).await.unwrap();
+
+        let markers = chapter_offline_markers_for_item(&pool, &server_id, "item-1", &[(0.0, 50.0), (50.0, 100.0)]).await.unwrap();
+        assert_eq!(markers, vec![true, false], "only the chapter fully within track 'a' should be marked downloaded");
+    }
+
     async fn pool_with_synced_tracks(item_id: &str, inos: &[&str]) -> (SqlitePool, String) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
@@ -453,6 +508,19 @@ mod tests {
         abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "b", "/p/b.mp3").await.unwrap();
         abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "b", 10).await.unwrap();
         assert_eq!(item_offline_availability(&pool, &server_id, "item-1").await.unwrap(), OfflineAvailability::Full);
+    }
+
+    #[tokio::test]
+    async fn complete_inos_for_item_includes_only_complete_tracks() {
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["a", "b"]).await;
+        assert!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().is_empty());
+
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "a", "/p/a.mp3").await.unwrap();
+        abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "a", 5, Some(10)).await.unwrap();
+        assert!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().is_empty(), "downloading-but-not-complete must not count");
+
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 10).await.unwrap();
+        assert_eq!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap(), BTreeSet::from(["a".to_string()]));
     }
 
     #[tokio::test]

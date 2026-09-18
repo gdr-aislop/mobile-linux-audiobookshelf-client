@@ -382,6 +382,33 @@ impl PlayerController {
         self.inner.borrow().now_playing.as_ref().map(|np| np.chapters.clone()).unwrap_or_default()
     }
 
+    /// `(session, server_id, item_id)` for whatever is currently loaded — the context a download
+    /// button needs to call `DownloadManager::start_download`. `None` if nothing is playing.
+    pub fn current_download_context(&self) -> Option<(abs_core::auth::Session, String, String)> {
+        let inner = self.inner.borrow();
+        let now_playing = inner.now_playing.as_ref()?;
+        Some((now_playing.session.clone(), now_playing.server_id.clone(), now_playing.item_id.clone()))
+    }
+
+    /// Index into `chapters()` that the current book-level position falls in — the same
+    /// `start_seconds <= position && position < end_seconds` test `build_chapter_row` uses to
+    /// highlight "the current chapter", pulled out here so a download button can default its
+    /// scope to it too. `None` if nothing is playing or the item has no chapter data; a position
+    /// past every chapter's range (a rare rounding edge) clamps to the last chapter.
+    pub fn current_chapter_index(&self) -> Option<usize> {
+        let inner = self.inner.borrow();
+        let now_playing = inner.now_playing.as_ref()?;
+        if now_playing.chapters.is_empty() {
+            return None;
+        }
+        let position = inner.book_position();
+        now_playing
+            .chapters
+            .iter()
+            .position(|c| c.start_seconds <= position && position < c.end_seconds)
+            .or(Some(now_playing.chapters.len() - 1))
+    }
+
     /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
     /// same precedent as `write_progress`'s local half: a plain repo write, no server sync, since
     /// none is specified for bookmarks. A no-op if nothing is playing.

@@ -12,10 +12,14 @@
 
 use std::rc::Rc;
 
+use adw::glib;
 use adw::prelude::*;
 
+use abs_core::download_tracks::OfflineAvailability;
+use abs_core::downloads::DownloadScope;
 use abs_core::settings::PlaybackSettings;
 
+use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
 use crate::player::{ChapterInfo, PlayerController, PlayerSnapshot};
 
 pub struct PlayerScreen {
@@ -52,6 +56,9 @@ pub struct TestHooks {
     pub mark_as_finished_button: gtk4::Button,
     pub reset_progress_button: gtk4::Button,
     pub toast_overlay: adw::ToastOverlay,
+    pub download_button: gtk4::MenuButton,
+    pub download_popover: gtk4::Popover,
+    pub download_popover_box: gtk4::Box,
 }
 
 #[cfg(test)]
@@ -61,7 +68,13 @@ impl PlayerScreen {
     }
 }
 
-pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, on_collapse: impl Fn() + 'static) -> PlayerScreen {
+pub fn build(
+    pool: sqlx::SqlitePool,
+    controller: PlayerController,
+    playback_settings: PlaybackSettings,
+    download_manager: crate::downloads::DownloadManager,
+    on_collapse: impl Fn() + 'static,
+) -> PlayerScreen {
     // Shared by the down-chevron header button and the Escape action below.
     let on_collapse = Rc::new(on_collapse);
     let header = adw::HeaderBar::new();
@@ -197,12 +210,18 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     }
 
     let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
+    // "● downloaded" legend (ui-spec: sits in the Chapters section header so the offline glyph's
+    // meaning doesn't need to be inferred from a single unlabeled icon on the active chapters).
+    let chapters_legend = gtk4::Label::builder().label("● downloaded").css_classes(["caption", "dim-label"]).xalign(0.0).margin_bottom(4).build();
+    let chapters_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    chapters_box.append(&chapters_legend);
+    chapters_box.append(&chapters_list);
     let chapters_scroller = gtk4::ScrolledWindow::builder()
         .max_content_height(320)
         .propagate_natural_height(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .width_request(260)
-        .child(&chapters_list)
+        .child(&chapters_box)
         .build();
     let chapters_popover = gtk4::Popover::builder().child(&chapters_scroller).build();
     let chapters_button = gtk4::MenuButton::builder()
@@ -210,10 +229,21 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
         .tooltip_text("Chapters")
         .popover(&chapters_popover)
         .build();
+
+    // Download button + its scope popover (ui-spec's Item Detail download sheet, adapted onto
+    // this screen — see `crate::downloads` module doc / the implementation plan for why this app
+    // has no separate Item Detail screen). Rows are rebuilt on every `connect_show` the same way
+    // `chapters_popover` rebuilds its rows, since which rows apply (is anything downloaded yet to
+    // clear?) can change between opens.
+    let download_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    let download_popover = gtk4::Popover::builder().child(&download_popover_box).build();
+    let download_button = gtk4::MenuButton::builder().icon_name("folder-download-symbolic").tooltip_text("Download").popover(&download_popover).build();
+
     let secondary_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(18).halign(gtk4::Align::Center).margin_top(10).build();
     secondary_row.append(&speed_button);
     secondary_row.append(&sleep_timer_button);
     secondary_row.append(&chapters_button);
+    secondary_row.append(&download_button);
 
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -264,6 +294,60 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             controller.reset_progress();
             menu_popover.popdown();
             toast_overlay.add_toast(adw::Toast::new("Progress reset"));
+        }
+    });
+
+    // Download button: rebuilt on every `connect_show` (same reasoning as the chapters popover —
+    // whether "Clear downloaded chapters" applies can change between opens) via an async
+    // `item_offline_availability` check, since that's the one bit of state here not already held
+    // in-memory on `controller`.
+    download_popover.connect_show({
+        let pool = pool.clone();
+        let controller = controller.clone();
+        let download_manager = download_manager.clone();
+        let download_popover_box = download_popover_box.clone();
+        let download_popover_for_rows = download_popover.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let Some((session, server_id, item_id)) = controller.current_download_context() else { return };
+            let current_chapter_index = controller.current_chapter_index().unwrap_or(0);
+            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &toast_overlay);
+            glib::spawn_future_local({
+                let pool = pool.clone();
+                let download_popover_box = download_popover_box.clone();
+                let download_manager = download_manager.clone();
+                let download_popover_for_rows = download_popover_for_rows.clone();
+                let session = session.clone();
+                let item_id = item_id.clone();
+                let toast_overlay = toast_overlay.clone();
+                async move {
+                    let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
+                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &toast_overlay);
+                }
+            });
+        }
+    });
+
+    // Reflects the currently-loaded item's overall download state on the button's own icon (ui-
+    // spec: idle -> in-progress -> checkmark). Registered once, for the manager's whole lifetime —
+    // same "permanent listener" shape `PlayerController::add_listener` already uses for MPRIS —
+    // and filters events against whatever `controller` currently has loaded rather than a single
+    // item id captured at build time, since the mini-bar can switch items while this screen is
+    // collapsed (not rebuilt) in the background.
+    download_manager.add_listener({
+        let controller = controller.clone();
+        let download_button = download_button.clone();
+        move |event| {
+            let DownloadEvent::ItemStateChanged { item_id, state } = event else { return };
+            let Some((_, _, current_item_id)) = controller.current_download_context() else { return };
+            if *item_id != current_item_id {
+                return;
+            }
+            download_button.set_icon_name(match state {
+                ItemDownloadState::Downloading => "content-loading-symbolic",
+                ItemDownloadState::Complete => "emblem-ok-symbolic",
+                ItemDownloadState::Idle | ItemDownloadState::Failed => "folder-download-symbolic",
+            });
         }
     });
 
@@ -337,14 +421,30 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
     chapters_popover.connect_show({
         let controller = controller.clone();
         let chapters_list = chapters_list.clone();
+        let pool = pool.clone();
         move |_| {
-            while let Some(child) = chapters_list.first_child() {
-                chapters_list.remove(&child);
-            }
             let chapters = controller.chapters();
             let position = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
-            for chapter in &chapters {
-                chapters_list.append(&build_chapter_row(chapter, position));
+            rebuild_chapters_list(&chapters_list, &chapters, position, &[]);
+
+            // Offline markers need an async DB read (`complete_inos_for_item`), unlike everything
+            // else here (in-memory on `controller`) — render without them first, then refine once
+            // the query lands, same "show now, refine once the async bit lands" shape `home.rs`'s
+            // cover-art re-render already uses.
+            if let Some((_, server_id, item_id)) = controller.current_download_context() {
+                let pool = pool.clone();
+                let chapters_list = chapters_list.clone();
+                let controller = controller.clone();
+                glib::spawn_future_local(async move {
+                    let chapters = controller.chapters();
+                    if chapters.is_empty() {
+                        return;
+                    }
+                    let chapter_ranges: Vec<(f64, f64)> = chapters.iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
+                    let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
+                    let position = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
+                    rebuild_chapters_list(&chapters_list, &chapters, position, &markers);
+                });
             }
         }
     });
@@ -449,6 +549,9 @@ pub fn build(controller: PlayerController, playback_settings: PlaybackSettings, 
             mark_as_finished_button,
             reset_progress_button,
             toast_overlay,
+            download_button,
+            download_popover,
+            download_popover_box,
         },
     }
 }
@@ -461,9 +564,81 @@ fn add_action(group: &gtk4::gio::SimpleActionGroup, name: &'static str, run: imp
     group.add_action(&action);
 }
 
-/// One row in the chapters sheet: title on the left, start time on the right, highlighted (via a
-/// css class) if `position` currently falls within this chapter's range.
-fn build_chapter_row(chapter: &ChapterInfo, position: f64) -> gtk4::ListBoxRow {
+/// (Re)builds the download button's popover rows: the four scope options (ui-spec's Item Detail
+/// download sheet, minus the size estimates and the "Next chapters" stepper — both need per-
+/// chapter file-size metadata / a larger widget this pass doesn't build; "Next chapters" fetches a
+/// fixed 10, matching the spec's own stated default), plus a destructive "Clear downloaded
+/// chapters" row shown only once `availability` says something is actually downloaded.
+#[allow(clippy::too_many_arguments)]
+fn populate_download_popover_rows(
+    popover_box: &gtk4::Box,
+    availability: OfflineAvailability,
+    download_manager: &DownloadManager,
+    popover: &gtk4::Popover,
+    session: &abs_core::auth::Session,
+    item_id: &str,
+    current_chapter_index: usize,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    while let Some(child) = popover_box.first_child() {
+        popover_box.remove(&child);
+    }
+
+    let scopes: [(&str, DownloadScope); 4] =
+        [("Current chapter", DownloadScope::CurrentChapter), ("Next 10 chapters", DownloadScope::NextChapters(10)), ("Remaining chapters", DownloadScope::RemainingChapters), ("Entire book", DownloadScope::EntireBook)];
+    for (label, scope) in scopes {
+        let button = gtk4::Button::builder().label(label).css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        button.connect_clicked({
+            let download_manager = download_manager.clone();
+            let popover = popover.clone();
+            let session = session.clone();
+            let item_id = item_id.to_string();
+            let toast_overlay = toast_overlay.clone();
+            move |_| {
+                download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
+                popover.popdown();
+                toast_overlay.add_toast(adw::Toast::new("Download started"));
+            }
+        });
+        popover_box.append(&button);
+    }
+
+    if availability != OfflineAvailability::None {
+        let clear_button = gtk4::Button::builder().label("Clear downloaded chapters").css_classes(["destructive-action"]).margin_top(6).build();
+        clear_button.connect_clicked({
+            let download_manager = download_manager.clone();
+            let popover = popover.clone();
+            let session = session.clone();
+            let item_id = item_id.to_string();
+            let toast_overlay = toast_overlay.clone();
+            move |_| {
+                download_manager.clear_item(session.server_id(), &item_id);
+                popover.popdown();
+                toast_overlay.add_toast(adw::Toast::new("Downloaded chapters cleared"));
+            }
+        });
+        popover_box.append(&clear_button);
+    }
+}
+
+/// Clears and repopulates `chapters_list`. `markers[i]` (if present for index `i`) shows a small
+/// offline glyph trailing chapter `i`'s time — an empty slice (the synchronous first pass, before
+/// the async offline lookup lands) means "not downloaded" for every chapter, never "unknown"; a
+/// glyph appearing a moment later is the expected two-stage render, not a flicker to hide.
+fn rebuild_chapters_list(chapters_list: &gtk4::ListBox, chapters: &[ChapterInfo], position: f64, markers: &[bool]) {
+    while let Some(child) = chapters_list.first_child() {
+        chapters_list.remove(&child);
+    }
+    for (index, chapter) in chapters.iter().enumerate() {
+        let is_downloaded = markers.get(index).copied().unwrap_or(false);
+        chapters_list.append(&build_chapter_row(chapter, position, is_downloaded));
+    }
+}
+
+/// One row in the chapters sheet: title on the left, start time (plus a small offline glyph when
+/// `is_downloaded`) on the right, highlighted (via a css class) if `position` currently falls
+/// within this chapter's range.
+fn build_chapter_row(chapter: &ChapterInfo, position: f64, is_downloaded: bool) -> gtk4::ListBoxRow {
     let is_current = chapter.start_seconds <= position && position < chapter.end_seconds;
 
     let title_label = gtk4::Label::builder().label(&chapter.title).xalign(0.0).hexpand(true).ellipsize(gtk4::pango::EllipsizeMode::End).build();
@@ -471,6 +646,9 @@ fn build_chapter_row(chapter: &ChapterInfo, position: f64) -> gtk4::ListBoxRow {
     let row_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).margin_top(6).margin_bottom(6).build();
     row_box.append(&title_label);
     row_box.append(&time_label);
+    if is_downloaded {
+        row_box.append(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+    }
 
     if is_current {
         title_label.add_css_class("heading");
@@ -510,6 +688,10 @@ pub(crate) mod tests {
     use crate::test_support::pump_until;
     use std::time::Duration;
 
+    fn test_download_manager(pool: sqlx::SqlitePool) -> DownloadManager {
+        DownloadManager::new(pool, crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false)
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
     /// scenario in this binary has to run from one single entry point. Starts real playback
     /// (reusing `player.rs`'s own wiremock-served-audio test helpers), builds the full player
@@ -531,7 +713,7 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let screen = build(controller.clone(), PlaybackSettings::default(), {
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
         });
@@ -584,7 +766,7 @@ pub(crate) mod tests {
         // readiness signal `PlayerController::start` itself waits on for the resume-seek).
         pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.chapters_button.popover().as_ref(), Some(&hooks.chapters_popover), "the chapters button should open the chapters popover");
 
@@ -614,6 +796,49 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Tapping "Current chapter" in the
+    /// download popover should call through to a real download (via `DownloadManager`) for that
+    /// chapter's track only, and the button's icon should reflect Downloading -> Complete as the
+    /// real `DownloadEvent`s land.
+    pub(crate) fn run_download_button_starts_a_download_and_reflects_state(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-1", 10, &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+
+        let download_manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), download_manager, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        click_button_labeled(&hooks.download_popover_box, "Current chapter");
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
+        assert_eq!(hooks.download_button.icon_name().as_deref(), Some("emblem-ok-symbolic"), "the button should reflect Complete once the download finishes");
+
+        window.destroy();
+        controller.stop();
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking a speed preset should call
     /// through to the real backend and update both the controller's snapshot and the button's
     /// label.
@@ -633,7 +858,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.speed_label.label(), "1.0×", "should start at the default speed");
         assert!(hooks.speed_button.popover().is_some(), "the speed button should open a popover");
@@ -668,7 +893,7 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let screen = build(controller.clone(), PlaybackSettings::default(), {
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
         });
@@ -739,7 +964,7 @@ pub(crate) mod tests {
         );
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert!(!hooks.sleep_timer_button.has_css_class("accent"), "no sleep timer armed yet");
         assert_eq!(hooks.sleep_timer_button.popover().as_ref(), Some(&hooks.sleep_timer_popover));
@@ -777,7 +1002,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
         assert!(hooks.menu_button.popover().is_some(), "the ... menu button should open a popover");
 
@@ -810,7 +1035,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
 
         hooks.mark_as_finished_button.emit_clicked();
@@ -845,7 +1070,7 @@ pub(crate) mod tests {
         controller.skip(2.0);
         pump_until(|| controller.snapshot().unwrap().position_seconds > 1.0, Duration::from_secs(5));
 
-        let screen = build(controller.clone(), PlaybackSettings::default(), || {});
+        let screen = build(pool.clone(), controller.clone(), PlaybackSettings::default(), test_download_manager(pool.clone()), || {});
         let hooks = screen.test_hooks();
 
         hooks.reset_progress_button.emit_clicked();

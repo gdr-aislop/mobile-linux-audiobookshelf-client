@@ -132,9 +132,10 @@ pub fn build(
         "Home",
         "go-home-symbolic",
     );
-    let library_screen = screens::library::build(pool, paths, server, account, session, on_play);
+    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play);
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    stack.add_titled_with_icon(&stub_page("folder-download-symbolic", "Downloads"), Some("downloads"), "Downloads", "folder-download-symbolic");
+    let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
+    stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
     stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
@@ -200,8 +201,10 @@ pub fn build(
         let controller = mini_bar.controller.clone();
         let window = window.clone();
         let root = root.clone();
+        let pool = pool.clone();
+        let download_manager = download_manager.clone();
         move |_, _, _, _| {
-            let player_screen = screens::player::build(controller.clone(), playback_settings, {
+            let player_screen = screens::player::build(pool.clone(), controller.clone(), playback_settings, download_manager.clone(), {
                 let window = window.clone();
                 let root = root.clone();
                 move || {

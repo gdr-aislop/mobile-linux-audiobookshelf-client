@@ -31,6 +31,8 @@ pub struct TestHooks {
     pub continue_section: gtk4::Box,
     pub recent_row: gtk4::Box,
     pub banner: crate::widgets::banner::ErrorBanner,
+    pub offline_toggle: gtk4::ToggleButton,
+    pub offline_banner: gtk4::Revealer,
 }
 
 #[cfg(test)]
@@ -164,6 +166,14 @@ struct HomeWidgets {
     libraries_list: gtk4::ListBox,
     banner: crate::widgets::banner::ErrorBanner,
     on_play: std::rc::Rc<dyn Fn(PlayRequest)>,
+    /// Shared persisted state with Library's own toggle (ui-spec: "not a per-screen setting") —
+    /// see `library.rs`'s identically-named field for the full reasoning.
+    offline_mode: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The last data `apply()` rendered, so the offline-mode toggle can re-filter and re-render
+    /// without a full re-sync — same "keep the last render around" shape `library.rs`'s
+    /// `LibraryData` cache already uses, just not behind its own repaint-triggering setter here
+    /// since Home's `apply()` is already the single re-render entry point.
+    last_data: std::rc::Rc<std::cell::RefCell<Option<HomeData>>>,
 }
 
 /// Everything one sync cycle needs, cloned as a whole so both the initial run and every
@@ -179,10 +189,15 @@ struct SyncCtx {
     session: abs_core::auth::Session,
 }
 
+#[derive(Clone)]
 struct HomeData {
     libraries: Vec<Library>,
     recent_items: Vec<Item>,
     continue_items: Vec<(Item, Progress)>,
+    /// Ids of items downloaded fully or partially — one query per load, checked per card rather
+    /// than a query per card. Feeds `item_card::build`'s read-only download badge, and (when
+    /// `offline_mode` is on) filters the shelves to just these items.
+    downloaded: std::collections::HashSet<String>,
 }
 
 /// Builds the screen. `server`/`account` are already-resolved rows (the caller, `main_window`,
@@ -218,6 +233,14 @@ pub fn build(
         .child(&gtk4::Label::new(Some(&avatar_letter)))
         .build();
     header.pack_end(&avatar);
+
+    // Offline-mode toggle (ui-spec: "leading side, opposite the avatar"). Shared persisted state
+    // with Library's own toggle — see `HomeWidgets::offline_mode`'s field doc.
+    let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
+    header.pack_start(&offline_toggle);
+
+    let offline_banner_label = gtk4::Label::builder().label("Showing downloaded items only").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+    let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_label).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
 
@@ -264,6 +287,7 @@ pub fn build(
     // visible in every state — when the shelves are empty the scroller is hidden, and a banner
     // trapped inside it was exactly how the first-sync failure used to disappear without a trace.
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
+    body.append(&offline_banner);
     body.append(banner.widget());
     body.append(&scroller);
     body.append(&empty_state.root);
@@ -281,6 +305,8 @@ pub fn build(
         libraries_list: libraries_list.clone(),
         banner: banner.clone(),
         on_play: std::rc::Rc::new(on_play),
+        offline_mode: std::rc::Rc::new(std::cell::Cell::new(false)),
+        last_data: std::rc::Rc::new(std::cell::RefCell::new(None)),
     };
 
     // The screen starts in the syncing state (EmptyState's construction default): a returning
@@ -307,6 +333,57 @@ pub fn build(
         });
     }
 
+    let offline_toggle_handler = offline_toggle.connect_toggled({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let offline_banner = offline_banner.clone();
+        let server_id = server.id.clone();
+        move |toggle| {
+            let active = toggle.is_active();
+            widgets.offline_mode.set(active);
+            offline_banner.set_reveal_child(active);
+            glib::spawn_future_local({
+                let pool = pool.clone();
+                let widgets = widgets.clone();
+                let server_id = server_id.clone();
+                async move {
+                    // Same "refetch, don't trust the last sync's snapshot" reasoning as
+                    // `library.rs`'s identical toggle handler.
+                    if let Ok(downloaded) = abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
+                        if let Some(data) = widgets.last_data.borrow_mut().as_mut() {
+                            data.downloaded = downloaded.into_iter().collect();
+                        }
+                    }
+                    if let Some(data) = widgets.last_data.borrow().clone() {
+                        apply(&data, &widgets);
+                    }
+
+                    if let Err(err) = abs_core::settings::save_offline_mode(&pool, active).await {
+                        tracing::warn!(%err, "couldn't persist offline mode; it won't be remembered next launch");
+                    }
+                }
+            });
+        }
+    });
+
+    // Same "load once, blocking the handler while restoring" pattern `library.rs` uses for its
+    // own view-mode toggle — the persisted value is shared between the two screens' toggles.
+    glib::spawn_future_local({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let offline_toggle = offline_toggle.clone();
+        let offline_banner = offline_banner.clone();
+        async move {
+            if let Ok(active) = abs_core::settings::load_offline_mode(&pool).await {
+                offline_toggle.block_signal(&offline_toggle_handler);
+                offline_toggle.set_active(active);
+                offline_toggle.unblock_signal(&offline_toggle_handler);
+                widgets.offline_mode.set(active);
+                offline_banner.set_reveal_child(active);
+            }
+        }
+    });
+
     HomeScreen {
         root: root.upcast(),
         #[cfg(test)]
@@ -316,6 +393,8 @@ pub fn build(
             continue_section,
             recent_row,
             banner,
+            offline_toggle,
+            offline_banner,
         },
     }
 }
@@ -478,13 +557,17 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
         }
     }
 
-    Ok(HomeData { libraries, recent_items, continue_items })
+    let downloaded = abs_core::download_tracks::downloaded_item_ids(pool, server_id).await?.into_iter().collect();
+
+    Ok(HomeData { libraries, recent_items, continue_items, downloaded })
 }
 
 /// Rebuilds every dynamic widget from `data`. Safe to call repeatedly — clears each container's
 /// children first, so this is a full re-render rather than an incremental diff (fine at this
 /// scale: a handful of shelf cards and library rows, not a large list needing virtualization).
 fn apply(data: &HomeData, widgets: &HomeWidgets) {
+    *widgets.last_data.borrow_mut() = Some(data.clone());
+
     // The empty state's *mode* is owned by the sync-cycle state machine, but its hiding happens
     // here, the moment real content renders — not later in the cycle (after the best-effort
     // cover fetches), so the spinner state never briefly coexists with the shelves.
@@ -495,22 +578,28 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
     // apply only ever has something (or nothing) to put in the scroller.
     widgets.scroller.set_visible(!data.libraries.is_empty());
 
+    let offline_mode = widgets.offline_mode.get();
+
     clear_box(&widgets.continue_row);
-    for (item, progress) in &data.continue_items {
+    let continue_items: Vec<_> = data.continue_items.iter().filter(|(item, _)| !offline_mode || data.downloaded.contains(&item.id)).collect();
+    for (item, progress) in &continue_items {
         let percent = if item.duration_seconds > 0.0 {
             (progress.current_time_seconds / item.duration_seconds * 100.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
         let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
+        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false, data.downloaded.contains(&item.id)));
     }
-    widgets.continue_section.set_visible(!data.continue_items.is_empty());
+    widgets.continue_section.set_visible(!continue_items.is_empty());
 
     clear_box(&widgets.recent_row);
-    for item in &data.recent_items {
+    // "Libraries" itself isn't filtered — a library entry isn't a downloadable item, only the
+    // items inside it are (ui-spec's "Libraries list" filtering is interpreted here as "still
+    // browsable", not "hidden entirely", since there's no per-library download concept).
+    for item in data.recent_items.iter().filter(|item| !offline_mode || data.downloaded.contains(&item.id)) {
         let subtitle = item_subtitle(item);
-        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false));
+        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false, data.downloaded.contains(&item.id)));
     }
 
     clear_listbox(&widgets.libraries_list);
@@ -643,6 +732,57 @@ pub(crate) mod tests {
         assert!(hooks.libraries_list.row_at_index(0).is_some(), "the synced library should have a row");
         assert!(hooks.recent_row.first_child().is_some(), "the synced item should show under Recently Added");
         assert!(!hooks.continue_section.is_visible(), "no progress exists yet, so Continue Listening stays hidden");
+    }
+
+    fn count_children(b: &gtk4::Box) -> usize {
+        let mut count = 0;
+        let mut child = b.first_child();
+        while let Some(widget) = child {
+            count += 1;
+            child = widget.next_sibling();
+        }
+        count
+    }
+
+    /// Toggling offline mode should narrow "Recently Added" to items with at least one completed
+    /// download and show the banner; toggling off restores the full shelf.
+    pub(crate) fn run_offline_mode_toggle_filters_recently_added(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {});
+        let hooks = screen.test_hooks();
+        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
+
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 3600.0, offset_seconds: 0.0 }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
+
+        hooks.offline_toggle.set_active(true);
+        pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(5));
+        assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
+
+        hooks.offline_toggle.set_active(false);
+        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(5));
+        assert!(!hooks.offline_banner.reveals_child());
     }
 
     pub(crate) fn run_shows_empty_state_when_the_server_has_no_libraries(runtime: &tokio::runtime::Runtime) {

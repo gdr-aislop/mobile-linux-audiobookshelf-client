@@ -419,6 +419,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// Like `mock_two_track_item`, but with no chapter data at all — the degenerate case
+    /// `start_download` falls back to "download every track" for, since there's no finer-grained
+    /// scope to resolve against.
+    async fn mock_two_track_item_without_chapters(mock_server: &MockServer, item_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": { "audioFiles": [{ "ino": "1", "duration": 5.0 }, { "ino": "2", "duration": 5.0 }] }
+            })))
+            .mount(mock_server)
+            .await;
+        for ino in ["1", "2"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/items/{item_id}/file/{ino}")))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "audio/mpeg").insert_header("Content-Length", "5").set_body_bytes(b"hello".to_vec()))
+                .mount(mock_server)
+                .await;
+        }
+    }
+
     /// A single-track item whose file response is deliberately slow, giving `cancel_item` tests a
     /// real window to cancel inside before the transfer would otherwise complete.
     async fn mock_slow_single_track_item(mock_server: &MockServer, item_id: &str, delay: Duration) {
@@ -573,5 +593,74 @@ pub(crate) mod tests {
         );
 
         assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty());
+    }
+
+    /// An item with no chapter markers at all has nothing for `resolve_scope`/
+    /// `tracks_needed_for_chapters` to select from — every scope must degenerate to "the whole
+    /// book" rather than downloading nothing.
+    pub(crate) fn run_start_download_with_no_chapters_fetches_every_track(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item_without_chapters(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(pool());
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
+
+        let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: None }), false);
+        manager.start_download(session, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().iter().filter(|d| d.status == DownloadStatus::Complete).count() == 2,
+            Duration::from_secs(10),
+        );
+
+        let rows = runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap();
+        assert_eq!(rows.iter().filter(|d| d.status == DownloadStatus::Complete).count(), 2, "with no chapters, every track should be fetched regardless of scope");
+    }
+
+    /// Toggling `wifi_only` mid-batch only affects downloads started *after* the change — a track
+    /// whose metered check already passed keeps running.
+    pub(crate) fn run_set_wifi_only_only_affects_downloads_started_afterwards(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_two_track_item(&mock_server, "item-1"));
+        runtime.block_on(mock_two_track_item(&mock_server, "item-2"));
+
+        let pool = runtime.block_on(pool());
+        let (session, server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2"));
+
+        let manager = DownloadManager::new(pool.clone(), test_paths(), Box::new(FakeNetworkMonitor { metered: Some(true) }), false);
+
+        let events: Rc<RefCell<Vec<DownloadEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        manager.add_listener({
+            let events = events.clone();
+            move |event| events.borrow_mut().push(event.clone())
+        });
+
+        // Started while wifi_only is still false — a metered connection must not block it.
+        manager.start_download(session.clone(), "item-1".to_string(), DownloadScope::CurrentChapter, 0);
+        pump_until(
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Complete, .. } if item_id == "item-1"))
+                || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-1")),
+            Duration::from_secs(10),
+        );
+        assert!(
+            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Complete, .. } if item_id == "item-1")),
+            "a download already in flight when wifi_only was false must not be blocked by a later toggle"
+        );
+
+        manager.set_wifi_only(true);
+
+        // Started after the toggle, still on a metered connection — this one must be blocked.
+        manager.start_download(session, "item-2".to_string(), DownloadScope::CurrentChapter, 0);
+        pump_until(
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-2")),
+            Duration::from_secs(5),
+        );
+        assert!(
+            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-2")),
+            "a download started after wifi_only was set true, on a metered connection, must be blocked"
+        );
     }
 }
