@@ -168,6 +168,7 @@ mod tests {
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
         (settings_servers_menu_actions_rebuild_the_shell, crate::screens::settings::tests::run_servers_menu_actions_rebuild_the_shell),
         (settings_add_server_row_opens_welcome_and_cancels_back, crate::screens::settings::tests::run_add_server_row_opens_welcome_and_cancels_back),
+        (connection_page_url_info_disconnect_and_back, crate::screens::connection::tests::run_url_info_disconnect_and_back),
         (playback_start_and_pause_persists_progress, crate::player::tests::run_start_and_pause_persists_progress),
         (playback_downloaded_track_is_preferred_over_streaming, crate::player::tests::run_downloaded_track_is_preferred_over_streaming),
         (playback_untrustworthy_complete_row_falls_back_to_streaming, crate::player::tests::run_untrustworthy_complete_row_falls_back_to_streaming),

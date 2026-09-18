@@ -326,19 +326,31 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   every new playback), the skip-back/forward interval combos (which the transport buttons, arrow
   keys and MPRIS next/previous read live), and the Wi-Fi-only downloads switch (applied live to
   the download manager). The **Appearance** group (Theme: system/light/dark, applied via
-  `AdwStyleManager` immediately and at startup) and the **About** row are real too. Account,
-  Servers, the Connection page and Playback's sleep-timer-default row are still stubs.
-- **Account** group: one row showing the *active* server/account (username, server host,
-  "active" subtitle) with a chevron, and one "Switch or manage servers" row that opens the
-  Servers list below. There is deliberately no top-level "Sign Out" action here — with multiple
-  servers supported, "sign out" is ambiguous about *which* account, so it isn't a global control.
+  `AdwStyleManager` immediately and at startup), the **About** row, and the **Account** and
+  **Servers** groups (below) are real too. Still stubs: Playback's sleep-timer-default row, and
+  the Connection page's Advanced group (see §Connection).
+- **Account** group: one row showing the *active* server/account — username as title,
+  `host · active` as subtitle — with a chevron; tapping it pushes the active server's
+  **Connection** page. The mockup's second row ("Switch or manage servers") is deliberately
+  dropped: both groups scroll on one page, so the Servers list directly below *is* that surface,
+  and a second row pointing at it would be dead UI (documented deviation). There is still no
+  top-level "Sign Out" action — with multiple servers supported, "sign out" is ambiguous about
+  *which* account, so it lives per server below.
 - **Servers** group: one `AdwActionRow` per configured server (host as title, logged-in username
   and "active" marker as subtitle), each with a trailing menu button (`⋯` / `GtkMenuButton`,
   ≥44×44px and spaced apart from the row body's own tap target per the touch-target note above)
-  opening a small popover with **Switch to this server**, **Sign Out**, and **Remove Server**
-  (destructive style). This is where sign-out actually lives — scoped to one server/account at a
-  time — plus an "Add Server" row at the end to register another Audiobookshelf instance. Tapping
-  a server row's body (as opposed to its `⋯` menu) pushes that server's **Connection** page.
+  opening a popover with **Switch to this server** (insensitive for the already-active server),
+  **Sign Out**, and **Remove Server** (destructive style) — Sign Out and Remove Server confirmed
+  first with a `GtkMessageDialog`, since both destroy local data (progress rows cascade with the
+  account; a removed server also purges its on-disk cover/download files, the same cleanup a
+  server switch via re-login performs). Every action ends by handing control back to the shell
+  rebuilder: rebuilt from the database, or the first-run Welcome screen when no active account
+  is left (switching or signing out also ends the session that was playing — the shell, and with
+  it the player, is rebuilt). Tapping a server row's body (as opposed to its `⋯` menu) pushes
+  that server's **Connection** page. An "Add Server" row closes the group: it opens the same
+  Welcome flow the first run uses (previously only reachable when no account was active — this
+  row is what makes a second server possible), with a Cancel affordance back to the shell; a
+  successful connect activates the new account and rebuilds the shell.
 - **About** group: a single `AdwActionRow` with the app version as its subtitle, opening an
   `AdwAboutWindow` (app name, version, website, license) on tap — not `AdwAboutDialog`, which
   needs libadwaita 1.5+ and is out of reach of this app's `v1_2` feature ceiling (see
@@ -348,28 +360,30 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   command-line flags print, so it can never drift between the two.
 
 ### Connection
-- `AdwNavigationPage` pushed from a server row in Settings' Servers group; one instance per
-  configured server, covering the advanced connection settings a self-hosted Audiobookshelf setup
-  commonly needs (custom reverse proxies, self-signed certs, LAN-only servers).
-- **Server connection** group: a single `AdwActionRow` showing the server's full URL as its
-  subtitle (monospace, since it's a literal value being confirmed rather than a label) with a
-  trailing info-button opening a popover/tooltip explaining what this connection is used for.
-- **Advanced** group:
-  - **Custom Headers** — `AdwActionRow`, chevron, pushes a page for adding request headers sent on
-    every server call (e.g. for auth proxies in front of Audiobookshelf).
-  - **Disable SSL verification** — `AdwSwitchRow`; off by default, since disabling verification is
-    a deliberate opt-in for servers with self-signed or otherwise unverifiable certificates.
-  - **Client certificate** — `AdwActionRow`, chevron, pushes a page to select/import a client
-    certificate for mTLS.
-  - **Local network server address** — `AdwActionRow`, chevron, pushes a page to set an alternate
-    address used automatically when on the server's home Wi-Fi (avoiding a round trip through the
-    public internet for LAN clients).
-  - **Change User Agent** — `AdwActionRow`, chevron, pushes a page to override the `User-Agent`
-    header the app sends (useful when a server or proxy filters by it).
-- A destructive **"Disconnect from the Server"** plain-text action (styled like `AdwButton`'s
-  `destructive-action` but as a flat/link-style button, not a filled button, since it's an
-  infrequent, page-level action rather than a primary one) sits below the Advanced group,
-  vertically separated rather than boxed in its own card.
+- Per-server connection settings, pushed from a server row in Settings' Servers group (or the
+  Account row, for the active server). **Partially built**: the navigation itself can't be an
+  `AdwNavigationPage` — `AdwNavigationView` is v1.4+, out of this crate's `v1_2` ceiling — so
+  the page is shown by swapping the window's content (the same mechanism the full player uses),
+  with a back button in its header that restores the captured shell widget; one instance per
+  configured server.
+- **Server connection** group (real): a single `AdwActionRow` showing the server's full URL as
+  its subtitle (monospace, via a small per-process stylesheet targeting the row's internal
+  subtitle label, since it's a literal value being confirmed rather than a label) with a
+  trailing info-button opening a popover explaining what this connection is used for (every
+  server call — syncing, streaming, downloads — goes through it).
+- **Advanced** group (deliberately not built yet): **Custom Headers**, **Disable SSL
+  verification**, **Client certificate**, **Local network server address**, and **Change User
+  Agent**. The `servers` table already carries a column for each, but applying any of them to
+  real traffic needs an HTTP-client factory threaded through every server call (library sync,
+  token refresh, covers, downloads, streaming) — a feature batch of its own; each row is added
+  when it can be live wiring, not decoration.
+- A destructive **"Disconnect from the Server"** plain-text action (real; styled like
+  `AdwButton`'s `destructive-action` but flat, not a filled button, since it's an infrequent,
+  page-level action rather than a primary one) sits below the groups, vertically separated
+  rather than boxed in its own card. It signs out the server's account — its local progress and
+  bookmarks cascade away, the server and its cache survive — after a confirming
+  `GtkMessageDialog`, then hands control back to the shell rebuilder (Welcome when no active
+  account is left).
 
 ## 4. Adaptive/responsive behavior summary
 

@@ -1,13 +1,12 @@
 //! The Settings destination — per `docs/design/ui-spec.md`'s "Settings" section, an
-//! `AdwPreferencesPage` under the tab bar. The **Account** group (the active server/account)
-//! and the **Servers** group (one row per configured server with a Switch/Sign Out/Remove
-//! menu, plus Add Server — which reuses the Welcome flow, the only way a second server can
-//! ever enter the database) are real; the **Playback** group (headphone switches, default
-//! speed, skip intervals, Wi-Fi-only downloads), the **Appearance** group (Theme) and the
-//! **About** row are too. Still to come: the per-server Connection page the server rows
-//! navigate to, and Playback's sleep-timer-default row — each arrives with its own feature,
-//! since every row is live wiring (session management, popover integration) rather than
-//! decoration.
+//! `AdwPreferencesPage` under the tab bar. The **Account** group (the active server/account;
+//! tapping it pushes the active server's Connection page) and the **Servers** group (one row
+//! per configured server with a Switch/Sign Out/Remove menu, plus Add Server — which reuses
+//! the Welcome flow, the only way a second server can ever enter the database) are real, as
+//! are the **Playback** group (headphone switches, default speed, skip intervals, Wi-Fi-only
+//! downloads), the **Appearance** group (Theme) and the **About** row. Still to come:
+//! Playback's sleep-timer-default row — it arrives with the sleep-timer popover feature, since
+//! every row here is live wiring rather than decoration.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -87,6 +86,17 @@ pub fn build(
     // that grace — so this row is a fact, not a picker; switching happens per server below.
     // (The mockup's "Switch or manage servers" row is deliberately absent: both groups scroll on
     // one page, so the Servers list *is* that surface — no second row can add anything.) ---
+    // The post-mutation shell handoff every session-changing action in these groups ends with —
+    // rebuilt from the database, or the Welcome screen when no active account is left.
+    let on_session_changed: Rc<dyn Fn()> = {
+        let pool = pool.clone();
+        let paths = paths.clone();
+        let window = window.clone();
+        std::rc::Rc::new(move || {
+            crate::application::show_main_or_welcome(&window, pool.clone(), paths.clone(), playback_settings)
+        })
+    };
+
     let (active_server, active_account) = servers_with_accounts
         .iter()
         .find_map(|(server, accounts)| {
@@ -100,6 +110,16 @@ pub fn build(
         .title(&active_account.username)
         .subtitle(format!("{} · active", host_of(&active_server.url)))
         .build();
+    account_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    account_row.set_activatable(true);
+    account_row.connect_activated({
+        let pool = pool.clone();
+        let window = window.clone();
+        let server = active_server.clone();
+        let account = active_account.clone();
+        let on_session_changed = on_session_changed.clone();
+        move |_| push_connection(&pool, &server, Some(account.clone()), &window, &on_session_changed)
+    });
     account_group.add(&account_row);
     page.add(&account_group);
 
@@ -160,6 +180,18 @@ pub fn build(
             .build();
         menu_button.set_popover(Some(&gtk4::Popover::builder().child(&menu_box).build()));
         row.add_suffix(&menu_button);
+
+        // Tapping the row's body (not the ⋯ menu) pushes the server's Connection page.
+        row.set_activatable(true);
+        row.connect_activated({
+            let pool = pool.clone();
+            let window = window.clone();
+            let server = server.clone();
+            let account = accounts.first().cloned();
+            let on_session_changed = on_session_changed.clone();
+            move |_| push_connection(&pool, &server, account.clone(), &window, &on_session_changed)
+        });
+
         servers_group.add(&row);
 
         if let Some(account) = accounts.first() {
@@ -498,9 +530,32 @@ pub fn build(
     }
 }
 
+/// Pushes a server's Connection page by swapping the window's content — the same mechanism the
+/// full player uses (`AdwNavigationView` is out of reach at this crate's libadwaita `v1_2`
+/// ceiling). The page's back button restores the shell widget captured here, so no shell state
+/// is lost.
+fn push_connection(
+    pool: &SqlitePool,
+    server: &Server,
+    account: Option<Account>,
+    window: &adw::ApplicationWindow,
+    on_session_changed: &Rc<dyn Fn()>,
+) {
+    let Some(shell_root) = window.content() else { return };
+    let screen = crate::screens::connection::build(
+        pool.clone(),
+        server.clone(),
+        account,
+        window,
+        &shell_root,
+        on_session_changed.clone(),
+    );
+    window.set_content(Some(&screen.root));
+}
+
 /// The `host[:port]` part of a server URL — what Account/Servers rows show instead of the full
 /// scheme-and-path form (the URL in full stays on the server's Connection page).
-fn host_of(url: &str) -> &str {
+pub(crate) fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     rest.split('/').next().unwrap_or(rest)
 }
@@ -508,7 +563,7 @@ fn host_of(url: &str) -> &str {
 /// A modal Ok/Cancel confirmation for a destructive session change — the same
 /// `GtkMessageDialog` pattern the Welcome screen's replace-data confirmation uses. Cancel just
 /// destroys the dialog; the confirmed action runs only on the affirmative response.
-fn confirm(
+pub(crate) fn confirm(
     window: &adw::ApplicationWindow,
     heading: &str,
     body: &str,
@@ -854,6 +909,21 @@ pub(crate) mod tests {
             "the active server can't be switched to — it's already active"
         );
         assert!(hooks.server_rows[0].sign_out_item.is_sensitive() && hooks.server_rows[0].remove_item.is_sensitive());
+
+        // Tapping the Account row's body pushes the active server's Connection page — a window
+        // content swap, not a rebuild (the page's back button is covered by the connection
+        // scenario).
+        let old_root = screen.root.clone();
+        app_window.set_content(Some(&old_root));
+        adw::prelude::ActionRowExt::activate(&hooks.account_row);
+        pump_until(
+            {
+                let old_root = old_root.clone();
+                let app_window = app_window.clone();
+                move || app_window.content().as_ref() != Some(&old_root)
+            },
+            Duration::from_secs(5),
+        );
 
         // Switching to the second server: the DB's active account flips, and the shell the
         // settings screen lives in is rebuilt around the new session (here observed as the

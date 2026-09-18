@@ -724,42 +724,64 @@ built (the tests below define the target behavior).
 
 ---
 
-## 15. Settings (SE) — 🚧 partially implemented (Playback, Appearance, About)
+## 15. Settings (SE) — 🚧 partially implemented (Account, Servers, Playback, Appearance, About)
 
 - [ ] **SE-1 — Groups exist.** Open the Settings tab.
       *Expected:* `AdwPreferencesPage`-style groups: Account, Servers, Playback, Appearance,
-      About. (Account and Servers are still missing.)
-      *Automated:* `settings_persistence` + `settings_playback_defaults_theme_and_about` check
-      the built groups.
+      About. (Only Playback's sleep-timer-default row is still missing.)
+      *Automated:* `settings_persistence`, `settings_playback_defaults_theme_and_about` and
+      `settings_account_and_servers_rows_reflect_the_database` check the built groups.
 
 - [ ] **SE-2 — Account group.** Inspect it.
       *Expected:* one row for the active server/account (username, server host, "active"
-      subtitle) with a chevron, plus a "Switch or manage servers" row opening the Servers list.
-      There is deliberately **no** top-level "Sign Out" button.
+      subtitle) with a chevron; tapping it pushes the active server's Connection page. The
+      mockup's "Switch or manage servers" row is deliberately dropped (documented deviation:
+      the Servers list is on the same page directly below). There is still **no** top-level
+      "Sign Out" button.
+      *Automated:* `settings_account_and_servers_rows_reflect_the_database` asserts the row's
+      title/subtitle and that tapping it swaps the window's content to the Connection page.
 
 - [ ] **SE-3 — Servers group.** With 2+ configured servers, inspect each row.
       *Expected:* host as title, logged-in username and an "active" marker as subtitle; a
-      trailing ⋯ menu button per row, clearly separated from the row's own tap target.
+      trailing ⋯ menu button per row (≥44px hit target), clearly separated from the row's own
+      tap target.
+      *Automated:* `settings_account_and_servers_rows_reflect_the_database` asserts rows,
+      subtitles and per-server menu-item sensitivity (Switch insensitive on the active server).
 
 - [ ] **SE-4 — Server row body → Connection.** Tap a server row's body (not its ⋯).
-      *Expected:* pushes that server's Connection page (§16).
+      *Expected:* pushes that server's Connection page (§16) as a window content swap; the
+      page's back button restores the shell.
+      *Automated:* the push mechanism is exercised via the Account row in
+      `settings_account_and_servers_rows_reflect_the_database`; back-restore in
+      `connection_page_url_info_disconnect_and_back`.
 
 - [ ] **SE-5 — Switch to this server.** Use a non-active server's ⋯ → "Switch to this server".
-      *Expected:* it becomes the active account (its "active" marker moves); Home/Library
-      re-render with that server's data; the mini bar's playback session ends or continues
-      cleanly without crashing.
+      *Expected:* it becomes the active account (its "active" marker moves); the shell is
+      rebuilt around the new session (Home/Library re-render with that server's data; ongoing
+      playback ends with the old shell).
+      *Automated:* `settings_account_and_servers_rows_reflect_the_database` asserts the DB's
+      active account flips and the window's content is swapped off the settings screen.
 
 - [ ] **SE-6 — Sign Out (per server).** Use ⋯ → "Sign Out" on a server.
-      *Expected:* that account's session is removed; if it was active, the app returns to the
-      Welcome screen; other servers remain configured.
+      *Expected:* a confirmation first (local progress is destroyed); confirming removes that
+      account's session; if it was the only one, the app returns to the Welcome screen;
+      cancelling changes nothing.
+      *Automated:* `settings_servers_menu_actions_rebuild_the_shell` drives both the cancelled
+      and the confirmed path (content swap to Welcome + DB asserts).
 
 - [ ] **SE-7 — Remove Server.** Use ⋯ → "Remove Server" (destructive styling).
-      *Expected:* the server and its account are removed from the list; if it was the last one,
-      Welcome appears.
+      *Expected:* a confirmation first; the server and its accounts cascade away and its
+      on-disk cover/download files are purged; if it was the last one, Welcome appears.
+      *Automated:* `settings_servers_menu_actions_rebuild_the_shell` asserts the cascade and
+      that a seeded cover file is purged, not orphaned.
 
 - [ ] **SE-8 — Add Server.** Tap the "Add Server" row at the end of the Servers group.
-      *Expected:* opens the add-server flow (Welcome-style form); a successful login adds and
-      activates the new server.
+      *Expected:* opens the add-server flow (the Welcome form, with a Cancel affordance back
+      to the shell); a successful login adds and activates the new server and rebuilds the
+      shell.
+      *Automated:* `settings_add_server_row_opens_welcome_and_cancels_back` asserts the content
+      swap, the visible Cancel button, and that cancelling restores the exact shell widget; the
+      successful-add path rides `welcome_connect` (`add_server_and_login`).
 
 - [ ] **SE-9 — Playback defaults take effect.** Set default speed and skip intervals in
       Settings → Playback, then start a book.
@@ -789,16 +811,22 @@ built (the tests below define the target behavior).
 
 ---
 
-## 16. Connection page (CN) — 🚧 not yet built
+## 16. Connection page (CN) — 🚧 partially implemented (Server connection row, Disconnect)
 
-Reached from Settings → a server row's body. One instance per configured server.
+Reached from Settings → a server row's body. One instance per configured server. Shown as a
+window content swap (no `AdwNavigationView` at the libadwaita `v1_2` ceiling) with a back
+button restoring the shell.
 
 - [ ] **CN-1 — Server connection row.** Open a server's Connection page.
       *Expected:* a "Server connection" group with one row whose subtitle is the server's full
-      URL in a monospace font, plus a trailing info button whose popover/tooltip explains what
-      this connection is used for.
+      URL in a monospace font, plus a trailing info button whose popover explains what this
+      connection is used for.
+      *Automated:* `connection_page_url_info_disconnect_and_back` asserts title/subtitle, the
+      monospace stylesheet flag, and the popover opening.
 
-- [ ] **CN-2 — Advanced group present.** Look below.
+- [ ] **CN-2 — Advanced group present.** 🚧 Deliberately deferred: the `servers` table has the
+      columns, but applying them to real traffic needs an HTTP-client factory threaded through
+      every server call — its own feature batch. Look below.
       *Expected:* rows for Custom Headers, Disable SSL verification (switch), Client
       certificate, Local network server address, and Change User Agent — all chevron rows except
       the switch.
@@ -831,9 +859,12 @@ Reached from Settings → a server row's body. One instance per configured serve
 
 - [ ] **CN-9 — Disconnect from the Server.** Tap the destructive "Disconnect from the Server"
       action at the bottom.
-      *Expected:* flat/link destructive styling (not a filled button); disconnecting removes the
-      session and returns appropriately (Settings/Welcome) without crashing; other servers are
+      *Expected:* flat/link destructive styling (not a filled button); a confirmation first
+      (local progress is destroyed); disconnecting signs the server's account out and returns
+      appropriately (Welcome when no active account is left) without crashing; other servers are
       untouched.
+      *Automated:* `connection_page_url_info_disconnect_and_back` drives both the cancelled and
+      the confirmed path, plus the back button's shell restore.
 
 ---
 
