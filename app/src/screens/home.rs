@@ -354,7 +354,14 @@ pub fn build(
                             data.downloaded = downloaded.into_iter().collect();
                         }
                     }
-                    if let Some(data) = widgets.last_data.borrow().clone() {
+                    // Borrowed and cloned in its own statement, not inline in the `if let`'s
+                    // scrutinee — a `Ref` there lives for the whole `if let` body (temporary
+                    // lifetime extension), so calling `apply()` (which itself borrows
+                    // `last_data` mutably) while still inside that scrutinee's `if let` panics
+                    // with "already borrowed" — caught live via the visual/manual verification
+                    // pass, not by any test.
+                    let cached = widgets.last_data.borrow().clone();
+                    if let Some(data) = cached {
                         apply(&data, &widgets);
                     }
 
