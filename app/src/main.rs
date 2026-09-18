@@ -1,4 +1,5 @@
 mod application;
+mod downloads;
 mod player;
 mod screens;
 #[cfg(test)]
@@ -95,6 +96,7 @@ mod tests {
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_retryable_error_when_the_first_sync_fails(&runtime);
+        crate::screens::home::tests::run_offline_mode_toggle_filters_recently_added(&runtime);
         crate::screens::home::tests::run_shows_a_spinner_while_the_first_sync_is_running(&runtime);
         crate::screens::home::tests::run_expired_token_is_refreshed_before_syncing(&runtime);
         crate::screens::home::tests::run_offers_login_again_when_the_session_is_rejected(&runtime);
@@ -102,6 +104,7 @@ mod tests {
         crate::screens::library::tests::run_renders_all_synced_items(&runtime);
         crate::screens::library::tests::run_search_filters_by_title_and_author(&runtime);
         crate::screens::library::tests::run_sort_changes_order(&runtime);
+        crate::screens::library::tests::run_offline_mode_toggle_filters_to_downloaded_items(&runtime);
         crate::screens::library::tests::run_shows_a_banner_when_sync_fails(&runtime);
         crate::screens::library::tests::run_shows_login_again_in_the_banner_when_a_resync_is_rejected(&runtime);
         crate::screens::library::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
@@ -113,6 +116,7 @@ mod tests {
         crate::screens::library::tests::run_view_mode_is_remembered_across_screen_rebuilds(&runtime);
         crate::widgets::item_card::tests::run();
         crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing();
+        crate::widgets::item_card::tests::run_downloaded_badge_shows_only_when_downloaded();
         crate::screens::main_window::tests::run(&runtime);
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
         crate::screens::main_window::tests::run_headphone_route_events_follow_the_settings(&runtime);
@@ -130,12 +134,22 @@ mod tests {
         crate::screens::player::tests::run(&runtime);
         crate::screens::player::tests::run_keyboard_actions(&runtime);
         crate::screens::player::tests::run_chapters_sheet_lists_and_seeks(&runtime);
+        crate::screens::player::tests::run_download_button_starts_a_download_and_reflects_state(&runtime);
         crate::screens::player::tests::run_speed_popover_changes_playback_speed(&runtime);
         crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary(&runtime);
         crate::screens::player::tests::run_add_bookmark_button_persists_a_row(&runtime);
         crate::screens::player::tests::run_mark_as_finished_button_updates_progress(&runtime);
         crate::screens::player::tests::run_reset_progress_button_resets_position_and_seeks(&runtime);
         crate::widgets::cover_image::tests::run();
+        crate::downloads::tests::run_start_download_fetches_only_the_needed_track_and_reaches_complete(&runtime);
+        crate::downloads::tests::run_cancel_item_stops_the_track_from_reaching_complete(&runtime);
+        crate::downloads::tests::run_wifi_only_blocks_a_download_on_a_metered_connection(&runtime);
+        crate::downloads::tests::run_clear_item_deletes_files_and_publishes_idle(&runtime);
+        crate::downloads::tests::run_start_download_with_no_chapters_fetches_every_track(&runtime);
+        crate::downloads::tests::run_set_wifi_only_only_affects_downloads_started_afterwards(&runtime);
+        crate::screens::downloads::tests::run_empty_state_renders_when_nothing_is_downloaded(&runtime);
+        crate::screens::downloads::tests::run_in_progress_download_shows_a_cancel_row(&runtime);
+        crate::screens::downloads::tests::run_completed_download_can_be_removed(&runtime);
     }
 
     #[test]

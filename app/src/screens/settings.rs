@@ -5,7 +5,7 @@
 //! (default speed, skip intervals, sleep-timer default) are yet to be built — each arrives with
 //! its own feature, since every row is live wiring rather than decoration.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::glib;
@@ -33,6 +33,9 @@ pub fn build(pool: SqlitePool, controller: PlayerController, playback_settings: 
     // then the *whole* struct is persisted (the kv store round-trips everything, so partial
     // writes would silently reset the other fields to their pre-edit values).
     let settings = Rc::new(RefCell::new(playback_settings));
+    // Save serialization state — see `persist` for why two saves must never run concurrently.
+    let pending_save: Rc<RefCell<Option<PlaybackSettings>>> = Rc::new(RefCell::new(None));
+    let writer_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
@@ -75,22 +78,26 @@ pub fn build(pool: SqlitePool, controller: PlayerController, playback_settings: 
     pause_on_unplug_switch.connect_state_set({
         let resume_on_replug_switch = resume_on_replug_switch.clone();
         let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        let writer_running = writer_running.clone();
         let controller = controller.clone();
         let pool = pool.clone();
         move |_, state| {
             settings.borrow_mut().pause_on_headphone_unplug = state;
-            persist(&pool, &settings, &controller);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller);
             resume_on_replug_switch.set_sensitive(state);
             glib::signal::Propagation::Proceed
         }
     });
     resume_on_replug_switch.connect_state_set({
         let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        let writer_running = writer_running.clone();
         let controller = controller.clone();
         let pool = pool.clone();
         move |_, state| {
             settings.borrow_mut().resume_on_headphone_replug = state;
-            persist(&pool, &settings, &controller);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller);
             glib::signal::Propagation::Proceed
         }
     });
@@ -112,14 +119,39 @@ pub fn build(pool: SqlitePool, controller: PlayerController, playback_settings: 
 /// signal handler that touches the database (`PlayerController`'s progress writes, Welcome's
 /// Connect button): capture everything up front, spawn, log on failure. Also applies the new
 /// values to the live controller immediately, so a toggle takes effect without an app restart.
-fn persist(pool: &SqlitePool, settings: &RefCell<PlaybackSettings>, controller: &PlayerController) {
-    let settings = *settings.borrow();
-    controller.set_headphone_behavior(settings.pause_on_headphone_unplug, settings.resume_on_headphone_replug);
+///
+/// Saves are serialized through `pending_save`/`writer_running` — one snapshot slot plus at most
+/// one in-flight writer task. Two concurrent `save_playback_settings` calls would interleave
+/// their per-key `kv::set`s (the pool allows multiple connections), so a stale snapshot's
+/// `pause_on_headphone_unplug=true` could land *after* a newer snapshot's `false` and win —
+/// caught live by the gtk_fast scenario: the resume toggle's save overracing the pause toggle's
+/// left the just-toggled value silently un-persisted. Draining the slot until empty also
+/// coalesces a rapid toggle burst into at most one save per still-queued snapshot.
+fn persist(
+    pool: &SqlitePool,
+    pending_save: &Rc<RefCell<Option<PlaybackSettings>>>,
+    writer_running: &Rc<Cell<bool>>,
+    settings: &RefCell<PlaybackSettings>,
+    controller: &PlayerController,
+) {
+    let snapshot = *settings.borrow();
+    controller.set_headphone_behavior(snapshot.pause_on_headphone_unplug, snapshot.resume_on_headphone_replug);
+    *pending_save.borrow_mut() = Some(snapshot);
+    if writer_running.get() {
+        return;
+    }
+    writer_running.set(true);
     let pool = pool.clone();
+    let pending_save = pending_save.clone();
+    let writer_running = writer_running.clone();
     glib::spawn_future_local(async move {
-        if let Err(err) = abs_core::settings::save_playback_settings(&pool, &settings).await {
-            tracing::warn!(%err, "couldn't save playback settings");
+        loop {
+            let Some(snapshot) = pending_save.borrow_mut().take() else { break };
+            if let Err(err) = abs_core::settings::save_playback_settings(&pool, &snapshot).await {
+                tracing::warn!(%err, "couldn't save playback settings");
+            }
         }
+        writer_running.set(false);
     });
 }
 

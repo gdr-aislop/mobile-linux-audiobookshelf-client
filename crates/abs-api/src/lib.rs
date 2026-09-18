@@ -20,7 +20,7 @@ pub use client::*;
 mod ext;
 pub use ext::{
     AudioFileRef, ChapterRef, CoverBytes, InvalidBearerToken, ItemPlaybackInfo, LibraryItemSummary,
-    LibraryItemsError, LoginError, LoginResult, ServerProgress,
+    LibraryItemsError, LoginError, LoginResult, ServerProgress, TrackFileError, TrackFileResponse,
 };
 
 #[cfg(test)]

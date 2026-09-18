@@ -23,7 +23,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
-
+use abs_core::streaming::locate_track;
 use abs_storage::AppPaths;
 
 use crate::widgets::cover_image::CoverImage;
@@ -104,16 +104,6 @@ struct NowPlaying {
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
-
-/// Maps a book-level position to `(track index, seconds into that track)` — the inverse of
-/// `Inner::book_position`. A position exactly at a track boundary lands on the *later* track (a
-/// book position equal to a track's own start means "play this track from 0"), which is also what
-/// makes a boundary-adjacent resume pick up the next file instead of the previous one's final
-/// instant.
-fn locate_track(tracks: &[abs_core::streaming::StreamTrack], book_seconds: f64) -> (usize, f64) {
-    let index = tracks.iter().rposition(|t| t.offset_seconds <= book_seconds + 1e-6).unwrap_or(0);
-    (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
-}
 
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
@@ -404,6 +394,33 @@ impl PlayerController {
     /// is playing or the item has no chapter data.
     pub fn chapters(&self) -> Vec<ChapterInfo> {
         self.inner.borrow().now_playing.as_ref().map(|np| np.chapters.clone()).unwrap_or_default()
+    }
+
+    /// `(session, server_id, item_id)` for whatever is currently loaded — the context a download
+    /// button needs to call `DownloadManager::start_download`. `None` if nothing is playing.
+    pub fn current_download_context(&self) -> Option<(abs_core::auth::Session, String, String)> {
+        let inner = self.inner.borrow();
+        let now_playing = inner.now_playing.as_ref()?;
+        Some((now_playing.session.clone(), now_playing.server_id.clone(), now_playing.item_id.clone()))
+    }
+
+    /// Index into `chapters()` that the current book-level position falls in — the same
+    /// `start_seconds <= position && position < end_seconds` test `build_chapter_row` uses to
+    /// highlight "the current chapter", pulled out here so a download button can default its
+    /// scope to it too. `None` if nothing is playing or the item has no chapter data; a position
+    /// past every chapter's range (a rare rounding edge) clamps to the last chapter.
+    pub fn current_chapter_index(&self) -> Option<usize> {
+        let inner = self.inner.borrow();
+        let now_playing = inner.now_playing.as_ref()?;
+        if now_playing.chapters.is_empty() {
+            return None;
+        }
+        let position = inner.book_position();
+        now_playing
+            .chapters
+            .iter()
+            .position(|c| c.start_seconds <= position && position < c.end_seconds)
+            .or(Some(now_playing.chapters.len() - 1))
     }
 
     /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
