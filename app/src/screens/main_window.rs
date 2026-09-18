@@ -14,6 +14,7 @@
 use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
+use abs_player::route_watch::RouteWatcher;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
@@ -30,6 +31,10 @@ pub struct MainWindow {
     /// D-Bus signals. `None` when no system bus (or no ModemManager on it) was reachable; call
     /// interruption is simply unavailable in that case, never a fatal error.
     _call_watcher: Option<abs_player::call_watch::ModemManagerCallWatcher>,
+    /// Same lifetime contract as `_call_watcher`: retained forever, `None` when no audio server
+    /// (PulseAudio/PipeWire) was reachable — headphone unplug/replug reaction is then simply
+    /// unavailable, never a fatal error.
+    _route_watcher: Option<abs_player::route_watch::PulseRouteWatcher>,
     /// Kept alive for the app's whole lifetime, same reasoning as `_call_watcher` — dropping it
     /// would lose every in-flight track's cancel flag and listener. No UI wires into it yet (see
     /// `crate::downloads`'s module doc); this pass only ensures one instance exists for a later
@@ -52,6 +57,10 @@ pub struct TestHooks {
     pub open_library_search: gtk4::gio::SimpleAction,
     /// The Library tab's search entry, the focus target of `open-library-search`.
     pub library_search: gtk4::SearchEntry,
+    /// Settings → Playback's headphone-behavior switches, so tests can assert initial state and
+    /// activation (the row-tap path) without reaching into the screen's internals.
+    pub pause_on_unplug_switch: gtk4::Switch,
+    pub resume_on_replug_switch: gtk4::Switch,
 }
 
 #[cfg(test)]
@@ -98,6 +107,28 @@ pub fn build(
         }
         Err(err) => {
             tracing::warn!(%err, "couldn't watch ModemManager for call interruptions; this feature will be unavailable");
+            None
+        }
+    };
+
+    // Headphone unplug/replug (see `route_watch`'s module docs) — best-effort in the same way:
+    // no audio server to talk to means the feature is unavailable, never fatal. The behavior
+    // knobs come from Settings → Playback and are applied before the first event can arrive.
+    // The callback is one line by design: all the semantics (only unplug pauses; a replug only
+    // lifts an unplug pause, never a manual one or a call) live in `handle_route_event`, where
+    // the tests can reach them.
+    mini_bar.controller.set_headphone_behavior(
+        playback_settings.pause_on_headphone_unplug,
+        playback_settings.resume_on_headphone_replug,
+    );
+    let route_watcher = match abs_player::route_watch::PulseRouteWatcher::new() {
+        Ok(mut watcher) => {
+            let controller = mini_bar.controller.clone();
+            watcher.start(Box::new(move |event| controller.handle_route_event(event)));
+            Some(watcher)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "couldn't watch the audio server for headphone changes; unplug-pause will be unavailable");
             None
         }
     };
@@ -171,7 +202,8 @@ pub fn build(
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths, server, account, session, download_manager.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
-    stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");
+    let settings_screen = screens::settings::build(pool.clone(), mini_bar.controller.clone(), playback_settings);
+    stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", "emblem-system-symbolic");
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
 
@@ -256,6 +288,7 @@ pub fn build(
     MainWindow {
         root: root.upcast(),
         _call_watcher: call_watcher,
+        _route_watcher: route_watcher,
         download_manager,
         #[cfg(test)]
         hooks: TestHooks {
@@ -267,15 +300,10 @@ pub fn build(
             bookmark: bookmark_action,
             open_library_search: open_library_search_action,
             library_search: library_screen.search_entry,
+            pause_on_unplug_switch: settings_screen.hooks.pause_on_unplug_switch,
+            resume_on_replug_switch: settings_screen.hooks.resume_on_replug_switch,
         },
     }
-}
-
-/// A placeholder page for a destination that doesn't have a real screen yet — still a genuine
-/// `AdwStatusPage` in the stack (not e.g. an empty box), so it reads as "not built yet" rather
-/// than "broken".
-fn stub_page(icon_name: &str, title: &str) -> adw::StatusPage {
-    adw::StatusPage::builder().icon_name(icon_name).title(title).description("Coming soon").vexpand(true).build()
 }
 
 #[cfg(test)]
@@ -306,6 +334,11 @@ pub(crate) mod tests {
         }
         assert!(hooks.switcher_bar.reveals(), "the tab bar should always be shown");
         assert!(!hooks.mini_bar.bar.is_visible(), "the mini bar should stay hidden until something plays");
+
+        // The Settings tab is real now — its switches must reflect the `PlaybackSettings` the
+        // shell was built with (the defaults here), so a user sees reality, not stale state.
+        assert!(hooks.pause_on_unplug_switch.state(), "pause-on-unplug defaults to on");
+        assert!(!hooks.resume_on_replug_switch.state(), "resume-on-replug defaults to off");
 
         // Keyboard actions (ui-spec §6), activated via their handles — the accel-to-action
         // mapping itself is GTK-level and can't be driven without real key events.
@@ -359,6 +392,86 @@ pub(crate) mod tests {
         on_call_active();
 
         assert!(!controller.snapshot().unwrap().is_playing, "a call becoming active should pause playback");
+        controller.stop();
+    }
+
+    /// `handle_route_event`'s full behavior matrix — all the semantics that the one-line closure
+    /// `build()` registers with `PulseRouteWatcher` delegates to (the watcher's own
+    /// audio-server-level classification lives in `abs-player`'s tests; the FakeRouteWatcher
+    /// isn't visible across the crate boundary, exactly like the call watcher's fake).
+    pub(crate) fn run_headphone_route_events_follow_the_settings(runtime: &tokio::runtime::Runtime) {
+        use crate::player::tests::{account_and_server, insert_synced_item, mock_playable_item, test_backend};
+        use crate::player::PlayRequest;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 8));
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let start_book = |controller: &crate::player::PlayerController| {
+            controller.start(
+                abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account),
+                PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+                1.0,
+            );
+        };
+        let unplug = abs_player::route_watch::RouteEvent::Unplugged;
+        let replug = abs_player::route_watch::RouteEvent::Replugged;
+
+        // Defaults (pause on, resume off): unplug pauses, replug stays paused.
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_headphone_behavior(true, false);
+        start_book(&controller);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        controller.handle_route_event(unplug);
+        assert!(!controller.snapshot().unwrap().is_playing, "unplugging headphones should pause playback");
+        controller.handle_route_event(replug);
+        assert!(!controller.snapshot().unwrap().is_playing, "with resume off (the default), a replug stays paused");
+        controller.stop();
+
+        // Resume on: a replug undoes exactly the unplug pause.
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_headphone_behavior(true, true);
+        start_book(&controller);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        controller.handle_route_event(unplug);
+        assert!(!controller.snapshot().unwrap().is_playing, "unplugging headphones should pause playback");
+        controller.handle_route_event(replug);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        controller.stop();
+
+        // A manual pause is never overridden by a replug — even with resume on, and even when
+        // the unplug happened while already paused (an unplug of a paused player is not a
+        // pause *caused by* the unplug).
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_headphone_behavior(true, true);
+        start_book(&controller);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        // The manual pause (also the path a phone call takes) clears the "paused by unplug" mark.
+        controller.pause();
+        controller.handle_route_event(unplug);
+        controller.handle_route_event(replug);
+        assert!(!controller.snapshot().unwrap().is_playing, "a replug must not resume a manually paused (or call-paused) book");
+        controller.stop();
+
+        // Pause-on-unplug off: unplugging changes nothing at all.
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_headphone_behavior(false, true);
+        start_book(&controller);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        controller.handle_route_event(unplug);
+        assert!(controller.snapshot().unwrap().is_playing, "with pause-on-unplug off, an unplug must not pause");
+        controller.handle_route_event(replug);
+        assert!(controller.snapshot().unwrap().is_playing);
+        controller.stop();
+
+        // Route events with nothing loaded are no-ops by contract.
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_headphone_behavior(true, true);
+        controller.handle_route_event(unplug);
+        controller.handle_route_event(replug);
+        assert!(controller.snapshot().is_none());
         controller.stop();
     }
 }

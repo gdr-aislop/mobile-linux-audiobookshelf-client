@@ -268,6 +268,23 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   manually via the mini-player or the lock-screen MPRIS card, since auto-resuming audio at an
   arbitrary moment after a call (still mid-conversation, walking away, etc.) would be more
   surprising than useful.
+- **Headphone unplug**: MPRIS likewise can't see audio-routing events, and the audio server
+  (PulseAudio / PipeWire's `pipewire-pulse` socket) handles rerouting silently — on unplug the
+  stream simply moves to the speakers and playback would continue, unheard, with progress
+  advancing. So `abs-player` watches the audio server directly (the same libpulse GStreamer's
+  `pulsesink` already uses) and pauses when the headphone output goes away: a wired jack
+  unplug (kernel jack detection, reported as the headphone port's availability) or a Bluetooth
+  device disconnecting (its sink disappearing). Known limit: outputs without jack detection
+  (some USB DACs report port availability "unknown") can't be detected — Bluetooth always can.
+  Both behaviors are configurable in Settings → Playback:
+  - **Pause when headphones disconnect** — on by default; the failure mode it prevents (an
+    audiobook blaring from the speaker, position advancing unheard) outweighs the rare
+    false pause. Turning it off makes unplugging change nothing.
+  - **Resume when headphones reconnect** — off by default (matching VLC's "Resume on headset
+    insertion" and AntennaPod's "unpause on reconnection", the only other apps that offer
+    this). It **only** lifts a pause caused by the disconnect itself: a manual pause, a phone
+    call, a sleep timer or end-of-book are never overridden by a reconnection, and the switch
+    is insensitive while pause-on-disconnect is off (a replug has nothing to act on then).
 
 ### Player — full
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for
@@ -292,6 +309,11 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - `AdwPreferencesPage` with groups: **Account**, **Servers**, **Playback** (default speed,
   skip-forward/back intervals, sleep-timer default), **Appearance** (follow system / light /
   dark), **About** (version, license, links).
+- **Partially built** (this is a living spec; the screen grows group by group): the **Playback**
+  group is real, currently holding the headphone-behavior switches from "Hardware controls &
+  interruptions" (pause-on-disconnect on, resume-on-reconnect off, the latter insensitive while
+  the former is off). Account, Servers, Appearance and About, plus Playback's speed/skip/
+  sleep-timer rows, are still stubs.
 - **Account** group: one row showing the *active* server/account (username, server host,
   "active" subtitle) with a chevron, and one "Switch or manage servers" row that opens the
   Servers list below. There is deliberately no top-level "Sign Out" action here — with multiple

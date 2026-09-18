@@ -130,6 +130,14 @@ struct Inner {
     listeners: Vec<SnapshotListener>,
     full_update: Option<SnapshotListener>,
     last_progress_write: Instant,
+    /// Headphone unplug behavior, from `PlaybackSettings` (Settings → Playback) — see
+    /// `handle_route_event`.
+    pause_on_unplug: bool,
+    resume_on_replug: bool,
+    /// Whether the current pause was caused by `handle_route_event`'s unplug handling (as opposed
+    /// to a manual pause, a phone call, a sleep timer or end-of-book). Only a pause this specific
+    /// may ever be lifted by a replug. Cleared by every other pause path.
+    paused_by_unplug: bool,
 }
 
 impl Inner {
@@ -336,18 +344,24 @@ impl PlayerController {
         backend: Box<dyn abs_player::AudioBackend>,
         mini_update: impl Fn(&PlayerSnapshot) + 'static,
     ) -> Self {
-        let controller = Self {
-            inner: Rc::new(RefCell::new(Inner {
-                backend,
-                pool,
-                paths,
-                now_playing: None,
-                listeners: vec![Box::new(mini_update)],
-                full_update: None,
-                last_progress_write: Instant::now(),
-            })),
-            tick_source: Rc::new(RefCell::new(None)),
-        };
+            let controller = Self {
+                inner: Rc::new(RefCell::new(Inner {
+                    backend,
+                    pool,
+                    paths,
+                    now_playing: None,
+                    listeners: vec![Box::new(mini_update)],
+                    full_update: None,
+                    last_progress_write: Instant::now(),
+                    // Overridden right after construction via `set_headphone_behavior` (the
+                    // settings aren't known to `new()`'s signature) — false/false is the safe
+                    // "do nothing automatically" middle.
+                    pause_on_unplug: false,
+                    resume_on_replug: false,
+                    paused_by_unplug: false,
+                })),
+                tick_source: Rc::new(RefCell::new(None)),
+            };
 
         let source_id = glib::timeout_add_local(TICK_INTERVAL, {
             let controller = controller.clone();
@@ -622,6 +636,7 @@ impl PlayerController {
 
     pub fn pause(&self) {
         let mut inner = self.inner.borrow_mut();
+        inner.paused_by_unplug = false;
         if inner.backend.pause().is_ok() {
             if let Some(now_playing) = &mut inner.now_playing {
                 now_playing.is_playing = false;
@@ -629,6 +644,57 @@ impl PlayerController {
         }
         inner.publish();
         inner.write_progress(false);
+    }
+
+    /// Applies Settings → Playback's headphone behavior switches (persisted; the live controller
+    /// must follow immediately, not on the next app start).
+    pub fn set_headphone_behavior(&self, pause_on_unplug: bool, resume_on_replug: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.pause_on_unplug = pause_on_unplug;
+        inner.resume_on_replug = resume_on_replug;
+    }
+
+    /// What `set_headphone_behavior` last applied — for asserting that the Settings screen's
+    /// switches actually reach the controller.
+    #[cfg(test)]
+    pub fn headphone_behavior(&self) -> (bool, bool) {
+        let inner = self.inner.borrow();
+        (inner.pause_on_unplug, inner.resume_on_replug)
+    }
+
+    /// Reacts to `abs_player::route_watch` events: an unplug pauses (when enabled, and only if
+    /// something is actually playing — that is the pause a replug may later lift), a replug
+    /// resumes **only** that kind of pause, and only when enabled. A manual pause, phone call,
+    /// sleep timer or end-of-book pause clears the "paused by unplug" mark (in `pause()` and
+    /// `tick()`'s own pause paths), so none of them can ever be overridden by a reconnection.
+    pub fn handle_route_event(&self, event: abs_player::route_watch::RouteEvent) {
+        match event {
+            abs_player::route_watch::RouteEvent::Unplugged => {
+                let was_playing = {
+                    let inner = self.inner.borrow();
+                    inner.pause_on_unplug && inner.now_playing.as_ref().is_some_and(|np| np.is_playing)
+                };
+                if !was_playing {
+                    return;
+                }
+                // `pause()` clears the mark (it's the generic pause path — also used for calls,
+                // MPRIS and the user); the unplug then re-marks it as *its* pause.
+                self.pause();
+                self.inner.borrow_mut().paused_by_unplug = true;
+            }
+            abs_player::route_watch::RouteEvent::Replugged => {
+                let should_resume = {
+                    let inner = self.inner.borrow();
+                    inner.resume_on_replug
+                        && inner.paused_by_unplug
+                        && inner.now_playing.as_ref().is_some_and(|np| !np.is_playing)
+                };
+                if should_resume {
+                    self.inner.borrow_mut().paused_by_unplug = false;
+                    self.play();
+                }
+            }
+        }
     }
 
     pub fn toggle_play_pause(&self) {
@@ -760,6 +826,8 @@ impl PlayerController {
                         if let Some(now_playing) = &mut inner.now_playing {
                             now_playing.is_playing = false;
                         }
+                        // End-of-book is not an unplug pause — a replug must not revive it.
+                        inner.paused_by_unplug = false;
                         inner.write_progress(true);
                     }
                 }
@@ -784,6 +852,8 @@ impl PlayerController {
                     now_playing.is_playing = false;
                     now_playing.sleep_timer = SleepTimerState::Off;
                 }
+                // A sleep-timer pause is deliberate; a replug must not override it.
+                inner.paused_by_unplug = false;
                 inner.write_progress(false);
             }
         }

@@ -64,7 +64,7 @@ desktop via MPRIS2 and pauses during phone calls."""
 depends = """\
 libgtk-4-1, libadwaita-1-0, \
 gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-libav, \
-glib-networking, libssl3 | libssl3t64"""
+glib-networking, libssl3 | libssl3t64, libpulse0"""
 assets = [
     ["target/release/abs-app", "usr/bin/", "755"],
     ["assets/abs-app.desktop", "usr/share/applications/", "644"],
