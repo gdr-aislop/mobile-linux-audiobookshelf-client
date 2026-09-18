@@ -600,6 +600,36 @@ Needs a real GNOME/phosh session.
       *Expected:* playback works normally; the app logs a warning at most — the missing watcher
       never blocks or crashes anything.
 
+- [ ] **HW-5 — Unplugging wired headphones pauses.** While playing through wired headphones,
+      unplug them.
+      *Expected:* playback pauses immediately — audio never continues through the phone's
+      speaker.
+
+- [ ] **HW-6 — Bluetooth loss pauses.** While playing through Bluetooth headphones, turn the
+      headphones off / walk out of range.
+      *Expected:* playback pauses.
+
+- [ ] **HW-7 — Replug stays paused by default.** With Settings → Playback → "Resume when
+      headphones reconnect" off (the default), replug the headphones after HW-5.
+      *Expected:* playback stays paused; resuming is manual.
+
+- [ ] **HW-8 — Resume on reconnect (opt-in).** Turn "Resume when headphones reconnect" on,
+      play, unplug, replug.
+      *Expected:* playback resumes on replug. Then pause manually, replug again — playback must
+      **not** resume (a replug only ever undoes an unplug pause, never a manual pause or a
+      phone call). The switch is also insensitive while "Pause when headphones disconnect" is
+      off.
+
+- [ ] **HW-9 — Unplug behavior is optional.** Turn "Pause when headphones disconnect" off, play,
+      unplug.
+      *Expected:* playback continues (now through the phone's speaker) — unplugging changes
+      nothing.
+
+- [ ] **HW-10 — Headphone watcher is optional.** Run the app where there is no audio server
+      reachable via the PulseAudio socket (e.g. a bare sandbox).
+      *Expected:* playback works normally; the app logs a warning at most — the missing watcher
+      never blocks or crashes anything.
+
 ---
 
 ## 13. Adaptive / responsive layout (AL) — 🚧 partially implemented

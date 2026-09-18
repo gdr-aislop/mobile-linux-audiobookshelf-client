@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 gstreamer = "0.23"
+# Headphone/route watching (`route_watch`): talks the PulseAudio client protocol, which is also
+# what PipeWire exposes via its `pipewire-pulse` compatibility socket — the common setup on mobile
+# Linux. Links the same libpulse GStreamer's `pulsesink` (our actual audio path) already uses.
+libpulse-binding = "2.30"
+futures.workspace = true
 gio.workspace = true
 glib.workspace = true
 thiserror.workspace = true

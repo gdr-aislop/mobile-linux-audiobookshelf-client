@@ -115,6 +115,8 @@ mod tests {
         crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing();
         crate::screens::main_window::tests::run(&runtime);
         crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback(&runtime);
+        crate::screens::main_window::tests::run_headphone_route_events_follow_the_settings(&runtime);
+        crate::screens::settings::tests::run(&runtime);
         crate::player::tests::run_start_and_pause_persists_progress(&runtime);
         crate::player::tests::run_start_resumes_from_existing_progress(&runtime);
         crate::player::tests::run_track_duration_correction_updates_the_book_total(&runtime);

@@ -19,6 +19,17 @@ pub struct PlaybackSettings {
     pub skip_forward_seconds: i64,
     pub sleep_timer_default_minutes: i64,
     pub wifi_only_downloads: bool,
+    /// Pause playback when the headphone output goes away (wired jack unplugged, Bluetooth
+    /// headphones disconnected) — see `abs-player`'s `route_watch`. On by default: the failure
+    /// mode it prevents (an audiobook blaring from the phone's speaker, position advancing
+    /// unheard) is worse than the rare false pause.
+    pub pause_on_headphone_unplug: bool,
+    /// Resume playback when a headphone output (re)appears, but only if the current pause was
+    /// itself caused by an unplug — never after a manual pause or a phone call. Off by default,
+    /// matching every podcast/audio app that offers this (VLC's "Resume on headset insertion",
+    /// AntennaPod's "unpause on reconnection"): auto-resuming at an arbitrary later moment is
+    /// more surprising than useful.
+    pub resume_on_headphone_replug: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -29,6 +40,8 @@ impl Default for PlaybackSettings {
             skip_forward_seconds: 30,
             sleep_timer_default_minutes: 30,
             wifi_only_downloads: true,
+            pause_on_headphone_unplug: true,
+            resume_on_headphone_replug: false,
         }
     }
 }
@@ -39,6 +52,8 @@ mod keys {
     pub const SKIP_FORWARD_SECONDS: &str = "playback.skip_forward_seconds";
     pub const SLEEP_TIMER_DEFAULT_MINUTES: &str = "playback.sleep_timer_default_minutes";
     pub const WIFI_ONLY_DOWNLOADS: &str = "playback.wifi_only_downloads";
+    pub const PAUSE_ON_HEADPHONE_UNPLUG: &str = "playback.pause_on_headphone_unplug";
+    pub const RESUME_ON_HEADPHONE_REPLUG: &str = "playback.resume_on_headphone_replug";
     pub const THEME: &str = "appearance.theme";
     pub const DOWNLOADED_ONLY: &str = "library.downloaded_only";
     pub const HIDE_FINISHED: &str = "library.hide_finished";
@@ -72,6 +87,18 @@ pub async fn load_playback_settings(pool: &SqlitePool) -> Result<PlaybackSetting
         )
         .await?,
         wifi_only_downloads: parse_or_default(pool, keys::WIFI_ONLY_DOWNLOADS, defaults.wifi_only_downloads).await?,
+        pause_on_headphone_unplug: parse_or_default(
+            pool,
+            keys::PAUSE_ON_HEADPHONE_UNPLUG,
+            defaults.pause_on_headphone_unplug,
+        )
+        .await?,
+        resume_on_headphone_replug: parse_or_default(
+            pool,
+            keys::RESUME_ON_HEADPHONE_REPLUG,
+            defaults.resume_on_headphone_replug,
+        )
+        .await?,
     })
 }
 
@@ -86,6 +113,8 @@ pub async fn save_playback_settings(pool: &SqlitePool, settings: &PlaybackSettin
     )
     .await?;
     kv::set(pool, keys::WIFI_ONLY_DOWNLOADS, &settings.wifi_only_downloads.to_string()).await?;
+    kv::set(pool, keys::PAUSE_ON_HEADPHONE_UNPLUG, &settings.pause_on_headphone_unplug.to_string()).await?;
+    kv::set(pool, keys::RESUME_ON_HEADPHONE_REPLUG, &settings.resume_on_headphone_replug.to_string()).await?;
     Ok(())
 }
 
@@ -283,6 +312,8 @@ mod tests {
             skip_forward_seconds: 60,
             sleep_timer_default_minutes: 15,
             wifi_only_downloads: false,
+            pause_on_headphone_unplug: false,
+            resume_on_headphone_replug: true,
         };
         save_playback_settings(&pool, &settings).await.unwrap();
         assert_eq!(load_playback_settings(&pool).await.unwrap(), settings);

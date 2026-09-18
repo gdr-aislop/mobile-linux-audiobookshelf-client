@@ -7,6 +7,7 @@
 pub mod call_watch;
 mod error;
 pub mod mpris;
+pub mod route_watch;
 
 use std::time::Duration;
 
