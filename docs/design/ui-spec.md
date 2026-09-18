@@ -395,7 +395,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   connection; the app clearly marks which items are available offline (small download badge on
   covers/rows, and per-chapter offline markers in Item detail). The Home/Library offline-mode
   toggle (see those sections) lets a user deliberately narrow either screen to only such items
-  even while online, e.g. before a trip.
+  even while online, e.g. before a trip. Starting playback offline works from the locally
+  cached track metadata: a fully-downloaded book plays end-to-end with no server contact, a
+  partially-downloaded one plays from the resume position and stops cleanly at the first
+  missing chapter, and a book never synced on this device (no cached metadata) can't start.
 
 ## 6. Keyboard shortcuts
 

@@ -507,8 +507,9 @@ impl PlayerController {
             // Asked at resolve time, not captured earlier — see `NowPlaying::session`.
             let access_token = session.access_token().await;
 
-            // Resolving the stream URL is required to proceed; reconciling progress and fetching
-            // the cover are both nice-to-haves that must never add their own delay on top — run
+            // Resolving the stream URL is required to proceed — unless the item can be played
+            // from locally cached state instead (below). Reconciling progress and fetching the
+            // cover are both nice-to-haves that must never add their own delay on top — run
             // all three concurrently (each already has its own bounded timeout) rather than one
             // after another, so a slow or unreachable server is only ever felt once, not thrice.
             let (target_result, reconcile_result, cover_path) = tokio::join!(
@@ -522,8 +523,21 @@ impl PlayerController {
             let target = match target_result {
                 Ok(target) => target,
                 Err(err) => {
-                    tracing::warn!(%err, item_id = %item.item_id, "couldn't resolve a playable URL");
-                    return;
+                    // The server is unreachable (or errored): fall back to locally cached track
+                    // metadata, letting downloaded files play offline. A fully-downloaded item
+                    // plays end-to-end; a partially-downloaded one starts and stops cleanly at
+                    // the first gap (`spawn_load_track`'s load failure path); an item never
+                    // resolved on this device has nothing to fall back on and can't start.
+                    match abs_core::streaming::offline_stream_target(&pool, session.server_id(), &item.item_id, session.server_url(), &access_token).await {
+                        Ok(offline) => {
+                            tracing::info!(item_id = %item.item_id, "couldn't reach the server; playing from locally cached tracks");
+                            offline
+                        }
+                        Err(offline_err) => {
+                            tracing::warn!(%err, offline = %offline_err, item_id = %item.item_id, "couldn't resolve a playable URL");
+                            return;
+                        }
+                    }
                 }
             };
 
@@ -1428,16 +1442,23 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Seeds the `tracks` rows (the cached per-file metadata `sync_item_tracks` normally writes
+    /// after resolving) for an item's full track list in one go — one call, not one per track,
+    /// since `upsert_all` *replaces* the item's whole list.
+    async fn seed_track_metadata(pool: &SqlitePool, server_id: &str, item_id: &str, tracks: &[(&str, f64, f64)]) {
+        let rows: Vec<abs_storage::repo::tracks::NewTrack<'_>> = tracks
+            .iter()
+            .map(|&(ino, duration_seconds, offset_seconds)| abs_storage::repo::tracks::NewTrack { ino, duration_seconds, offset_seconds })
+            .collect();
+        abs_storage::repo::tracks::upsert_all(pool, server_id, item_id, &rows).await.unwrap();
+    }
+
     /// Seeds a `Complete` `download_tracks` row for `ino` pointing at a real file written with
     /// `bytes` — the exact "trustworthy" shape `local_track_path`/`verified_complete_path` require
-    /// (status `Complete`, on-disk size matching `expected_size_bytes`).
+    /// (status `Complete`, on-disk size matching `expected_size_bytes`). The item's `tracks` rows
+    /// must already exist (via `seed_track_metadata` — the download table has a foreign key on
+    /// them, normally written by `sync_item_tracks` before any download starts).
     async fn seed_downloaded_track(pool: &SqlitePool, paths: &AppPaths, server_id: &str, item_id: &str, ino: &str, bytes: &[u8]) {
-        // `download_tracks` has a foreign key on `(server_id, item_id, ino)` referencing `tracks`
-        // — a row must exist there first (normally written by `sync_item_tracks` after resolving
-        // the stream target); a fixed `offset_seconds: 0.0` is fine since these tests don't
-        // exercise chapter/track-offset mapping.
-        abs_storage::repo::tracks::upsert_all(pool, server_id, item_id, &[abs_storage::repo::tracks::NewTrack { ino, duration_seconds: 0.0, offset_seconds: 0.0 }]).await.unwrap();
-
         let path = paths.track_file_path(server_id, item_id, ino, "wav");
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, bytes).await.unwrap();
@@ -1457,6 +1478,7 @@ pub(crate) mod tests {
         let paths = crate::test_support::test_paths();
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0)]));
         runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
 
         let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
@@ -1489,6 +1511,7 @@ pub(crate) mod tests {
         let paths = crate::test_support::test_paths();
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0)]));
         runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
         // Delete the file after the row was written — the row still says `Complete`, but it's a
         // lie now.
@@ -1524,6 +1547,7 @@ pub(crate) mod tests {
         let paths = crate::test_support::test_paths();
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 2.0, 0.0)]));
         runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(2)));
 
         let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
@@ -1546,6 +1570,83 @@ pub(crate) mod tests {
         );
         let requests = runtime.block_on(mock_server.received_requests()).unwrap();
         assert!(requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/2"), "the not-yet-downloaded second track must be streamed");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Offline start of a fully-downloaded
+    /// item: the server can't even serve the item's playback info (nothing is mounted, so
+    /// wiremock 404s it), but every track is on disk — playback must start entirely from the
+    /// local files, with the book duration coming from the locally cached track metadata, and
+    /// never touch the server's file endpoint.
+    pub(crate) fn run_fully_downloaded_item_plays_offline(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0), ("2", 2.0, 3.0)]));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "2", &silent_wav_bytes(2)));
+
+        let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool, &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Offline Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.is_playing, "a fully-downloaded item must play offline");
+        assert_eq!(snapshot.duration_seconds, 5.0, "the book total must come from the locally cached track metadata, not the failed resolve");
+
+        // Give playback a real moment — long enough that a streamed track would definitely have
+        // issued its HTTP request by now — then confirm it never did.
+        pump_until(|| false, Duration::from_millis(500));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            !requests.iter().any(|r| r.url.path().starts_with("/api/items/item-1/file/")),
+            "a fully-downloaded item must play entirely offline"
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Offline start of a partially-
+    /// downloaded item: the downloaded first track plays from disk; when it ends and playback
+    /// crosses into the not-downloaded second track, the streaming load fails (the server is
+    /// unreachable) and playback stops at the gap through the existing error path — instead of
+    /// the item failing to start at all.
+    pub(crate) fn run_partially_downloaded_item_plays_until_a_gap_offline(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 2.0, 0.0), ("2", 2.0, 2.0)]));
+        // Only the first track is downloaded; the second has metadata but no file, no download row.
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(2)));
+
+        let controller = PlayerController::new(pool.clone(), paths, test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool, &mock_server.uri(), &server.id, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Half Offline Book".to_string(), author: None },
+            1.0,
+        );
+
+        // The downloaded track plays from disk — never streamed.
+        pump_until(|| controller.snapshot().is_some_and(|s| s.duration_seconds > 0.0), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(!requests.iter().any(|r| r.url.path() == "/api/items/item-1/file/1"), "the downloaded track must not be streamed");
+
+        // Crossing into the gap reaches for the server, fails, and stops playback.
+        pump_until(
+            || runtime.block_on(mock_server.received_requests()).unwrap().iter().any(|r| r.url.path() == "/api/items/item-1/file/2"),
+            Duration::from_secs(15),
+        );
+        pump_until(|| !controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
         controller.stop();
     }
 

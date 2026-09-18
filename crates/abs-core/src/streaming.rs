@@ -80,6 +80,43 @@ pub fn track_url(server_url: &str, item_id: &str, ino: &str, access_token: &str)
     format!("{server_url}/api/items/{item_id}/file/{ino}?token={access_token}")
 }
 
+/// Builds a [`StreamTarget`] entirely from locally cached state — the offline fallback for
+/// callers whose `resolve_stream_target` failed. Tracks come from `tracks::cached_tracks`
+/// (synced as a side effect of every resolve and download run), chapters from
+/// `chapters::cached_chapters`. No download-row check gates this: the local-file-vs-stream
+/// preference happens per track at load time (`download_tracks::local_track_path`, via the
+/// caller's own URL resolution), not here — a not-yet-downloaded track simply gets the normal
+/// streaming URL, which fails to load when the server is genuinely unreachable, stopping
+/// playback at that gap through the caller's existing error handling. So a fully-downloaded
+/// item plays end-to-end offline and a partially-downloaded one plays until the first missing
+/// chapter. Err means there's no cached track metadata at all — the item was never resolved or
+/// downloaded on this device — and playback genuinely cannot start.
+pub async fn offline_stream_target(
+    pool: &sqlx::SqlitePool,
+    server_id: &str,
+    item_id: &str,
+    server_url: &str,
+    access_token: &str,
+) -> Result<StreamTarget> {
+    let cached = crate::tracks::cached_tracks(pool, server_id, item_id).await?;
+    if cached.is_empty() {
+        return Err(CoreError::UnexpectedResponse(format!("item {item_id} has no cached track metadata to play from")));
+    }
+    let mut tracks = Vec::with_capacity(cached.len());
+    let mut duration_seconds = 0.0;
+    for track in &cached {
+        tracks.push(StreamTrack {
+            ino: track.ino.clone(),
+            url: track_url(server_url, item_id, &track.ino, access_token),
+            duration_seconds: track.duration_seconds,
+            offset_seconds: track.offset_seconds,
+        });
+        duration_seconds += track.duration_seconds;
+    }
+    let chapters = crate::chapters::cached_chapters(pool, server_id, item_id).await?;
+    Ok(StreamTarget { tracks, duration_seconds, chapters })
+}
+
 /// Pushes local playback progress up to the server, so it shows up in the official apps and
 /// survives a fresh install — not just recorded in this client's own local `progress` table.
 /// Callers are expected to treat a failure here as non-fatal: the local write (the source of
@@ -223,6 +260,75 @@ mod tests {
             .await;
 
         sync_progress_to_server(&mock_server.uri(), "test-token", "item-1", 42.5, 100.0, false).await.unwrap();
+    }
+
+    /// Same shape `tracks.rs`'s own tests need: a migrated pool plus the server/library/item rows
+    /// the `tracks` table's foreign keys require.
+    async fn pool_with_synced_item() -> (sqlx::SqlitePool, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
+        std::mem::forget(tmp);
+        let server_id = abs_storage::repo::servers::add(&pool, "https://a.example").await.unwrap();
+        abs_storage::repo::libraries::upsert(
+            &pool,
+            abs_storage::repo::libraries::UpsertLibrary { id: "lib-1", server_id: &server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 },
+        )
+        .await
+        .unwrap();
+        abs_storage::repo::items::upsert(
+            &pool,
+            abs_storage::repo::items::UpsertItem {
+                id: "item-1",
+                server_id: &server_id,
+                library_id: "lib-1",
+                title: "Project Hail Mary",
+                author: None,
+                narrator: None,
+                description: None,
+                duration_seconds: 3600.0,
+                added_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        (pool, server_id)
+    }
+
+    #[tokio::test]
+    async fn offline_stream_target_builds_from_cached_tracks_and_chapters() {
+        let (pool, server_id) = pool_with_synced_item().await;
+        let tracks = two_tracks();
+        crate::tracks::sync_item_tracks(&pool, &server_id, "item-1", &tracks).await.unwrap();
+        crate::chapters::sync_item_chapters(
+            &pool,
+            &server_id,
+            "item-1",
+            &[abs_api::ChapterRef { title: "Part One".into(), start_seconds: 0.0, end_seconds: 1800.0 }],
+        )
+        .await
+        .unwrap();
+
+        // Deliberately no download rows: the offline target is built from cached *metadata*
+        // alone — whether a file is actually on disk is decided per track at load time, not here.
+        let target = offline_stream_target(&pool, &server_id, "item-1", "https://a.example", "tok").await.unwrap();
+
+        assert_eq!(target.tracks.len(), 2);
+        assert_eq!(target.tracks[0].ino, "1");
+        assert_eq!(target.tracks[1].ino, "2");
+        assert_eq!(target.tracks[1].offset_seconds, 1800.0);
+        assert_eq!(target.tracks[1].url, "https://a.example/api/items/item-1/file/2?token=tok");
+        assert_eq!(target.duration_seconds, 3600.0);
+        assert_eq!(target.chapters.len(), 1);
+        assert_eq!(target.chapters[0].title, "Part One");
+    }
+
+    #[tokio::test]
+    async fn offline_stream_target_errors_without_cached_tracks() {
+        let (pool, server_id) = pool_with_synced_item().await;
+
+        let result = offline_stream_target(&pool, &server_id, "item-1", "https://a.example", "tok").await;
+
+        assert!(result.is_err(), "an item never resolved or downloaded on this device can't be played offline");
     }
 
     fn two_tracks() -> Vec<StreamTrack> {

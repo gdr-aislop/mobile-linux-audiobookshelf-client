@@ -875,6 +875,15 @@ Reached from Settings → a server row's body. One instance per configured serve
       *Expected:* the UI flags it before starting ("Not enough free space"); a download that
       *does* run out of space mid-way stops cleanly, keeps completed chapters, and surfaces an
       error — never corrupts existing downloads or crashes.
+- [ ] **AC-13 — Offline start of a fully-downloaded book.** With the device offline (or the
+      server unreachable), tap a fully-downloaded book to start playback.
+      *Expected:* playback starts normally from the local files — book duration and position
+      come from locally cached metadata, and no request reaches the server.
+- [ ] **AC-14 — Offline start of a partially-downloaded book.** With the device offline, tap a
+      book with only some chapters downloaded, positioned inside (or before) a downloaded one.
+      *Expected:* playback starts from the downloaded content and stops cleanly when it crosses
+      into a missing chapter (treated like a pause, not an error); a book with no cached
+      metadata at all (never synced on this device) simply doesn't start.
 
 ---
 

@@ -171,6 +171,8 @@ mod tests {
         (playback_track_duration_correction_updates_the_book_total, crate::player::tests::run_track_duration_correction_updates_the_book_total),
         (playback_multi_track_advances_to_the_next_track, crate::player::tests::run_multi_track_advances_to_the_next_track),
         (playback_multi_track_final_track_marks_finished, crate::player::tests::run_multi_track_final_track_marks_finished),
+        (playback_fully_downloaded_item_plays_offline, crate::player::tests::run_fully_downloaded_item_plays_offline),
+        (playback_partially_downloaded_item_plays_until_a_gap_offline, crate::player::tests::run_partially_downloaded_item_plays_until_a_gap_offline),
         (playback_seek_across_track_boundary_lands_in_the_next_file, crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file),
         (playback_resume_jumps_straight_to_the_second_track, crate::player::tests::run_resume_jumps_straight_to_the_second_track),
         (playback_end_of_stream_pauses_and_marks_finished, crate::player::tests::run_end_of_stream_pauses_and_marks_finished),
