@@ -6,6 +6,9 @@ pub enum CoreError {
     #[error("login failed: {0}")]
     Login(#[from] abs_api::LoginError),
 
+    #[error("the server rejected this session's credentials — sign in again")]
+    Auth,
+
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
 }

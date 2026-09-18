@@ -106,15 +106,50 @@ pub fn build(
         move |request: PlayRequest| controller.start(session.clone(), request, default_speed)
     };
 
+    // "Log in again" (Home/Library's authorization-failure states) hands control back to the
+    // shell: the window's content is swapped for the login screen, pre-filled with this session's
+    // URL and username so only the password is left to type. The seed describes the session this
+    // shell was built for — exactly what a re-login compares against.
+    let on_relogin = {
+        let window = window.clone();
+        let pool = pool.clone();
+        let paths = paths.clone();
+        // Cloned into locals first: a `move` closure would otherwise capture the `server`/
+        // `account` fields it touches by value (editions' disjoint field capture), pulling the
+        // rug out from under the `server.clone()`/`account.clone()` calls further down.
+        let seed_server_id = server.id.clone();
+        let seed_server_url = server.url.clone();
+        let seed_account_id = account.id.clone();
+        let seed_username = account.username.clone();
+        move || {
+            let seed = abs_core::accounts::ReloginSeed {
+                server_id: seed_server_id.clone(),
+                account_id: seed_account_id.clone(),
+                url: seed_server_url.clone(),
+                username: seed_username.clone(),
+            };
+            crate::application::show_welcome(&window, pool.clone(), paths.clone(), playback_settings, Some(seed));
+        }
+    };
+
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     stack.add_titled_with_icon(
-        &screens::home::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone()).root,
+        &screens::home::build(
+            pool.clone(),
+            paths.clone(),
+            server.clone(),
+            account.clone(),
+            session.clone(),
+            on_play.clone(),
+            on_relogin.clone(),
+        )
+        .root,
         Some("home"),
         "Home",
         "go-home-symbolic",
     );
-    let library_screen = screens::library::build(pool, paths, server, account, session, on_play);
+    let library_screen = screens::library::build(pool, paths, server, account, session, on_play, on_relogin);
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     stack.add_titled_with_icon(&stub_page("folder-download-symbolic", "Downloads"), Some("downloads"), "Downloads", "folder-download-symbolic");
     stack.add_titled_with_icon(&stub_page("emblem-system-symbolic", "Settings"), Some("settings"), "Settings", "emblem-system-symbolic");

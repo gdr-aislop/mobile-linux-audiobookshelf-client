@@ -7,17 +7,30 @@ use sqlx::SqlitePool;
 
 use crate::error::{CoreError, Result};
 
+/// The one distinction the sync pipeline's error-flattening preserves: a 401/403 from any
+/// authenticated call means the stored session itself is dead (revoked refresh token, removed or
+/// demoted user, password changed elsewhere) and only signing in again fixes it — the UI keys its
+/// "Log in again" affordance off `CoreError::Auth`, and must not show it for a network outage or
+/// a 500, which "Try again" can genuinely fix.
+fn auth_or_unexpected(status: Option<u16>, fallback: String) -> CoreError {
+    match status {
+        Some(code) if code == 401 || code == 403 => CoreError::Auth,
+        _ => CoreError::UnexpectedResponse(fallback),
+    }
+}
+
 /// Fetch the server's libraries and upsert them into local storage, returning how many were
 /// synced. Libraries the server no longer reports are left in place rather than deleted — a
 /// transient fetch failure or a server-side hiccup shouldn't nuke the local cache of a library a
 /// user has downloaded content from.
 pub async fn sync_libraries(pool: &SqlitePool, api: &abs_api::Client, server_id: &str) -> Result<usize> {
     // `progenitor`'s generated `Error<E>` type differs per operation (its error-body type
-    // parameter), so there's no single `From` impl to lean on here — stringify instead.
+    // parameter), so there's no single `From` impl to lean on here — stringify instead,
+    // preserving only the auth distinction via the error's HTTP status.
     let response = api
         .get_libraries()
         .await
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+        .map_err(|e| auth_or_unexpected(e.status().map(|s| s.as_u16()), e.to_string()))?;
     let libraries = response.into_inner().libraries;
 
     let mut synced = 0;
@@ -60,7 +73,10 @@ pub async fn sync_items_for_library(
     let remote_items = api
         .get_library_items_with_media(library_id)
         .await
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+        .map_err(|e| match e {
+            abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
+            other => CoreError::UnexpectedResponse(other.to_string()),
+        })?;
 
     let mut synced = 0;
     for item in remote_items {
@@ -243,7 +259,52 @@ mod tests {
         let api = abs_api::Client::new(&mock_server.uri());
 
         let result = sync_libraries(&pool, &api, &server_id).await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(CoreError::UnexpectedResponse(_))),
+            "a 500 is a server problem, not an auth failure — the UI must not offer 'Log in again' for it"
+        );
+    }
+
+    /// The classification the re-login flow is built on: a 401 from the libraries call means the
+    /// stored session is dead, and `CoreError::Auth` is what the UI keys its "Log in again"
+    /// affordance off.
+    #[tokio::test]
+    async fn sync_libraries_maps_a_401_to_the_auth_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let (pool, server_id) = pool_with_server(&mock_server.uri()).await;
+        let api = abs_api::Client::new(&mock_server.uri());
+
+        let result = sync_libraries(&pool, &api, &server_id).await;
+        assert!(
+            matches!(result, Err(CoreError::Auth)),
+            "a 401 must be classified as an auth failure, not a generic one"
+        );
+    }
+
+    /// Same classification, hand-written-op side: `get_library_items_with_media` carries the
+    /// status in its own `LibraryItemsError`, and the sync layer must map it to `CoreError::Auth`
+    /// too — otherwise a session that dies mid-sync (after libraries, on items) would look like a
+    /// generic failure.
+    #[tokio::test]
+    async fn sync_items_for_library_maps_a_401_to_the_auth_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/items"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let (pool, server_id) = pool_with_server_and_library(&mock_server.uri(), "lib-1").await;
+        let api = abs_api::Client::new(&mock_server.uri());
+
+        let result = sync_items_for_library(&pool, &api, &server_id, "lib-1").await;
+        assert!(matches!(result, Err(CoreError::Auth)));
     }
 
     #[tokio::test]

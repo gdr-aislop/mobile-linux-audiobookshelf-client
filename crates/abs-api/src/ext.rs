@@ -305,8 +305,18 @@ struct MeResponseBody {
 pub enum LibraryItemsError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
+    #[error("the server rejected this session's credentials (HTTP {0})")]
+    Unauthorized(u16),
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
+}
+
+/// Whether an HTTP status means "this session itself is dead — only signing in again fixes it".
+/// 401 is the obvious one; 403 is included because Audiobookshelf revokes access per-user and a
+/// demoted/removed user gets 403s with perfectly valid tokens, which the UI should treat the
+/// same way (sign in again, possibly as someone else) rather than as a transient sync hiccup.
+pub fn is_auth_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
 }
 
 impl Client {
@@ -330,6 +340,9 @@ impl Client {
             .send()
             .await?;
 
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
                 "GET /api/libraries/{library_id}/items returned HTTP {}",
@@ -371,6 +384,9 @@ impl Client {
     pub async fn get_item_playback_info(&self, item_id: &str) -> Result<ItemPlaybackInfo, LibraryItemsError> {
         let response = self.client().get(format!("{}/api/items/{item_id}", self.baseurl())).send().await?;
 
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
                 "GET /api/items/{item_id} returned HTTP {}",
@@ -409,6 +425,9 @@ impl Client {
     pub async fn get_item_cover(&self, item_id: &str) -> Result<CoverBytes, LibraryItemsError> {
         let response = self.client().get(format!("{}/api/items/{item_id}/cover", self.baseurl())).send().await?;
 
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
                 "GET /api/items/{item_id}/cover returned HTTP {}",
@@ -448,6 +467,9 @@ impl Client {
             .send()
             .await?;
 
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
                 "PATCH /api/me/progress/{item_id} returned HTTP {}",
@@ -470,6 +492,9 @@ impl Client {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
                 "GET /api/me/progress/{item_id} returned HTTP {}",
@@ -489,6 +514,9 @@ impl Client {
     pub async fn get_all_media_progress(&self) -> Result<Vec<ServerProgress>, LibraryItemsError> {
         let response = self.client().get(format!("{}/api/me", self.baseurl())).send().await?;
 
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!("GET /api/me returned HTTP {}", response.status())));
         }
