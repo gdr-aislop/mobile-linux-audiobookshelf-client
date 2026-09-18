@@ -70,6 +70,11 @@ impl MainWindow {
     }
 }
 
+/// A signed-in shell's construction from everything it needs. The argument count is the shell's
+/// genuine composition — pool, paths, the session it fronts, the two long-lived managers, the
+/// screen data and the window itself — not an accident to refactor into a params struct; the
+/// allow documents that judgment call.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     paths: AppPaths,
@@ -368,7 +373,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
         let window = build(
             pool,
@@ -436,7 +441,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
-        controller.start(abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
         crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
 
         let on_call_active: Box<dyn Fn()> = {
@@ -465,7 +470,7 @@ pub(crate) mod tests {
 
         let start_book = |controller: &crate::player::PlayerController| {
             controller.start(
-                abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account),
+                abs_core::auth::Session::new(pool.clone(), &server, &account),
                 PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
                 1.0,
             );

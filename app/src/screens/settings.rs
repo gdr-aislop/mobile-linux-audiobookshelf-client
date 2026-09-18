@@ -56,6 +56,9 @@ pub struct ServerRowHooks {
     pub remove_item: gtk4::Button,
 }
 
+/// A settings page is wired to everything it can edit — the argument count reflects that
+/// surface, not a missing params-struct refactor; the allow documents that judgment call.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     controller: PlayerController,
@@ -153,7 +156,7 @@ pub fn build(
             .css_classes(["flat"])
             .height_request(44)
             .build();
-        switch_item.set_sensitive(!is_active_server && accounts.first().is_some());
+        switch_item.set_sensitive(!is_active_server && !accounts.is_empty());
         menu_box.append(&switch_item);
 
         let sign_out_item = gtk4::Button::builder()
@@ -161,7 +164,7 @@ pub fn build(
             .css_classes(["flat"])
             .height_request(44)
             .build();
-        sign_out_item.set_sensitive(accounts.first().is_some());
+        sign_out_item.set_sensitive(!accounts.is_empty());
         menu_box.append(&sign_out_item);
 
         let remove_item = gtk4::Button::builder()
