@@ -2,25 +2,39 @@
 //! been downloaded fully or partially, or is currently being fetched, with a remove/cancel action
 //! and an empty state when nothing has been downloaded yet.
 //!
+//! Completed rows carry a gray subtitle — "10 chapters, 64.1 MB" — computed from the local
+//! `download_tracks` rows (count of `Complete` tracks, summed `bytes_downloaded`). In-flight rows
+//! show live progress instead: "3/10 chapters · 18.2 MB · 2.1 MB/s", driven by the manager's
+//! `batch_progress` (chapters tick per track outcome) and `TrackProgress` events (bytes + a
+//! smoothed speed), throttled so per-chunk events don't thrash the label — the spinner stays as
+//! the at-a-glance "something is moving" cue.
+//!
 //! No storage-used/free-space summary row (the spec's own "nice to have") — computing device free
 //! space needs `statvfs`-style OS calls with no existing precedent in this codebase, left as a
-//! documented follow-up rather than built here. Progress is shown as a plain `GtkSpinner` rather
-//! than an exact percentage: `DownloadEvent::TrackProgress` is per-track, and aggregating several
-//! tracks' byte counts into one item-level fraction is more machinery than this pass needs — "in
-//! progress" is the signal that matters for a remove/cancel decision.
+//! documented follow-up rather than built here.
 //!
 //! Never imports `abs_api`: the only calls here are `abs_core::download_tracks` (read the
 //! downloaded-item list) and `DownloadManager` (cancel/clear) — same boundary every other screen
 //! respects.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
+use abs_storage::models::DownloadStatus;
+
+/// Minimum gap between live subtitle writes for one item — `TrackProgress` fires per chunk
+/// written, which can be many times a second; the subtitle only needs ~5 updates a second.
+const LABEL_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A speed sample older than this means nothing has arrived in a while — hide the speed part
+/// rather than showing a frozen rate as if it were current.
+const SPEED_DISPLAY_WINDOW: Duration = Duration::from_secs(2);
 
 pub struct DownloadsScreen {
     pub root: gtk4::Widget,
@@ -42,6 +56,15 @@ impl DownloadsScreen {
     }
 }
 
+/// Per-item speed smoothing, kept across row rebuilds (rebuilds happen on every
+/// `ItemStateChanged`; the download itself doesn't reset each time).
+struct SpeedState {
+    ema: f64,
+    last_bytes: u64,
+    last_instant: Option<Instant>,
+    last_label_write: Instant,
+}
+
 struct Widgets {
     pool: SqlitePool,
     server_id: String,
@@ -53,6 +76,16 @@ struct Widgets {
     /// `downloaded_item_ids` query only ever reflects *complete* tracks, so a download still in
     /// flight (nothing complete yet) needs to be tracked here to show a row for it at all.
     downloading: Rc<RefCell<HashSet<String>>>,
+    /// Per-item, per-track cumulative downloaded bytes — seeded from the DB at every refresh
+    /// (`bytes_downloaded` is the full size for `Complete` tracks, the last checkpoint otherwise)
+    /// and updated from `TrackProgress` events (per-track cumulative, so no deltas to reconcile).
+    track_bytes: Rc<RefCell<HashMap<String, HashMap<String, u64>>>>,
+    /// Smoothed per-item download speed across rebuilds — see `SpeedState`.
+    speeds: Rc<RefCell<HashMap<String, SpeedState>>>,
+    /// The in-flight rows themselves, keyed by item id — `TrackProgress` updates a row's subtitle
+    /// text in place (throttled) instead of rebuilding the whole list per chunk. Rebuilt rows
+    /// re-register here at refresh.
+    live_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>>,
 }
 
 pub fn build(
@@ -84,15 +117,19 @@ pub fn build(
         scroller: scroller.clone(),
         download_manager: download_manager.clone(),
         downloading: Rc::new(RefCell::new(HashSet::new())),
+        track_bytes: Rc::new(RefCell::new(HashMap::new())),
+        speeds: Rc::new(RefCell::new(HashMap::new())),
+        live_rows: Rc::new(RefCell::new(HashMap::new())),
     });
 
     // Registered once, for the manager's whole lifetime — same permanent-listener shape
-    // `PlayerController::add_listener`/MPRIS already use. Any state change for any item (this
-    // screen has no notion of "which item is mine" — it shows all of them) triggers a re-render.
+    // `PlayerController::add_listener`/MPRIS already use. Every event fires on the GTK main
+    // thread (the manager publishes from `spawn_future_local` futures only), so touching
+    // widgets here is safe.
     download_manager.add_listener({
         let widgets = widgets.clone();
-        move |event| {
-            if let DownloadEvent::ItemStateChanged { item_id, state } = event {
+        move |event| match event {
+            DownloadEvent::ItemStateChanged { item_id, state } => {
                 match state {
                     ItemDownloadState::Downloading => {
                         widgets.downloading.borrow_mut().insert(item_id.clone());
@@ -102,6 +139,42 @@ pub fn build(
                     }
                 }
                 spawn_refresh(widgets.clone());
+            }
+            DownloadEvent::TrackProgress { item_id, ino, bytes_downloaded, .. } => {
+                // Per-track cumulative bytes: just overwrite the slot — no delta math.
+                widgets.track_bytes.borrow_mut().entry(item_id.clone()).or_default().insert(ino.clone(), *bytes_downloaded);
+
+                let now = Instant::now();
+                let mut speeds = widgets.speeds.borrow_mut();
+                let speed = speeds.entry(item_id.clone()).or_insert(SpeedState { ema: 0.0, last_bytes: *bytes_downloaded, last_instant: None, last_label_write: now });
+                match speed.last_instant {
+                    // First sample of a (re)started download: seed the baseline, no rate yet.
+                    None => {
+                        speed.last_bytes = *bytes_downloaded;
+                        speed.last_instant = Some(now);
+                    }
+                    Some(_) => {
+                        let elapsed = now.duration_since(speed.last_instant.unwrap()).as_secs_f64();
+                        if elapsed > 0.0 {
+                            let instant_rate = (*bytes_downloaded).saturating_sub(speed.last_bytes) as f64 / elapsed;
+                            speed.ema = if speed.ema <= 0.0 { instant_rate } else { speed.ema * 0.5 + instant_rate * 0.5 };
+                            speed.last_bytes = *bytes_downloaded;
+                            speed.last_instant = Some(now);
+                        }
+                    }
+                }
+
+                // Throttled in-place subtitle update — never a list rebuild per chunk.
+                if now.duration_since(speed.last_label_write) >= LABEL_UPDATE_INTERVAL {
+                    speed.last_label_write = now;
+                    let ema = speed.ema;
+                    drop(speeds);
+                    let bytes: u64 = widgets.track_bytes.borrow().get(item_id).map(|tracks| tracks.values().sum()).unwrap_or(0);
+                    let batch = widgets.download_manager.batch_progress(&widgets.server_id, item_id);
+                    if let Some(row) = widgets.live_rows.borrow().get(item_id.as_str()) {
+                        row.set_subtitle(&downloading_subtitle(batch, bytes, Some(ema)));
+                    }
+                }
             }
         }
     });
@@ -124,6 +197,10 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 ids.push(id.clone());
             }
         }
+        let all_ids = ids.clone();
+
+        // Rows are rebuilt from scratch every refresh; the in-flight rows re-register below.
+        widgets.live_rows.borrow_mut().clear();
 
         while let Some(child) = widgets.list_box.row_at_index(0) {
             widgets.list_box.remove(&child);
@@ -133,21 +210,59 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
         for item_id in ids {
             let Ok(item) = abs_storage::repo::items::get(&widgets.pool, &widgets.server_id, &item_id).await else { continue };
             let is_downloading = widgets.downloading.borrow().contains(&item_id);
-            widgets.list_box.append(&download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id));
+            let tracks = abs_storage::repo::download_tracks::list_for_item(&widgets.pool, &widgets.server_id, &item_id).await.unwrap_or_default();
+
+            // Seed the live byte map for this item: `bytes_downloaded` is the full size for
+            // `Complete` tracks and the last checkpoint for pending/failed ones — exactly the
+            // per-track cumulative value `TrackProgress` events will keep overwriting.
+            widgets
+                .track_bytes
+                .borrow_mut()
+                .insert(item_id.clone(), tracks.iter().map(|track| (track.ino.clone(), track.bytes_downloaded.max(0) as u64)).collect());
+
+            let subtitle = if is_downloading {
+                let batch = widgets.download_manager.batch_progress(&widgets.server_id, &item_id);
+                let bytes: u64 = tracks.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
+                let speed = {
+                    let speeds = widgets.speeds.borrow();
+                    speeds
+                        .get(&item_id)
+                        .filter(|state| state.ema > 0.0 && state.last_instant.is_some_and(|at| at.elapsed() < SPEED_DISPLAY_WINDOW))
+                        .map(|state| state.ema)
+                };
+                Some(downloading_subtitle(batch, bytes, speed))
+            } else {
+                let complete: Vec<_> = tracks.iter().filter(|track| track.status == DownloadStatus::Complete).collect();
+                let size: u64 = complete.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
+                if complete.is_empty() { None } else { Some(format!("{}, {}", chapters_label(complete.len()), format_bytes(size))) }
+            };
+
+            let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle);
+            if is_downloading {
+                widgets.live_rows.borrow_mut().insert(item_id.clone(), row.clone());
+            }
+            widgets.list_box.append(&row);
             any_row = true;
         }
+
+        // Drop bookkeeping for items that left the list entirely (cleared/removed downloads).
+        widgets.track_bytes.borrow_mut().retain(|id, _| all_ids.contains(id));
+        widgets.speeds.borrow_mut().retain(|id, _| all_ids.contains(id));
 
         widgets.status_page.set_visible(!any_row);
         widgets.scroller.set_visible(any_row);
     });
 }
 
-fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download_manager: &DownloadManager, server_id: &str) -> adw::ActionRow {
+fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download_manager: &DownloadManager, server_id: &str, subtitle: Option<String>) -> adw::ActionRow {
     const THUMBNAIL_SIZE: i32 = 48;
     let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
     cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
 
     let row = adw::ActionRow::builder().title(&item.title).build();
+    if let Some(text) = subtitle {
+        row.set_subtitle(&text);
+    }
     row.add_prefix(cover.widget());
 
     if is_downloading {
@@ -175,6 +290,38 @@ fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download
     }
 
     row
+}
+
+/// "1 chapter" / "10 chapters" — the completed-download subtitle's first half.
+fn chapters_label(count: usize) -> String {
+    if count == 1 { "1 chapter".to_string() } else { format!("{count} chapters") }
+}
+
+/// "5 B", "18.2 MB", "1.3 GB" — decimal units, matching how servers report Content-Length.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1e6)
+    } else if bytes >= 1_000 {
+        format!("{:.1} kB", bytes as f64 / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The in-flight subtitle: chapter progress from the manager's batch ("3/10 chapters"), total
+/// bytes so far, and — while samples are flowing — the smoothed speed.
+fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
+    let mut parts = Vec::new();
+    if let Some((finished, total)) = batch {
+        parts.push(format!("{finished}/{total} chapters"));
+    }
+    parts.push(format_bytes(bytes));
+    if let Some(speed) = speed.filter(|rate| *rate > 0.0) {
+        parts.push(format!("{}/s", format_bytes(speed as u64)));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -273,6 +420,50 @@ pub(crate) mod tests {
         manager.cancel_item(&server.id, "item-1");
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(10));
         assert!(hooks.status_page.is_visible(), "canceling the only (never-completed) download should return to the empty state");
+    }
+
+    /// An in-flight download's row shows live progress (chapter fraction from the batch, bytes,
+    /// speed while samples flow) in its subtitle, not just a spinner; once complete, the
+    /// subtitle becomes the static "1 chapter, 5 B" summary.
+    pub(crate) fn run_in_progress_download_shows_progress_and_speed(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::from_secs(2)));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone());
+        let hooks = screen.test_hooks();
+
+        manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
+        let subtitle = row.subtitle().unwrap();
+        assert!(subtitle.contains("0/1 chapters"), "in-flight subtitle should show the batch's chapter progress, got: {subtitle}");
+        assert!(subtitle.contains("B"), "in-flight subtitle should show bytes so far, got: {subtitle}");
+
+        // Pure formatting, asserted alongside so the units stay pinned (no GTK involved).
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.2 MB");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(downloading_subtitle(Some((3, 10)), 18_900_000, Some(2_200_000.0)), "3/10 chapters · 18.9 MB · 2.2 MB/s");
+        assert_eq!(chapters_label(1), "1 chapter");
+        assert_eq!(chapters_label(10), "10 chapters");
+
+        pump_until(
+            || {
+                hooks
+                    .list_box
+                    .row_at_index(0)
+                    .and_then(|row| row.downcast::<adw::ActionRow>().ok())
+                    .and_then(|row| row.subtitle())
+                    .is_some_and(|subtitle| subtitle.contains("chapter") && subtitle.contains(","))
+            },
+            Duration::from_secs(10),
+        );
+        let subtitle = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap().subtitle().unwrap();
+        assert_eq!(subtitle, "1 chapter, 5 B", "completed subtitle is the static chapters+size summary");
     }
 
     /// A completed download shows a row with a remove button; removing it deletes the row and the

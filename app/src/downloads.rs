@@ -119,6 +119,16 @@ impl DownloadManager {
         self.inner.borrow_mut().listeners.push(Box::new(listener));
     }
 
+    /// This item's in-flight batch's progress as `(finished tracks, total tracks)`. `finished`
+    /// ticks per track outcome (completed, failed, or canceled) — not just when the whole batch
+    /// ends, which is the only thing `ItemStateChanged` reports — so the Downloads screen's
+    /// subtitle can advance live while chapters land. `None` when nothing is in flight.
+    pub fn batch_progress(&self, server_id: &str, item_id: &str) -> Option<(usize, usize)> {
+        let inner = self.inner.borrow();
+        let batch = inner.batches.get(&(server_id.to_string(), item_id.to_string()))?;
+        Some((batch.finished(), batch.total))
+    }
+
     pub fn set_wifi_only(&self, value: bool) {
         self.inner.borrow_mut().wifi_only = value;
     }

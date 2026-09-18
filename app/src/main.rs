@@ -194,6 +194,7 @@ mod tests {
         (downloads_engine_set_wifi_only_only_affects_downloads_started_afterwards, crate::downloads::tests::run_set_wifi_only_only_affects_downloads_started_afterwards),
         (downloads_screen_empty_state_renders_when_nothing_is_downloaded, crate::screens::downloads::tests::run_empty_state_renders_when_nothing_is_downloaded),
         (downloads_screen_in_progress_download_shows_a_cancel_row, crate::screens::downloads::tests::run_in_progress_download_shows_a_cancel_row),
+        (downloads_screen_in_progress_download_shows_progress_and_speed, crate::screens::downloads::tests::run_in_progress_download_shows_progress_and_speed),
         (downloads_screen_completed_download_can_be_removed, crate::screens::downloads::tests::run_completed_download_can_be_removed),
     }
 
