@@ -24,7 +24,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
-use abs_core::error::Result as CoreResult;
+use abs_core::error::{CoreError, Result as CoreResult};
 use abs_core::settings::LibraryViewMode;
 use abs_storage::models::{Account, Item, Server};
 use abs_storage::AppPaths;
@@ -116,7 +116,8 @@ struct LibraryData {
 /// Builds the screen. Signature mirrors `home::build`'s exactly — same reasoning: `server`/
 /// `account` are already-resolved rows the caller looks up once, and `on_play` is how tapping a
 /// cover starts playback without this screen ever touching `abs-player`/`abs-core::streaming`
-/// itself.
+/// itself. `on_relogin` routes the banner's "Log in again" action (authorization failures only)
+/// back to the shell, same as Home's.
 pub fn build(
     pool: SqlitePool,
     paths: AppPaths,
@@ -124,6 +125,7 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
+    on_relogin: impl Fn() + Clone + 'static,
 ) -> LibraryScreen {
     let header = adw::HeaderBar::new();
 
@@ -166,6 +168,12 @@ pub fn build(
     let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_label).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
+    // The "Log in again" action (revealed only on authorization failures) routes to the shell,
+    // same as Home's.
+    banner.action_button().connect_clicked({
+        let on_relogin = on_relogin.clone();
+        move |_| on_relogin()
+    });
 
     let flow_box = gtk4::FlowBox::builder()
         .homogeneous(true)
@@ -194,8 +202,6 @@ pub fn build(
         .build();
 
     let scroll_content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    scroll_content.append(&offline_banner);
-    scroll_content.append(banner.widget());
     scroll_content.append(&flow_box);
     scroll_content.append(&list_box);
 
@@ -209,7 +215,14 @@ pub fn build(
         .visible(false)
         .build();
 
+    // The banners live directly under the header bar, outside the scroller — same reason as
+    // home.rs's identically-placed banners: `apply` hides the scroller whenever nothing is
+    // cached (zero items renders the status page instead), and a banner trapped inside the
+    // hidden scroller disappears without a trace. Above the status page too, so the failure
+    // is visible in every state.
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
+    body.append(&offline_banner);
+    body.append(banner.widget());
     body.append(&scroller);
     body.append(&status_page);
 
@@ -407,7 +420,16 @@ pub fn build(
             match &sync_result {
                 Ok(()) => widgets.banner.set_revealed(false),
                 Err(err) => {
-                    widgets.banner.set_title("Couldn't sync — showing what's cached.");
+                    // An authorization failure is not fixable by re-syncing — the session itself
+                    // is what died — so the banner swaps its copy and grows a "Log in again"
+                    // action routed to the shell, mirroring Home's failure state.
+                    if matches!(err, CoreError::Auth) {
+                        widgets.banner.set_title("Session expired — showing what's cached.");
+                        widgets.banner.set_action_label(Some("Log in again"));
+                    } else {
+                        widgets.banner.set_title("Couldn't sync — showing what's cached.");
+                        widgets.banner.set_action_label(None);
+                    }
                     widgets.banner.set_details(Some(&err.to_string()));
                     widgets.banner.set_revealed(true);
                 }
@@ -677,7 +699,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -716,7 +738,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -759,7 +781,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {});
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
@@ -804,7 +826,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -831,13 +853,60 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
 
         assert!(hooks.banner.widget().reveals_child(), "a sync failure should show the banner");
         assert!(hooks.status_page.is_visible(), "with nothing cached yet, the empty state stays up too");
+    }
+
+    /// Dead session with cached data on the Library tab: the banner must swap its copy and offer
+    /// "Log in again" — a retry can't fix a revoked session, and the Library tab is where a user
+    /// browsing while the token dies will actually be.
+    pub(crate) fn run_shows_login_again_in_the_banner_when_a_resync_is_rejected(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(abs_storage::repo::libraries::upsert(
+            &pool,
+            abs_storage::repo::libraries::UpsertLibrary {
+                id: "lib-1",
+                server_id: &server.id,
+                name: "Audiobooks",
+                media_type: "book",
+                icon: None,
+                display_order: 1,
+            },
+        ))
+        .unwrap();
+
+        let relogin_requested = Rc::new(std::cell::Cell::new(false));
+        let on_relogin = {
+            let relogin_requested = relogin_requested.clone();
+            move || relogin_requested.set(true)
+        };
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
+
+        assert_eq!(hooks.banner.title(), "Session expired — showing what's cached.");
+        assert!(hooks.banner.action_visible(), "an auth failure must offer Log in again in the banner");
+        assert!(hooks.status_page.is_visible(), "no synced items yet, so the status page stays up");
+        assert!(!relogin_requested.get(), "merely showing the banner must not trigger a re-login");
+
+        hooks.banner.action_button().emit_clicked();
+        assert!(relogin_requested.get(), "the banner's login action must fire on_relogin");
     }
 
     pub(crate) fn run_shows_empty_state_when_the_server_has_no_libraries(runtime: &tokio::runtime::Runtime) {
@@ -853,7 +922,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| false, Duration::from_millis(500));
@@ -890,7 +959,7 @@ pub(crate) mod tests {
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -929,7 +998,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -972,7 +1041,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1013,7 +1082,7 @@ pub(crate) mod tests {
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1053,7 +1122,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1094,7 +1163,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account), |_| {});
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account), |_| {}, || {});
         let first_hooks = first_screen.test_hooks();
         pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
         assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
@@ -1124,7 +1193,7 @@ pub(crate) mod tests {
         pump_until(|| persisted.load(std::sync::atomic::Ordering::SeqCst), Duration::from_secs(5));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let second_hooks = second_screen.test_hooks();
         pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
@@ -1149,7 +1218,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(20));

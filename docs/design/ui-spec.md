@@ -73,6 +73,11 @@ Fractal) rather than copying Lissen's Material Design look.
 - This screen (via `abs_core::accounts::add_server_and_login`) is what's shown whenever
   `abs_storage::repo::accounts::get_active` returns `None` — i.e. on first launch, or after
   signing out of every configured server.
+- **Re-login mode** (launched from a dead session's "Log in again", see the flow above): the
+  form is pre-filled with the previous session's URL and username and focuses the password field;
+  a Cancel button appears below Connect; and connecting with credentials that would replace the
+  previous session's local data asks for confirmation first (a different account, or a different
+  server — same credentials just rotate tokens with no prompt).
 
 ### Library picker
 - Shown only if the server exposes >1 library. Simple `AdwActionRow` list, one row per library
@@ -92,12 +97,39 @@ Fractal) rather than copying Lissen's Material Design look.
     "Check your connection and try again.", the underlying error text in a small selectable
     details line, and a **Try again** button that re-runs the sync cycle (returning to the
     Syncing state first).
+  - **Signed out** (authorization failure — 401/403 from any authenticated call, meaning the
+    stored session itself is dead: expired or revoked refresh token, removed or demoted user):
+    a lock glyph, "Sign in again", "Your session on this server has expired or was revoked.",
+    the underlying error text in the same selectable details line, and two buttons — **Log in
+    again** (routes to the Welcome screen, pre-filled with this session's URL and username, per
+    the re-login flow below) alongside Try again. A retry cannot fix a dead session, so the
+    login affordance is the point; both buttons stay up since transient misconfigurations do
+    happen on self-hosted servers.
   - **Empty** (sync succeeded but the server exposes no libraries): the folder-music glyph,
     "No library synced yet", "This server doesn't have any libraries yet.", and Try again.
   Once anything is cached, shelves render normally and a failed re-sync surfaces as the
   "Couldn't sync — showing what's cached." banner instead; that banner sits below the header
-  bar, outside the shelves' scroller, so it's visible in every state. Try again is the only
-  user-triggerable sync until the Sync now menu item (below) is built.
+  bar, outside the shelves' scroller, so it's visible in every state. On an authorization
+  failure the banner reads "Session expired — showing what's cached." and grows a **Log in
+  again** button of its own. Try again is the only user-triggerable sync until the Sync now menu
+  item (below) is built.
+
+### Re-login flow
+- When a session dies (the Signed-out state above), "Log in again" swaps the window's content for
+  the Welcome screen in its re-login mode: the form comes **pre-filled with the previous
+  session's URL and username** (the session died, not the server address — only the password
+  should be left to type), the password field takes focus, and a **Cancel** button returns to the
+  main window with the old session untouched. Cancel exists so "Log in again" is never a trap.
+- Signing in with the **same URL and username** rotates the stored tokens in place — nothing else
+  changes, all cached data is kept.
+- Signing in with **different credentials** — a different account on the same server, or a
+  different server — first asks for confirmation (a modal `GtkMessageDialog`, since this crate's
+  libadwaita ceiling predates `AdwAlertDialog`), spelling out what is replaced: a different
+  account on the same server keeps the server's cached libraries/items/covers/downloads (they're
+  keyed by server) but removes the old account's on-device progress and bookmarks; a different
+  server removes everything cached for the old server, rows and on-disk files alike. Nothing is
+  removed until the new login actually succeeds — a failed login leaves the old session intact.
+  Both ways, everything that matters stays on the server; only the local cache is touched.
 - **Offline-mode toggle**: a `GtkToggleButton` in the header bar (leading side, opposite the
   avatar), iconified with an airplane/cloud-off glyph and labeled "Offline". When active, an
   `AdwBanner`-style strip appears below the header ("Showing downloaded items only") and every
@@ -323,7 +355,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   spinners over skeleton screens for this style of app).
 - **Empty:** `AdwStatusPage` with an icon, title, and short description (e.g. "No downloads yet").
 - **Error/offline:** `AdwBanner` at the top of the affected page, plus `AdwToast` for transient
-  errors (e.g. "Failed to sync progress — will retry").
+  errors (e.g. "Failed to sync progress — will retry"). On an authorization failure (the server
+  rejects the session), the banner swaps to "Session expired — showing what's cached." and grows
+  a "Log in again" button routing to the re-login flow (see Home) — on every screen that shows
+  the banner, not just Home.
 - **Offline-first playback:** downloaded items remain playable and browsable without a server
   connection; the app clearly marks which items are available offline (small download badge on
   covers/rows, and per-chapter offline markers in Item detail). The Home/Library offline-mode

@@ -11,7 +11,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
-use abs_core::error::Result as CoreResult;
+use abs_core::error::{CoreError, Result as CoreResult};
 use abs_storage::models::{Account, Item, Library, Progress, Server};
 use abs_storage::AppPaths;
 
@@ -60,6 +60,8 @@ pub(crate) struct EmptyState {
     description: gtk4::Label,
     details: gtk4::Label,
     retry: gtk4::Button,
+    login_again: gtk4::Button,
+    buttons: gtk4::Box,
 }
 
 impl EmptyState {
@@ -89,6 +91,13 @@ impl EmptyState {
             .css_classes(["pill", "suggested-action"])
             .visible(false)
             .build();
+        // Only revealed by the authorization-failure mode — the one failure "Try again" can't
+        // fix, since the stored session itself is what's dead.
+        let login_again = gtk4::Button::builder()
+            .label("Log in again")
+            .css_classes(["pill"])
+            .visible(false)
+            .build();
 
         let root = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
@@ -104,9 +113,17 @@ impl EmptyState {
         root.append(&title);
         root.append(&description);
         root.append(&details);
-        root.append(&retry);
 
-        let state = Self { root, spinner, icon, title, description, details, retry };
+        let buttons = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .visible(false)
+            .build();
+        buttons.append(&retry);
+        buttons.append(&login_again);
+        root.append(&buttons);
+
+        let state = Self { root, spinner, icon, title, description, details, retry, login_again, buttons };
         state.show_syncing();
         state
     }
@@ -118,7 +135,7 @@ impl EmptyState {
         self.title.set_label("Syncing your libraries…");
         self.description.set_label("This can take a moment on first sync.");
         self.details.set_visible(false);
-        self.retry.set_visible(false);
+        self.buttons.set_visible(false);
         self.root.set_visible(true);
     }
 
@@ -131,7 +148,29 @@ impl EmptyState {
         self.description.set_label("Check your connection and try again.");
         self.details.set_label(error);
         self.details.set_visible(!error.is_empty());
+        self.buttons.set_visible(true);
         self.retry.set_visible(true);
+        self.login_again.set_visible(false);
+        self.root.set_visible(true);
+    }
+
+    /// The authorization-failure mode: the session itself is dead (revoked/expired refresh token,
+    /// removed or demoted user), so "Try again" would just 401 forever — the way out is signing
+    /// in again, which the extra button offers (the shell routes it to a pre-filled login
+    /// screen). Both buttons stay up: a retry costs nothing and transient misconfigurations do
+    /// happen on self-hosted servers.
+    fn show_auth_error(&self, error: &str) {
+        self.spinner.set_visible(false);
+        self.spinner.stop();
+        self.icon.set_visible(true);
+        self.icon.set_icon_name(Some("system-lock-screen-symbolic"));
+        self.title.set_label("Sign in again");
+        self.description.set_label("Your session on this server has expired or was revoked.");
+        self.details.set_label(error);
+        self.details.set_visible(!error.is_empty());
+        self.buttons.set_visible(true);
+        self.retry.set_visible(true);
+        self.login_again.set_visible(true);
         self.root.set_visible(true);
     }
 
@@ -143,7 +182,9 @@ impl EmptyState {
         self.title.set_label("No library synced yet");
         self.description.set_label("This server doesn't have any libraries yet.");
         self.details.set_visible(false);
+        self.buttons.set_visible(true);
         self.retry.set_visible(true);
+        self.login_again.set_visible(false);
         self.root.set_visible(true);
     }
 
@@ -204,7 +245,10 @@ struct HomeData {
 /// looks them up once) rather than bare ids, so this module never has to fail on a missing
 /// server/account — that would be a caller bug, not a Home-screen concern. `on_play` is how
 /// tapping a cover card starts playback — Home never touches `abs-player`/`abs-core::streaming`
-/// itself, matching the `on_success`-callback pattern `welcome.rs` already uses.
+/// itself, matching the `on_success`-callback pattern `welcome.rs` already uses. `on_relogin` is
+/// how the authorization-failure states hand control back to the shell: it swaps the window's
+/// content for a pre-filled login screen (the session that just died is the shell's knowledge,
+/// not Home's).
 pub fn build(
     pool: SqlitePool,
     paths: AppPaths,
@@ -212,6 +256,7 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
+    on_relogin: impl Fn() + Clone + 'static,
 ) -> HomeScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Home", "")));
@@ -331,6 +376,17 @@ pub fn build(
             widgets.banner.set_revealed(false);
             spawn_sync_cycle(ctx.clone(), widgets.clone());
         });
+    }
+
+    // "Log in again" — from the failure state or the banner — hands control to the shell, which
+    // swaps the window's content for a login screen pre-filled with this session's URL/username.
+    {
+        let on_relogin = std::rc::Rc::new(on_relogin);
+        empty_state.login_again.connect_clicked({
+            let on_relogin = on_relogin.clone();
+            move |_| on_relogin()
+        });
+        banner.action_button().connect_clicked(move |_| on_relogin());
     }
 
     let offline_toggle_handler = offline_toggle.connect_toggled({
@@ -521,13 +577,20 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
         // actually landed in local storage. The two visible outcomes are mutually exclusive:
         // with data, the banner (if anything, the partial-failure case); without, the empty
         // state carries the whole story — which is why it, not the banner, owns the no-data
-        // failure mode.
+        // failure mode. Auth failures get their own copy and a "Log in again" action in both
+        // places: they're the one failure retrying can't fix.
         if data_after_sync.as_ref().is_some_and(|data| !data.libraries.is_empty()) {
             widgets.empty_state.hide();
             match sync_result {
                 Ok(()) => widgets.banner.set_revealed(false),
                 Err(err) => {
-                    widgets.banner.set_title("Couldn't sync — showing what's cached.");
+                    if matches!(err, CoreError::Auth) {
+                        widgets.banner.set_title("Session expired — showing what's cached.");
+                        widgets.banner.set_action_label(Some("Log in again"));
+                    } else {
+                        widgets.banner.set_title("Couldn't sync — showing what's cached.");
+                        widgets.banner.set_action_label(None);
+                    }
                     widgets.banner.set_details(Some(&err.to_string()));
                     widgets.banner.set_revealed(true);
                 }
@@ -536,7 +599,13 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
             widgets.banner.set_revealed(false);
             match sync_result {
                 Ok(()) => widgets.empty_state.show_empty(),
-                Err(err) => widgets.empty_state.show_error(&err.to_string()),
+                Err(err) => {
+                    if matches!(err, CoreError::Auth) {
+                        widgets.empty_state.show_auth_error(&err.to_string());
+                    } else {
+                        widgets.empty_state.show_error(&err.to_string());
+                    }
+                }
             }
         }
     });
@@ -678,6 +747,7 @@ fn clear_listbox(lb: &gtk4::ListBox) {
 pub(crate) mod tests {
     use super::*;
     use crate::test_support::{pool, pump_until};
+    use abs_storage::repo::libraries::UpsertLibrary;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -727,7 +797,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         // `empty_state` starts in the syncing state (only shown while nothing is cached), so
@@ -775,7 +845,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {});
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
 
@@ -805,7 +875,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         // An always-empty result looks identical before and after sync, but the state machine's
@@ -853,7 +923,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.empty_state.retry.is_visible(), Duration::from_secs(10));
@@ -874,6 +944,96 @@ pub(crate) mod tests {
 
         assert!(hooks.libraries_list.row_at_index(0).is_some(), "a successful retry should land the data");
         assert!(!hooks.banner.widget().reveals_child(), "a successful retry must not leave a failure banner up");
+    }
+
+    /// The authorization-failure path: the server 401s the sync (a dead session — revoked or
+    /// expired refresh token, removed user). The state must not read as an ordinary sync failure:
+    /// it offers "Log in again", and pressing it hands control to the shell (`on_relogin`) rather
+    /// than pretending a retry could help.
+    pub(crate) fn run_offers_login_again_when_the_session_is_rejected(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        // The stored token is a plain string (not a JWT), so `Session` hands it over untouched —
+        // exactly the legacy-token case, and the request then 401s like a revoked session would.
+        let relogin_requested = std::rc::Rc::new(std::cell::Cell::new(false));
+        let on_relogin = {
+            let relogin_requested = relogin_requested.clone();
+            move || relogin_requested.set(true)
+        };
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.empty_state.login_again.is_visible(), Duration::from_secs(10));
+
+        assert!(hooks.empty_state.root.is_visible());
+        assert_eq!(hooks.empty_state.title.label(), "Sign in again");
+        assert!(hooks.empty_state.retry.is_visible(), "retry stays available alongside the login action");
+        assert!(!hooks.banner.widget().reveals_child(), "nothing is cached, so no banner");
+        assert!(!relogin_requested.get(), "merely showing the state must not trigger a re-login");
+
+        hooks.empty_state.login_again.emit_clicked();
+        assert!(
+            relogin_requested.get(),
+            "the login button must hand control back to the shell via on_relogin"
+        );
+    }
+
+    /// Same dead session, but with cached data on screen: the failure lands in the banner (which
+    /// stays up because the scroller no longer hides), with its own "Log in again" action.
+    pub(crate) fn run_shows_login_again_in_the_banner_when_a_resync_is_rejected(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // Data from a previous sync, so the shelves render and the failure must take the banner
+        // path ("showing what's cached"), not the empty-state path.
+        runtime.block_on(abs_storage::repo::libraries::upsert(
+            &pool,
+            UpsertLibrary {
+                id: "lib-1",
+                server_id: &server.id,
+                name: "Audiobooks",
+                media_type: "book",
+                icon: None,
+                display_order: 1,
+            },
+        ))
+        .unwrap();
+
+        let relogin_requested = std::rc::Rc::new(std::cell::Cell::new(false));
+        let on_relogin = {
+            let relogin_requested = relogin_requested.clone();
+            move || relogin_requested.set(true)
+        };
+        let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
+
+        assert_eq!(hooks.banner.title(), "Session expired — showing what's cached.");
+        assert!(hooks.banner.action_visible(), "an auth failure must offer Log in again in the banner");
+        assert_eq!(hooks.banner.action_label(), "Log in again");
+        assert!(!hooks.empty_state.root.is_visible(), "cached data keeps the shelves up; no empty state");
+
+        hooks.banner.action_button().emit_clicked();
+        assert!(relogin_requested.get(), "the banner's login action must fire on_relogin too");
     }
 
     /// A fresh login with a slow server: the spinner state must be up — and animated — for as
@@ -906,7 +1066,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         assert!(hooks.empty_state.root.is_visible(), "with nothing cached, the empty state should be up immediately");
@@ -971,7 +1131,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account.id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &mock_server.uri(), &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(10));
@@ -999,7 +1159,7 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.libraries_list.row_at_index(0).is_some(), Duration::from_secs(20));

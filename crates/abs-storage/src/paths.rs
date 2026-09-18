@@ -92,6 +92,27 @@ impl AppPaths {
         tokio::fs::create_dir_all(self.covers_dir()).await?;
         Ok(())
     }
+
+    /// Delete everything on disk scoped to one server — its cover-cache subtree
+    /// (`covers/<server_id>/`) and its downloads subtree (`downloads/<server_id>/`). Used when a
+    /// re-login switches to a different server and the old one's cached files would otherwise sit
+    /// orphaned forever. Missing directories are fine (nothing was ever downloaded); any other
+    /// error surfaces to the caller, which decides it's non-fatal — stale files are wasteful, not
+    /// harmful.
+    pub async fn purge_server_data(&self, server_id: &str) -> std::io::Result<()> {
+        let mut first_error = None;
+        for dir in [self.downloads_dir().join(server_id), self.covers_dir().join(server_id)] {
+            if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
+                if err.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,15 +177,45 @@ mod tests {
         assert!(paths.cache_dir().is_dir());
         assert!(paths.covers_dir().is_dir());
     }
-
     #[tokio::test]
     async fn ensure_dirs_is_idempotent() {
         let (_tmp, paths) = test_paths();
         paths.ensure_dirs().await.expect("first call succeeds");
+
         paths
             .ensure_dirs()
             .await
             .expect("second call on already-existing dirs also succeeds");
+    }
+
+    #[tokio::test]
+    async fn purge_server_data_removes_only_that_servers_subtrees() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().await.unwrap();
+
+        let old_cover = paths.cover_cache_path("old-server", "item-1", "jpg");
+        tokio::fs::create_dir_all(old_cover.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&old_cover, b"bytes").await.unwrap();
+        let old_download = paths.item_downloads_dir("old-server", "item-1");
+        tokio::fs::create_dir_all(&old_download).await.unwrap();
+        tokio::fs::write(old_download.join("001-ch.mp3"), b"bytes").await.unwrap();
+        let kept_cover = paths.cover_cache_path("kept-server", "item-1", "jpg");
+        tokio::fs::create_dir_all(kept_cover.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&kept_cover, b"bytes").await.unwrap();
+
+        paths.purge_server_data("old-server").await.expect("purge succeeds");
+
+        assert!(!old_cover.exists(), "the old server's covers must go");
+        assert!(!old_download.exists(), "the old server's downloads must go");
+        assert!(kept_cover.exists(), "other servers' files must be untouched");
+    }
+
+    #[tokio::test]
+    async fn purge_server_data_tolerates_a_server_that_never_downloaded_anything() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().await.unwrap();
+
+        paths.purge_server_data("no-such-server").await.expect("missing dirs are a no-op, not an error");
     }
 
     #[test]

@@ -49,66 +49,97 @@ fn build_window(app: &adw::Application, state: &AppState) {
     add_keyboard_support(app, &window);
 
     match &state.active_account {
-        None => {
-            let pool = state.pool.clone();
-            let paths = state.paths.clone();
-            let window_for_callback = window.clone();
-            let on_success_pool = pool.clone();
-            let playback_settings = state.playback_settings;
-            let screen = screens::welcome::build(pool, move |added| {
-                let pool = on_success_pool.clone();
-                let paths = paths.clone();
-                let window_for_callback = window_for_callback.clone();
-                glib::spawn_future_local(async move {
-                    // `add_server_and_login` only hands back ids; re-fetch the full rows rather
-                    // than threading server/account fields through `AddedAccount` just for this.
-                    let server = abs_storage::repo::servers::get(&pool, &added.server_id)
-                        .await
-                        .expect("the server just created by add_server_and_login must exist");
-                    let account = abs_storage::repo::accounts::get(&pool, &added.account_id)
-                        .await
-                        .expect("the account just created by add_server_and_login must exist");
-                    let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-                    let main_window = screens::main_window::build(
-                        pool,
-                        paths,
-                        server,
-                        account,
-                        session,
-                        playback_settings,
-                        window_for_callback.clone(),
-                    );
-                    window_for_callback.set_content(Some(&main_window.root));
-                });
-            });
-            window.set_content(Some(&screen.root));
-        }
-        Some(account) => {
-            let pool = state.pool.clone();
-            let paths = state.paths.clone();
-            let account = account.clone();
-            let window_for_callback = window.clone();
-            let playback_settings = state.playback_settings;
-            glib::spawn_future_local(async move {
-                let server = abs_storage::repo::servers::get(&pool, &account.server_id)
-                    .await
-                    .expect("an active account's server must exist");
-                let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
-                let main_window = screens::main_window::build(
-                    pool,
-                    paths,
-                    server,
-                    account,
-                    session,
-                    playback_settings,
-                    window_for_callback.clone(),
-                );
-                window_for_callback.set_content(Some(&main_window.root));
-            });
-        }
+        None => show_welcome(&window, state.pool.clone(), state.paths.clone(), state.playback_settings, None),
+        Some(_) => show_main(&window, state.pool.clone(), state.paths.clone(), state.playback_settings),
     }
 
     window.present();
+}
+
+/// Swaps the window's content for the login screen. `seed` turns this into the re-login flow:
+/// the form comes pre-filled with the seeded session's URL and username (only the password left
+/// to type), a Cancel affordance returns to the main window, and replacing the seeded session's
+/// local data with different credentials asks for confirmation first. `None` is the plain
+/// first-run flow.
+pub(crate) fn show_welcome(
+    window: &adw::ApplicationWindow,
+    pool: SqlitePool,
+    paths: abs_storage::AppPaths,
+    playback_settings: abs_core::settings::PlaybackSettings,
+    seed: Option<abs_core::accounts::ReloginSeed>,
+) {
+    let window_for_callback = window.clone();
+    let on_success_pool = pool.clone();
+    let on_success_paths = paths.clone();
+    // Cancel only exists in the re-login flow (first run has nothing to go back to), and goes
+    // back to the main window resolved fresh from the database — the session it returns to is
+    // exactly the seeded one, untouched by an aborted re-login.
+    let on_cancel: Option<std::rc::Rc<dyn Fn()>> = seed.as_ref().map(|_| {
+        let pool = pool.clone();
+        let paths = paths.clone();
+        let window = window.clone();
+        std::rc::Rc::new(move || show_main(&window, pool.clone(), paths.clone(), playback_settings))
+            as std::rc::Rc<dyn Fn()>
+    });
+
+    let screen = screens::welcome::build(
+        pool,
+        paths,
+        seed,
+        move |_added| {
+            // The just-logged-in account is the active one by the time on_success fires, so
+            // resolving the main window from the DB's active account (rather than the callback's
+            // ids) builds the identical shell — and doubles as the Cancel flow's entry point.
+            let pool = on_success_pool.clone();
+            let paths = on_success_paths.clone();
+            let window = window_for_callback.clone();
+            glib::spawn_future_local(async move {
+                let main_window =
+                    build_main_window(pool, paths, playback_settings, window.clone()).await;
+                window.set_content(Some(&main_window.root));
+            });
+        },
+        on_cancel,
+    );
+    window.set_content(Some(&screen.root));
+}
+
+/// Swaps the window's content for the main shell, resolved from the database's active account —
+/// the single entry point for every path back into the app (startup, post-login, re-login
+/// cancel).
+pub(crate) fn show_main(
+    window: &adw::ApplicationWindow,
+    pool: SqlitePool,
+    paths: abs_storage::AppPaths,
+    playback_settings: abs_core::settings::PlaybackSettings,
+) {
+    let window_for_content = window.clone();
+    glib::spawn_future_local(async move {
+        let main_window = build_main_window(pool, paths, playback_settings, window_for_content.clone()).await;
+        window_for_content.set_content(Some(&main_window.root));
+    });
+}
+
+/// Resolves the active account (and its server) from storage and builds the main shell. Panics
+/// on a missing active account — every caller guarantees one by construction (checked at startup,
+/// or just created by a successful login), so this is a caller bug, not a runtime condition.
+async fn build_main_window(
+    pool: SqlitePool,
+    paths: abs_storage::AppPaths,
+    playback_settings: abs_core::settings::PlaybackSettings,
+    window: adw::ApplicationWindow,
+) -> screens::main_window::MainWindow {
+    // Re-fetch the full rows rather than threading server/account fields through callbacks —
+    // ids are all the login flows hand back.
+    let account = abs_storage::repo::accounts::get_active(&pool)
+        .await
+        .expect("checking for an active account must not fail")
+        .expect("the main window requires an active account");
+    let server = abs_storage::repo::servers::get(&pool, &account.server_id)
+        .await
+        .expect("an active account's server must exist");
+    let session = abs_core::auth::Session::new(pool.clone(), &server.url, &server.id, &account);
+    screens::main_window::build(pool, paths, server, account, session, playback_settings, window)
 }
 
 /// The keyboard half of ui-spec §6: the accelerators (app-wide — they only fire when the matching

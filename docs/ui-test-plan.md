@@ -97,6 +97,20 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       credentials.
       *Expected:* the connectivity-failure banner (WT-8 wording), app stays on the login screen.
 
+- [ ] **WT-13 — Re-login is pre-filled and abortable.** Trigger the re-login flow (HT-2a: let a
+      session die, press Log in again).
+      *Expected:* the login screen appears with Server URL and Username already filled in
+      (password empty and focused), and a Cancel button below Connect. Cancel returns to the app
+      with the old session still working; the form is otherwise the ordinary login screen (WT-1
+      minus "no back button anywhere").
+
+- [ ] **WT-14 — Replacing an account asks first.** From WT-13's pre-filled screen, change the
+      username (or the URL) and connect.
+      *Expected:* a confirmation dialog spelling out what will be removed on this device before
+      anything happens. Cancel dismisses it with nothing changed (the form stays usable, the old
+      session stays active). Replace proceeds with the login; if the login then fails, the old
+      session is still intact (retryable, nothing was removed).
+
 ---
 
 ## 2. App shell & navigation (NT) — ✅ implemented (stubs for unbuilt tabs)
@@ -131,6 +145,23 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       details line and a Try again button that restarts the sync; if the server genuinely has no
       libraries, "No library synced yet" with Try again.
 
+- [ ] **HT-2a — Dead session state.** Point the app at a server that 401s the sync (revoked
+      refresh token, removed user — anything that makes the server reject the session).
+      *Expected:* "Sign in again" with "Your session on this server has expired or was revoked.",
+      the error in the details line, and both Try again and a **Log in again** button. Pressing
+      Log in again opens the Welcome screen with URL and username pre-filled (only the password
+      left to type) and a Cancel button back to the app.
+
+- [ ] **HT-2b — Re-login replaces cleanly.** From HT-2a's pre-filled Welcome screen, sign in
+      with the same credentials; then again with a different account on the same server; then
+      with a different server entirely.
+      *Expected:* same credentials — straight back to your libraries, no prompt, no re-sync from
+      scratch. Different account on the same server — a confirmation dialog explains the old
+      account's on-device progress is removed; after confirming, the libraries appear immediately
+      (the cache is reused). Different server — the dialog explains the old server's cached data
+      is removed; after confirming, a fresh sync runs. Cancelling the dialog or pressing Cancel
+      at any point changes nothing (the old session stays intact).
+
 - [ ] **HT-3 — Tapping a cover starts playback.** Tap any cover card in Continue Listening or
       Recently Added.
       *Expected:* playback starts (mini bar appears). Note: the spec's end state is tapping
@@ -142,7 +173,9 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       *Expected:* banner "Couldn't sync — showing what's cached." and the previously cached
       shelves still render. With nothing cached, the retryable failure state shows instead
       ("Couldn't sync your libraries" + Try again) — the error is never hidden behind an empty
-      state. No crash, no blank page.
+      state. If the failure is an authorization failure instead (server 401s the session), the
+      banner reads "Session expired — showing what's cached." and carries a **Log in again**
+      button (HT-2a). No crash, no blank page.
 
 - [ ] **HT-5 — Cached render beats the network.** With Wi-Fi off but a previously synced Home,
       launch the app.

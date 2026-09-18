@@ -92,17 +92,21 @@ mod tests {
         let _guard = runtime.enter();
 
         crate::screens::welcome::tests::run(&runtime);
+        crate::screens::welcome::tests::run_relogin_flow(&runtime);
         crate::screens::home::tests::run_renders_synced_library_and_recently_added_item(&runtime);
         crate::screens::home::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::home::tests::run_shows_a_retryable_error_when_the_first_sync_fails(&runtime);
         crate::screens::home::tests::run_offline_mode_toggle_filters_recently_added(&runtime);
         crate::screens::home::tests::run_shows_a_spinner_while_the_first_sync_is_running(&runtime);
         crate::screens::home::tests::run_expired_token_is_refreshed_before_syncing(&runtime);
+        crate::screens::home::tests::run_offers_login_again_when_the_session_is_rejected(&runtime);
+        crate::screens::home::tests::run_shows_login_again_in_the_banner_when_a_resync_is_rejected(&runtime);
         crate::screens::library::tests::run_renders_all_synced_items(&runtime);
         crate::screens::library::tests::run_search_filters_by_title_and_author(&runtime);
         crate::screens::library::tests::run_sort_changes_order(&runtime);
         crate::screens::library::tests::run_offline_mode_toggle_filters_to_downloaded_items(&runtime);
         crate::screens::library::tests::run_shows_a_banner_when_sync_fails(&runtime);
+        crate::screens::library::tests::run_shows_login_again_in_the_banner_when_a_resync_is_rejected(&runtime);
         crate::screens::library::tests::run_shows_empty_state_when_the_server_has_no_libraries(&runtime);
         crate::screens::library::tests::run_tapping_a_card_invokes_on_play(&runtime);
         crate::screens::library::tests::run_list_view_toggle_switches_visible_container(&runtime);

@@ -19,6 +19,7 @@ pub struct ErrorBanner {
     label: gtk4::Label,
     expander: gtk4::Expander,
     details_label: gtk4::Label,
+    action_button: gtk4::Button,
 }
 
 impl ErrorBanner {
@@ -37,6 +38,15 @@ impl ErrorBanner {
             .build();
         message_row.append(&icon);
         message_row.append(&label);
+
+        // The optional trailing action (e.g. "Log in again" on an authorization failure). Hidden
+        // unless `set_action_label` says otherwise; visibility is relative to the revealer's, so
+        // `set_revealed` keeps owning whether the banner shows at all.
+        let action_button = gtk4::Button::builder()
+            .css_classes(["pill"])
+            .valign(gtk4::Align::Center)
+            .visible(false)
+            .build();
 
         // Collapsed by default: raw HTTP/TLS library text isn't meant for a general audience, but
         // a self-hosted user debugging an unusual TLS/proxy setup benefits from being able to see
@@ -62,6 +72,7 @@ impl ErrorBanner {
             .margin_start(12)
             .margin_end(12)
             .build();
+        message_row.append(&action_button);
         content.append(&message_row);
         content.append(&expander);
 
@@ -71,7 +82,7 @@ impl ErrorBanner {
             .reveal_child(false)
             .build();
 
-        Self { revealer, label, expander, details_label }
+        Self { revealer, label, expander, details_label, action_button }
     }
 
     pub fn widget(&self) -> &gtk4::Revealer {
@@ -101,6 +112,33 @@ impl ErrorBanner {
                 self.expander.set_visible(false);
             }
         }
+    }
+
+    /// The optional trailing action button (e.g. "Log in again" on an authorization failure).
+    /// `Some(label)` shows the button; wire its handler via [`Self::action_button`] once per
+    /// banner — the label is pure state, the handler survives relabeling.
+    pub fn set_action_label(&self, label: Option<&str>) {
+        match label {
+            Some(text) => {
+                self.action_button.set_label(text);
+                self.action_button.set_visible(true);
+            }
+            None => self.action_button.set_visible(false),
+        }
+    }
+
+    pub fn action_button(&self) -> &gtk4::Button {
+        &self.action_button
+    }
+
+    #[cfg(test)]
+    pub fn action_label(&self) -> glib::GString {
+        self.action_button.label().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn action_visible(&self) -> bool {
+        self.action_button.is_visible()
     }
 
     #[cfg(test)]
