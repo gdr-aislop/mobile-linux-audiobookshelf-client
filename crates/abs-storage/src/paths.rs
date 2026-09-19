@@ -115,6 +115,16 @@ impl AppPaths {
     }
 }
 
+/// Bytes available to this (unprivileged) process on the filesystem holding `path` — what the
+/// download sheet's size estimates are compared against (ui-spec: an option whose estimate
+/// exceeds free space is refused up front instead of failing partway through). `None` when it
+/// can't be determined (the path doesn't exist yet, an exotic filesystem) — callers must treat
+/// that as "don't restrict", never as "zero": an unknown free space must not block downloads.
+pub fn free_space_bytes(path: &Path) -> Option<u64> {
+    let stats = rustix::fs::statvfs(path).ok()?;
+    Some(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +133,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
         (tmp, paths)
+    }
+
+    #[test]
+    fn free_space_is_some_positive_for_an_existing_dir_and_none_for_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let free = free_space_bytes(tmp.path());
+        assert!(free.is_some_and(|bytes| bytes > 0), "a real directory always has some free space");
+
+        assert_eq!(free_space_bytes(&tmp.path().join("does-not-exist")), None, "a missing path can't be probed — treated as unknown, not zero");
     }
 
     #[test]

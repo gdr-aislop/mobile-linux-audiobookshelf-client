@@ -139,6 +139,15 @@ impl DownloadManager {
         self.inner.borrow().batches.contains_key(&(server_id.to_string(), item_id.to_string()))
     }
 
+    /// Bytes free on the filesystem holding the downloads directory — the number the download
+    /// sheet's size estimates are compared against. The downloads dir may not exist yet (it's
+    /// created lazily at first download), so its parent is probed first; either missing means
+    /// "unknown", and the sheet must treat unknown as unrestricted, never as empty.
+    pub fn free_space_bytes(&self) -> Option<u64> {
+        let paths = self.inner.borrow().paths.clone();
+        abs_storage::paths::free_space_bytes(&paths.downloads_dir()).or_else(|| abs_storage::paths::free_space_bytes(paths.data_dir()))
+    }
+
     pub fn set_wifi_only(&self, value: bool) {
         self.inner.borrow_mut().wifi_only = value;
     }

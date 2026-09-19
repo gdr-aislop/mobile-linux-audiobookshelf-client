@@ -322,7 +322,9 @@ pub fn build(
             // read, so only the async pass has them — subtitles arriving a moment later is the
             // expected two-stage render, same as the chapter rows' offline glyphs.
             let chapter_ranges: Vec<(f64, f64)> = controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
-            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &[], &next_count, &toast_overlay);
+            // Free space is one cheap statvfs — available even to the synchronous first pass.
+            let free_space = download_manager.free_space_bytes();
+            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &[], free_space, &next_count, &toast_overlay);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let download_popover_box = download_popover_box.clone();
@@ -335,7 +337,7 @@ pub fn build(
                 async move {
                     let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
                     let tracks = abs_core::tracks::cached_tracks(&pool, &server_id, &item_id).await.unwrap_or_default();
-                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &tracks, &next_count, &toast_overlay);
+                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &tracks, free_space, &next_count, &toast_overlay);
                 }
             });
         }
@@ -606,6 +608,16 @@ fn estimate_label(bytes: u64) -> gtk4::Label {
         .build()
 }
 
+/// The spec's "Not enough free space" subtitle — the row's estimate exceeds the free space the
+/// manager just measured, so the row refuses to start anything (it toasts instead).
+fn blocked_label() -> gtk4::Label {
+    gtk4::Label::builder()
+        .label("Not enough free space")
+        .css_classes(["error"])
+        .xalign(0.0)
+        .build()
+}
+
 /// (Re)builds the download button's popover rows: the four scope options from ui-spec's Item
 /// Detail download sheet — "Current chapter", "Next chapters" with its inline − / count / +
 /// stepper (default 10, clamped to the chapters actually remaining after the current one; tapping
@@ -627,6 +639,7 @@ fn populate_download_popover_rows(
     current_chapter_index: usize,
     chapter_ranges: &[(f64, f64)],
     tracks: &[abs_core::tracks::TrackRef],
+    free_space: Option<u64>,
     next_count: &Rc<Cell<u32>>,
     toast_overlay: &adw::ToastOverlay,
 ) {
@@ -643,8 +656,14 @@ fn populate_download_popover_rows(
     let add_scope_row = |label: &str, scope: DownloadScope| {
         let inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).build();
         inner.append(&gtk4::Label::builder().label(label).xalign(0.0).build());
-        if let Some(bytes) = estimate_for(scope) {
-            inner.append(&estimate_label(bytes));
+        // ui-spec: an option whose estimate exceeds free space switches its subtitle to an error
+        // tint reading "Not enough free space" instead of letting the download start and fail
+        // partway through. Unknown free space (or unknown size) never blocks anything.
+        let blocked = matches!((estimate_for(scope), free_space), (Some(bytes), Some(free)) if bytes > free);
+        match (estimate_for(scope), blocked) {
+            (Some(bytes), false) => inner.append(&estimate_label(bytes)),
+            (Some(_), true) => inner.append(&blocked_label()),
+            (None, _) => {}
         }
         let button = gtk4::Button::builder().child(&inner).css_classes(["flat"]).build();
         button.connect_clicked({
@@ -654,6 +673,10 @@ fn populate_download_popover_rows(
             let item_id = item_id.to_string();
             let toast_overlay = toast_overlay.clone();
             move |_| {
+                if blocked {
+                    toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
+                    return;
+                }
                 download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
                 popover.popdown();
                 toast_overlay.add_toast(adw::Toast::new("Download started"));
@@ -700,6 +723,10 @@ fn populate_download_popover_rows(
     let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
     let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
     let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
+    // Whether the Next-chapters estimate currently exceeds free space — flipped by the subtitle
+    // update (which knows) and read by the row's click handler, so stepping into or out of the
+    // blocked range changes what tapping the row does.
+    let next_blocked = Rc::new(Cell::new(false));
 
     let update_count_label: Rc<dyn Fn()> = {
         let count_label = count_label.clone();
@@ -709,16 +736,30 @@ fn populate_download_popover_rows(
     let update_next_subtitle: Rc<dyn Fn()> = {
         let next_subtitle = next_subtitle.clone();
         let next_count = next_count.clone();
+        let next_blocked = next_blocked.clone();
         let tracks = tracks.to_vec();
         let chapter_ranges = chapter_ranges.to_vec();
         Rc::new(move || {
             let scope = DownloadScope::NextChapters(next_count.get());
-            match estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index) {
-                Some(bytes) => {
-                    next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
+            match (estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index), free_space) {
+                (Some(bytes), Some(free)) if bytes > free => {
+                    next_subtitle.set_label("Not enough free space");
+                    next_subtitle.remove_css_class("dim-label");
+                    next_subtitle.add_css_class("error");
                     next_subtitle.set_visible(true);
+                    next_blocked.set(true);
                 }
-                None => next_subtitle.set_visible(false),
+                (Some(bytes), _) => {
+                    next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
+                    next_subtitle.remove_css_class("error");
+                    next_subtitle.add_css_class("dim-label");
+                    next_subtitle.set_visible(true);
+                    next_blocked.set(false);
+                }
+                (None, _) => {
+                    next_subtitle.set_visible(false);
+                    next_blocked.set(false);
+                }
             }
         })
     };
@@ -754,7 +795,12 @@ fn populate_download_popover_rows(
         let item_id = item_id.to_string();
         let toast_overlay = toast_overlay.clone();
         let next_count = next_count.clone();
+        let next_blocked = next_blocked.clone();
         move |_| {
+            if next_blocked.get() {
+                toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
+                return;
+            }
             download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
             popover.popdown();
             toast_overlay.add_toast(adw::Toast::new("Download started"));
@@ -1174,6 +1220,61 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A scope whose estimate exceeds free
+    /// space must switch to the spec's error-tinted "Not enough free space" subtitle and refuse to
+    /// start (ID-10/ID-16: no download, no partial state) — the sizes here are petabyte-scale
+    /// precisely so the assertion can't depend on the test machine's actual free space.
+    pub(crate) fn run_download_rows_block_when_free_space_is_insufficient(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        // Same read side the real flow produces (the manager caches these sizes on an item's first
+        // download) — but sized like the Library of Alexandria's raw footage.
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[
+            abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 5.0, offset_seconds: 0.0, size_bytes: Some(1_000_000_000_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "2", duration_seconds: 5.0, offset_seconds: 5.0, size_bytes: Some(1_000_000_000_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "3", duration_seconds: 5.0, offset_seconds: 10.0, size_bytes: Some(1_000_000_000_000_000) },
+        ]))
+        .unwrap();
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.chapters().len() == 3, Duration::from_secs(10));
+
+        // The manager's own test helper mints a fresh paths tempdir; this test needs one whose
+        // directories actually exist, since free space is "unknown" (and unknown is treated as
+        // unrestricted) for a path that isn't there yet.
+        let paths = crate::test_support::test_paths();
+        runtime.block_on(paths.ensure_dirs()).unwrap();
+        let download_manager = DownloadManager::new(pool.clone(), paths, Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        let screen = build(pool.clone(), controller.clone(), download_manager.clone(), || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        pump_until(|| blocked_row_count(&hooks.download_popover_box) == 4, Duration::from_secs(2));
+
+        click_button_labeled(&hooks.download_popover_box, "Entire book");
+        // Let any wrongly-started download land; nothing should (the same pump-a-beat-and-check
+        // idiom `run_..._reset_progress...` uses for proving a negative).
+        pump_until(|| false, Duration::from_millis(300));
+        let rows = runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap();
+        assert!(rows.is_empty(), "a blocked row must not start any download, not even partially");
+
+        window.destroy();
+        controller.stop();
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking a speed preset should call
     /// through to the real backend and update both the controller's snapshot and the button's
     /// label.
@@ -1505,5 +1606,18 @@ pub(crate) mod tests {
             }
         });
         texts
+    }
+
+    /// How many scope rows currently show the spec's "Not enough free space" subtitle.
+    fn blocked_row_count(container: &gtk4::Box) -> usize {
+        let mut count = 0;
+        for_each_descendant(container.upcast_ref(), &mut |widget| {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                if label.label() == "Not enough free space" {
+                    count += 1;
+                }
+            }
+        });
+        count
     }
 }

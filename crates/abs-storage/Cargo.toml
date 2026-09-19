@@ -8,6 +8,7 @@ license.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 directories.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
