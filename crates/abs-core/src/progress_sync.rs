@@ -11,6 +11,12 @@
 
 use std::time::Duration;
 
+// The stringify-into-`CoreError` boundaries below use `error_chain` rather than plain
+// `to_string()`: reqwest's Display is just "error sending request for url (...)" for every
+// transport failure — timeout, DNS and TLS certificate errors are indistinguishable without
+// the `source()` chain it never prints.
+use abs_api::error_chain;
+
 use crate::error::{CoreError, Result};
 
 /// Best-effort work should never be felt as a hang — this is deliberately much shorter than the
@@ -32,9 +38,9 @@ pub async fn reconcile_item_progress(
 ) -> Result<()> {
     let api = connection
         .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+        .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
     let Some(server_progress) =
-        api.get_media_progress(item_id).await.map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?
+        api.get_media_progress(item_id).await.map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?
     else {
         return Ok(());
     };
@@ -56,8 +62,8 @@ pub async fn reconcile_all_progress(
 ) -> Result<()> {
     let api = connection
         .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
-    let all_progress = api.get_all_media_progress().await.map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+        .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
+    let all_progress = api.get_all_media_progress().await.map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
 
     for server_progress in &all_progress {
         if abs_storage::repo::items::get(pool, server_id, &server_progress.library_item_id).await.is_err() {

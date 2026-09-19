@@ -573,15 +573,43 @@ impl PlayerController {
                 }
             };
 
+            // The cover fetch is detached from playback start entirely: even bounded by its
+            // own timeout, waiting for it in the join below could delay the first note on a
+            // slow network (each cover fetch opens a fresh connection — cold DNS + TCP + TLS
+            // before any bytes move). Instead it runs as its own background task and lands in
+            // the snapshot whenever it's ready — cache hits within a tick, cold fetches after —
+            // which the mini-player, player screen and MPRIS art all pick up automatically.
+            {
+                let inner_rc = inner_rc.clone();
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let connection = connection.clone();
+                let access_token = access_token.clone();
+                let server_id = session.server_id().to_string();
+                let item_id = item.item_id.clone();
+                tokio::spawn(async move {
+                    let Some(cover_path) =
+                        abs_core::covers::fetch_and_cache_cover(&paths, &pool, &connection, &access_token, &server_id, &item_id).await
+                    else {
+                        return;
+                    };
+                    let mut inner = inner_rc.borrow_mut();
+                    match &mut inner.now_playing {
+                        Some(now_playing) if now_playing.item_id == item_id => now_playing.cover_path = Some(cover_path),
+                        // Playback ended or switched items while the fetch was in flight.
+                        _ => return,
+                    }
+                    inner.publish();
+                });
+            }
+
             // Resolving the stream URL is required to proceed — unless the item can be played
-            // from locally cached state instead (below). Reconciling progress and fetching the
-            // cover are both nice-to-haves that must never add their own delay on top — run
-            // all three concurrently (each already has its own bounded timeout) rather than one
-            // after another, so a slow or unreachable server is only ever felt once, not thrice.
-            let (target_result, reconcile_result, cover_path) = tokio::join!(
+            // from locally cached state instead (below). Reconciling progress is a nice-to-have
+            // that must never add its own delay on top — run both concurrently rather than one
+            // after another, so a slow or unreachable server is only ever felt once, not twice.
+            let (target_result, reconcile_result) = tokio::join!(
                 abs_core::streaming::resolve_stream_target(&connection, &access_token, &item.item_id),
                 abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item.item_id),
-                abs_core::covers::fetch_and_cache_cover(&paths, &pool, &connection, &access_token, session.server_id(), &item.item_id),
             );
             if let Err(err) = reconcile_result {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't reconcile progress with the server; using local progress");
@@ -699,7 +727,9 @@ impl PlayerController {
                 chapters,
                 speed: applied_speed,
                 sleep_timer: SleepTimerState::Off,
-                cover_path,
+                // Filled in by the detached cover-fetch task above once it lands (cache hits
+                // within a tick, cold fetches when the fetch finishes) — never gating start.
+                cover_path: None,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();

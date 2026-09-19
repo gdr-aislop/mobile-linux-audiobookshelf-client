@@ -2,6 +2,7 @@
 
 use abs_storage::repo::items::{self, UpsertItem};
 use abs_storage::repo::libraries::{self, UpsertLibrary};
+use abs_api::error_chain;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
@@ -26,11 +27,13 @@ fn auth_or_unexpected(status: Option<u16>, fallback: String) -> CoreError {
 pub async fn sync_libraries(pool: &SqlitePool, api: &abs_api::Client, server_id: &str) -> Result<usize> {
     // `progenitor`'s generated `Error<E>` type differs per operation (its error-body type
     // parameter), so there's no single `From` impl to lean on here — stringify instead,
-    // preserving only the auth distinction via the error's HTTP status.
+    // preserving only the auth distinction via the error's HTTP status. The string keeps the
+    // full error chain (`error_chain`), so a transport failure is logged/shown with its real
+    // cause instead of reqwest's display, which is identical for every failure mode.
     let response = api
         .get_libraries()
         .await
-        .map_err(|e| auth_or_unexpected(e.status().map(|s| s.as_u16()), e.to_string()))?;
+        .map_err(|e| auth_or_unexpected(e.status().map(|s| s.as_u16()), error_chain(&e)))?;
     let libraries = response.into_inner().libraries;
 
     let mut synced = 0;
@@ -75,7 +78,7 @@ pub async fn sync_items_for_library(
         .await
         .map_err(|e| match e {
             abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
-            other => CoreError::UnexpectedResponse(other.to_string()),
+            other => CoreError::UnexpectedResponse(other.details()),
         })?;
 
     let mut synced = 0;
@@ -114,7 +117,7 @@ pub async fn sync_items_for_library(
 pub async fn sync_all(pool: &SqlitePool, connection: &crate::connection::ConnectionTarget, server_id: &str, access_token: &str) -> Result<()> {
     let api = connection
         .api_client(access_token)
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+        .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
     sync_libraries(pool, &api, server_id).await?;
     for library in libraries::list_for_server(pool, server_id).await? {
         sync_items_for_library(pool, &api, server_id, &library.id).await?;

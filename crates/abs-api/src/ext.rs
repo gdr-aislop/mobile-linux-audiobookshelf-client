@@ -66,13 +66,7 @@ impl LoginError {
             LoginError::Tls(e) | LoginError::Connect(e) | LoginError::Timeout(e) | LoginError::Network(e) => e,
             LoginError::InvalidCredentials | LoginError::SessionExpired | LoginError::UnexpectedResponse(_) => return None,
         };
-        let mut parts = vec![err.to_string()];
-        let mut current = err.source();
-        while let Some(source) = current {
-            parts.push(source.to_string());
-            current = source.source();
-        }
-        Some(parts.join(" → "))
+        Some(error_chain(err))
     }
 }
 
@@ -105,6 +99,47 @@ fn is_tls_error(err: &(dyn std::error::Error + 'static)) -> bool {
         return true;
     }
     err.source().is_some_and(is_tls_error)
+}
+
+/// Walks an error's `source()` chain into a single line: the error itself, then each cause,
+/// joined with " → ". reqwest's `Display` is just "error sending request for url (...)" for
+/// every transport failure — a timeout, a DNS failure, a refused connection and a TLS
+/// handshake failure all print identically — while what actually happened only appears in
+/// the `source()` chain, which `Display` never prints. Every log line and "details" surface
+/// for transport errors is built on this ([`LoginError::details`],
+/// [`LibraryItemsError::details`]).
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        parts.push(source.to_string());
+        current = source.source();
+    }
+    parts.join(" → ")
+}
+
+/// A short, greppable classification of a transport failure — `"timeout"`, `"tls"`,
+/// `"connect"` (DNS or TCP; hyper reports DNS failures as connect errors), `"body"`,
+/// `"decode"`, `"request"` (any other send-phase failure) or `"unknown"`. Checks are ordered
+/// most-actionable-first: a timed-out connect reports as `"timeout"`, and a TLS failure
+/// while connecting as `"tls"` (matched via the source chain, reqwest having no public
+/// `is_tls`).
+pub fn transport_error_kind(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if is_tls_error(err) {
+        "tls"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_body() {
+        "body"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_request() {
+        "request"
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,6 +486,20 @@ pub enum LibraryItemsError {
     Unauthorized(u16),
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
+}
+
+impl LibraryItemsError {
+    /// What happened, in one line for logs: a transport failure ([`LibraryItemsError::Network`])
+    /// gets a short classification ([`transport_error_kind`]) plus the full `source()` chain
+    /// ([`error_chain`]) — reqwest's Display alone is identical for a timeout, a DNS failure
+    /// and a certificate error — while the other variants already name their cause in
+    /// `Display` (an HTTP status, in particular, e.g. a 404 from a missing cover).
+    pub fn details(&self) -> String {
+        match self {
+            LibraryItemsError::Network(err) => format!("{}: {}", transport_error_kind(err), error_chain(err)),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Whether an HTTP status means "this session itself is dead — only signing in again fixes it".
@@ -877,6 +926,64 @@ mod tests {
         let result = client.get_media_progress("item-1").await;
         assert!(result.is_err(), "a request to a server that never responds must time out, not succeed");
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "the timeout should cut this off in ~200ms, not hang");
+    }
+
+    /// The full classification pipeline on a genuine timeout (same never-responding server shape
+    /// as the hang test above): `LibraryItemsError::details` must lead with the kind — "timeout"
+    /// — and walk the source chain, because reqwest's Display alone is identical for every
+    /// failure mode and the log line built on this is what a user debugging a slow server sees.
+    #[tokio::test]
+    async fn library_items_error_details_leads_with_the_kind_and_walks_the_chain() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept the connection and hold it open forever without writing a response.
+            let _ = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+
+        let client = Client::with_bearer_token_and_timeout(&format!("http://{addr}"), "token", std::time::Duration::from_millis(200)).unwrap();
+        let err = client.get_library_items_with_media("lib-1").await.unwrap_err();
+
+        let details = err.details();
+        assert!(details.starts_with("timeout: "), "got {details}");
+        assert!(details.contains("error sending request for url"), "the chain should include the display text: {details}");
+    }
+
+    /// A refused connection classifies as `"connect"` (DNS failures land there too, hyper
+    /// folding them into the connect phase) — distinct from `"timeout"`, which the classification
+    /// checks first.
+    #[tokio::test]
+    async fn transport_error_kind_classifies_a_refused_connection_as_connect() {
+        // Port 1 on loopback is (practically always) closed — the OS refuses immediately.
+        let client = Client::with_bearer_token_and_timeout("http://127.0.0.1:1", "token", std::time::Duration::from_secs(2)).unwrap();
+        let err = client.get_library_items_with_media("lib-1").await.unwrap_err();
+
+        let LibraryItemsError::Network(e) = &err else { panic!("expected a network error, got {err:?}") };
+        assert_eq!(transport_error_kind(e), "connect", "got {}", err.details());
+    }
+
+    /// A non-transport failure passes through unchanged: its Display already names the cause
+    /// (an HTTP status, in particular — a 404 from a missing cover, say).
+    #[test]
+    fn library_items_error_details_passthrough_for_non_transport_variants() {
+        let err = LibraryItemsError::UnexpectedResponse("GET /x returned HTTP 404".to_string());
+        assert_eq!(err.details(), err.to_string());
+    }
+
+    /// `error_chain` walks every source into one " → " line — the base all transport-error logs
+    /// and "Show details" surfaces are built on.
+    #[test]
+    fn error_chain_walks_the_whole_source_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("root cause: {0}")]
+        struct Root(&'static str);
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("middle layer")]
+        struct Middle(#[source] Root);
+
+        assert_eq!(error_chain(&Middle(Root("disk full"))), "middle layer → root cause: disk full");
     }
 
     /// A server's custom headers and user-agent override must reach the actual wire — this is

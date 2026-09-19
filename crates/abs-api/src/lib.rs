@@ -21,7 +21,8 @@ mod ext;
 pub use ext::{
     AudioFileRef, ChapterRef, ConnectionBuildError, ConnectionOptions, CoverBytes, ItemPlaybackInfo,
     LibraryItemSummary, LibraryItemsError, LoginError, LoginResult, ServerProgress, TrackFileError,
-    TrackFileResponse, is_valid_header_name, is_valid_header_value, validate_client_cert_file,
+    TrackFileResponse, error_chain, is_valid_header_name, is_valid_header_value,
+    transport_error_kind, validate_client_cert_file,
 };
 
 #[cfg(test)]

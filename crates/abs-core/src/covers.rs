@@ -1,8 +1,10 @@
 //! Fetches and locally caches an item's cover image. Best-effort, same posture as
 //! `progress_sync`'s reconciliation: a cover is cosmetic, never required for playback, so a
 //! failure here is logged by the caller and treated as "no cover" rather than a playback error.
-//! Uses a short timeout for the same reason — this must never add material delay to starting
-//! playback.
+//! Callers run this detached from anything time-critical (the player spawns it as a background
+//! task after playback starts; Home/Library fetch covers in a post-render task), so the timeout
+//! only bounds how long a slow server keeps the cover itself pending — it can never delay
+//! playback or any already-rendered UI.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,7 +13,11 @@ use sqlx::SqlitePool;
 
 use abs_storage::AppPaths;
 
-const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous by design: covers are fetched in parallel bursts, each with a fresh connection
+/// (cold DNS + TCP + TLS handshake before any bytes move), on networks where that alone can
+/// take several seconds — the failure mode this timeout prevents is a slow-but-working server
+/// starving every cover into an error, not a hang (nothing waits on these fetches).
+const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Returns the local path to the item's cached cover, fetching and writing it first if it isn't
 /// already cached. Returns `None` on any failure (offline, 404, disk error, ...) — callers treat
@@ -32,7 +38,10 @@ pub async fn fetch_and_cache_cover(
     let cover = match api.get_item_cover(item_id).await {
         Ok(cover) => cover,
         Err(err) => {
-            tracing::warn!(%err, item_id, "couldn't fetch cover art");
+            // `details` classifies the failure (timeout / tls / connect / ...) and walks the
+            // full source chain — reqwest's Display alone is just "error sending request for
+            // url (...)", identical for a timeout, a DNS failure and a certificate error.
+            tracing::warn!(details = err.details(), item_id, "couldn't fetch cover art");
             return None;
         }
     };
