@@ -26,6 +26,9 @@ library baseline of the target distros.
 
 # Anywhere, via a Debian bookworm container (docker or podman):
 ./scripts/build-appimage-in-docker.sh
+
+# aarch64 AppImage on an x86_64 host (arm64 container under QEMU emulation):
+./scripts/build-aarch64-appimage-on-x86.sh
 ```
 
 Output lands in `build/appimage/abs-app-<version>-<arch>.AppImage`.
