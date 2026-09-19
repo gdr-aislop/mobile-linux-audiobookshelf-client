@@ -56,6 +56,7 @@ dependencies = [
  "base64",
  "chrono",
  "futures",
+ "image",
  "reqwest",
  "serde_json",
  "sqlx",

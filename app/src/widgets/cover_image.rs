@@ -5,7 +5,9 @@
 //! placeholder", since cover art is cosmetic and this codebase already shows a plain placeholder
 //! card everywhere covers aren't available yet.
 
-use std::path::Path;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use adw::prelude::*;
 
@@ -14,6 +16,12 @@ pub struct CoverImage {
     overlay: gtk4::Overlay,
     placeholder: gtk4::Box,
     picture: gtk4::Picture,
+    /// The path whose image is currently rendered, shared across clones (the widget handle and
+    /// the closure it was cloned into must agree). Snapshots arrive ~4×/second while anything
+    /// is playing — the player's 250 ms tick republishes to advance the scrubber — and every
+    /// one re-runs `set_path`; `set_path` decodes from disk, so an unchanged path has to
+    /// short-circuit rather than re-decode the same file four times a second.
+    last_path: Rc<Cell<Option<PathBuf>>>,
 }
 
 impl CoverImage {
@@ -59,17 +67,36 @@ impl CoverImage {
             .build();
         overlay.add_overlay(&picture);
 
-        Self { overlay, placeholder, picture }
+        Self { overlay, placeholder, picture, last_path: Rc::new(Cell::new(None)) }
     }
 
     pub fn widget(&self) -> &gtk4::Widget {
         self.overlay.upcast_ref()
     }
 
+    /// Test-only view of the underlying `GtkPicture` — scenarios assert visibility on it to pin,
+    /// end to end, that a cached cover actually rendered rather than stayed a placeholder.
+    #[cfg(test)]
+    pub(crate) fn picture(&self) -> &gtk4::Picture {
+        &self.picture
+    }
+
     /// Shows the cached image at `path`, or falls back to the placeholder if `path` is `None` or
     /// the file can't be decoded (missing, corrupt, unsupported format — none of these should
-    /// ever crash the player screen over cosmetic art).
+    /// ever crash the player screen over cosmetic art). Repeated calls with the same path are a
+    /// no-op: the snapshot cadence (~4 Hz) would otherwise re-decode the same file from disk on
+    /// every tick.
     pub fn set_path(&self, path: Option<&Path>) {
+        // `replace` stores the new value and hands back the previous one in a single step — the
+        // comparison can't precede the store, or a rapid A→A sequence (same path republished)
+        // would re-decode. Note a path whose *contents* changed under the same name therefore
+        // won't repaint until some other path lands; covers are cached item-keyed, so that
+        // only happens when a server replaces a cover in place, and the next session's decode
+        // picks the new bytes up.
+        let previous = self.last_path.replace(path.map(Path::to_path_buf));
+        if previous.as_deref() == path {
+            return;
+        }
         let Some(path) = path else {
             self.show_placeholder();
             return;

@@ -34,7 +34,7 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
 # distros (no loader shipped in Debian bookworm, PureOS Crimson's base), while
 # Audiobookshelf serves many covers as WebP. Decoded in-process and turned
 # into a `gdk::MemoryTexture` when pixbuf can't handle a file.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

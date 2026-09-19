@@ -88,12 +88,25 @@ async fn fetch_and_cache_cover_with(
     server_id: &str,
     item_id: &str,
 ) -> Option<PathBuf> {
-    if let Some(cached) = already_cached(pool, server_id, item_id).await {
+    if let Some(cached) = cached_cover_path(pool, server_id, item_id).await {
         return Some(cached);
     }
 
     let cover = match api.get_item_cover(item_id).await {
-        Ok(cover) => cover,
+        Ok(cover) => {
+            // A server (or a proxy in front of it) can answer 200 with a body that isn't an
+            // image at all. Such bytes must never reach the cache: a recorded
+            // `cover_cache_path` is trusted on file existence alone (see `cached_cover_path`),
+            // so garbage would permanently evict this item's real cover everywhere it's
+            // displayed — the player replacing a good cached cover with a white placeholder
+            // included. Same decoder feature set as the app's `CoverImage` fallback, so
+            // "valid enough to cache" and "decodable for display" can't drift apart.
+            if let Err(err) = image::load_from_memory(&cover.bytes) {
+                tracing::warn!(item_id, content_type = %cover.content_type, %err, "server returned a non-image cover body; ignoring it");
+                return None;
+            }
+            cover
+        }
         Err(err) => {
             // `details` classifies the failure (timeout / tls / connect / ...) and walks the
             // full source chain — reqwest's Display alone is just "error sending request for
@@ -120,10 +133,13 @@ async fn fetch_and_cache_cover_with(
     Some(path)
 }
 
-/// A cached path is only trusted if the file it points to still actually exists on disk — the
-/// cache directory is evictable (`$XDG_CACHE_HOME`), so the recorded path can go stale without
-/// this client's own doing.
-async fn already_cached(pool: &SqlitePool, server_id: &str, item_id: &str) -> Option<PathBuf> {
+/// The item's locally cached cover path, if one is recorded **and** the file it points to still
+/// actually exists on disk — the cache directory is evictable (`$XDG_CACHE_HOME`), so the
+/// recorded path can go stale without this client's own doing. This is the one canonical read
+/// of "what cover do we already have": the player seeds its snapshot from it (so the cover is
+/// there from the first frame, with no network involved), Home/Library render it directly, and
+/// `fetch_and_cache_cover_with` uses it as its cache hit.
+pub async fn cached_cover_path(pool: &SqlitePool, server_id: &str, item_id: &str) -> Option<PathBuf> {
     let item = abs_storage::repo::items::get(pool, server_id, item_id).await.ok()?;
     let existing = Path::new(item.cover_cache_path.as_deref()?).to_path_buf();
     tokio::fs::metadata(&existing).await.ok()?;
@@ -178,12 +194,27 @@ mod tests {
         (tmp, paths)
     }
 
+    /// Real, decodable 1x1 images — since downloaded cover bodies are validated with the
+    /// `image` crate before being cached, fake byte vectors would now (correctly) be rejected.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
+        0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
+    const WEBP_1X1: &[u8] = &[
+        0x52, 0x49, 0x46, 0x46, 0x3c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20, 0x30, 0x00, 0x00, 0x00, 0xd0,
+        0x01, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x00, 0x03,
+        0xb0, 0x00, 0xfe, 0xf0, 0xc4, 0x0b, 0xff, 0x20, 0xb9, 0x61, 0x75, 0xc8, 0xd7, 0xff, 0x20, 0x3f, 0xe4, 0x07, 0xfc, 0x80, 0xff,
+        0xf8, 0xf2, 0x00, 0x00, 0x00,
+    ];
+
     #[tokio::test]
     async fn fetch_and_cache_cover_writes_the_file_with_the_right_extension() {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-1/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/webp").set_body_bytes(vec![1, 2, 3]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/webp").set_body_bytes(WEBP_1X1.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -194,9 +225,49 @@ mod tests {
         let cached = cached.expect("fetch should succeed");
 
         assert_eq!(cached.extension().unwrap(), "webp");
-        assert_eq!(tokio::fs::read(&cached).await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), WEBP_1X1);
         let item = abs_storage::repo::items::get(&pool, &server_id, "item-1").await.unwrap();
         assert_eq!(item.cover_cache_path.as_deref(), Some(cached.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fetch_and_cache_cover_ignores_a_non_image_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(b"<html>definitely not an image</html>".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
+
+        let result = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
+        assert!(result.is_none(), "a non-image body must be treated as a failed fetch");
+        let item = abs_storage::repo::items::get(&pool, &server_id, "item-1").await.unwrap();
+        assert!(item.cover_cache_path.is_none(), "a non-image body must never be recorded as the cached cover");
+        assert!(!paths.covers_dir().exists(), "a rejected body must not be written to disk either");
+    }
+
+    #[tokio::test]
+    async fn cached_cover_path_trusts_a_recorded_path_only_while_the_file_exists() {
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
+
+        assert!(cached_cover_path(&pool, &server_id, "item-1").await.is_none(), "nothing recorded yet");
+
+        let real = paths.cover_cache_path(&server_id, "item-1", "png");
+        tokio::fs::create_dir_all(real.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&real, PNG_1X1).await.unwrap();
+        abs_storage::repo::items::set_cover_cache_path(&pool, &server_id, "item-1", Some(&real.to_string_lossy())).await.unwrap();
+        assert_eq!(cached_cover_path(&pool, &server_id, "item-1").await.as_deref(), Some(real.as_path()));
+
+        tokio::fs::remove_file(&real).await.unwrap();
+        assert!(cached_cover_path(&pool, &server_id, "item-1").await.is_none(), "an evicted cache file must not be trusted");
     }
 
     #[tokio::test]
@@ -204,7 +275,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-1/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![9, 9, 9]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -236,7 +307,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-1/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![1]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -256,10 +327,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_and_cache_covers_fetches_every_uncached_item_and_records_the_paths() {
         let mock_server = MockServer::start().await;
-        for (item_id, body) in [("item-1", vec![1, 1]), ("item-2", vec![2, 2])] {
+        for (item_id, content_type, body) in [("item-1", "image/png", PNG_1X1), ("item-2", "image/webp", WEBP_1X1)] {
             Mock::given(method("GET"))
                 .and(path(format!("/api/items/{item_id}/cover")))
-                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(body.clone()))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", content_type).set_body_bytes(body.to_vec()))
                 .mount(&mock_server)
                 .await;
         }
@@ -269,7 +340,7 @@ mod tests {
 
         fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
 
-        for (item_id, body) in [("item-1", vec![1, 1]), ("item-2", vec![2, 2])] {
+        for (item_id, _content_type, body) in [("item-1", "image/png", PNG_1X1), ("item-2", "image/webp", WEBP_1X1)] {
             let item = abs_storage::repo::items::get(&pool, &server_id, item_id).await.unwrap();
             let cached = PathBuf::from(item.cover_cache_path.expect("every batched item's cover should be recorded"));
             assert_eq!(tokio::fs::read(&cached).await.unwrap(), body);
@@ -284,7 +355,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-2/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![2]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -304,12 +375,12 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-1/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![1]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
             .mount(&mock_server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/items/item-2/cover"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![2]))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
             .mount(&mock_server)
             .await;
 

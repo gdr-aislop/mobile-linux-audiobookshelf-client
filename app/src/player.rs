@@ -573,39 +573,21 @@ impl PlayerController {
                 }
             };
 
-            // The cover fetch is detached from playback start entirely: even bounded by its
-            // own timeout, waiting for it in the join below could delay the first note on a
-            // slow network (each cover fetch opens a fresh connection — cold DNS + TCP + TLS
-            // before any bytes move). Instead it runs as its own background task and lands in
-            // the snapshot whenever it's ready — cache hits within a tick, cold fetches after —
-            // which the mini-player, player screen and MPRIS art all pick up automatically.
-            {
-                let inner_rc = inner_rc.clone();
-                let pool = pool.clone();
-                let paths = paths.clone();
-                let connection = connection.clone();
-                let access_token = access_token.clone();
-                let server_id = session.server_id().to_string();
-                let item_id = item.item_id.clone();
-                // Runs on the GTK main loop (`spawn_future_local`, not `tokio::spawn`): it holds
-                // `Rc`s and borrows main-loop state, and the reqwest-driven fetch works because
-                // main.rs keeps the Tokio runtime entered for the GTK loop's lifetime — the same
-                // shape as every other future in this file.
-                glib::spawn_future_local(async move {
-                    let Some(cover_path) =
-                        abs_core::covers::fetch_and_cache_cover(&paths, &pool, &connection, &access_token, &server_id, &item_id).await
-                    else {
-                        return;
-                    };
-                    let mut inner = inner_rc.borrow_mut();
-                    match &mut inner.now_playing {
-                        Some(now_playing) if now_playing.item_id == item_id => now_playing.cover_path = Some(cover_path),
-                        // Playback ended or switched items while the fetch was in flight.
-                        _ => return,
-                    }
-                    inner.publish();
-                });
-            }
+            // The cover the player shows is, first of all, whatever is already cached locally —
+            // the same `cover_cache_path` Home/Library render from. Seeding `now_playing` with it
+            // below (rather than starting from `None` and waiting on a fetch) is what makes the
+            // cover appear with the very first snapshot: the detached fetch task used to run
+            // *here*, but its result only landed when a matching `now_playing` already existed —
+            // so on a first play a fast cache hit was discarded (the cover stayed blank), and on
+            // a re-play it landed in the *previous* session's struct only to be wiped by this
+            // function's tail (the cover appeared, then vanished). A local DB read never delays
+            // anything, so this runs inline; the network fetch itself stays detached, spawned
+            // once `now_playing` exists (below) so its result can always land.
+            let cached_cover = abs_core::covers::cached_cover_path(&pool, session.server_id(), &item.item_id).await;
+            // Captured up front — `item` and `session` move into `NowPlaying` below, and the
+            // detached cover task needs these after that.
+            let item_id = item.item_id.clone();
+            let server_id = session.server_id().to_string();
 
             // Resolving the stream URL is required to proceed — unless the item can be played
             // from locally cached state instead (below). Reconciling progress is a nice-to-have
@@ -735,12 +717,53 @@ impl PlayerController {
                 chapters,
                 speed: applied_speed,
                 sleep_timer: SleepTimerState::Off,
-                // Filled in by the detached cover-fetch task above once it lands (cache hits
-                // within a tick, cold fetches when the fetch finishes) — never gating start.
-                cover_path: None,
+                // Seeded from the local cover cache (read at the top of `start()`), so the very
+                // first snapshot already shows the same cover Home/Library do. Only the detached
+                // task below ever replaces it, and only with a valid, different downloaded
+                // cover — a failed fetch simply leaves the cached one in place.
+                cover_path: cached_cover,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();
+            drop(inner);
+
+            // The cover fetch, spawned only now that it can't race `now_playing` into existence.
+            // Still detached from anything time-critical (its own timeout only bounds a slow
+            // server — it must never gate the first note), and it runs on the GTK main loop
+            // (`spawn_future_local`, not `tokio::spawn`): it holds `Rc`s and borrows main-loop
+            // state, and the reqwest-driven fetch works because main.rs keeps the Tokio runtime
+            // entered for the GTK loop's lifetime — the same shape as every other future in this
+            // file. The snapshot was seeded from the local cache above, so this only ever
+            // *replaces* it: a fetch failure changes nothing (the cached cover stays), and a
+            // success replaces only a *different* path — a cache hit re-returns the seeded path,
+            // and republishing it would make every listener react to a no-op (CoverImage
+            // short-circuits same-path calls, but MPRIS would still re-notify).
+            {
+                let inner_rc = inner_rc.clone();
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let connection = connection.clone();
+                let access_token = access_token.clone();
+                glib::spawn_future_local(async move {
+                    let Some(cover_path) =
+                        abs_core::covers::fetch_and_cache_cover(&paths, &pool, &connection, &access_token, &server_id, &item_id).await
+                    else {
+                        return;
+                    };
+                    let mut inner = inner_rc.borrow_mut();
+                    match &mut inner.now_playing {
+                        Some(now_playing)
+                            if now_playing.item_id == item_id && now_playing.cover_path.as_deref() != Some(cover_path.as_path()) =>
+                        {
+                            now_playing.cover_path = Some(cover_path);
+                        }
+                        // Same cover as already shown (cache hit), playback ended, or switched
+                        // items while the fetch was in flight — nothing to publish.
+                        _ => return,
+                    }
+                    inner.publish();
+                });
+            }
         });
     }
 
@@ -1020,6 +1043,7 @@ pub struct MiniPlayerBar {
 #[cfg(test)]
 pub struct MiniPlayerHooks {
     pub bar: gtk4::Box,
+    pub cover_picture: gtk4::Picture,
     pub title_label: gtk4::Label,
     pub author_label: gtk4::Label,
     pub play_button: gtk4::Button,
@@ -1095,7 +1119,14 @@ pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_pl
         root: bar.clone().upcast(),
         controller,
         #[cfg(test)]
-        hooks: MiniPlayerHooks { bar, title_label, author_label, play_button, progress },
+        hooks: MiniPlayerHooks {
+            bar,
+            cover_picture: cover.picture().clone(),
+            title_label,
+            author_label,
+            play_button,
+            progress,
+        },
     }
 }
 
@@ -1207,6 +1238,16 @@ pub(crate) mod tests {
     use crate::test_support::{pool, pump_until};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// A real, valid PNG (1x1, black pixel) — cover endpoints serve real images, and downloaded
+    /// bodies are validated with the `image` crate before being cached, so fake byte vectors
+    /// would (correctly) be rejected. Same fixture the `CoverImage` and `covers` tests use.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
+        0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
 
     /// A real, valid WAV file's bytes — served over HTTP by wiremock so `PlayerController::start`
     /// exercises the actual network fetch (via GStreamer's own HTTP source), not a `file://` URI.
@@ -1973,6 +2014,126 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Pre-caches a cover the way the cover pipeline would have: real PNG bytes on disk under
+    /// `covers/<server>/<item>.<ext>`, path recorded on the item row — what
+    /// `abs_core::covers::cached_cover_path` then hands the player as its seed.
+    async fn seed_cached_cover(
+        paths: &abs_storage::AppPaths,
+        pool: &SqlitePool,
+        server_id: &str,
+        item_id: &str,
+        extension: &str,
+    ) -> std::path::PathBuf {
+        let path = paths.cover_cache_path(server_id, item_id, extension);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, PNG_1X1).await.unwrap();
+        abs_storage::repo::items::set_cover_cache_path(pool, server_id, item_id, Some(&path.to_string_lossy())).await.unwrap();
+        path
+    }
+
+    /// The reported bug: the player started from `cover_path: None` and relied on the detached
+    /// cover-fetch task — whose result could only land in an *existing* matching `now_playing`,
+    /// so a cache hit was discarded on a first play (blank cover for the whole session) and on a
+    /// re-play it landed in the previous session's struct only to be wiped by `start()`'s tail
+    /// (the cover appeared, then vanished). The snapshot must instead be seeded from the local
+    /// cover cache immediately, and a failed cover fetch (here: the endpoint 404s) must leave
+    /// that cached cover in place.
+    pub(crate) fn run_start_shows_the_cached_cover_and_keeps_it_when_the_fetch_fails(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+        // Deliberately no `/api/items/item-1/cover` route: every cover request 404s.
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let cached_cover = runtime.block_on(seed_cached_cover(&paths, &pool, &server.id, "item-1", "png"));
+
+        let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+        let controller = PlayerController::new(pool.clone(), paths.clone(), test_backend(), {
+            let seen = seen.clone();
+            move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
+        });
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        assert!(
+            seen.borrow().iter().any(|s| s.cover_path.as_deref() == Some(cached_cover.as_path())),
+            "snapshots must carry the cached cover from the first publish on, with no network involved"
+        );
+
+        // Pump well past where the cover fetch's 404 would have landed: the cached cover must
+        // not just appear but *stay* (the old bug blanked it again after the fetch settled).
+        pump_until(|| false, Duration::from_millis(500));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(
+            snapshot.cover_path.as_deref(),
+            Some(cached_cover.as_path()),
+            "a failed cover fetch must leave the cached cover in place"
+        );
+        controller.stop();
+    }
+
+    /// The replace half of the contract: with nothing cached yet, the snapshot starts without a
+    /// cover and the detached fetch swaps it over exactly once a valid image has been downloaded
+    /// and recorded. (A replace over an *existing* cached cover can't be driven through this
+    /// pipeline — a cache hit skips HTTP entirely — which is exactly the "keep using the cached
+    /// cover" posture the scenario above pins.)
+    pub(crate) fn run_start_replaces_the_cover_once_a_valid_new_one_is_downloaded(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1/cover"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
+                .mount(&mock_server)
+                .await;
+        });
+
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let fetched_cover = paths.cover_cache_path(&server.id, "item-1", "png");
+
+        let seen: Rc<RefCell<Vec<PlayerSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+        let controller = PlayerController::new(pool.clone(), paths.clone(), test_backend(), {
+            let seen = seen.clone();
+            move |snapshot: &PlayerSnapshot| seen.borrow_mut().push(snapshot.clone())
+        });
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(
+            || controller.snapshot().is_some_and(|s| s.cover_path.as_deref() == Some(fetched_cover.as_path())),
+            Duration::from_secs(10),
+        );
+        {
+            let seen = seen.borrow();
+            assert!(seen.first().is_some_and(|s| s.cover_path.is_none()), "with nothing cached, the first snapshot has no cover");
+            assert!(
+                seen.iter().any(|s| s.cover_path.as_deref() == Some(fetched_cover.as_path())),
+                "once a valid cover lands, snapshots must switch to it"
+            );
+        }
+        let item = runtime.block_on(abs_storage::repo::items::get(&pool, &server.id, "item-1")).unwrap();
+        assert_eq!(
+            item.cover_cache_path.as_deref(),
+            Some(fetched_cover.to_string_lossy().as_ref()),
+            "the fetch must record the new cover path on the item row"
+        );
+        controller.stop();
+    }
+
     /// The mini-player bar's own widget wiring (`build_mini_bar`) is otherwise untested by every
     /// scenario above, which all drive a bare `PlayerController` directly. Covers: hidden until
     /// something plays, then visible with the right title/author, a live progress fraction, and
@@ -1980,12 +2141,16 @@ pub(crate) mod tests {
     pub(crate) fn run_mini_bar_reflects_playback_state(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+        // No cover route: the seeded cache below is what must render, and the 404 must not
+        // blank it again.
 
         let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let cached_cover = runtime.block_on(seed_cached_cover(&paths, &pool, &server.id, "item-1", "png"));
 
-        let mini_bar = build_mini_bar(pool.clone(), crate::test_support::test_paths(), test_backend());
+        let mini_bar = build_mini_bar(pool.clone(), paths, test_backend());
         let hooks = &mini_bar.hooks;
         assert!(!hooks.bar.is_visible(), "the mini bar should stay hidden until something plays");
 
@@ -1998,6 +2163,12 @@ pub(crate) mod tests {
 
         assert_eq!(hooks.title_label.label(), "Test Book");
         assert_eq!(hooks.author_label.label(), "Some Author");
+        pump_until(|| hooks.cover_picture.is_visible(), Duration::from_secs(10));
+        assert!(
+            hooks.cover_picture.is_visible(),
+            "the seeded cached cover must render in the mini bar even though the cover fetch 404s"
+        );
+        assert!(mini_bar.controller.snapshot().unwrap().cover_path.as_deref() == Some(cached_cover.as_path()));
 
         pump_until(|| hooks.progress.fraction() > 0.0, Duration::from_secs(5));
         assert!(hooks.progress.fraction() > 0.0, "the progress line should reflect a live position");

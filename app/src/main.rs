@@ -187,6 +187,8 @@ mod tests {
         (playback_seek_across_track_boundary_lands_in_the_next_file, crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file),
         (playback_resume_jumps_straight_to_the_second_track, crate::player::tests::run_resume_jumps_straight_to_the_second_track),
         (playback_end_of_stream_pauses_and_marks_finished, crate::player::tests::run_end_of_stream_pauses_and_marks_finished),
+        (playback_start_shows_the_cached_cover_and_keeps_it_when_the_fetch_fails, crate::player::tests::run_start_shows_the_cached_cover_and_keeps_it_when_the_fetch_fails),
+        (playback_start_replaces_the_cover_once_a_valid_new_one_is_downloaded, crate::player::tests::run_start_replaces_the_cover_once_a_valid_new_one_is_downloaded),
         (playback_mini_bar_reflects_playback_state, crate::player::tests::run_mini_bar_reflects_playback_state),
         (playback_add_bookmark_persists_a_row, crate::player::tests::run_add_bookmark_persists_a_row),
         (player_screen_renders, crate::screens::player::tests::run),
