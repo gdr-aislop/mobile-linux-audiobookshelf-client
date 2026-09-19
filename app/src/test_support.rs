@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use adw::glib;
+use adw::prelude::*;
 use sqlx::SqlitePool;
 
 /// A fresh, migrated, tempdir-backed SQLite database — leaked (`mem::forget`) rather than cleaned
@@ -38,4 +39,25 @@ pub fn pump_until(done: impl Fn() -> bool, timeout: Duration) {
         while context.iteration(false) {}
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// True if any `GtkLabel` under `root` displays exactly `text` — how scenarios assert toasts:
+/// an `AdwToast`'s title lives on an internal label inside the `AdwToastOverlay`, and other
+/// transient feedback (the toasts' action-button labels, stacked toasts) is easier to match
+/// "anywhere under the overlay" than to chase one internal widget path through the Adwaita
+/// template hierarchy.
+pub fn any_label_reads(root: &gtk4::Widget, text: &str) -> bool {
+    if let Some(label) = root.downcast_ref::<gtk4::Label>() {
+        if label.text() == text {
+            return true;
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if any_label_reads(&widget, text) {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }

@@ -3,9 +3,10 @@
 //! `abs_core::sync::sync_all`. See `docs/design/ui-spec.md`'s "Home" section and the published
 //! mockup for the visual design this implements.
 //!
-//! Deliberately out of scope for this pass (see the implementation plan): the offline-mode toggle
-//! and manual "Sync now" action. Cover art now reuses the same `abs_core::covers`/`CoverImage`
-//! pipeline the player screen already built.
+//! Manual re-sync ("Sync now", ui-spec Home): a header-bar ⋯ overflow item plus a pull-to-refresh
+//! gesture on the main scroller, both feeding the same sync cycle the screen opens with — see
+//! `spawn_sync_cycle` and `crate::widgets::ManualSync`. Cover art reuses the same
+//! `abs_core::covers`/`CoverImage` pipeline the player screen already built.
 
 use adw::glib;
 use adw::prelude::*;
@@ -45,6 +46,9 @@ pub struct TestHooks {
     pub banner: crate::widgets::banner::ErrorBanner,
     pub offline_toggle: gtk4::ToggleButton,
     pub offline_banner: gtk4::Revealer,
+    pub sync_now_button: gtk4::Button,
+    pub toast_overlay: adw::ToastOverlay,
+    pub scroller: gtk4::ScrolledWindow,
 }
 
 #[cfg(test)]
@@ -295,6 +299,20 @@ pub fn build(
         .build();
     header.pack_end(&avatar);
 
+    // "Sync now" (ui-spec Home): the header-bar ⋯ overflow — the one page-level action this
+    // screen needs — forcing an immediate resync instead of waiting on the next tab-entry or
+    // retry cycle. The pull-to-refresh gesture on the main scroller (wired below) runs the
+    // exact same manual path. Plain `GtkMenuButton` + `GtkPopover` + flat button, matching the
+    // no-GMenu convention everywhere else in this crate.
+    let sync_now_button = gtk4::Button::builder().label("Sync now").css_classes(["flat"]).build();
+    let sync_menu_popover = gtk4::Popover::builder().child(&sync_now_button).build();
+    let sync_menu_button = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More")
+        .popover(&sync_menu_popover)
+        .build();
+    header.pack_end(&sync_menu_button);
+
     // Offline-mode toggle (ui-spec: "leading side, opposite the avatar"). Shared persisted state
     // with Library's own toggle — see `HomeWidgets::offline_mode`'s field doc.
     let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
@@ -369,6 +387,11 @@ pub fn build(
     root.append(&header);
     root.append(&body);
 
+    // Toasts float over the whole screen, header bar included — same shape as the player
+    // screen's own overlay. Manual sync triggers report through this one.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&root));
+
     let widgets = HomeWidgets {
         empty_state: empty_state.clone(),
         scroller: scroller.clone(),
@@ -392,17 +415,41 @@ pub fn build(
         account: account.clone(),
         session: session.clone(),
     };
-    spawn_sync_cycle(ctx.clone(), widgets.clone());
+    spawn_sync_cycle(ctx.clone(), widgets.clone(), None);
+
+    // The two manual triggers — the ⋯ menu's "Sync now" and a pull past the scroller's top —
+    // share one `ManualSync` (toast + in-flight guard) between them; see `spawn_sync_cycle`.
+    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay);
 
     // Try again re-runs the whole cycle: back to the spinner first, then the same
-    // sync → render → resolve pipeline the screen opened with.
+    // sync → render → resolve pipeline the screen opened with. Unguarded and toast-less like
+    // the automatic cycle — its feedback is the empty state it just reset.
     {
         let ctx = ctx.clone();
         let widgets = widgets.clone();
         empty_state.retry.connect_clicked(move |_| {
             widgets.empty_state.show_syncing();
             widgets.banner.set_revealed(false);
-            spawn_sync_cycle(ctx.clone(), widgets.clone());
+            spawn_sync_cycle(ctx.clone(), widgets.clone(), None);
+        });
+    }
+
+    {
+        let ctx = ctx.clone();
+        let widgets = widgets.clone();
+        let manual_sync = manual_sync.clone();
+        let popover = sync_menu_popover.clone();
+        sync_now_button.connect_clicked(move |_| {
+            popover.popdown();
+            spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        let widgets = widgets.clone();
+        let manual_sync = manual_sync.clone();
+        crate::widgets::pull_to_refresh::attach(&scroller, move || {
+            spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
         });
     }
 
@@ -476,7 +523,7 @@ pub fn build(
     });
 
     HomeScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: TestHooks {
             empty_state,
@@ -489,14 +536,22 @@ pub fn build(
             banner,
             offline_toggle,
             offline_banner,
+            sync_now_button,
+            toast_overlay,
+            scroller,
         },
     }
 }
 
 /// Runs one full sync cycle on the main loop: render whatever's cached, sync against the server
 /// on worker threads, render again, then resolve the empty-state/banner from the outcome. Called
-/// once when the screen is built and again on every "Try again" press, so it must leave all
+/// once when the screen is built, again on every "Try again" press, and on every *manual* sync
+/// trigger (the ⋯ menu's "Sync now", pull-to-refresh — see `manual`), so it must leave all
 /// widget state consistent no matter how many times it runs.
+///
+/// A manual trigger (`manual`) additionally reports the outcome as a transient toast and shares
+/// an in-flight guard with the screen's other manual trigger — see `crate::widgets::ManualSync`.
+/// The automatic cycle and "Try again" pass none and stay unguarded.
 ///
 /// The network/DB pipeline runs inside `tokio::spawn` (worker threads), not directly in this
 /// `spawn_future_local` future: the latter is polled on the GTK main thread, so HTTP body chunk
@@ -508,7 +563,16 @@ pub fn build(
 ///
 /// Rendering is gated on there being at least one library: shelves with nothing in them look
 /// broken, and the empty state below is the honest rendering of "nothing to show yet".
-fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
+fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::widgets::ManualSync>) {
+    // A manual trigger while its sibling is still running is a no-op: an overshot can fire
+    // repeatedly during one rubber-band, and the ⋯ menu is one tap away from the gesture.
+    // Overlapping syncs wouldn't corrupt anything (every write is an idempotent upsert), but
+    // they'd race each other's covers-fetches and double-toast — not worth it.
+    if let Some(manual) = &manual {
+        if !manual.claim() {
+            return;
+        }
+    }
     glib::spawn_future_local(async move {
         let SyncCtx { pool, paths, server, account, session } = ctx;
         let server_id = server.id.clone();
@@ -625,6 +689,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
         // state carries the whole story — which is why it, not the banner, owns the no-data
         // failure mode. Auth failures get their own copy and a "Log in again" action in both
         // places: they're the one failure retrying can't fix.
+        let manual_ok = sync_result.is_ok();
         if data_after_sync.as_ref().is_some_and(|data| !data.libraries.is_empty()) {
             widgets.empty_state.hide();
             match sync_result {
@@ -653,6 +718,14 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets) {
                     }
                 }
             }
+        }
+
+        // The manual trigger's own feedback — a transient outcome toast — lands only after the
+        // resolve above, so the detailed surface (banner/empty state) is already showing
+        // whatever the toast is about. "Sync failed" carries no details itself: those live in
+        // the banner/empty state, which this same cycle just set.
+        if let Some(manual) = manual {
+            manual.finish(manual_ok);
         }
     });
 }
@@ -1078,6 +1151,118 @@ pub(crate) mod tests {
 
         assert!(hooks.libraries_list.row_at_index(0).is_some(), "a successful retry should land the data");
         assert!(!hooks.banner.widget().reveals_child(), "a successful retry must not leave a failure banner up");
+    }
+
+    /// The manual sync success contract shared by the ⋯ menu's "Sync now" and the
+    /// pull-to-refresh gesture (both feed the same manual path — ui-spec Home's "Sync now"):
+    /// the mock's items response grows after the first sync consumes it (the established
+    /// `up_to_n_times` idiom above), so the manual sync's round-trip is observable as the shelf
+    /// gaining a card without leaving the tab — and the outcome must toast.
+    fn run_manual_sync_lands_new_data_and_toasts(runtime: &tokio::runtime::Runtime, trigger: impl Fn(&TestHooks)) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .up_to_n_times(1)
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        // The outcome toast only surfaces in a mapped overlay (`AdwToastOverlay` defers
+        // unmapped toasts) — same mapped-window requirement as the shell/popover scenarios.
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(10));
+        assert!(
+            !crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            "the automatic cycle reports through the banner/empty state, not a toast"
+        );
+
+        trigger(hooks);
+
+        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
+        // The toast lands at the cycle's resolve step — after its (best-effort) cover-fetch
+        // stage, which can finish after the rows are already up — so wait on it, don't assert
+        // it immediately.
+        pump_until(
+            || crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            Duration::from_secs(10),
+        );
+        assert!(
+            crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            "the manual sync's completion toast must appear"
+        );
+    }
+
+    /// "Sync now" via the ⋯ menu (HT-10): forces an immediate resync and toasts the outcome.
+    pub(crate) fn run_sync_now_resyncs_and_toasts(runtime: &tokio::runtime::Runtime) {
+        run_manual_sync_lands_new_data_and_toasts(runtime, |hooks| hooks.sync_now_button.emit_clicked());
+    }
+
+    /// Pull-to-refresh (HT-10's gesture twin): a pull past the main scroller's top runs the same
+    /// manual sync path as the ⋯ menu. The sandbox has no touch hardware, so the scenario drives
+    /// the scroller's own `edge-overshot` signal — the exact one the gesture listens to.
+    pub(crate) fn run_pull_to_refresh_resyncs_and_toasts(runtime: &tokio::runtime::Runtime) {
+        run_manual_sync_lands_new_data_and_toasts(runtime, |hooks| {
+            hooks.scroller.emit_by_name::<()>("edge-overshot", &[&gtk4::PositionType::Top]);
+        });
+    }
+
+    /// "Sync now" against a server nothing listens on: the toast reports the failure while the
+    /// empty state stays the detailed failure surface — the toast deliberately carries no
+    /// details, since that state (or the banner, with cached data) already shows them.
+    pub(crate) fn run_sync_now_toasts_failure(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        // The unreachable-URL precedent from `run_shelf_headers_invoke_on_open_shelf`.
+        let (server, account) = runtime.block_on(account_and_server(&pool, "http://127.0.0.1:1"));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        // Mapped like the success scenarios — the failure toast needs the overlay mapped too.
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        // The first (automatic) sync fails into the error empty state; only then is a manual
+        // re-trigger meaningful to press.
+        pump_until(|| hooks.empty_state.retry.is_visible(), Duration::from_secs(10));
+
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync failed"), Duration::from_secs(10));
+        assert_eq!(
+            hooks.empty_state.title.label(),
+            "Couldn't sync your libraries",
+            "the empty state stays the detailed failure surface"
+        );
     }
 
     /// The authorization-failure path: the server 401s the sync (a dead session — revoked or

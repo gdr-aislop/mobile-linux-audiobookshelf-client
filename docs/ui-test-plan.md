@@ -113,7 +113,7 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 
 ---
 
-## 2. App shell & navigation (NT) — ✅ implemented (stubs for unbuilt tabs)
+## 2. App shell & navigation (NT) — ✅ implemented
 
 - [ ] **NT-1 — Four tabs exist.** After login, check the bottom tab bar.
       *Expected:* Home, Library, Downloads, Settings — each with an icon and label, Home
@@ -122,17 +122,13 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 - [ ] **NT-2 — Tab switching.** Tap each tab in turn and back.
       *Expected:* content switches instantly each time; selected tab stays highlighted.
 
-- [ ] **NT-3 — Unbuilt tabs are honest stubs.** Open Library, Downloads, Settings.
-      *Expected:* each shows a status page titled with the tab's name and "Coming soon" — not a
-      blank screen, not a crash.
-
 - [ ] **NT-4 — Mini bar absent before first playback.** On a fresh session, look above the tab
       bar on every tab.
       *Expected:* no mini-player bar anywhere.
 
 ---
 
-## 3. Home (HT) — ✅ implemented (offline toggle & Sync now: 🚧)
+## 3. Home (HT) — ✅ implemented
 
 - [ ] **HT-1 — Shelves populate.** With a synced server, check Home.
       *Expected:* "Continue Listening" (only books with progress), "Recently Added", and "Your
@@ -208,19 +204,32 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       row sideways.
       *Expected:* the row scrolls horizontally without also scrolling the page vertically.
 
-- [ ] **HT-8 — 🚧 Offline-mode toggle.** Once built: tap the "Offline" toggle in Home's header
+- [ ] **HT-8 — Offline-mode toggle.** Tap the "Offline" toggle in Home's header
       (leading side, opposite the avatar).
       *Expected:* an "Showing downloaded items only" banner appears below the header and every
       shelf — plus the Libraries list — filters down to downloaded items (fully or partially).
+      *Automated:* `home_offline_mode_toggle_filters_recently_added` drives the toggle and the
+      shelf filtering; the shared persisted state with Library is asserted there too (the same
+      settings key).
 
-- [ ] **HT-9 — 🚧 Offline toggle is shared state.** With Home's offline toggle on, open Library
+- [ ] **HT-9 — Offline toggle is shared state.** With Home's offline toggle on, open Library
       browse; then toggle it there and check Home.
       *Expected:* the same state is reflected on both screens (it's one setting, not two), and
       it survives leaving the tab.
+      *Automated:* both screens load/save `abs_core::settings::{load,save}_offline_mode` —
+      `home_offline_mode_toggle_filters_recently_added` and
+      `library_offline_mode_toggle_filters_to_downloaded_items` each restore the persisted
+      value on rebuild.
 
-- [ ] **HT-10 — 🚧 Sync now.** Once built: Home's ⋯ header menu → "Sync now".
-      *Expected:* an immediate re-sync runs and a transient toast confirms completion — or
-      reports failure — without needing to leave the tab.
+- [ ] **HT-10 — Sync now.** Home's ⋯ header menu → "Sync now"; or pull the page down past its
+      top (pull-to-refresh).
+      *Expected:* an immediate re-sync runs — the shelves pick up whatever changed server-side —
+      and a transient toast confirms completion — or reports failure — without needing to leave
+      the tab. Both triggers share one manual sync path and in-flight guard.
+      *Automated:* `home_sync_now_resyncs_and_toasts` (menu → grown mock response + "Sync
+      complete" toast), `home_pull_to_refresh_resyncs_and_toasts` (the scroller's own
+      `edge-overshot` signal), `home_sync_now_toasts_failure` (unreachable server → "Sync
+      failed" toast, empty state unchanged).
 
 ---
 
@@ -245,7 +254,12 @@ Shown between login and Home only when the server exposes **more than one** libr
 
 ---
 
-## 5. Library browse (LB) — 🚧 not yet built
+## 5. Library browse (LB) — 🚧 partially implemented
+
+Built: search, sort (incl. "Last listened"), the in-progress filter with its funnel indicator and
+banner, grid/list toggle, offline toggle, download badges, and Sync now. Not yet built: the view
+options sheet (LB-6's "Downloaded only"/"Hide finished"/"Grouping" rows — LB-7/LB-8/LB-9),
+category chips (LB-4), and the "Application settings" shortcut (LB-11).
 
 - [ ] **LB-1 — Header layout.** Open the Library tab.
       *Expected:* header bar with a **persistent, always-visible search field** (not hidden
@@ -296,9 +310,12 @@ Shown between login and Home only when the server exposes **more than one** libr
       sheet.
       *Expected:* the sheet closes and the app lands on the Settings tab (§15).
 
-- [ ] **LB-12 — Sync now.** Library's ⋯ header menu → "Sync now".
+- [ ] **LB-12 — Sync now.** Library's ⋯ header menu → "Sync now"; or pull the page down past its
+      top (pull-to-refresh).
       *Expected:* immediate re-sync of this library's contents and playback progress; transient
-      toast on completion or failure.
+      toast on completion or failure. Same manual path and toast as Home's (HT-10).
+      *Automated:* `library_sync_now_and_pull_to_refresh` drives both triggers against stacked
+      mock responses (each sync's render is its own observable) and asserts the toast.
 
 - [ ] **LB-13 — Download badge on covers.** With items downloaded (§14), look at the grid.
       *Expected:* downloaded items carry a small download badge on their cover.
@@ -682,7 +699,10 @@ built (the tests below define the target behavior).
 
 ---
 
-## 14. Downloads screen (DS) — 🚧 not yet built
+## 14. Downloads screen (DS) — ✅ implemented (DS-1's storage summary deliberately skipped)
+
+The spec's own "nice to have" — the storage-used/free-space summary row — is the one piece not
+built (documented in `app/src/screens/downloads.rs`'s module doc).
 
 - [ ] **DS-1 — Summary row.** Open the Downloads tab.
       *Expected:* a grouped list whose first row shows storage used by the app and the device's

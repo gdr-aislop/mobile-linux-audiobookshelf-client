@@ -24,6 +24,7 @@ use sqlx::SqlitePool;
 use abs_storage::models::{Account, Server};
 
 use crate::screens::settings::{confirm, host_of};
+use crate::widgets::find_descendant;
 
 pub struct ConnectionScreen {
     pub root: gtk4::Widget,
@@ -370,22 +371,8 @@ type SaveHandler = Rc<dyn Fn(&gtk4::Dialog, &gtk4::Label)>;
 /// The single-line editors' save handlers, which also receive the field's text.
 type EntrySaveHandler = Rc<dyn Fn(&str, &gtk4::Dialog, &gtk4::Label)>;
 
-/// Depth-first search for the first descendant widget of type `T` — how an editor's save
-/// handler reaches its field. The layout is the builder functions' business; this keeps the
-/// handlers independent of it.
-fn find_descendant<T: glib::object::IsA<gtk4::Widget>>(root: &gtk4::Widget) -> Option<T> {
-    if let Some(found) = root.downcast_ref::<T>() {
-        return Some(found.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = find_descendant::<T>(&widget) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
+// The editors reach their fields with `crate::widgets::find_descendant` (imported below): the
+// layout is the builder functions' business; the handlers stay independent of it.
 
 /// The save/cancel dialog shell the Advanced rows' editors share: modal, transient, Cancel +
 /// Save, and `on_save` invoked on Save with the dialog and the inline error label (also

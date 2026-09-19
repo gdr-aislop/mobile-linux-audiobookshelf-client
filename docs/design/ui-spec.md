@@ -148,6 +148,10 @@ Fractal) rather than copying Lissen's Material Design look.
   home networks are more likely to have stale or interrupted background syncs than a hosted
   service would, so this needs to be a user-triggerable action, not just an automatic behavior.
   Shows a transient `AdwToast` on completion or failure. Shared with Library browse (see below).
+  A **pull-down-to-refresh** gesture on the page's main scroller runs the exact same manual path —
+  hand-rolled via `GtkScrolledWindow`'s `edge-overshot` signal, since neither GTK4 nor libadwaita
+  ships the gesture (and the GNOME HIG doesn't prescribe one); the threshold-less overshot trigger
+  needs the same on-device calibration as the mini-player's swipe-up gesture above.
 
 ### Library browse
 - Header bar with a **persistent, always-visible `GtkSearchEntry`** — not revealed behind a search
@@ -162,7 +166,8 @@ Fractal) rather than copying Lissen's Material Design look.
   (three-line "adjustments" icon) that opens the view options sheet described below; these two stay
   compact icon-buttons since they're used less often than search.
 - **Sync now**: same header-bar `⋯` menu item as Home (see above), forcing an immediate resync of
-  this library's contents and the user's playback progress.
+  this library's contents and the user's playback progress — plus the same pull-to-refresh gesture
+  on this screen's main scroller, both sharing one manual sync path and outcome toast with Home's.
 - Content: `GtkGridView` of cover art (grid mode) or `GtkListView` with `AdwActionRow`s (list mode,
   useful for podcast episode-style feeds); toggle between the two via header bar button.
 - Sticky section headers when sorted/grouped by author or series (`GtkListView` section headers).

@@ -89,6 +89,9 @@ pub struct TestHooks {
     pub view_toggle: gtk4::ToggleButton,
     pub offline_toggle: gtk4::ToggleButton,
     pub offline_banner: gtk4::Revealer,
+    pub sync_now_button: gtk4::Button,
+    pub toast_overlay: adw::ToastOverlay,
+    pub scroller: gtk4::ScrolledWindow,
 }
 
 #[cfg(test)]
@@ -240,6 +243,19 @@ pub fn build(
     let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
     header.pack_start(&offline_toggle);
 
+    // "Sync now" (ui-spec Library browse) — the same header-bar ⋯ overflow as Home's, forcing
+    // an immediate resync; the pull-to-refresh gesture on the main scroller (wired below) runs
+    // the exact same manual path. Plain `GtkMenuButton` + flat button, per this crate's
+    // no-GMenu convention.
+    let sync_now_button = gtk4::Button::builder().label("Sync now").css_classes(["flat"]).build();
+    let sync_menu_popover = gtk4::Popover::builder().child(&sync_now_button).build();
+    let sync_menu_button = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More")
+        .popover(&sync_menu_popover)
+        .build();
+    header.pack_end(&sync_menu_button);
+
     let offline_banner_label = gtk4::Label::builder().label("Showing downloaded items only").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
     let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_label).reveal_child(false).build();
 
@@ -306,6 +322,11 @@ pub fn build(
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&body);
+
+    // Toasts float over the whole screen, header bar included — same shape as the player
+    // screen's and Home's own overlays. Manual sync triggers report through this one.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&root));
 
     let widgets = LibraryWidgets {
         status_page: status_page.clone(),
@@ -463,127 +484,39 @@ pub fn build(
         });
     }
 
-    // Same 3-phase render shape as `home.rs`: render from cache immediately, sync + reconcile
-    // progress, re-render, then fetch cover art concurrently for everything just rendered and
-    // re-render once more. This is the only place this screen touches `abs_core`; it never
-    // imports `abs_api` at all.
-    //
-    // As in home.rs, the network/DB pipeline runs inside `tokio::spawn` (worker threads) — the
-    // `spawn_future_local` future is polled on the GTK main thread, and doing HTTP body
-    // handling, statement building and cache writes directly there steals frames from the main
-    // loop. The main context only parks on the `JoinHandle`s and applies widget updates between
-    // stages.
-    glib::spawn_future_local({
-        let pool = pool.clone();
+    let ctx = SyncCtx {
+        pool: pool.clone(),
+        paths: paths.clone(),
+        session: session.clone(),
+        server_id: server.id.clone(),
+        account_id: account.id.clone(),
+    };
+    spawn_sync_cycle(ctx.clone(), widgets.clone(), None);
+
+    // The two manual triggers — the ⋯ menu's "Sync now" and a pull past the scroller's top —
+    // share one `ManualSync` (toast + in-flight guard) between them, mirroring home.rs.
+    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay);
+    {
+        let ctx = ctx.clone();
         let widgets = widgets.clone();
-        let session = session.clone();
-        let server_id = server.id.clone();
-        let account_id = account.id.clone();
-        async move {
-            if let Ok(data) = load(&pool, &server_id, &account_id).await {
-                apply(data, &widgets);
-            }
-
-            let spawned_sync = tokio::spawn({
-                let pool = pool.clone();
-                let session = session.clone();
-                let server_id = server_id.clone();
-                let account_id = account_id.clone();
-                async move {
-                    // Asked at call time, not captured at build time — see home.rs's pipeline note.
-                    // The connection (settings + resolved base URL) is asked the same way.
-                    let access_token = session.access_token().await;
-                    let connection = match session.connection_target().await {
-                        Ok(connection) => connection,
-                        Err(err) => {
-                            tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
-                            return Err(err);
-                        }
-                    };
-                    let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
-
-                    if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id).await
-                    {
-                        tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
-                    }
-
-                    sync_result
-                }
-            });
-            let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
-
-            let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
-            let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.items.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
-            if let Some(data) = data_after_sync {
-                apply(data, &widgets);
-            }
-
-            match &sync_result {
-                Ok(()) => widgets.banner.set_revealed(false),
-                Err(err) => {
-                    // An authorization failure is not fixable by re-syncing — the session itself
-                    // is what died — so the banner swaps its copy and grows a "Log in again"
-                    // action routed to the shell, mirroring Home's failure state.
-                    if matches!(err, CoreError::Auth) {
-                        widgets.banner.set_title("Session expired — showing what's cached.");
-                        widgets.banner.set_action_label(Some("Log in again"));
-                    } else {
-                        widgets.banner.set_title("Couldn't sync — showing what's cached.");
-                        widgets.banner.set_action_label(None);
-                    }
-                    widgets.banner.set_details(Some(&err.to_string()));
-                    widgets.banner.set_revealed(true);
-                }
-            }
-
-            // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
-            // fetched concurrently for everything just rendered — after the rest of the screen
-            // is already showing (the `apply` above), so a slow/offline server delays only the
-            // artwork, never the initial post-sync render. Same two-stage `tokio::spawn` shape
-            // as `home.rs`'s `spawn_sync_cycle`.
-            if !item_ids_after_sync.is_empty() {
-                let spawned_covers = tokio::spawn({
-                    let pool = pool.clone();
-                    let paths = paths.clone();
-                    let session = session.clone();
-                    let server_id = server_id.clone();
-                    async move {
-                        let access_token = session.access_token().await;
-                        // Best-effort like the fetches themselves: a settings failure here just
-                        // means no covers — logged (above), never surfaced.
-                        let connection = session.connection_target().await.ok();
-                        let fetches = item_ids_after_sync
-                            .iter()
-                            .map(|item_id| {
-                                let pool = pool.clone();
-                                let paths = paths.clone();
-                                let connection = connection.clone();
-                                let access_token = access_token.clone();
-                                let server_id = server_id.clone();
-                                let item_id = item_id.clone();
-                                async move {
-                                    match &connection {
-                                        Some(connection) => {
-                                            abs_core::covers::fetch_and_cache_cover(&paths, &pool, connection, &access_token, &server_id, &item_id).await
-                                        }
-                                        None => None,
-                                    }
-                                }
-                            });
-                        futures::future::join_all(fetches).await;
-                    }
-                });
-                spawned_covers.await.expect("the Library cover-fetch task must not panic");
-
-                if let Ok(data) = load(&pool, &server_id, &account_id).await {
-                    apply(data, &widgets);
-                }
-            }
-        }
-    });
+        let manual_sync = manual_sync.clone();
+        let popover = sync_menu_popover.clone();
+        sync_now_button.connect_clicked(move |_| {
+            popover.popdown();
+            spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        let widgets = widgets.clone();
+        let manual_sync = manual_sync.clone();
+        crate::widgets::pull_to_refresh::attach(&scroller, move || {
+            spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
+        });
+    }
 
     LibraryScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         search_entry: search_entry.clone(),
         widgets: widgets.clone(),
         #[cfg(test)]
@@ -601,8 +534,157 @@ pub fn build(
             view_toggle,
             offline_toggle,
             offline_banner,
+            sync_now_button,
+            toast_overlay,
+            scroller,
         },
     }
+}
+
+/// What a sync cycle needs, bundled for re-spawning — the manual triggers (the ⋯ menu's
+/// "Sync now", pull-to-refresh) re-run the exact cycle the screen opens with. Mirrors home.rs's
+/// `SyncCtx`; `server`/`account` ride along as the ids the pipeline actually uses.
+#[derive(Clone)]
+struct SyncCtx {
+    pool: SqlitePool,
+    paths: AppPaths,
+    session: abs_core::auth::Session,
+    server_id: String,
+    account_id: String,
+}
+
+/// Runs one full sync cycle on the main loop — the same 3-phase render shape as `home.rs`:
+/// render from cache immediately, sync + reconcile progress, re-render, then fetch cover art
+/// concurrently for everything just rendered and re-render once more. This is the only place
+/// this screen touches `abs_core`; it never imports `abs_api` at all. Called once when the
+/// screen is built and again on every manual trigger, so it must leave all widget state
+/// consistent no matter how many times it runs.
+///
+/// As in home.rs, the network/DB pipeline runs inside `tokio::spawn` (worker threads) — the
+/// `spawn_future_local` future is polled on the GTK main thread, and doing HTTP body handling,
+/// statement building and cache writes directly there steals frames from the main loop. The
+/// main context only parks on the `JoinHandle`s and applies widget updates between stages.
+///
+/// A manual trigger (`manual`) reports its outcome as a toast and shares an in-flight guard
+/// with the screen's other manual trigger — see `crate::widgets::ManualSync`. The automatic
+/// cycle passes none and stays unguarded.
+fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate::widgets::ManualSync>) {
+    if let Some(manual) = &manual {
+        if !manual.claim() {
+            return;
+        }
+    }
+    glib::spawn_future_local(async move {
+        let SyncCtx { pool, paths, session, server_id, account_id } = ctx;
+
+        if let Ok(data) = load(&pool, &server_id, &account_id).await {
+            apply(data, &widgets);
+        }
+
+        let spawned_sync = tokio::spawn({
+            let pool = pool.clone();
+            let session = session.clone();
+            let server_id = server_id.clone();
+            let account_id = account_id.clone();
+            async move {
+                // Asked at call time, not captured at build time — see home.rs's pipeline note.
+                // The connection (settings + resolved base URL) is asked the same way, so a
+                // settings change is honored by the next sync cycle.
+                let access_token = session.access_token().await;
+                let connection = match session.connection_target().await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
+                        return Err(err);
+                    }
+                };
+                let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
+
+                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id).await
+                {
+                    tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
+                }
+
+                sync_result
+            }
+        });
+        let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
+        let manual_ok = sync_result.is_ok();
+
+        let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
+        let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.items.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
+        if let Some(data) = data_after_sync {
+            apply(data, &widgets);
+        }
+
+        match &sync_result {
+            Ok(()) => widgets.banner.set_revealed(false),
+            Err(err) => {
+                // An authorization failure is not fixable by re-syncing — the session itself
+                // is what died — so the banner swaps its copy and grows a "Log in again"
+                // action routed to the shell, mirroring Home's failure state.
+                if matches!(err, CoreError::Auth) {
+                    widgets.banner.set_title("Session expired — showing what's cached.");
+                    widgets.banner.set_action_label(Some("Log in again"));
+                } else {
+                    widgets.banner.set_title("Couldn't sync — showing what's cached.");
+                    widgets.banner.set_action_label(None);
+                }
+                widgets.banner.set_details(Some(&err.to_string()));
+                widgets.banner.set_revealed(true);
+            }
+        }
+
+        // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
+        // fetched concurrently for everything just rendered — after the rest of the screen
+        // is already showing (the `apply` above), so a slow/offline server delays only the
+        // artwork, never the initial post-sync render. Same two-stage `tokio::spawn` shape
+        // as home.rs's identically-named cycle.
+        if !item_ids_after_sync.is_empty() {
+            let spawned_covers = tokio::spawn({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                let session = session.clone();
+                let server_id = server_id.clone();
+                async move {
+                    let access_token = session.access_token().await;
+                    // Best-effort like the fetches themselves: a settings failure here just
+                    // means no covers — logged (above), never surfaced.
+                    let connection = session.connection_target().await.ok();
+                    let fetches = item_ids_after_sync
+                        .iter()
+                        .map(|item_id| {
+                            let pool = pool.clone();
+                            let paths = paths.clone();
+                            let connection = connection.clone();
+                            let access_token = access_token.clone();
+                            let server_id = server_id.clone();
+                            let item_id = item_id.clone();
+                            async move {
+                                match &connection {
+                                    Some(connection) => {
+                                        abs_core::covers::fetch_and_cache_cover(&paths, &pool, connection, &access_token, &server_id, &item_id).await
+                                    }
+                                    None => None,
+                                }
+                            }
+                        });
+                    futures::future::join_all(fetches).await;
+                }
+            });
+            spawned_covers.await.expect("the Library cover-fetch task must not panic");
+
+            if let Ok(data) = load(&pool, &server_id, &account_id).await {
+                apply(data, &widgets);
+            }
+        }
+
+        // The manual trigger's own feedback — after the resolve above, so the banner already
+        // shows whatever the toast is about; "Sync failed" carries no details itself.
+        if let Some(manual) = manual {
+            manual.finish(manual_ok);
+        }
+    });
 }
 
 /// The single writer behind every "in progress only" surface — the popover's check, the header
@@ -1530,5 +1612,100 @@ pub(crate) mod tests {
 
         assert!(!hooks.status_page.is_visible(), "the live demo server has at least one item, so the empty state should clear");
         assert!(hooks.flow_box.child_at_index(0).is_some());
+    }
+
+    /// "Sync now" via the ⋯ menu, then pull-to-refresh — the two manual triggers share one sync
+    /// cycle and one outcome toast (LB-12, mirroring Home's HT-10 scenarios). Each trigger's
+    /// round-trip lands a distinct response, so every stage's render is its own observable. The
+    /// gesture itself is driven by the scroller's own `edge-overshot` signal — the exact one the
+    /// gesture listens to; the sandbox has no touch hardware.
+    pub(crate) fn run_sync_now_and_pull_to_refresh(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .up_to_n_times(1)
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Dune", "Frank Herbert", 1_600_000_000_000, 7200.0)
+                    ]
+                })))
+                .up_to_n_times(1)
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Dune", "Frank Herbert", 1_600_000_000_000, 7200.0),
+                        item_json("item-3", "Red Mars", "Kim Stanley Robinson", 1_500_000_000_000, 10800.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        // Mapped like Home's manual-sync scenarios — the outcome toast needs the overlay mapped.
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 1);
+        assert!(
+            !crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            "the automatic cycle reports through the banner/status page, not a toast"
+        );
+
+        // Each trigger's round-trip lands a distinct response (1 → 2 → 3 items, via the stacked
+        // `up_to_n_times` mocks above), so every stage's render is its own observable.
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 2, Duration::from_secs(10));
+        // The toast lands at the cycle's resolve step — after its cover-fetch stage — so wait
+        // on it, don't assert it immediately.
+        pump_until(
+            || crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            Duration::from_secs(10),
+        );
+        assert!(
+            crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            "the manual sync's completion toast must appear"
+        );
+
+        hooks.scroller.emit_by_name::<()>("edge-overshot", &[&gtk4::PositionType::Top]);
+        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 3, Duration::from_secs(10));
+        pump_until(
+            || crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            Duration::from_secs(10),
+        );
+        assert!(
+            crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
+            "the pull's completion toast must appear too"
+        );
     }
 }
