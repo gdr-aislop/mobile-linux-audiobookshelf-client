@@ -4,24 +4,36 @@
 //! Callers run this detached from anything time-critical (the player spawns it as a background
 //! task after playback starts; Home/Library fetch covers in a post-render task), so the timeout
 //! only bounds how long a slow server keeps the cover itself pending — it can never delay
-//! playback or any already-rendered UI.
+//! playback or any already-rendered UI. A screen's burst of covers goes through
+//! [`fetch_and_cache_covers`], which shares one HTTP client (one connection pool) across the
+//! whole batch, so the burst amortizes a single DNS+TCP+TLS handshake instead of paying one
+//! per cover — and gets HTTP/2 multiplexing over the pooled connection for free.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures::StreamExt;
 use sqlx::SqlitePool;
 
 use abs_storage::AppPaths;
 
-/// Generous by design: covers are fetched in parallel bursts, each with a fresh connection
-/// (cold DNS + TCP + TLS handshake before any bytes move), on networks where that alone can
-/// take several seconds — the failure mode this timeout prevents is a slow-but-working server
-/// starving every cover into an error, not a hang (nothing waits on these fetches).
+/// Generous by design: a batch shares one pooled connection, but on networks where even the
+/// first handshake can take several seconds — and where a server may then still be slow to
+/// answer — a per-request ceiling keeps a slow-but-working server from starving every cover
+/// into an error. Not a hang guard: nothing waits on these fetches.
 const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many covers of one batch may be in flight at once over the shared connection pool —
+/// enough overlap to keep the connection busy without hammering a small self-hosted server
+/// with dozens of simultaneous image requests.
+const COVER_FETCH_CONCURRENCY: usize = 6;
 
 /// Returns the local path to the item's cached cover, fetching and writing it first if it isn't
 /// already cached. Returns `None` on any failure (offline, 404, disk error, ...) — callers treat
 /// "no cover" as a normal outcome, not something to surface to the user.
+///
+/// The single-item entry point, for callers fetching exactly one cover (the player). Screen
+/// bursts should use [`fetch_and_cache_covers`], which reuses one client across the batch.
 pub async fn fetch_and_cache_cover(
     paths: &AppPaths,
     pool: &SqlitePool,
@@ -30,11 +42,56 @@ pub async fn fetch_and_cache_cover(
     server_id: &str,
     item_id: &str,
 ) -> Option<PathBuf> {
+    let api = connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT).ok()?;
+    fetch_and_cache_cover_with(&api, paths, pool, server_id, item_id).await
+}
+
+/// Fetches covers for a whole batch of items over one shared HTTP client — one mint, one
+/// connection pool, so h2 multiplexing and keep-alive pooling actually get a chance instead
+/// of every cover paying a full DNS+TCP+TLS handshake before its first byte. Items already
+/// cached issue no HTTP at all; a failure on one item (404, offline, disk error) is logged
+/// and never aborts its siblings. Best-effort throughout: no result is returned, callers
+/// re-read local storage to pick up whatever landed.
+pub async fn fetch_and_cache_covers(
+    paths: &AppPaths,
+    pool: &SqlitePool,
+    connection: &crate::connection::ConnectionTarget,
+    access_token: &str,
+    server_id: &str,
+    item_ids: Vec<String>,
+) {
+    let api = match connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT) {
+        Ok(api) => api,
+        Err(err) => {
+            tracing::warn!(%err, count = item_ids.len(), "couldn't build a client for the cover batch");
+            return;
+        }
+    };
+
+    futures::stream::iter(item_ids.into_iter().map(|item_id| {
+        // Cheap `Client` clone (Arc'd internals) — every future shares the same pool.
+        let api = api.clone();
+        async move { fetch_and_cache_cover_with(&api, paths, pool, server_id, &item_id).await; }
+    }))
+    .buffer_unordered(COVER_FETCH_CONCURRENCY)
+    .collect::<()>()
+    .await;
+}
+
+/// The per-item work behind both entry points — everything after client minting, so a batch
+/// runs it concurrently over clones of one shared client. The cache check comes first: the
+/// common case on repeat visits (cover already on disk) never touches the client at all.
+async fn fetch_and_cache_cover_with(
+    api: &abs_api::Client,
+    paths: &AppPaths,
+    pool: &SqlitePool,
+    server_id: &str,
+    item_id: &str,
+) -> Option<PathBuf> {
     if let Some(cached) = already_cached(pool, server_id, item_id).await {
         return Some(cached);
     }
 
-    let api = connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT).ok()?;
     let cover = match api.get_item_cover(item_id).await {
         Ok(cover) => cover,
         Err(err) => {
@@ -81,7 +138,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn pool_with_synced_item(item_id: &str) -> (SqlitePool, String) {
+    async fn pool_with_synced_items(item_ids: &[&str]) -> (SqlitePool, String) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = abs_storage::connect_and_migrate(&tmp.path().join("db.sqlite3")).await.unwrap();
         std::mem::forget(tmp);
@@ -94,22 +151,24 @@ mod tests {
         )
         .await
         .unwrap();
-        items::upsert(
-            &pool,
-            items::UpsertItem {
-                id: item_id,
-                server_id: &server_id,
-                library_id: "lib-1",
-                title: "Test Item",
-                author: None,
-                narrator: None,
-                description: None,
-                duration_seconds: 0.0,
-                added_at: chrono::Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
+        for item_id in item_ids {
+            items::upsert(
+                &pool,
+                items::UpsertItem {
+                    id: item_id,
+                    server_id: &server_id,
+                    library_id: "lib-1",
+                    title: "Test Item",
+                    author: None,
+                    narrator: None,
+                    description: None,
+                    duration_seconds: 0.0,
+                    added_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        }
         (pool, server_id)
     }
 
@@ -129,7 +188,7 @@ mod tests {
             .await;
 
         let (_tmp, paths) = test_paths();
-        let (pool, server_id) = pool_with_synced_item("item-1").await;
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
 
         let cached = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
         let cached = cached.expect("fetch should succeed");
@@ -150,7 +209,7 @@ mod tests {
             .await;
 
         let (_tmp, paths) = test_paths();
-        let (pool, server_id) = pool_with_synced_item("item-1").await;
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
 
         let first = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
         let second = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
@@ -166,7 +225,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
 
         let (_tmp, paths) = test_paths();
-        let (pool, server_id) = pool_with_synced_item("item-1").await;
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
 
         let result = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await;
         assert!(result.is_none());
@@ -182,7 +241,7 @@ mod tests {
             .await;
 
         let (_tmp, paths) = test_paths();
-        let (pool, server_id) = pool_with_synced_item("item-1").await;
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
 
         let cached = fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
         tokio::fs::remove_file(&cached).await.unwrap();
@@ -192,5 +251,78 @@ mod tests {
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_cache_covers_fetches_every_uncached_item_and_records_the_paths() {
+        let mock_server = MockServer::start().await;
+        for (item_id, body) in [("item-1", vec![1, 1]), ("item-2", vec![2, 2])] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/items/{item_id}/cover")))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(body.clone()))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1", "item-2"]).await;
+
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+
+        for (item_id, body) in [("item-1", vec![1, 1]), ("item-2", vec![2, 2])] {
+            let item = abs_storage::repo::items::get(&pool, &server_id, item_id).await.unwrap();
+            let cached = PathBuf::from(item.cover_cache_path.expect("every batched item's cover should be recorded"));
+            assert_eq!(tokio::fs::read(&cached).await.unwrap(), body);
+        }
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_cache_covers_keeps_going_when_one_item_fails() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-2/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![2]))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1", "item-2"]).await;
+
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+
+        let failed = abs_storage::repo::items::get(&pool, &server_id, "item-1").await.unwrap();
+        assert!(failed.cover_cache_path.is_none(), "a failed item must not record a cover path");
+        let sibling = abs_storage::repo::items::get(&pool, &server_id, "item-2").await.unwrap();
+        assert!(sibling.cover_cache_path.is_some(), "one item's failure must not abort its siblings");
+    }
+
+    #[tokio::test]
+    async fn fetch_and_cache_covers_skips_http_for_already_cached_items() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![1]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-2/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![2]))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1", "item-2"]).await;
+
+        // Pre-cache item-1 through the single-item path, then batch over both: only the
+        // uncached item-2 may reach the wire (1 pre-cache request + 1 batch request; a batch
+        // that ignored the cache would make 3).
+        fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "the batch must serve the cached item from disk, not HTTP");
     }
 }

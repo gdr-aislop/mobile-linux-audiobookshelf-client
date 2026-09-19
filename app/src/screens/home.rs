@@ -633,14 +633,17 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
         // uses for the player screen) — fetched concurrently for every item just rendered,
         // after the rest of the screen is already showing, so a slow/offline server delays
-        // only the artwork, never the initial render. `fetch_and_cache_cover` itself no-ops
-        // once a cover is already cached on disk, so this is cheap on every subsequent visit.
+        // only the artwork, never the initial render. The whole batch shares one HTTP client
+        // (one pooled connection), and per item it no-ops once a cover is already cached on
+        // disk, so this is cheap on every subsequent visit.
         let spawned_covers = data_after_sync.as_ref().filter(|data| !data.libraries.is_empty()).map(|data| {
-            let item_ids: std::collections::BTreeSet<String> = data
+            let item_ids: Vec<String> = data
                 .recent_items
                 .iter()
                 .map(|item| item.id.clone())
                 .chain(data.continue_items.iter().map(|(item, _)| item.id.clone()))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
             tokio::spawn({
                 let pool = pool.clone();
@@ -652,23 +655,9 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     let access_token = session.access_token().await;
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged, never surfaced.
-                    let connection = session.connection_target().await.ok();
-                    let fetches = item_ids.into_iter().map(|item_id| {
-                        let pool = pool.clone();
-                        let paths = paths.clone();
-                        let connection = connection.clone();
-                        let access_token = access_token.clone();
-                        let server_id = server_id.clone();
-                        async move {
-                            match &connection {
-                                Some(connection) => {
-                                    abs_core::covers::fetch_and_cache_cover(&paths, &pool, connection, &access_token, &server_id, &item_id).await
-                                }
-                                None => None,
-                            }
-                        }
-                    });
-                    futures::future::join_all(fetches).await;
+                    if let Some(connection) = session.connection_target().await.ok().as_ref() {
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids).await;
+                    }
 
                     load(&pool, &server_id, &account_id).await.ok()
                 }

@@ -639,7 +639,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         // fetched concurrently for everything just rendered — after the rest of the screen
         // is already showing (the `apply` above), so a slow/offline server delays only the
         // artwork, never the initial post-sync render. Same two-stage `tokio::spawn` shape
-        // as home.rs's identically-named cycle.
+        // as home.rs's identically-named cycle; the batch shares one HTTP client (one pooled
+        // connection) across all of it.
         if !item_ids_after_sync.is_empty() {
             let spawned_covers = tokio::spawn({
                 let pool = pool.clone();
@@ -650,26 +651,9 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                     let access_token = session.access_token().await;
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged (above), never surfaced.
-                    let connection = session.connection_target().await.ok();
-                    let fetches = item_ids_after_sync
-                        .iter()
-                        .map(|item_id| {
-                            let pool = pool.clone();
-                            let paths = paths.clone();
-                            let connection = connection.clone();
-                            let access_token = access_token.clone();
-                            let server_id = server_id.clone();
-                            let item_id = item_id.clone();
-                            async move {
-                                match &connection {
-                                    Some(connection) => {
-                                        abs_core::covers::fetch_and_cache_cover(&paths, &pool, connection, &access_token, &server_id, &item_id).await
-                                    }
-                                    None => None,
-                                }
-                            }
-                        });
-                    futures::future::join_all(fetches).await;
+                    if let Some(connection) = session.connection_target().await.ok().as_ref() {
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids_after_sync).await;
+                    }
                 }
             });
             spawned_covers.await.expect("the Library cover-fetch task must not panic");
