@@ -221,12 +221,19 @@ pub fn build(
 
     // The filter's ambient indicator while the popover is closed (the funnel icon on the header
     // button is only a hint) — an in-view "why are books hidden" banner with a one-tap escape,
-    // mirroring the offline banner's placement and idiom. `ErrorBanner` is wrong here: this is a
-    // neutral filter notice, not a failure.
-    let progress_banner_label = gtk4::Label::builder().label("Showing books in progress").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+    // built from the same banner row as the offline banner below. `ErrorBanner` is wrong here:
+    // this is a neutral filter notice, not a failure.
+    // Shared by both filter notices (this one and the offline banner below) so the two can't
+    // drift apart — the caption label gets its own lightly-margined row rather than hugging the
+    // screen edge. This banner alone appends its "Show all" escape button to the returned row.
+    let caption_banner_row = |text: &str| {
+        let label = gtk4::Label::builder().label(text).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+        let row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).margin_start(12).margin_end(12).margin_top(4).margin_bottom(4).build();
+        row.append(&label);
+        (label, row)
+    };
+    let (_, progress_banner_row) = caption_banner_row("Showing books in progress");
     let progress_show_all = gtk4::Button::builder().label("Show all").css_classes(["flat"]).valign(gtk4::Align::Center).build();
-    let progress_banner_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).margin_start(12).margin_end(12).margin_top(4).margin_bottom(4).build();
-    progress_banner_row.append(&progress_banner_label);
     progress_banner_row.append(&progress_show_all);
     let progress_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&progress_banner_row).reveal_child(false).build();
 
@@ -256,8 +263,8 @@ pub fn build(
         .build();
     header.pack_end(&sync_menu_button);
 
-    let offline_banner_label = gtk4::Label::builder().label("Showing downloaded items only").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
-    let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_label).reveal_child(false).build();
+    let (_, offline_banner_row) = caption_banner_row("Showing downloaded items only");
+    let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_row).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
     // The "Log in again" action (revealed only on authorization failures) routes to the shell,
@@ -411,6 +418,13 @@ pub fn build(
             let active = toggle.is_active();
             widgets.offline_mode.set(active);
             offline_banner.set_reveal_child(active);
+            // Rendered synchronously, before any DB work: the visible filter change must not be
+            // gated behind the refetch's pool acquire — on a contended pool (sync/cover/progress
+            // cycles all fighting over the 5 connections) that await has been observed stalling
+            // for tens of seconds, leaving the grid unfiltered the whole time. The in-memory
+            // `downloaded` set is whatever the last full load saw, which is immediate-and-slightly-
+            // stale; the spawned refetch below re-renders with fresh data when it lands.
+            render_from_current_data(&widgets);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -1048,13 +1062,24 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
         runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
 
+        // The filter must land synchronously on the toggle, not after the handler's background
+        // refetch resolves — that refetch's pool acquire has been observed stalling for tens of
+        // seconds on a contended device pool, leaving the grid unfiltered the whole time (and
+        // only a view-mode round-trip forced an immediate re-render). The first toggle-on still
+        // waits for the refetch here, because the download above was inserted after this
+        // screen's load — the in-memory set is stale and the synchronous render legitimately
+        // shows nothing — but every later toggle below round-trips with no pump at all: the
+        // list re-renders inside the handler, from the by-then-warm in-memory set.
         hooks.offline_toggle.set_active(true);
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Project Hail Mary".to_string()], Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
         hooks.offline_toggle.set_active(false);
-        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 2, Duration::from_secs(5));
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child(), "the banner should hide once offline mode is off");
+
+        hooks.offline_toggle.set_active(true);
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Project Hail Mary".to_string()], "toggling offline mode on must filter synchronously from the in-memory downloaded set");
     }
 
     pub(crate) fn run_sort_changes_order(runtime: &tokio::runtime::Runtime) {

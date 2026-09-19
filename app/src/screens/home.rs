@@ -473,6 +473,15 @@ pub fn build(
             let active = toggle.is_active();
             widgets.offline_mode.set(active);
             offline_banner.set_reveal_child(active);
+            // Rendered synchronously, before any DB work — same reasoning as `library.rs`'s
+            // identical handler: the refetch's pool acquire must not gate the visible filter
+            // change (a contended pool has stalled it for tens of seconds on-device). The
+            // in-memory snapshot is immediate-and-slightly-stale; the spawned refetch below
+            // re-renders with fresh data when it lands.
+            let cached = widgets.last_data.borrow().clone();
+            if let Some(data) = cached {
+                apply(&data, &widgets);
+            }
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -1049,13 +1058,20 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
         runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
 
+        // Same immediacy contract as `library.rs`'s offline scenario: the first toggle-on waits
+        // for the handler's background refetch (the download above landed after this screen's
+        // load, so the in-memory set is stale), but every later toggle below re-renders
+        // synchronously inside the handler — no pump, no contended-pool wait.
         hooks.offline_toggle.set_active(true);
         pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
         hooks.offline_toggle.set_active(false);
-        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(5));
+        assert_eq!(count_children(&hooks.recent_row), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child());
+
+        hooks.offline_toggle.set_active(true);
+        assert_eq!(count_children(&hooks.recent_row), 1, "toggling offline mode on must filter synchronously from the in-memory downloaded set");
     }
 
     pub(crate) fn run_shows_empty_state_when_the_server_has_no_libraries(runtime: &tokio::runtime::Runtime) {
