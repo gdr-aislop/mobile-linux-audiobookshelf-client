@@ -57,6 +57,11 @@ Fractal) rather than copying Lissen's Material Design look.
 - Primary `AdwButton` (suggested-action style, full width) "Connect", **disabled until the
   required fields for the current mode are filled in** — on first launch, with an empty form,
   this is the state the user actually sees.
+- **On-screen keyboard**: the Server URL field sets `GtkEditable:input-purpose` to `URL` (via its
+  internal `GtkText` delegate, which `AdwEntryRow` doesn't expose) so mobile keyboards show their
+  URL layout — dedicated `/` and `:` keys, no autocapitalization. The same applies to the
+  Connection page's Local Network Server Address editor; the other fields (username, password,
+  token) stay plain-text/purpose-managed.
 - **Error state**: on a failed connection attempt, an inline `AdwBanner`-style strip appears above
   the form, with copy that distinguishes *why* it failed rather than one generic message:
   - **Authentication failure** (bad credentials/token): "Unable to sign in — check your username

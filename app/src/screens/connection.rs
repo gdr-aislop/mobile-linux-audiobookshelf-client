@@ -197,7 +197,14 @@ pub fn build(
                     }
                 })
             };
-            show_entry_dialog(&window, "Local Network Server Address", "Define server access for home Wi-Fi — used when it's reachable, the public address otherwise.", current.as_deref().unwrap_or(""), on_save);
+            show_entry_dialog(
+                &window,
+                "Local Network Server Address",
+                "Define server access for home Wi-Fi — used when it's reachable, the public address otherwise.",
+                current.as_deref().unwrap_or(""),
+                gtk4::InputPurpose::Url,
+                on_save,
+            );
         }
     });
     advanced_group.add(&local_address_row);
@@ -238,7 +245,14 @@ pub fn build(
                     });
                 })
             };
-            show_entry_dialog(&window, "Change User Agent", "Customize the application User-Agent header. Leave empty for the default.", current.as_deref().unwrap_or(""), on_save);
+            show_entry_dialog(
+                &window,
+                "Change User Agent",
+                "Customize the application User-Agent header. Leave empty for the default.",
+                current.as_deref().unwrap_or(""),
+                gtk4::InputPurpose::FreeForm,
+                on_save,
+            );
         }
     });
     advanced_group.add(&user_agent_row);
@@ -409,13 +423,15 @@ fn add_dialog_content(dialog: &gtk4::Dialog, description: &str) -> gtk4::Box {
 }
 
 /// The single-line editor shared by the Local Network Server Address and Change User Agent
-/// rows — the differences (validation, persistence, subtitle text) all live in `on_save`,
-/// which gets the field's text.
+/// rows — the differences (keyboard type, validation, persistence, subtitle text) all live in
+/// the arguments, with `on_save` getting the field's text. `input_purpose` picks the on-screen
+/// keyboard layout (URL for addresses, plain text for a User-Agent string).
 fn show_entry_dialog(
     window: &adw::ApplicationWindow,
     title: &str,
     description: &str,
     initial: &str,
+    input_purpose: gtk4::InputPurpose,
     on_save: EntrySaveHandler,
 ) {
     let (dialog, error_label) = save_cancel_dialog(window, title, {
@@ -428,7 +444,8 @@ fn show_entry_dialog(
         })
     });
     let content = add_dialog_content(&dialog, description);
-    content.append(&gtk4::Entry::builder().text(initial).hexpand(true).build());
+    content
+        .append(&gtk4::Entry::builder().text(initial).input_purpose(input_purpose).hexpand(true).build());
     content.append(&error_label);
     dialog.present();
 }
@@ -739,9 +756,13 @@ pub(crate) mod tests {
         adw::prelude::ActionRowExt::activate(&screen.hooks.local_address_row);
         pump_until_dialog_mapped();
         let dialog = find_dialog().unwrap();
-        find_descendant::<gtk4::Entry>(dialog.content_area().upcast_ref())
-            .unwrap()
-            .set_text("  http://192.168.1.50:13378/ ");
+        let address_entry = find_descendant::<gtk4::Entry>(dialog.content_area().upcast_ref()).unwrap();
+        assert_eq!(
+            address_entry.input_purpose(),
+            gtk4::InputPurpose::Url,
+            "the Local Network Server Address editor must ask the on-screen keyboard for its URL layout"
+        );
+        address_entry.set_text("  http://192.168.1.50:13378/ ");
         dialog.response(gtk4::ResponseType::Ok);
         pump_until(
             {
@@ -827,7 +848,13 @@ pub(crate) mod tests {
         adw::prelude::ActionRowExt::activate(&screen.hooks.user_agent_row);
         pump_until_dialog_mapped();
         let dialog = find_dialog().unwrap();
-        find_descendant::<gtk4::Entry>(dialog.content_area().upcast_ref()).unwrap().set_text("  MyAgent/1.0 ");
+        let user_agent_entry = find_descendant::<gtk4::Entry>(dialog.content_area().upcast_ref()).unwrap();
+        assert_eq!(
+            user_agent_entry.input_purpose(),
+            gtk4::InputPurpose::FreeForm,
+            "a User-Agent string is free text, not a URL — it must not get the URL keyboard"
+        );
+        user_agent_entry.set_text("  MyAgent/1.0 ");
         dialog.response(gtk4::ResponseType::Ok);
         pump_until(
             {

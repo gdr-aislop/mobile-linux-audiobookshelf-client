@@ -125,6 +125,7 @@ pub fn build(
         .build();
 
     let url_row = adw::EntryRow::builder().title("Server URL").show_apply_button(false).build();
+    crate::widgets::entry_row_input_purpose(&url_row, gtk4::InputPurpose::Url);
     let username_row = adw::EntryRow::builder().title("Username").show_apply_button(false).build();
     let password_row = adw::PasswordEntryRow::builder().title("Password").show_apply_button(false).build();
     let token_row = adw::EntryRow::builder().title("API Token").show_apply_button(false).build();
@@ -779,6 +780,17 @@ pub(crate) mod tests {
             let hooks = screen.test_hooks();
 
             assert!(!hooks.connect_button.is_sensitive(), "empty form should start disabled");
+            let url_text = hooks
+                .url_row
+                .delegate()
+                .unwrap()
+                .downcast::<gtk4::Text>()
+                .expect("EntryRow delegate should be a GtkText");
+            assert_eq!(
+                url_text.input_purpose(),
+                gtk4::InputPurpose::Url,
+                "the Server URL field must ask the on-screen keyboard for its URL layout"
+            );
 
             hooks.url_row.set_text(DEMO_SERVER_URL);
             hooks.username_row.set_text("demo");

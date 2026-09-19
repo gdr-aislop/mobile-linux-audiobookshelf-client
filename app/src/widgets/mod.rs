@@ -33,6 +33,19 @@ pub(crate) fn find_descendant<T: glib::object::IsA<gtk4::Widget>>(root: &gtk4::W
     None
 }
 
+/// Sets `GtkEditable:input-purpose` on an `AdwEntryRow` — which libadwaita doesn't expose as a
+/// row property: the purpose lives on the row's internal `GtkText` editable delegate. The
+/// on-screen keyboard picks its layout from this (squeekboard shows its URL layout — `/`, `:`,
+/// no autocapitalization — only when the focused entry's purpose is `URL`), so fields that hold
+/// addresses must set it or they get the plain text keyboard.
+pub(crate) fn entry_row_input_purpose(row: &adw::EntryRow, purpose: gtk4::InputPurpose) {
+    let text = row
+        .delegate()
+        .and_then(|delegate| delegate.downcast::<gtk4::Text>().ok())
+        .expect("AdwEntryRow's editable delegate should be a GtkText");
+    text.set_input_purpose(purpose);
+}
+
 /// What a *manual* sync trigger — a screen's ⋯ menu "Sync now" item, or the pull-to-refresh
 /// gesture — adds to that screen's sync cycle: a toast reporting the outcome (the banner/empty
 /// state stay the detailed failure surface), and the in-flight flag both of a screen's triggers
