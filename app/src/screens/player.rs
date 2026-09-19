@@ -647,6 +647,12 @@ fn populate_download_popover_rows(
         popover_box.remove(&child);
     }
 
+    // The spec titles this sheet "Download book" (test-plan ID-6). A real AdwBottomSheet needs
+    // libadwaita 1.6 and this crate's ceiling is 1.2, so the popover carries the title as a
+    // heading row instead — rebuilt here (not once at construction) so it survives the clear
+    // below on every re-open.
+    popover_box.append(&gtk4::Label::builder().label("Download book").css_classes(["heading"]).halign(gtk4::Align::Start).margin_bottom(4).build());
+
     // Estimated bytes for a scope — the same chapter->track mapping the actual download uses, so
     // the estimate is of exactly what would be fetched. The fallbacks (no chapters at all ->
     // whole book; nothing to fetch or no cached sizes -> no estimate) live in
@@ -1212,6 +1218,13 @@ pub(crate) mod tests {
         pump_until(|| estimate_texts(&hooks.download_popover_box) == ["≈1.0 MB".to_string(), "≈6.0 MB".to_string(), "≈7.0 MB".to_string(), "≈7.0 MB".to_string()], Duration::from_secs(2));
         assert_eq!(estimate_texts(&hooks.download_popover_box), ["≈1.0 MB", "≈6.0 MB", "≈7.0 MB", "≈7.0 MB"], "current (file 1), next (default count 2: files 2+3), remaining and entire (everything)");
 
+        // ID-6: the sheet is titled "Download book" (as a heading row, the popover stand-in for
+        // the spec's AdwBottomSheet).
+        assert!(
+            for_each_descendant_labels(&hooks.download_popover_box).iter().any(|t| t == "Download book"),
+            "the popover should carry the spec's 'Download book' title"
+        );
+
         let (minus, _, _) = stepper_widgets(&hooks.download_popover_box);
         minus.emit_clicked();
         assert_eq!(estimate_texts(&hooks.download_popover_box), ["≈1.0 MB", "≈2.0 MB", "≈7.0 MB", "≈7.0 MB"], "stepping the count down to 1 shrinks the estimate to just file 2");
@@ -1593,31 +1606,26 @@ pub(crate) mod tests {
         found.expect("a − button (the Next-chapters stepper) exists in the popover")
     }
 
-    /// The popover's size-estimate subtitles, in row order — the labels starting with the spec's
-    /// "≈" (rows without an estimable size simply have no such label).
-    fn estimate_texts(container: &gtk4::Box) -> Vec<String> {
+    /// Every label's text under `root`, in order — the generic form the specific collectors below
+    /// filter.
+    fn for_each_descendant_labels(root: &gtk4::Box) -> Vec<String> {
         let mut texts = Vec::new();
-        for_each_descendant(container.upcast_ref(), &mut |widget| {
+        for_each_descendant(root.upcast_ref(), &mut |widget| {
             if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
-                let text = label.label().to_string();
-                if text.starts_with('≈') {
-                    texts.push(text);
-                }
+                texts.push(label.label().to_string());
             }
         });
         texts
     }
 
+    /// The popover's size-estimate subtitles, in row order — the labels starting with the spec's
+    /// "≈" (rows without an estimable size simply have no such label).
+    fn estimate_texts(container: &gtk4::Box) -> Vec<String> {
+        for_each_descendant_labels(container).into_iter().filter(|text| text.starts_with('≈')).collect()
+    }
+
     /// How many scope rows currently show the spec's "Not enough free space" subtitle.
     fn blocked_row_count(container: &gtk4::Box) -> usize {
-        let mut count = 0;
-        for_each_descendant(container.upcast_ref(), &mut |widget| {
-            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
-                if label.label() == "Not enough free space" {
-                    count += 1;
-                }
-            }
-        });
-        count
+        for_each_descendant_labels(container).into_iter().filter(|text| text == "Not enough free space").count()
     }
 }
