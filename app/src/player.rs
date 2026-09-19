@@ -587,7 +587,11 @@ impl PlayerController {
                 let access_token = access_token.clone();
                 let server_id = session.server_id().to_string();
                 let item_id = item.item_id.clone();
-                tokio::spawn(async move {
+                // Runs on the GTK main loop (`spawn_future_local`, not `tokio::spawn`): it holds
+                // `Rc`s and borrows main-loop state, and the reqwest-driven fetch works because
+                // main.rs keeps the Tokio runtime entered for the GTK loop's lifetime — the same
+                // shape as every other future in this file.
+                glib::spawn_future_local(async move {
                     let Some(cover_path) =
                         abs_core::covers::fetch_and_cache_cover(&paths, &pool, &connection, &access_token, &server_id, &item_id).await
                     else {

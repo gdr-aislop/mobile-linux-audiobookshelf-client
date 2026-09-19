@@ -916,7 +916,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             // Accept the connection and hold it open forever without writing a response.
-            let _ = listener.accept();
+            // The stream must be bound, not discarded — `let _ = accept()` drops it (and the
+            // socket with it), closing the connection instantly and turning the client's
+            // failure into "connection closed" instead of the timeout this exists to test.
+            let (_stream, _) = listener.accept().expect("the test client should connect");
             std::thread::sleep(std::time::Duration::from_secs(60));
         });
 
@@ -938,7 +941,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             // Accept the connection and hold it open forever without writing a response.
-            let _ = listener.accept();
+            // The stream must be bound, not discarded — `let _ = accept()` drops it (and the
+            // socket with it), closing the connection instantly and turning the client's
+            // failure into "connection closed" instead of the timeout this exists to test.
+            let (_stream, _) = listener.accept().expect("the test client should connect");
             std::thread::sleep(std::time::Duration::from_secs(60));
         });
 
