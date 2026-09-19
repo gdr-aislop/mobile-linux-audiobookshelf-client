@@ -10,6 +10,7 @@
 //! long as this screen is open and removes it on collapse, so those accelerators are inert
 //! everywhere else.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::glib;
@@ -313,7 +314,11 @@ pub fn build(
         move |_| {
             let Some((session, server_id, item_id)) = controller.current_download_context() else { return };
             let current_chapter_index = controller.current_chapter_index().unwrap_or(0);
-            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &toast_overlay);
+            // The stepper's count defaults to 10 (ui-spec) on every open and is shared by both
+            // populate passes below, so the async availability rebuild can't reset it mid-open.
+            let chapter_count = controller.chapters().len();
+            let next_count = Rc::new(Cell::new(10u32));
+            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, chapter_count, &next_count, &toast_overlay);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let download_popover_box = download_popover_box.clone();
@@ -321,10 +326,11 @@ pub fn build(
                 let download_popover_for_rows = download_popover_for_rows.clone();
                 let session = session.clone();
                 let item_id = item_id.clone();
+                let next_count = next_count.clone();
                 let toast_overlay = toast_overlay.clone();
                 async move {
                     let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
-                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &toast_overlay);
+                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, chapter_count, &next_count, &toast_overlay);
                 }
             });
         }
@@ -568,11 +574,15 @@ fn add_action(group: &gtk4::gio::SimpleActionGroup, name: &'static str, run: imp
     group.add_action(&action);
 }
 
-/// (Re)builds the download button's popover rows: the four scope options (ui-spec's Item Detail
-/// download sheet, minus the size estimates and the "Next chapters" stepper — both need per-
-/// chapter file-size metadata / a larger widget this pass doesn't build; "Next chapters" fetches a
-/// fixed 10, matching the spec's own stated default), plus a destructive "Clear downloaded
-/// chapters" row shown only once `availability` says something is actually downloaded.
+/// (Re)builds the download button's popover rows: the four scope options from ui-spec's Item
+/// Detail download sheet — "Current chapter", "Next chapters" with its inline − / count / +
+/// stepper (default 10, clamped to the chapters actually remaining after the current one; tapping
+/// the row body starts the download for the stepper's count), "Remaining chapters", "Entire book"
+/// — plus a destructive "Clear downloaded chapters" row shown only once `availability` says
+/// something is actually downloaded. The size-estimate subtitles the spec also asks of these rows
+/// still need per-chapter file-size metadata and come separately. `next_count` is shared with the
+/// caller so the popover's synchronous and async populate passes (same open) can't clobber a
+/// count the user already stepped.
 #[allow(clippy::too_many_arguments)]
 fn populate_download_popover_rows(
     popover_box: &gtk4::Box,
@@ -582,14 +592,30 @@ fn populate_download_popover_rows(
     session: &abs_core::auth::Session,
     item_id: &str,
     current_chapter_index: usize,
+    chapter_count: usize,
+    next_count: &Rc<Cell<u32>>,
     toast_overlay: &adw::ToastOverlay,
 ) {
     while let Some(child) = popover_box.first_child() {
         popover_box.remove(&child);
     }
 
-    let scopes: [(&str, DownloadScope); 4] =
-        [("Current chapter", DownloadScope::CurrentChapter), ("Next 10 chapters", DownloadScope::NextChapters(10)), ("Remaining chapters", DownloadScope::RemainingChapters), ("Entire book", DownloadScope::EntireBook)];
+    let add_scope_row = |label: &str, scope: DownloadScope| {
+        let button = gtk4::Button::builder().label(label).css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        button.connect_clicked({
+            let download_manager = download_manager.clone();
+            let popover = popover.clone();
+            let session = session.clone();
+            let item_id = item_id.to_string();
+            let toast_overlay = toast_overlay.clone();
+            move |_| {
+                download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
+                popover.popdown();
+                toast_overlay.add_toast(adw::Toast::new("Download started"));
+            }
+        });
+        popover_box.append(&button);
+    };
 
     // While a download is in flight for this item, Stop is the first action — it ends the job
     // keeping the chapters that already completed (same semantics as the Downloads screen's
@@ -611,22 +637,77 @@ fn populate_download_popover_rows(
         popover_box.append(&stop_button);
     }
 
-    for (label, scope) in scopes {
-        let button = gtk4::Button::builder().label(label).css_classes(["flat"]).halign(gtk4::Align::Start).build();
-        button.connect_clicked({
-            let download_manager = download_manager.clone();
-            let popover = popover.clone();
-            let session = session.clone();
-            let item_id = item_id.to_string();
-            let toast_overlay = toast_overlay.clone();
-            move |_| {
-                download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
-                popover.popdown();
-                toast_overlay.add_toast(adw::Toast::new("Download started"));
-            }
+    add_scope_row("Current chapter", DownloadScope::CurrentChapter);
+
+    // "Next chapters" is the one scope row with an inline stepper (ui-spec: "− / count / +, each
+    // button ≥44×44px per the touch-target note"; the row body outside the stepper starts the
+    // download for the stepper's count). The count is clamped to what's actually remaining after
+    // the current chapter — on the last chapter there is nothing after it, so the whole row goes
+    // insensitive rather than offering a download that could only ever no-op.
+    let remaining = chapter_count.saturating_sub(current_chapter_index + 1);
+    let next_button = gtk4::Button::builder().label("Next chapters").css_classes(["flat"]).hexpand(true).build();
+    let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
+    let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
+    let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
+
+    let update_count_label: Rc<dyn Fn()> = {
+        let count_label = count_label.clone();
+        let next_count = next_count.clone();
+        Rc::new(move || count_label.set_label(&next_count.get().to_string()))
+    };
+    next_count.set(next_count.get().clamp(1, remaining.max(1) as u32));
+    update_count_label();
+
+    {
+        let next_count = next_count.clone();
+        let update_count_label = update_count_label.clone();
+        minus_button.connect_clicked(move |_| {
+            next_count.set(next_count.get().saturating_sub(1).max(1));
+            update_count_label();
         });
-        popover_box.append(&button);
     }
+    {
+        let next_count = next_count.clone();
+        let update_count_label = update_count_label.clone();
+        plus_button.connect_clicked(move |_| {
+            next_count.set((next_count.get() + 1).min(remaining.max(1) as u32));
+            update_count_label();
+        });
+    }
+
+    next_button.connect_clicked({
+        let download_manager = download_manager.clone();
+        let popover = popover.clone();
+        let session = session.clone();
+        let item_id = item_id.to_string();
+        let toast_overlay = toast_overlay.clone();
+        let next_count = next_count.clone();
+        move |_| {
+            download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
+            popover.popdown();
+            toast_overlay.add_toast(adw::Toast::new("Download started"));
+        }
+    });
+
+    if remaining == 0 {
+        next_button.set_sensitive(false);
+        minus_button.set_sensitive(false);
+        plus_button.set_sensitive(false);
+        count_label.add_css_class("dim-label");
+    }
+
+    let stepper = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).build();
+    stepper.append(&minus_button);
+    stepper.append(&count_label);
+    stepper.append(&plus_button);
+
+    let next_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).build();
+    next_row.append(&next_button);
+    next_row.append(&stepper);
+    popover_box.append(&next_row);
+
+    add_scope_row("Remaining chapters", DownloadScope::RemainingChapters);
+    add_scope_row("Entire book", DownloadScope::EntireBook);
 
     if availability != OfflineAvailability::None {
         let clear_button = gtk4::Button::builder().label("Clear downloaded chapters").css_classes(["destructive-action"]).margin_top(6).build();
@@ -862,6 +943,108 @@ pub(crate) mod tests {
         );
         pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
         assert_eq!(hooks.download_button.icon_name().as_deref(), Some("emblem-ok-symbolic"), "the button should reflect Complete once the download finishes");
+
+        window.destroy();
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Next chapters" stepper must
+    /// behave per ui-spec (ID-8): default 10, ±1 per tap, clamped to the chapters remaining after
+    /// the current one (so a default of 10 displays as 9 for ten chapters at the first one), and
+    /// floored at 1; both stepper buttons are 44×44px touch targets.
+    pub(crate) fn run_download_next_chapters_stepper_defaults_clamps_and_steps(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        let titles: Vec<String> = (0..10).map(|i| format!("C{i}")).collect();
+        let chapters: Vec<(&str, f64, f64)> = titles.iter().enumerate().map(|(i, t)| (t.as_str(), i as f64, i as f64 + 1.0)).collect();
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-1", 10, &chapters));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.chapters().len() == 10, Duration::from_secs(10));
+
+        let download_manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+
+        let (minus, count, plus) = stepper_widgets(&hooks.download_popover_box);
+        assert_eq!(count.label(), "9", "the default 10 must clamp to the 9 chapters remaining after the current one");
+        assert_eq!(minus.width_request(), 44, "stepper buttons need their own 44px touch target");
+        assert_eq!(minus.height_request(), 44);
+        assert_eq!(plus.width_request(), 44);
+        assert_eq!(plus.height_request(), 44);
+
+        plus.emit_clicked();
+        assert_eq!(count.label(), "9", "+ at the remaining-chapters ceiling must be a no-op");
+
+        for expected in (1..=8).rev() {
+            minus.emit_clicked();
+            assert_eq!(count.label(), expected.to_string());
+        }
+        minus.emit_clicked();
+        assert_eq!(count.label(), "1", "− must floor at 1 (a scope of zero chapters is not a choice)");
+
+        window.destroy();
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Tapping the "Next chapters" row body
+    /// must download exactly the stepper's count of chapters (ui-spec ID-9): on a two-chapter,
+    /// two-file item at the first chapter the clamped count is 1, so only the *second* chapter's
+    /// track may ever be fetched.
+    pub(crate) fn run_download_next_chapters_row_uses_the_stepper_count(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_two_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.chapters().len() == 2, Duration::from_secs(10));
+
+        let download_manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        let (_, count, _) = stepper_widgets(&hooks.download_popover_box);
+        assert_eq!(count.label(), "1", "only chapter 2 remains after chapter 1, so the stepper clamps to 1");
+        click_button_labeled(&hooks.download_popover_box, "Next chapters");
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "2")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
+        assert!(
+            runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
+            "chapter 1's track must not be fetched — the download is exactly the stepper's 1 chapter"
+        );
 
         window.destroy();
         controller.stop();
@@ -1112,20 +1295,23 @@ pub(crate) mod tests {
         controller.stop();
     }
 
-    /// Finds and clicks the button with the given label inside a popover's button box (speed or
-    /// sleep-timer presets), so tests can drive the popover the same way a user tapping it would.
+    /// Finds and clicks the button with the given label anywhere inside a container (speed or
+    /// sleep-timer presets sit flat in their popover box; the download popover's "Next chapters"
+    /// button is nested inside its stepper row), so tests can drive widgets the same way a user
+    /// tapping them would.
     fn click_button_labeled(container: &gtk4::Box, label: &str) {
-        let mut child = container.first_child();
-        while let Some(widget) = child {
+        let mut found = None;
+        for_each_descendant(container.upcast_ref(), &mut |widget| {
+            if found.is_some() {
+                return;
+            }
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
                 if button.label().as_deref() == Some(label) {
-                    button.emit_clicked();
-                    return;
+                    found = Some(button.clone());
                 }
             }
-            child = widget.next_sibling();
-        }
-        panic!("no button labeled {label:?} found");
+        });
+        found.unwrap_or_else(|| panic!("no button labeled {label:?} found")).emit_clicked();
     }
 
     /// Extracts the title label's text from a chapters-sheet row built by `build_chapter_row`.
@@ -1133,5 +1319,35 @@ pub(crate) mod tests {
         let row_box = row.child().expect("row has a child box").downcast::<gtk4::Box>().unwrap();
         let title_label = row_box.first_child().expect("row box has a title label").downcast::<gtk4::Label>().unwrap();
         title_label.label()
+    }
+
+    /// Visits every descendant of `root` depth-first.
+    fn for_each_descendant(root: &gtk4::Widget, f: &mut dyn FnMut(&gtk4::Widget)) {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            f(&widget);
+            for_each_descendant(&widget, f);
+            child = widget.next_sibling();
+        }
+    }
+
+    /// Finds the "Next chapters" row's stepper: the `−` button (whose parent box also holds the
+    /// count label and the `+` button as its next siblings, per `populate_download_popover_rows`).
+    fn stepper_widgets(container: &gtk4::Box) -> (gtk4::Button, gtk4::Label, gtk4::Button) {
+        let mut found: Option<(gtk4::Button, gtk4::Label, gtk4::Button)> = None;
+        for_each_descendant(container.upcast_ref(), &mut |widget| {
+            if found.is_some() {
+                return;
+            }
+            let Some(button) = widget.downcast_ref::<gtk4::Button>() else { return };
+            if button.label().as_deref() != Some("−") {
+                return;
+            }
+            let parent = button.parent().expect("stepper button has a parent box").downcast::<gtk4::Box>().unwrap();
+            let count = parent.first_child().and_then(|m| m.next_sibling()).expect("count label follows the − button").downcast::<gtk4::Label>().unwrap();
+            let plus = count.next_sibling().expect("+ button follows the count label").downcast::<gtk4::Button>().unwrap();
+            found = Some((button.clone(), count, plus));
+        });
+        found.expect("a − button (the Next-chapters stepper) exists in the popover")
     }
 }

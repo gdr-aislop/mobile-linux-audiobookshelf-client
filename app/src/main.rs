@@ -193,6 +193,10 @@ mod tests {
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),
         (player_screen_chapters_sheet_lists_and_seeks, crate::screens::player::tests::run_chapters_sheet_lists_and_seeks),
         (player_screen_download_button_starts_a_download_and_reflects_state, crate::screens::player::tests::run_download_button_starts_a_download_and_reflects_state),
+
+        (player_screen_download_next_chapters_stepper_defaults_clamps_and_steps, crate::screens::player::tests::run_download_next_chapters_stepper_defaults_clamps_and_steps),
+
+        (player_screen_download_next_chapters_row_uses_the_stepper_count, crate::screens::player::tests::run_download_next_chapters_row_uses_the_stepper_count),
         (player_screen_speed_popover_changes_playback_speed, crate::screens::player::tests::run_speed_popover_changes_playback_speed),
         (player_screen_sleep_timer_end_of_chapter_pauses_at_the_boundary, crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary),
         (player_screen_add_bookmark_button_persists_a_row, crate::screens::player::tests::run_add_bookmark_button_persists_a_row),

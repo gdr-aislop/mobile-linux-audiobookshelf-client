@@ -438,7 +438,7 @@ pub(crate) mod tests {
 
     /// A two-file item, one chapter per file, so `DownloadScope::CurrentChapter` maps onto exactly
     /// one track — the simplest possible case that still exercises chapter->track resolution.
-    async fn mock_two_track_item(mock_server: &MockServer, item_id: &str) {
+    pub(crate) async fn mock_two_track_item(mock_server: &MockServer, item_id: &str) {
         Mock::given(method("GET"))
             .and(path(format!("/api/items/{item_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
