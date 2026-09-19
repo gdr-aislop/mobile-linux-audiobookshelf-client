@@ -392,6 +392,15 @@ struct RawItemMedia {
 struct RawAudioFile {
     ino: Option<String>,
     duration: Option<f64>,
+    /// The server wraps the real file facts (path, byte size, timestamps) in a `metadata` object —
+    /// only the byte size matters here (it's what download size estimates are computed from), and
+    /// it's absent on some endpoints/servers, so everything else is ignored.
+    metadata: Option<RawFileMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFileMetadata {
+    size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,6 +414,10 @@ struct RawChapter {
 pub struct AudioFileRef {
     pub ino: String,
     pub duration_seconds: f64,
+    /// The file's byte size as the server reports it in its metadata — `None` when the metadata
+    /// is missing or omits it. Callers (download size estimates) treat `None` as "unknown",
+    /// never as an error or as zero.
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -624,12 +637,12 @@ impl Client {
             Some(media) => (media.audio_files, media.chapters),
             None => (Vec::new(), Vec::new()),
         };
-        let audio_files = audio_files
-            .into_iter()
-            .filter_map(|f| {
-                Some(AudioFileRef { ino: f.ino?, duration_seconds: f.duration.unwrap_or(0.0) })
-            })
-            .collect();
+    let audio_files = audio_files
+        .into_iter()
+        .filter_map(|f| {
+            Some(AudioFileRef { ino: f.ino?, duration_seconds: f.duration.unwrap_or(0.0), size_bytes: f.metadata.and_then(|m| m.size) })
+        })
+        .collect();
         // A malformed chapter entry (missing title/start/end) is skipped rather than failing the
         // whole call, same tolerance as audio files above — one bad chapter shouldn't take down
         // playback or the chapters sheet for the rest of the book.
@@ -1431,6 +1444,33 @@ mod tests {
         assert_eq!(info.chapters[0].start_seconds, 0.0);
         assert_eq!(info.chapters[0].end_seconds, 100.0);
         assert_eq!(info.chapters[1].title, "Chapter 1");
+    }
+
+    #[tokio::test]
+    async fn get_item_playback_info_parses_audio_file_sizes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [
+                        { "ino": "1", "duration": 1800.0, "metadata": { "size": 33_000_000 } },
+                        { "ino": "2", "duration": 1800.0 },
+                        { "ino": "3", "duration": 1800.0, "metadata": { "size": null } },
+                    ],
+                    "chapters": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let info = client.get_item_playback_info("item-1").await.unwrap();
+
+        assert_eq!(info.audio_files.len(), 3);
+        assert_eq!(info.audio_files[0].size_bytes, Some(33_000_000));
+        assert_eq!(info.audio_files[1].size_bytes, None, "no metadata object at all is unknown, not zero");
+        assert_eq!(info.audio_files[2].size_bytes, None, "an explicit null size is unknown, not zero");
     }
 
     #[tokio::test]

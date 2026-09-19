@@ -203,7 +203,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tracks::upsert_all(&pool, &server_id, item_id, &[tracks::NewTrack { ino, duration_seconds: 3600.0, offset_seconds: 0.0 }]).await.unwrap();
+        tracks::upsert_all(&pool, &server_id, item_id, &[tracks::NewTrack { ino, duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }]).await.unwrap();
         (pool, server_id)
     }
 

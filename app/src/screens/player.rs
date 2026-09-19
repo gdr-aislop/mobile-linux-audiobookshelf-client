@@ -316,9 +316,13 @@ pub fn build(
             let current_chapter_index = controller.current_chapter_index().unwrap_or(0);
             // The stepper's count defaults to 10 (ui-spec) on every open and is shared by both
             // populate passes below, so the async availability rebuild can't reset it mid-open.
-            let chapter_count = controller.chapters().len();
             let next_count = Rc::new(Cell::new(10u32));
-            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, chapter_count, &next_count, &toast_overlay);
+            // Chapter ranges come from the controller's in-memory list, so even the synchronous
+            // first pass has them; cached track sizes (the estimates' raw material) are a DB
+            // read, so only the async pass has them — subtitles arriving a moment later is the
+            // expected two-stage render, same as the chapter rows' offline glyphs.
+            let chapter_ranges: Vec<(f64, f64)> = controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
+            populate_download_popover_rows(&download_popover_box, OfflineAvailability::None, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &[], &next_count, &toast_overlay);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let download_popover_box = download_popover_box.clone();
@@ -330,7 +334,8 @@ pub fn build(
                 let toast_overlay = toast_overlay.clone();
                 async move {
                     let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
-                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, chapter_count, &next_count, &toast_overlay);
+                    let tracks = abs_core::tracks::cached_tracks(&pool, &server_id, &item_id).await.unwrap_or_default();
+                    populate_download_popover_rows(&download_popover_box, availability, &download_manager, &download_popover_for_rows, &session, &item_id, current_chapter_index, &chapter_ranges, &tracks, &next_count, &toast_overlay);
                 }
             });
         }
@@ -574,15 +579,43 @@ fn add_action(group: &gtk4::gio::SimpleActionGroup, name: &'static str, run: imp
     group.add_action(&action);
 }
 
+/// Estimated bytes a scope would fetch, or `None` when no honest estimate exists: sizes not
+/// cached yet, or nothing to fetch (a disabled row shouldn't advertise "≈0 B"). No chapters at
+/// all means every scope degenerates to the whole book — the same fallback
+/// `DownloadManager::start_download` applies — so the estimate is every cached track.
+fn estimate_bytes_for(tracks: &[abs_core::tracks::TrackRef], chapter_ranges: &[(f64, f64)], scope: DownloadScope, current_chapter_index: usize) -> Option<u64> {
+    if chapter_ranges.is_empty() {
+        if tracks.is_empty() || tracks.iter().any(|t| t.size_bytes.is_none()) {
+            return None;
+        }
+        return Some(tracks.iter().map(|t| t.size_bytes.unwrap_or(0)).sum());
+    }
+    let indices = abs_core::downloads::resolve_scope(scope, current_chapter_index, chapter_ranges.len());
+    if indices.is_empty() {
+        return None;
+    }
+    abs_core::download_tracks::estimate_bytes_for_chapters(tracks, chapter_ranges, &indices)
+}
+
+/// The spec's estimate subtitle ("≈340 MB") — dim, on its own line under the row's title.
+fn estimate_label(bytes: u64) -> gtk4::Label {
+    gtk4::Label::builder()
+        .label(format!("≈{}", crate::screens::downloads::format_bytes(bytes)))
+        .css_classes(["dim-label"])
+        .xalign(0.0)
+        .build()
+}
+
 /// (Re)builds the download button's popover rows: the four scope options from ui-spec's Item
 /// Detail download sheet — "Current chapter", "Next chapters" with its inline − / count / +
 /// stepper (default 10, clamped to the chapters actually remaining after the current one; tapping
 /// the row body starts the download for the stepper's count), "Remaining chapters", "Entire book"
 /// — plus a destructive "Clear downloaded chapters" row shown only once `availability` says
-/// something is actually downloaded. The size-estimate subtitles the spec also asks of these rows
-/// still need per-chapter file-size metadata and come separately. `next_count` is shared with the
-/// caller so the popover's synchronous and async populate passes (same open) can't clobber a
-/// count the user already stepped.
+/// something is actually downloaded. Each scope row carries the spec's size-estimate subtitle
+/// ("≈340 MB"), computed offline from the cached per-track sizes (`tracks` — empty means sizes
+/// aren't synced yet, so no subtitle is shown at all rather than a wrong one). `next_count` is
+/// shared with the caller so the popover's synchronous and async populate passes (same open)
+/// can't clobber a count the user already stepped.
 #[allow(clippy::too_many_arguments)]
 fn populate_download_popover_rows(
     popover_box: &gtk4::Box,
@@ -592,7 +625,8 @@ fn populate_download_popover_rows(
     session: &abs_core::auth::Session,
     item_id: &str,
     current_chapter_index: usize,
-    chapter_count: usize,
+    chapter_ranges: &[(f64, f64)],
+    tracks: &[abs_core::tracks::TrackRef],
     next_count: &Rc<Cell<u32>>,
     toast_overlay: &adw::ToastOverlay,
 ) {
@@ -600,8 +634,19 @@ fn populate_download_popover_rows(
         popover_box.remove(&child);
     }
 
+    // Estimated bytes for a scope — the same chapter->track mapping the actual download uses, so
+    // the estimate is of exactly what would be fetched. The fallbacks (no chapters at all ->
+    // whole book; nothing to fetch or no cached sizes -> no estimate) live in
+    // `estimate_bytes_for` below.
+    let estimate_for = |scope: DownloadScope| estimate_bytes_for(tracks, chapter_ranges, scope, current_chapter_index);
+
     let add_scope_row = |label: &str, scope: DownloadScope| {
-        let button = gtk4::Button::builder().label(label).css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        let inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).build();
+        inner.append(&gtk4::Label::builder().label(label).xalign(0.0).build());
+        if let Some(bytes) = estimate_for(scope) {
+            inner.append(&estimate_label(bytes));
+        }
+        let button = gtk4::Button::builder().child(&inner).css_classes(["flat"]).build();
         button.connect_clicked({
             let download_manager = download_manager.clone();
             let popover = popover.clone();
@@ -643,9 +688,15 @@ fn populate_download_popover_rows(
     // button ≥44×44px per the touch-target note"; the row body outside the stepper starts the
     // download for the stepper's count). The count is clamped to what's actually remaining after
     // the current chapter — on the last chapter there is nothing after it, so the whole row goes
-    // insensitive rather than offering a download that could only ever no-op.
-    let remaining = chapter_count.saturating_sub(current_chapter_index + 1);
-    let next_button = gtk4::Button::builder().label("Next chapters").css_classes(["flat"]).hexpand(true).build();
+    // insensitive rather than offering a download that could only ever no-op. Its subtitle
+    // recomputes on every step, since the count is what the estimate is of.
+    let remaining = chapter_ranges.len().saturating_sub(current_chapter_index + 1);
+    let next_title = gtk4::Label::builder().label("Next chapters").xalign(0.0).build();
+    let next_subtitle = gtk4::Label::builder().css_classes(["dim-label"]).xalign(0.0).visible(false).build();
+    let next_inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).hexpand(true).valign(gtk4::Align::Center).build();
+    next_inner.append(&next_title);
+    next_inner.append(&next_subtitle);
+    let next_button = gtk4::Button::builder().child(&next_inner).css_classes(["flat"]).build();
     let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
     let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
     let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
@@ -655,23 +706,44 @@ fn populate_download_popover_rows(
         let next_count = next_count.clone();
         Rc::new(move || count_label.set_label(&next_count.get().to_string()))
     };
+    let update_next_subtitle: Rc<dyn Fn()> = {
+        let next_subtitle = next_subtitle.clone();
+        let next_count = next_count.clone();
+        let tracks = tracks.to_vec();
+        let chapter_ranges = chapter_ranges.to_vec();
+        Rc::new(move || {
+            let scope = DownloadScope::NextChapters(next_count.get());
+            match estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index) {
+                Some(bytes) => {
+                    next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
+                    next_subtitle.set_visible(true);
+                }
+                None => next_subtitle.set_visible(false),
+            }
+        })
+    };
     next_count.set(next_count.get().clamp(1, remaining.max(1) as u32));
     update_count_label();
+    update_next_subtitle();
 
     {
         let next_count = next_count.clone();
         let update_count_label = update_count_label.clone();
+        let update_next_subtitle = update_next_subtitle.clone();
         minus_button.connect_clicked(move |_| {
             next_count.set(next_count.get().saturating_sub(1).max(1));
             update_count_label();
+            update_next_subtitle();
         });
     }
     {
         let next_count = next_count.clone();
         let update_count_label = update_count_label.clone();
+        let update_next_subtitle = update_next_subtitle.clone();
         plus_button.connect_clicked(move |_| {
             next_count.set((next_count.get() + 1).min(remaining.max(1) as u32));
             update_count_label();
+            update_next_subtitle();
         });
     }
 
@@ -1050,6 +1122,58 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Every scope row must show the spec's
+    /// size-estimate subtitle computed from the cached per-file sizes (ID-7), and the "Next
+    /// chapters" subtitle must track the stepper (three 1/2/4 MB files at the first chapter:
+    /// default count clamps to 2 -> ≈6.0 MB; one step down -> just the second file's ≈2.0 MB).
+    pub(crate) fn run_download_rows_show_size_estimates_that_track_the_stepper(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        // The popover's estimates read the *cached* track sizes, which the download manager
+        // normally writes on an item's first download — seeded directly here so the test
+        // exercises the popover's read side without a download round-trip.
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[
+            abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 5.0, offset_seconds: 0.0, size_bytes: Some(1_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "2", duration_seconds: 5.0, offset_seconds: 5.0, size_bytes: Some(2_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "3", duration_seconds: 5.0, offset_seconds: 10.0, size_bytes: Some(4_000_000) },
+        ]))
+        .unwrap();
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.chapters().len() == 3, Duration::from_secs(10));
+
+        let download_manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        // Two-stage render: the synchronous first pass has no cached track sizes yet (no
+        // subtitles), the async pass fetches them from the DB — so pump until the estimates are
+        // the *correct* ones, not merely present.
+        pump_until(|| estimate_texts(&hooks.download_popover_box) == ["≈1.0 MB".to_string(), "≈6.0 MB".to_string(), "≈7.0 MB".to_string(), "≈7.0 MB".to_string()], Duration::from_secs(2));
+        assert_eq!(estimate_texts(&hooks.download_popover_box), ["≈1.0 MB", "≈6.0 MB", "≈7.0 MB", "≈7.0 MB"], "current (file 1), next (default count 2: files 2+3), remaining and entire (everything)");
+
+        let (minus, _, _) = stepper_widgets(&hooks.download_popover_box);
+        minus.emit_clicked();
+        assert_eq!(estimate_texts(&hooks.download_popover_box), ["≈1.0 MB", "≈2.0 MB", "≈7.0 MB", "≈7.0 MB"], "stepping the count down to 1 shrinks the estimate to just file 2");
+
+        window.destroy();
+        controller.stop();
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking a speed preset should call
     /// through to the real backend and update both the controller's snapshot and the button's
     /// label.
@@ -1295,10 +1419,10 @@ pub(crate) mod tests {
         controller.stop();
     }
 
-    /// Finds and clicks the button with the given label anywhere inside a container (speed or
-    /// sleep-timer presets sit flat in their popover box; the download popover's "Next chapters"
-    /// button is nested inside its stepper row), so tests can drive widgets the same way a user
-    /// tapping them would.
+    /// Finds and clicks the button with the given label anywhere inside a container, so tests can
+    /// drive widgets the same way a user tapping them would. The text may sit on the button
+    /// itself (the flat scope rows used to) or on a label inside it (scope rows are title +
+    /// subtitle stacks now; "Next chapters" carries its title in its child box).
     fn click_button_labeled(container: &gtk4::Box, label: &str) {
         let mut found = None;
         for_each_descendant(container.upcast_ref(), &mut |widget| {
@@ -1306,12 +1430,29 @@ pub(crate) mod tests {
                 return;
             }
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
-                if button.label().as_deref() == Some(label) {
+                if button_text(button).as_deref() == Some(label) {
                     found = Some(button.clone());
                 }
             }
         });
         found.unwrap_or_else(|| panic!("no button labeled {label:?} found")).emit_clicked();
+    }
+
+    /// A button's effective text: its own label, else the first label inside its child box.
+    fn button_text(button: &gtk4::Button) -> Option<String> {
+        if let Some(label) = button.label() {
+            return Some(label.to_string());
+        }
+        let child = button.child()?;
+        let mut text = None;
+        for_each_descendant(&child, &mut |widget| {
+            if text.is_none() {
+                if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                    text = Some(label.label().to_string());
+                }
+            }
+        });
+        text
     }
 
     /// Extracts the title label's text from a chapters-sheet row built by `build_chapter_row`.
@@ -1349,5 +1490,20 @@ pub(crate) mod tests {
             found = Some((button.clone(), count, plus));
         });
         found.expect("a − button (the Next-chapters stepper) exists in the popover")
+    }
+
+    /// The popover's size-estimate subtitles, in row order — the labels starting with the spec's
+    /// "≈" (rows without an estimable size simply have no such label).
+    fn estimate_texts(container: &gtk4::Box) -> Vec<String> {
+        let mut texts = Vec::new();
+        for_each_descendant(container.upcast_ref(), &mut |widget| {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                let text = label.label().to_string();
+                if text.starts_with('≈') {
+                    texts.push(text);
+                }
+            }
+        });
+        texts
     }
 }

@@ -83,7 +83,8 @@ pub struct Progress {
 
 /// Cached per-item track metadata — mirrors `abs_core::streaming::StreamTrack`, persisted so
 /// downloads (and, later, offline-availability checks) don't need a network call to know what a
-/// book's tracks are.
+/// book's tracks are. `size_bytes` is the server-reported file size, when known — what size
+/// estimates are computed from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct Track {
     pub server_id: String,
@@ -92,6 +93,7 @@ pub struct Track {
     pub track_index: i64,
     pub duration_seconds: f64,
     pub offset_seconds: f64,
+    pub size_bytes: Option<i64>,
 }
 
 /// A track download's lifecycle. `Downloading` and `Failed` both retain whatever

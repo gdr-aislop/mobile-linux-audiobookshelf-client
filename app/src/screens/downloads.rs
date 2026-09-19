@@ -300,7 +300,7 @@ fn chapters_label(count: usize) -> String {
 }
 
 /// "5 B", "18.2 MB", "1.3 GB" — decimal units, matching how servers report Content-Length.
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
         format!("{:.1} GB", bytes as f64 / 1e9)
     } else if bytes >= 1_000_000 {

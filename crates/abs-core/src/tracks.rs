@@ -15,12 +15,15 @@ pub struct TrackRef {
     pub track_index: i64,
     pub duration_seconds: f64,
     pub offset_seconds: f64,
+    /// The server-reported file size, when known — what download size estimates are computed
+    /// from. `None` is "unknown", never an error.
+    pub size_bytes: Option<u64>,
 }
 
 pub async fn sync_item_tracks(pool: &SqlitePool, server_id: &str, item_id: &str, tracks: &[StreamTrack]) -> Result<()> {
     let new_tracks: Vec<abs_storage::repo::tracks::NewTrack> = tracks
         .iter()
-        .map(|t| abs_storage::repo::tracks::NewTrack { ino: &t.ino, duration_seconds: t.duration_seconds, offset_seconds: t.offset_seconds })
+        .map(|t| abs_storage::repo::tracks::NewTrack { ino: &t.ino, duration_seconds: t.duration_seconds, offset_seconds: t.offset_seconds, size_bytes: t.size_bytes })
         .collect();
     abs_storage::repo::tracks::upsert_all(pool, server_id, item_id, &new_tracks).await?;
     Ok(())
@@ -30,7 +33,13 @@ pub async fn cached_tracks(pool: &SqlitePool, server_id: &str, item_id: &str) ->
     let tracks = abs_storage::repo::tracks::list_for_item(pool, server_id, item_id).await?;
     Ok(tracks
         .into_iter()
-        .map(|t| TrackRef { ino: t.ino, track_index: t.track_index, duration_seconds: t.duration_seconds, offset_seconds: t.offset_seconds })
+        .map(|t| TrackRef {
+            ino: t.ino,
+            track_index: t.track_index,
+            duration_seconds: t.duration_seconds,
+            offset_seconds: t.offset_seconds,
+            size_bytes: t.size_bytes.and_then(|s| u64::try_from(s).ok()),
+        })
         .collect())
 }
 
@@ -73,8 +82,8 @@ mod tests {
     async fn sync_item_tracks_then_cached_tracks_round_trips() {
         let (pool, server_id, item_id) = pool_with_item().await;
         let tracks = vec![
-            StreamTrack { ino: "111".into(), url: "u1".into(), duration_seconds: 1800.0, offset_seconds: 0.0 },
-            StreamTrack { ino: "222".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 1800.0 },
+            StreamTrack { ino: "111".into(), url: "u1".into(), duration_seconds: 1800.0, offset_seconds: 0.0, size_bytes: Some(1) },
+            StreamTrack { ino: "222".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 1800.0, size_bytes: Some(2) },
         ];
 
         sync_item_tracks(&pool, &server_id, &item_id, &tracks).await.unwrap();
@@ -88,10 +97,10 @@ mod tests {
     #[tokio::test]
     async fn syncing_again_replaces_the_previous_track_list() {
         let (pool, server_id, item_id) = pool_with_item().await;
-        let first = vec![StreamTrack { ino: "111".into(), url: "u1".into(), duration_seconds: 3600.0, offset_seconds: 0.0 }];
+        let first = vec![StreamTrack { ino: "111".into(), url: "u1".into(), duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }];
         let second = vec![
-            StreamTrack { ino: "222".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 0.0 },
-            StreamTrack { ino: "333".into(), url: "u3".into(), duration_seconds: 1800.0, offset_seconds: 1800.0 },
+            StreamTrack { ino: "222".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 0.0, size_bytes: None },
+            StreamTrack { ino: "333".into(), url: "u3".into(), duration_seconds: 1800.0, offset_seconds: 1800.0, size_bytes: None },
         ];
 
         sync_item_tracks(&pool, &server_id, &item_id, &first).await.unwrap();

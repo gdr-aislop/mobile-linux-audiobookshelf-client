@@ -461,6 +461,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A three-file item, one chapter per file, with the server's per-file `metadata.size`
+    /// populated (1/2/4 MB) — the smallest case where the download sheet's size-estimate
+    /// subtitles can be watched change as the "Next chapters" stepper steps.
+    pub(crate) async fn mock_three_track_item(mock_server: &MockServer, item_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": {
+                    "audioFiles": [
+                        { "ino": "1", "duration": 5.0, "metadata": { "size": 1_000_000 } },
+                        { "ino": "2", "duration": 5.0, "metadata": { "size": 2_000_000 } },
+                        { "ino": "3", "duration": 5.0, "metadata": { "size": 4_000_000 } },
+                    ],
+                    "chapters": [
+                        { "id": 0, "start": 0.0, "end": 5.0, "title": "Chapter 1" },
+                        { "id": 1, "start": 5.0, "end": 10.0, "title": "Chapter 2" },
+                        { "id": 2, "start": 10.0, "end": 15.0, "title": "Chapter 3" },
+                    ],
+                }
+            })))
+            .mount(mock_server)
+            .await;
+        for ino in ["1", "2", "3"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/items/{item_id}/file/{ino}")))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "audio/mpeg").insert_header("Content-Length", "5").set_body_bytes(b"hello".to_vec()))
+                .mount(mock_server)
+                .await;
+        }
+    }
+
     /// Like `mock_two_track_item`, but with no chapter data at all — the degenerate case
     /// `start_download` falls back to "download every track" for, since there's no finer-grained
     /// scope to resolve against.

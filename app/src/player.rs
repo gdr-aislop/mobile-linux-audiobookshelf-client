@@ -656,7 +656,11 @@ impl PlayerController {
                 resume_at.map(|at| locate_track(&target.tracks, at)).unwrap_or((0, 0.0));
 
             // Local DB write only, no network involved — inline rather than part of the
-            // `tokio::join!` above, which is reserved for concurrent network calls.
+            // `tokio::join!` above, which is reserved for concurrent network calls. (Deliberately
+            // NOT syncing tracks here: `upsert_all` deletes and re-inserts the item's track rows,
+            // and `download_tracks` cascades on that FK, so a playback-time sync would wipe
+            // existing download state. The download manager syncs tracks itself, before any
+            // download of an item that was never synced before.)
             if let Err(err) = abs_core::chapters::sync_item_chapters(&pool, session.server_id(), &item.item_id, &target.chapters).await {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't persist chapters locally");
             }
@@ -1574,7 +1578,7 @@ pub(crate) mod tests {
     async fn seed_track_metadata(pool: &SqlitePool, server_id: &str, item_id: &str, tracks: &[(&str, f64, f64)]) {
         let rows: Vec<abs_storage::repo::tracks::NewTrack<'_>> = tracks
             .iter()
-            .map(|&(ino, duration_seconds, offset_seconds)| abs_storage::repo::tracks::NewTrack { ino, duration_seconds, offset_seconds })
+            .map(|&(ino, duration_seconds, offset_seconds)| abs_storage::repo::tracks::NewTrack { ino, duration_seconds, offset_seconds, size_bytes: None })
             .collect();
         abs_storage::repo::tracks::upsert_all(pool, server_id, item_id, &rows).await.unwrap();
     }

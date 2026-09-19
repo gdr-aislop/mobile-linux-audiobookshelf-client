@@ -29,6 +29,9 @@ pub struct StreamTrack {
     /// of the files before it. Progress and chapters are defined book-level, so everything
     /// user-facing positions itself through this.
     pub offset_seconds: f64,
+    /// The server-reported file size, when the item's metadata carries it — what download size
+    /// estimates are computed from. `None` is "unknown", never an error.
+    pub size_bytes: Option<u64>,
 }
 
 /// Resolves a playable stream for an item through the server connection `connection` describes
@@ -56,6 +59,7 @@ pub async fn resolve_stream_target(connection: &crate::connection::ConnectionTar
             url: connection.track_url(item_id, &file.ino, access_token),
             duration_seconds: file.duration_seconds,
             offset_seconds,
+            size_bytes: file.size_bytes,
         });
         offset_seconds += file.duration_seconds;
     }
@@ -104,6 +108,7 @@ pub async fn offline_stream_target(
             url: connection.track_url(item_id, &track.ino, access_token),
             duration_seconds: track.duration_seconds,
             offset_seconds: track.offset_seconds,
+            size_bytes: track.size_bytes,
         });
         duration_seconds += track.duration_seconds;
     }
@@ -361,8 +366,8 @@ mod tests {
 
     fn two_tracks() -> Vec<StreamTrack> {
         vec![
-            StreamTrack { ino: "1".into(), url: "u1".into(), duration_seconds: 1800.0, offset_seconds: 0.0 },
-            StreamTrack { ino: "2".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 1800.0 },
+            StreamTrack { ino: "1".into(), url: "u1".into(), duration_seconds: 1800.0, offset_seconds: 0.0, size_bytes: Some(1) },
+            StreamTrack { ino: "2".into(), url: "u2".into(), duration_seconds: 1800.0, offset_seconds: 1800.0, size_bytes: Some(2) },
         ]
     }
 

@@ -96,6 +96,33 @@ pub fn tracks_needed_for_chapters(tracks: &[TrackRef], chapters: &[abs_api::Chap
     needed
 }
 
+/// The total bytes a download for the given chapter indices would need to fetch — the sum of the
+/// server-reported sizes of every *distinct* track those chapters touch. Whole files are what
+/// downloads fetch, so a chapter straddling two tracks counts both, and two chapters sharing one
+/// file count it once. `None` when any touched track's size is unknown — callers show no estimate
+/// rather than a wrong one. Pure (no I/O), for the download sheet's per-row subtitles; takes
+/// plain `(f64, f64)` chapter ranges so a caller with its own chapter type (the Player screen's
+/// `ChapterInfo`) never has to construct an `abs_api` one, the same boundary
+/// `chapter_offline_markers_for_item` below already draws.
+pub fn estimate_bytes_for_chapters(tracks: &[TrackRef], chapter_ranges: &[(f64, f64)], chapter_indices: &[usize]) -> Option<u64> {
+    let chapters: Vec<abs_api::ChapterRef> = chapter_ranges
+        .iter()
+        .map(|&(start_seconds, end_seconds)| abs_api::ChapterRef { title: String::new(), start_seconds, end_seconds })
+        .collect();
+    let needed = tracks_needed_for_chapters(tracks, &chapters, chapter_indices);
+    // An empty `needed` (no cached tracks at all, or chapters that map onto none) is "can't know",
+    // not "zero bytes" — a caller showing "≈0 B" for a real book would be worse than no estimate.
+    if needed.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    for ino in needed {
+        let track = tracks.iter().find(|t| t.ino == ino)?;
+        total += track.size_bytes?;
+    }
+    Some(total)
+}
+
 /// One bool per chapter (in order) — the per-chapter offline glyph Item Detail will show, without
 /// storing a single "chapter downloaded" row anywhere (there's no such file to point at). A
 /// chapter counts as offline only if *every* track it touches is complete — a chapter split across
@@ -394,7 +421,13 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn track(ino: &str, offset: f64, duration: f64) -> TrackRef {
-        TrackRef { ino: ino.to_string(), track_index: 0, duration_seconds: duration, offset_seconds: offset }
+        TrackRef { ino: ino.to_string(), track_index: 0, duration_seconds: duration, offset_seconds: offset, size_bytes: Some(1000) }
+    }
+
+    /// Like `track`, but with an unknown size — the "server didn't report it" case estimates
+    /// must handle by refusing, not by guessing.
+    fn unsized_track(ino: &str, offset: f64, duration: f64) -> TrackRef {
+        TrackRef { ino: ino.to_string(), track_index: 0, duration_seconds: duration, offset_seconds: offset, size_bytes: None }
     }
 
     fn chapter(start: f64, end: f64) -> abs_api::ChapterRef {
@@ -438,6 +471,40 @@ mod tests {
     }
 
     #[test]
+    fn estimate_bytes_sums_the_distinct_tracks_a_scope_touches() {
+        let tracks = vec![track("a", 0.0, 100.0), track("b", 100.0, 100.0), track("c", 200.0, 100.0)];
+        let ranges: Vec<(f64, f64)> = vec![(0.0, 100.0), (100.0, 200.0), (200.0, 300.0)];
+
+        // One chapter -> its one track; two chapters sharing nothing -> both; a shared file ->
+        // counted once, not twice.
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[0]), Some(1000));
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[0, 2]), Some(2000));
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[0, 1]), Some(2000));
+        assert_eq!(estimate_bytes_for_chapters(&[], &ranges, &[0]), None, "no cached tracks at all is 'can't know', not 'zero bytes'");
+    }
+
+    #[test]
+    fn estimate_bytes_counts_a_shared_file_once_and_a_straddle_twice() {
+        let one_shared = vec![track("only", 0.0, 300.0)];
+        let ranges = vec![(0.0, 150.0), (150.0, 300.0)];
+        assert_eq!(estimate_bytes_for_chapters(&one_shared, &ranges, &[0, 1]), Some(1000));
+
+        let straddling = vec![track("a", 0.0, 150.0), track("b", 150.0, 150.0)];
+        let straddle_chapters = vec![(100.0, 200.0)]; // starts in "a", ends in "b"
+        assert_eq!(estimate_bytes_for_chapters(&straddling, &straddle_chapters, &[0]), Some(2000));
+    }
+
+    #[test]
+    fn estimate_bytes_is_none_when_any_touched_track_has_an_unknown_size() {
+        let tracks = vec![track("a", 0.0, 100.0), unsized_track("b", 100.0, 100.0), track("c", 200.0, 100.0)];
+        let ranges: Vec<(f64, f64)> = vec![(0.0, 100.0), (100.0, 200.0), (200.0, 300.0)];
+
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[0]), Some(1000), "untouched unknowns don't spoil the estimate");
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[1]), None);
+        assert_eq!(estimate_bytes_for_chapters(&tracks, &ranges, &[0, 1]), None);
+    }
+
+    #[test]
     fn chapter_offline_markers_reflects_which_tracks_are_complete() {
         let tracks = vec![track("a", 0.0, 100.0), track("b", 100.0, 100.0)];
         let chapters = vec![chapter(0.0, 100.0), chapter(100.0, 200.0)];
@@ -476,8 +543,8 @@ mod tests {
             &server_id,
             "item-1",
             &[
-                crate::streaming::StreamTrack { ino: "a".to_string(), url: "u1".to_string(), duration_seconds: 50.0, offset_seconds: 0.0 },
-                crate::streaming::StreamTrack { ino: "b".to_string(), url: "u2".to_string(), duration_seconds: 50.0, offset_seconds: 50.0 },
+                crate::streaming::StreamTrack { ino: "a".to_string(), url: "u1".to_string(), duration_seconds: 50.0, offset_seconds: 0.0, size_bytes: None },
+                crate::streaming::StreamTrack { ino: "b".to_string(), url: "u2".to_string(), duration_seconds: 50.0, offset_seconds: 50.0, size_bytes: None },
             ],
         )
         .await
@@ -516,7 +583,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let new_tracks: Vec<_> = inos.iter().map(|ino| abs_storage::repo::tracks::NewTrack { ino, duration_seconds: 100.0, offset_seconds: 0.0 }).collect();
+        let new_tracks: Vec<_> = inos.iter().map(|ino| abs_storage::repo::tracks::NewTrack { ino, duration_seconds: 100.0, offset_seconds: 0.0, size_bytes: None }).collect();
         abs_storage::repo::tracks::upsert_all(&pool, &server_id, item_id, &new_tracks).await.unwrap();
         (pool, server_id)
     }
