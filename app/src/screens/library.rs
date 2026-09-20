@@ -140,10 +140,11 @@ struct LibraryWidgets {
     /// [`set_in_progress_only`] so they can't drift apart. Session-transient like `sort`.
     in_progress_only: Rc<Cell<bool>>,
     view_mode: Rc<Cell<LibraryViewMode>>,
-    /// Shared state per `docs/design/ui-spec.md` ("not a per-screen setting") — this screen and
-    /// Home each load/save the same `abs_core::settings::{load,save}_offline_mode` key, same
-    /// reasoning `LibraryViewMode` already established for a different persisted toggle.
-    offline_mode: Rc<Cell<bool>>,
+    /// Shared, live-updating state per `docs/design/ui-spec.md` ("not a per-screen setting") —
+    /// see `crate::offline_mode::OfflineModeState`'s doc for why this can't be a screen-local
+    /// `Cell` (that was the actual bug: toggling on one screen never reached the other's
+    /// already-built instance).
+    offline_mode: crate::offline_mode::OfflineModeState,
     data: Rc<std::cell::RefCell<LibraryData>>,
     on_play: Rc<dyn Fn(PlayRequest)>,
     /// Header dropdown button — mutated only to reflect the filter state (funnel icon while a
@@ -169,12 +170,14 @@ struct LibraryData {
 /// cover starts playback without this screen ever touching `abs-player`/`abs-core::streaming`
 /// itself. `on_relogin` routes the banner's "Log in again" action (authorization failures only)
 /// back to the shell, same as Home's.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     paths: AppPaths,
     server: Server,
     account: Account,
     session: abs_core::auth::Session,
+    offline_mode: crate::offline_mode::OfflineModeState,
     on_play: impl Fn(PlayRequest) + Clone + 'static,
     on_relogin: impl Fn() + Clone + 'static,
 ) -> LibraryScreen {
@@ -345,7 +348,7 @@ pub fn build(
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
         in_progress_only: Rc::new(Cell::new(false)),
         view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
-        offline_mode: Rc::new(Cell::new(false)),
+        offline_mode,
         data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new(), downloaded: std::collections::HashSet::new(), last_listened: std::collections::HashMap::new() })),
         on_play: Rc::new(on_play),
         sort_menu_button: sort_menu_button.clone(),
@@ -409,14 +412,32 @@ pub fn build(
     });
 
     let offline_toggle_server_id = server.id.clone();
+
+    // Shrunk to just forwarding into the shared state — every visible effect (banner, re-render,
+    // background refetch, persistence, and this screen's own `LibraryViewOptions.downloaded_only`
+    // sync) now lives in the `add_listener` callback below, since that same logic must run
+    // whether *this* screen's own toggle fired or Home's did.
     let offline_toggle_handler = offline_toggle.connect_toggled({
+        let offline_mode = widgets.offline_mode.clone();
+        move |toggle| offline_mode.set(toggle.is_active())
+    });
+
+    widgets.offline_mode.add_listener({
         let pool = pool.clone();
         let widgets = widgets.clone();
+        let offline_toggle = offline_toggle.clone();
         let offline_banner = offline_banner.clone();
-        let server_id = offline_toggle_server_id.clone();
-        move |toggle| {
-            let active = toggle.is_active();
-            widgets.offline_mode.set(active);
+        let server_id = offline_toggle_server_id;
+        move |active| {
+            // Sync the toggle widget's visual state without re-triggering `connect_toggled`. When
+            // this screen's own toggle caused the change, `is_active()` already equals `active`
+            // (GTK flips it before `connect_toggled` runs), so this is a no-op here and only
+            // actually touches the widget when the *other* screen changed it.
+            if offline_toggle.is_active() != active {
+                offline_toggle.block_signal(&offline_toggle_handler);
+                offline_toggle.set_active(active);
+                offline_toggle.unblock_signal(&offline_toggle_handler);
+            }
             offline_banner.set_reveal_child(active);
             // Rendered synchronously, before any DB work: the visible filter change must not be
             // gated behind the refetch's pool acquire — on a contended pool (sync/cover/progress
@@ -440,9 +461,11 @@ pub fn build(
                     }
                     render_from_current_data(&widgets);
 
-                    if let Err(err) = abs_core::settings::save_offline_mode(&pool, active).await {
-                        tracing::warn!(%err, "couldn't persist offline mode; it won't be remembered next launch");
-                    }
+                    // `LibraryViewOptions.downloaded_only` is a Library-specific concept — the
+                    // shared `OfflineModeState` deliberately knows nothing about it — so this
+                    // screen keeps it in sync itself, now from either screen's toggle rather than
+                    // only its own (fixing a related bug: this used to never fire from a
+                    // Home-driven toggle at all).
                     if let Ok(mut options) = abs_core::settings::load_library_view_options(&pool).await {
                         options.downloaded_only = active;
                         if let Err(err) = abs_core::settings::save_library_view_options(&pool, &options).await {
@@ -451,32 +474,6 @@ pub fn build(
                     }
                 }
             });
-        }
-    });
-
-    // Same "load once, blocking the handler while restoring" pattern as the view-mode toggle
-    // above — the persisted value is shared with Home's own toggle (ui-spec: "not a per-screen
-    // setting"), so this screen must reflect whatever was last set from either tab.
-    glib::spawn_future_local({
-        let pool = pool.clone();
-        let widgets = widgets.clone();
-        let offline_toggle = offline_toggle.clone();
-        let offline_banner = offline_banner.clone();
-        let server_id = offline_toggle_server_id;
-        async move {
-            if let Ok(active) = abs_core::settings::load_offline_mode(&pool).await {
-                offline_toggle.block_signal(&offline_toggle_handler);
-                offline_toggle.set_active(active);
-                offline_toggle.unblock_signal(&offline_toggle_handler);
-                widgets.offline_mode.set(active);
-                offline_banner.set_reveal_child(active);
-                if active {
-                    if let Ok(downloaded) = abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
-                        widgets.data.borrow_mut().downloaded = downloaded.into_iter().collect();
-                    }
-                }
-                render_from_current_data(&widgets);
-            }
         }
     });
 
@@ -903,7 +900,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn flow_box_titles(flow_box: &gtk4::FlowBox) -> Vec<String> {
+    pub(crate) fn flow_box_titles(flow_box: &gtk4::FlowBox) -> Vec<String> {
         let mut titles = Vec::new();
         let mut index = 0;
         while let Some(child) = flow_box.child_at_index(index) {
@@ -970,7 +967,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1009,7 +1007,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1052,7 +1051,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
@@ -1108,7 +1108,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1158,7 +1159,8 @@ pub(crate) mod tests {
         runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-3", "Middle Book", 1_500_000_000_000, None));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
@@ -1206,7 +1208,8 @@ pub(crate) mod tests {
         runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-3", "Untouched Book", 1_500_000_000_000, None));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
@@ -1249,7 +1252,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -1291,7 +1295,8 @@ pub(crate) mod tests {
             move || relogin_requested.set(true)
         };
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, on_relogin);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, on_relogin);
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -1318,7 +1323,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| false, Duration::from_millis(500));
@@ -1355,7 +1361,8 @@ pub(crate) mod tests {
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_play, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1394,7 +1401,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1437,7 +1445,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1478,7 +1487,8 @@ pub(crate) mod tests {
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, on_play, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_play, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1518,7 +1528,8 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1559,7 +1570,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {});
         let first_hooks = first_screen.test_hooks();
         pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
         assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
@@ -1589,7 +1601,8 @@ pub(crate) mod tests {
         pump_until(|| persisted.load(std::sync::atomic::Ordering::SeqCst), Duration::from_secs(5));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let second_hooks = second_screen.test_hooks();
         pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
@@ -1614,7 +1627,8 @@ pub(crate) mod tests {
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &added.account_id)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(20));
@@ -1675,7 +1689,8 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, |_| {}, || {});
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
         let hooks = screen.test_hooks();
 
         let app_window = adw::ApplicationWindow::builder().build();

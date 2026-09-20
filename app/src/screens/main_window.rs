@@ -159,6 +159,10 @@ pub fn build(
         }
     };
     let download_manager = crate::downloads::DownloadManager::new(pool.clone(), paths.clone(), network_monitor, playback_settings.wifi_only_downloads);
+    // Shared between Home and Library only (per docs/design/ui-spec.md, "not a per-screen
+    // setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this must be a single
+    // shared instance rather than each screen loading its own copy.
+    let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
 
     let stack = adw::ViewStack::new();
 
@@ -203,7 +207,7 @@ pub fn build(
     // Library is built before Home only so the tap-through closure below can capture the
     // already-built screen; the `add_titled_with_icon` calls (not build order) fix the
     // switcher's tab order — Home stays first.
-    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), on_play.clone(), on_relogin.clone());
+    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), offline_mode.clone(), on_play.clone(), on_relogin.clone());
 
     // Home's shelf headings' tap-through (ui-spec Home section): switch to Library and land on
     // the shelf's view — Recently Added pre-sorted by date added; Continue Listening pre-sorted
@@ -228,6 +232,7 @@ pub fn build(
             server.clone(),
             account.clone(),
             session.clone(),
+            offline_mode.clone(),
             on_play.clone(),
             on_relogin,
             on_open_shelf,
@@ -532,5 +537,87 @@ pub(crate) mod tests {
         controller.handle_route_event(replug);
         assert!(controller.snapshot().is_none());
         controller.stop();
+    }
+
+    /// Regression test for the reported bug: toggling offline mode on Home didn't move Library's
+    /// toggle or its filtered list until the app restarted (and vice versa), because each screen
+    /// kept its own private `Rc<Cell<bool>>` instead of sharing one `OfflineModeState`. Builds
+    /// both `screens::home::build` and `screens::library::build` sharing one `OfflineModeState`
+    /// and one pool — exactly as `main_window::build` wires them — and toggles each screen's own
+    /// widget in turn, asserting the *other*, already-built screen's toggle/banner/filtered list
+    /// update live, with neither screen being rebuilt.
+    pub(crate) fn run_offline_mode_toggle_is_shared_between_home_and_library(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::{account_and_server, count_children, item_json};
+        use crate::screens::library::tests::flow_box_titles;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+
+        let home_screen = crate::screens::home::build(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            server.clone(),
+            account.clone(),
+            session.clone(),
+            offline_mode.clone(),
+            |_| {},
+            || {},
+            |_| {},
+        );
+        let library_screen = crate::screens::library::build(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            server.clone(),
+            account.clone(),
+            session,
+            offline_mode,
+            |_| {},
+            || {},
+        );
+        let home_hooks = home_screen.test_hooks();
+        let library_hooks = library_screen.test_hooks();
+
+        pump_until(|| count_children(&home_hooks.recent_row) == 2, std::time::Duration::from_secs(10));
+        pump_until(|| library_hooks.flow_box.child_at_index(1).is_some(), std::time::Duration::from_secs(10));
+
+        // Mark "item-1" downloaded, same setup as each screen's own single-screen offline test.
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
+
+        // Toggle from HOME's widget only — Library must pick it up without being rebuilt.
+        home_hooks.offline_toggle.set_active(true);
+        pump_until(|| library_hooks.offline_toggle.is_active(), std::time::Duration::from_secs(5));
+        assert!(library_hooks.offline_banner.reveals_child(), "Library's banner should reveal from a Home-driven toggle, with no rebuild");
+        pump_until(|| flow_box_titles(&library_hooks.flow_box) == vec!["Project Hail Mary".to_string()], std::time::Duration::from_secs(5));
+        assert!(home_hooks.offline_banner.reveals_child());
+
+        // Toggle back off from LIBRARY's widget — Home must pick up the reverse.
+        library_hooks.offline_toggle.set_active(false);
+        pump_until(|| !home_hooks.offline_toggle.is_active(), std::time::Duration::from_secs(5));
+        assert!(!home_hooks.offline_banner.reveals_child());
+        pump_until(|| count_children(&home_hooks.recent_row) == 2, std::time::Duration::from_secs(5));
+        assert_eq!(flow_box_titles(&library_hooks.flow_box).len(), 2);
     }
 }

@@ -1,5 +1,6 @@
 mod application;
 mod downloads;
+mod offline_mode;
 mod player;
 mod screens;
 #[cfg(test)]
@@ -165,6 +166,7 @@ mod tests {
         (item_card_wrap_title_shows_the_full_title_without_ellipsizing, |_rt| crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing()),
         (item_card_downloaded_badge_shows_only_when_downloaded, |_rt| crate::widgets::item_card::tests::run_downloaded_badge_shows_only_when_downloaded()),
         (main_window_shell, crate::screens::main_window::tests::run),
+        (main_window_offline_mode_toggle_is_shared_between_home_and_library, crate::screens::main_window::tests::run_offline_mode_toggle_is_shared_between_home_and_library),
         (main_window_call_interruption_wiring_pauses_playback, crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback),
         (main_window_headphone_route_events_follow_the_settings, crate::screens::main_window::tests::run_headphone_route_events_follow_the_settings),
         (settings_persistence, crate::screens::settings::tests::run),
