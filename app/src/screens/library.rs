@@ -377,14 +377,16 @@ pub fn build(
     let view_toggle_handler = view_toggle.connect_toggled({
         let pool = pool.clone();
         let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
         move |toggle| {
             let mode = if toggle.is_active() { LibraryViewMode::List } else { LibraryViewMode::Grid };
             apply_view_mode(mode, &widgets, toggle);
             glib::spawn_future_local({
                 let pool = pool.clone();
+                let toast_overlay = toast_overlay.clone();
                 async move {
                     if let Err(err) = abs_core::settings::save_library_view_mode(&pool, mode).await {
-                        tracing::warn!(%err, "couldn't persist the Library view mode; it won't be remembered next launch");
+                        crate::error_reporting::report_background_error(&toast_overlay, "Saving view mode", err);
                     }
                 }
             });
@@ -428,6 +430,7 @@ pub fn build(
         let offline_toggle = offline_toggle.clone();
         let offline_banner = offline_banner.clone();
         let server_id = offline_toggle_server_id;
+        let toast_overlay = toast_overlay.clone();
         move |active| {
             // Sync the toggle widget's visual state without re-triggering `connect_toggled`. When
             // this screen's own toggle caused the change, `is_active()` already equals `active`
@@ -450,14 +453,16 @@ pub fn build(
                 let pool = pool.clone();
                 let widgets = widgets.clone();
                 let server_id = server_id.clone();
+                let toast_overlay = toast_overlay.clone();
                 async move {
                     // Refetched here rather than trusting whatever `data.downloaded` last held
                     // from the sync pipeline — a download can complete in the background (the
                     // Player screen's download button) well after Library's last full load, and
                     // toggling offline mode should reflect the *current* download state, not a
                     // stale snapshot.
-                    if let Ok(downloaded) = abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
-                        widgets.data.borrow_mut().downloaded = downloaded.into_iter().collect();
+                    match abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
+                        Ok(downloaded) => widgets.data.borrow_mut().downloaded = downloaded.into_iter().collect(),
+                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Refreshing downloaded items", err),
                     }
                     render_from_current_data(&widgets);
 
@@ -465,12 +470,10 @@ pub fn build(
                     // shared `OfflineModeState` deliberately knows nothing about it — so this
                     // screen keeps it in sync itself, now from either screen's toggle rather than
                     // only its own (fixing a related bug: this used to never fire from a
-                    // Home-driven toggle at all).
-                    if let Ok(mut options) = abs_core::settings::load_library_view_options(&pool).await {
-                        options.downloaded_only = active;
-                        if let Err(err) = abs_core::settings::save_library_view_options(&pool, &options).await {
-                            tracing::warn!(%err, "couldn't persist the Library downloaded-only view option");
-                        }
+                    // Home-driven toggle at all). A single targeted write, not the full
+                    // load-mutate-save round trip over all four view-option fields.
+                    if let Err(err) = abs_core::settings::set_downloaded_only(&pool, active).await {
+                        crate::error_reporting::report_background_error(&toast_overlay, "Saving offline mode", err);
                     }
                 }
             });

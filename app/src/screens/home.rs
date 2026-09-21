@@ -482,6 +482,7 @@ pub fn build(
         let offline_toggle = offline_toggle.clone();
         let offline_banner = offline_banner.clone();
         let server_id = server.id.clone();
+        let toast_overlay = toast_overlay.clone();
         move |active| {
             // Sync the toggle widget's visual state without re-triggering `connect_toggled`. When
             // this screen's own toggle caused the change, `is_active()` already equals `active`
@@ -505,13 +506,17 @@ pub fn build(
                 let pool = pool.clone();
                 let widgets = widgets.clone();
                 let server_id = server_id.clone();
+                let toast_overlay = toast_overlay.clone();
                 async move {
                     // Refetched here rather than trusting whatever the last sync's snapshot saw —
                     // a download can complete in the background well after the last sync.
-                    if let Ok(downloaded) = abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
-                        if let Some(data) = widgets.last_data.borrow_mut().as_mut() {
-                            data.downloaded = downloaded.into_iter().collect();
+                    match abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
+                        Ok(downloaded) => {
+                            if let Some(data) = widgets.last_data.borrow_mut().as_mut() {
+                                data.downloaded = downloaded.into_iter().collect();
+                            }
                         }
+                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Refreshing downloaded items", err),
                     }
                     // Borrowed and cloned in its own statement, not inline in the `if let`'s
                     // scrutinee — a `Ref` there lives for the whole `if let` body (temporary

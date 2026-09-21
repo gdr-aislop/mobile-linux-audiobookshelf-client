@@ -1,5 +1,6 @@
 mod application;
 mod downloads;
+mod error_reporting;
 mod offline_mode;
 mod player;
 mod screens;
@@ -131,6 +132,7 @@ mod tests {
     }
 
     gtk_scenarios! {
+        (error_reporting_shows_one_toast, crate::error_reporting::tests::run_report_background_error_shows_one_toast),
         (welcome_connect, crate::screens::welcome::tests::run),
         (welcome_relogin_flow, crate::screens::welcome::tests::run_relogin_flow),
         (home_renders_synced_library_and_recently_added_item, crate::screens::home::tests::run_renders_synced_library_and_recently_added_item),

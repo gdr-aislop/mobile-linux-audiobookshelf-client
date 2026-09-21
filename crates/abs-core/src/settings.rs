@@ -247,6 +247,14 @@ pub async fn save_library_view_options(pool: &SqlitePool, options: &LibraryViewO
     Ok(())
 }
 
+/// Writes just the `downloaded_only` flag — one query, not the full load-mutate-save round trip
+/// of `load_library_view_options`/`save_library_view_options` over all four fields. Exists
+/// because the shared offline-mode toggle used to do exactly that full round trip just to flip
+/// this one bit, adding three unneeded reads and three unneeded writes to every click.
+pub async fn set_downloaded_only(pool: &SqlitePool, downloaded_only: bool) -> Result<()> {
+    kv::set(pool, keys::DOWNLOADED_ONLY, &downloaded_only.to_string()).await
+}
+
 /// Grid vs. list for the Library browse screen's content — a separate setting from
 /// `LibraryViewOptions` above, which models that screen's not-yet-built view-options *sheet*
 /// (Downloaded only/Hide finished/Grouping/Sort by). Per `docs/design/ui-spec.md`, the grid/list
@@ -385,6 +393,21 @@ mod tests {
         };
         save_library_view_options(&pool, &options).await.unwrap();
         assert_eq!(load_library_view_options(&pool).await.unwrap(), options);
+    }
+
+    #[tokio::test]
+    async fn set_downloaded_only_touches_only_that_field() {
+        let pool = pool().await;
+        let options = LibraryViewOptions { downloaded_only: false, hide_finished: true, grouping: Grouping::ByAuthor, sort_by: SortBy::Duration };
+        save_library_view_options(&pool, &options).await.unwrap();
+
+        set_downloaded_only(&pool, true).await.unwrap();
+
+        let after = load_library_view_options(&pool).await.unwrap();
+        assert!(after.downloaded_only, "set_downloaded_only must flip the flag");
+        assert_eq!(after.hide_finished, options.hide_finished, "other fields must be left alone");
+        assert_eq!(after.grouping, options.grouping);
+        assert_eq!(after.sort_by, options.sort_by);
     }
 
     #[tokio::test]

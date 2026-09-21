@@ -26,11 +26,18 @@ pub async fn connect_and_migrate(path: &Path) -> Result<SqlitePool> {
         // vs. speed tradeoff is a non-issue for cache-and-progress data.
         .synchronous(SqliteSynchronous::Normal)
         // Explicit rather than the default: a contended write waits (up to this long) instead
-        // of erroring with "database is locked".
-        .busy_timeout(Duration::from_secs(5));
+        // of erroring with "database is locked". 15s (up from an original 5s) gives a
+        // UI-triggered write enough room to ride out the auto-sync cycle's writes without
+        // erroring — a user action landing mid-sync was observed timing out under the old
+        // value even though the writer released the lock well within 15s.
+        .busy_timeout(Duration::from_secs(15));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        // Explicit rather than sqlx's undocumented-at-this-call-site 30s default: kept just
+        // under it so a pool-exhaustion failure surfaces a little before that default would,
+        // while still comfortably outlasting normal sync-vs-UI-action contention.
+        .acquire_timeout(Duration::from_secs(20))
         .connect_with(options)
         .await?;
 
