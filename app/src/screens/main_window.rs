@@ -255,7 +255,7 @@ pub fn build(
             let on_back = {
                 let window = window.clone();
                 let root = root.clone();
-                move || window.set_content(Some(&root))
+                move || crate::widgets::swap_content(&window, &root)
             };
             let item_detail_screen = screens::item_detail::build(
                 pool.clone(),
@@ -267,7 +267,7 @@ pub fn build(
                 on_play,
                 on_back,
             );
-            window.set_content(Some(&item_detail_screen.root));
+            crate::widgets::swap_content(&window, &item_detail_screen.root);
         }
     };
 
@@ -394,12 +394,12 @@ pub fn build(
                 let window = window.clone();
                 let root = root.clone();
                 move || {
-                    window.set_content(Some(&root));
+                    crate::widgets::swap_content(&window, &root);
                     window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
                 }
             });
             window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
-            window.set_content(Some(&player_screen.root));
+            crate::widgets::swap_content(&window, &player_screen.root);
         }
     });
     mini_bar.root.add_controller(mini_bar_gesture);

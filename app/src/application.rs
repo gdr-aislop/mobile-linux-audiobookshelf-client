@@ -111,7 +111,7 @@ pub(crate) fn show_welcome(
         },
         on_cancel,
     );
-    window.set_content(Some(&screen.root));
+    crate::widgets::swap_content(window, &screen.root);
 }
 
 /// "Add Server" from Settings' Servers group: the plain first-run login flow (`previous=None`
@@ -132,7 +132,7 @@ pub(crate) fn show_add_server(
     let on_cancel: std::rc::Rc<dyn Fn()> = match window.content() {
         Some(previous_root) => {
             let window = window.clone();
-            std::rc::Rc::new(move || window.set_content(Some(&previous_root)))
+            std::rc::Rc::new(move || crate::widgets::swap_content(&window, &previous_root))
         }
         None => {
             let pool = pool.clone();
@@ -151,7 +151,7 @@ pub(crate) fn show_add_server(
         move |_added| show_main(&on_success_window, on_success_pool.clone(), on_success_paths.clone(), playback_settings),
         Some(on_cancel),
     );
-    window.set_content(Some(&screen.root));
+    crate::widgets::swap_content(window, &screen.root);
 }
 
 /// The single entry point after any session mutation from Settings (switch server, sign out,
@@ -176,7 +176,7 @@ pub(crate) fn show_main_or_welcome(
                 let main_window =
                     build_main_window(pool, paths, playback_settings, window_for_callback.clone())
                         .await;
-                window_for_callback.set_content(Some(&main_window.root));
+                crate::widgets::swap_content(&window_for_callback, &main_window.root);
             }
             None => show_welcome(&window_for_callback, pool, paths, playback_settings, None),
         }
@@ -195,7 +195,7 @@ pub(crate) fn show_main(
     let window_for_content = window.clone();
     glib::spawn_future_local(async move {
         let main_window = build_main_window(pool, paths, playback_settings, window_for_content.clone()).await;
-        window_for_content.set_content(Some(&main_window.root));
+        crate::widgets::swap_content(&window_for_content, &main_window.root);
     });
 }
 

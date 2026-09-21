@@ -17,6 +17,20 @@ use std::rc::Rc;
 use adw::glib;
 use adw::prelude::*;
 
+/// Swaps `window`'s content one main-loop idle tick later than requested, instead of immediately.
+/// GTK's click/gesture/row-activation handling expects the widget it's currently processing a
+/// press/release for to still exist in its original ancestor chain when that handling finishes;
+/// calling `window.set_content(...)` synchronously *inside* that same widget's own handler
+/// unparents (and can finalize) it mid-bookkeeping, which is exactly what produces GTK's "Broken
+/// accounting of active state for widget" warning. Deferring by one idle callback lets the
+/// originating event finish unwinding first. Every window-content swap in this app should go
+/// through here rather than calling `set_content` directly, so this can't regress silently.
+pub(crate) fn swap_content(window: &adw::ApplicationWindow, content: &impl glib::object::IsA<gtk4::Widget>) {
+    let window = window.clone();
+    let content = content.clone().upcast::<gtk4::Widget>();
+    glib::idle_add_local_once(move || window.set_content(Some(&content)));
+}
+
 /// Walks `root`'s descendant tree depth-first looking for the first widget of type `T` — how
 /// tests and this crate's few styled-parent cases reach into widgets GTK won't hand out handles
 /// to (a `GtkMessageDialog`'s internal entry, an `AdwToast`'s title label).

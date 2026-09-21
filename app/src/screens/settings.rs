@@ -553,7 +553,7 @@ fn push_connection(
         &shell_root,
         on_session_changed.clone(),
     );
-    window.set_content(Some(&screen.root));
+    crate::widgets::swap_content(window, &screen.root);
 }
 
 /// The `host[:port]` part of a server URL — what Account/Servers rows show instead of the full

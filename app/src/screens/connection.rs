@@ -62,7 +62,7 @@ pub fn build(
     back_button.connect_clicked({
         let window = window.clone();
         let shell_root = shell_root.clone();
-        move |_| window.set_content(Some(&shell_root))
+        move |_| crate::widgets::swap_content(&window, &shell_root)
     });
 
     let header = adw::HeaderBar::new();
