@@ -1,7 +1,8 @@
-//! A tappable library-item card: cover art, title, subtitle, wrapped in a flat button that starts
-//! playback. Shared between `screens::home` (shelf cards) and `screens::library` (grid tiles) —
-//! extracted from `home.rs`'s original `cover_card` once a second screen needed the exact same
-//! widget, same reasoning as `test_support.rs`'s own extraction history.
+//! A tappable library-item card: cover art, title, subtitle, wrapped in a flat button that opens
+//! the Item Detail screen (`docs/design/ui-spec.md`'s "tap -> Item detail -> Play" flow). Shared
+//! between `screens::home` (shelf cards) and `screens::library` (grid tiles) — extracted from
+//! `home.rs`'s original `cover_card` once a second screen needed the exact same widget, same
+//! reasoning as `test_support.rs`'s own extraction history.
 
 use adw::prelude::*;
 use std::rc::Rc;
@@ -11,15 +12,13 @@ use abs_storage::models::Item;
 use crate::player::PlayRequest;
 use crate::widgets::cover_image::CoverImage;
 
-/// `size` is both the cover's width/height and the card's fixed width. There's no Item Detail
-/// screen yet, so tapping directly starts playback rather than the ui-spec's real
-/// "tap -> Item detail -> Play" flow (same "skip screens not yet built" scoping already used for
-/// Library/Downloads/Settings' stub tabs). `is_downloaded` shows a small corner badge on the cover
-/// when this item has at least one completed track (`abs_core::download_tracks::downloaded_item_ids`)
-/// — read-only here; the actual download button/scope picker lives on the Player screen (see
-/// `docs/design/ui-spec.md`'s "small download badge on covers/rows" vs. the download sheet itself,
-/// which needs a place to show a chapter list this card has no room for).
-pub fn build(size: i32, item: &Item, subtitle: &str, on_play: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> gtk4::Widget {
+/// `size` is both the cover's width/height and the card's fixed width. `is_downloaded` shows a
+/// small corner badge on the cover when this item has at least one completed track
+/// (`abs_core::download_tracks::downloaded_item_ids`) — read-only here; the actual download
+/// button/scope picker lives on the Item Detail (and Player) screen. `on_open` reports the tapped
+/// item's `PlayRequest` up to the caller, which opens Item Detail for it — this card never starts
+/// playback itself.
+pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> gtk4::Widget {
     // Every widget in this card is explicitly `hexpand(false)` — a `GtkBox`'s own hexpand is
     // computed from its children unless overridden, so a single stray `true` here would propagate
     // all the way up to the wrapping `GtkButton` and stretch a single-item shelf/row's card full
@@ -106,8 +105,8 @@ pub fn build(size: i32, item: &Item, subtitle: &str, on_play: &Rc<dyn Fn(PlayReq
     // card's cover as a wide, squashed rectangle instead of a `size`x`size` square.
     let button = gtk4::Button::builder().css_classes(["flat"]).hexpand(false).halign(gtk4::Align::Center).child(&card).build();
     let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
-    let on_play = on_play.clone();
-    button.connect_clicked(move |_| on_play(request.clone()));
+    let on_open = on_open.clone();
+    button.connect_clicked(move |_| on_open(request.clone()));
 
     button.upcast()
 }
@@ -165,16 +164,16 @@ pub(crate) mod tests {
         let item = fixture_item();
 
         let received: Rc<RefCell<Vec<PlayRequest>>> = Rc::new(RefCell::new(Vec::new()));
-        let on_play: Rc<dyn Fn(PlayRequest)> = {
+        let on_open: Rc<dyn Fn(PlayRequest)> = {
             let received = received.clone();
             Rc::new(move |request: PlayRequest| received.borrow_mut().push(request))
         };
 
-        let widget = build(132, &item, "Andy Weir · 1.0h", &on_play, false, false);
+        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, false);
         let button = widget.clone().downcast::<gtk4::Button>().expect("item_card::build returns a GtkButton");
         button.emit_clicked();
 
-        assert_eq!(received.borrow().len(), 1, "clicking the card should invoke on_play exactly once");
+        assert_eq!(received.borrow().len(), 1, "clicking the card should invoke on_open exactly once");
         assert_eq!(received.borrow()[0].item_id, "item-1");
         assert_eq!(received.borrow()[0].title, "Project Hail Mary");
 
@@ -188,9 +187,9 @@ pub(crate) mod tests {
     /// The downloaded badge is purely read-only — it just reflects `is_downloaded`.
     pub(crate) fn run_downloaded_badge_shows_only_when_downloaded() {
         let item = fixture_item();
-        let on_play: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
+        let on_open: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
 
-        let widget = build(132, &item, "Andy Weir · 1.0h", &on_play, false, true);
+        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, true);
         assert!(downloaded_badge_of(&widget).is_visible(), "is_downloaded: true should show the badge");
     }
 
@@ -198,9 +197,9 @@ pub(crate) mod tests {
     /// instead of cutting it off — the opposite trade-off from Home's shelf cards.
     pub(crate) fn run_wrap_title_shows_the_full_title_without_ellipsizing() {
         let item = fixture_item();
-        let on_play: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
+        let on_open: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
 
-        let widget = build(108, &item, "Andy Weir · 1.0h", &on_play, true, false);
+        let widget = build(108, &item, "Andy Weir · 1.0h", &on_open, true, false);
         let title_label = title_label_of(&widget);
 
         assert!(title_label.wraps(), "wrap_title: true should wrap instead of ellipsizing");

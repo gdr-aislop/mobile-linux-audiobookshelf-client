@@ -222,7 +222,7 @@ struct HomeWidgets {
     recent_row: gtk4::Box,
     libraries_list: gtk4::ListBox,
     banner: crate::widgets::banner::ErrorBanner,
-    on_play: std::rc::Rc<dyn Fn(PlayRequest)>,
+    on_open: std::rc::Rc<dyn Fn(PlayRequest)>,
     /// Shared, live-updating state with Library's own toggle (ui-spec: "not a per-screen
     /// setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this can't be a
     /// screen-local `Cell` (that was the actual bug: toggling on one screen never reached the
@@ -261,9 +261,10 @@ struct HomeData {
 
 /// Builds the screen. `server`/`account` are already-resolved rows (the caller, `main_window`,
 /// looks them up once) rather than bare ids, so this module never has to fail on a missing
-/// server/account — that would be a caller bug, not a Home-screen concern. `on_play` is how
-/// tapping a cover card starts playback — Home never touches `abs-player`/`abs-core::streaming`
-/// itself, matching the `on_success`-callback pattern `welcome.rs` already uses. `on_relogin` is
+/// server/account — that would be a caller bug, not a Home-screen concern. `on_open` is how
+/// tapping a cover card opens the Item Detail screen for it — Home never touches
+/// `abs-player`/`abs-core::streaming` itself, matching the `on_success`-callback pattern
+/// `welcome.rs` already uses. `on_relogin` is
 /// how the authorization-failure states hand control back to the shell: it swaps the window's
 /// content for a pre-filled login screen (the session that just died is the shell's knowledge,
 /// not Home's). `on_open_shelf` is the shelf headings' tap-through: it navigates to the Library
@@ -277,7 +278,7 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     offline_mode: crate::offline_mode::OfflineModeState,
-    on_play: impl Fn(PlayRequest) + Clone + 'static,
+    on_open: impl Fn(PlayRequest) + Clone + 'static,
     on_relogin: impl Fn() + Clone + 'static,
     on_open_shelf: impl Fn(Shelf) + Clone + 'static,
 ) -> HomeScreen {
@@ -403,7 +404,7 @@ pub fn build(
         recent_row: recent_row.clone(),
         libraries_list: libraries_list.clone(),
         banner: banner.clone(),
-        on_play: std::rc::Rc::new(on_play),
+        on_open: std::rc::Rc::new(on_open),
         offline_mode,
         last_data: std::rc::Rc::new(std::cell::RefCell::new(None)),
     };
@@ -783,7 +784,7 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
             0.0
         };
         let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false, data.downloaded.contains(&item.id)));
+        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id)));
     }
     widgets.continue_section.set_visible(!continue_items.is_empty());
 
@@ -793,7 +794,7 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
     // browsable", not "hidden entirely", since there's no per-library download concept).
     for item in data.recent_items.iter().filter(|item| !offline_mode || data.downloaded.contains(&item.id)) {
         let subtitle = item_subtitle(item);
-        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_play, false, data.downloaded.contains(&item.id)));
+        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id)));
     }
 
     clear_listbox(&widgets.libraries_list);
@@ -1149,7 +1150,7 @@ pub(crate) mod tests {
             !hooks.banner.widget().reveals_child(),
             "the 'showing what's cached' banner must not appear when nothing is cached"
         );
-        assert!(!hooks.libraries_list.row_at_index(0).is_some());
+        assert!(hooks.libraries_list.row_at_index(0).is_none());
 
         hooks.empty_state.retry.emit_clicked();
         // Wait on the state flip, not the rows: the cycle resolves the empty state only after

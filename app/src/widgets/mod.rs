@@ -7,6 +7,7 @@
 
 pub mod banner;
 pub mod cover_image;
+pub mod download_scope_menu;
 pub mod item_card;
 pub mod pull_to_refresh;
 

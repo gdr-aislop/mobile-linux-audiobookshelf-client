@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
 use abs_player::route_watch::RouteWatcher;
+use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
@@ -36,9 +37,10 @@ pub struct MainWindow {
     /// unavailable, never a fatal error.
     _route_watcher: Option<abs_player::route_watch::PulseRouteWatcher>,
     /// Kept alive for the app's whole lifetime, same reasoning as `_call_watcher` — dropping it
-    /// would lose every in-flight track's cancel flag and listener. No UI wires into it yet (see
-    /// `crate::downloads`'s module doc); this pass only ensures one instance exists for a later
-    /// screen to be handed a clone of.
+    /// would lose every in-flight track's cancel flag and listener. Every screen that needs it
+    /// (Downloads, Settings, Item Detail, Player) is handed its own clone at build time; this
+    /// field itself is never read back (hence the allow), only retained.
+    #[allow(dead_code)]
     pub download_manager: crate::downloads::DownloadManager,
     #[cfg(test)]
     hooks: TestHooks,
@@ -166,13 +168,35 @@ pub fn build(
 
     let stack = adw::ViewStack::new();
 
-    let on_play = {
+    // Starts real playback (`PlayerController::start`) for a request, optionally seeking to a
+    // chapter once it's ready — the one place in the shell that actually calls into
+    // `abs-player`/`abs-core::streaming` on a card's behalf. Used below both as Item Detail's own
+    // `on_play` (a chapter tap or Play/Resume) — Item Detail itself never touches the controller
+    // directly, same "screens report intent, the shell acts on it" boundary `home.rs`/`library.rs`
+    // already draw for `on_open`.
+    let start_playback = {
         let controller = mini_bar.controller.clone();
         let session = session.clone();
-        move |request: PlayRequest| {
+        move |request: PlayRequest, start_chapter: Option<usize>| {
             // The default speed is read at call time, not captured — a "Default speed" change in
             // Settings applies to the next playback without rebuilding the shell.
-            controller.start(session.clone(), request, controller.default_speed())
+            controller.start(session.clone(), request, controller.default_speed());
+            if let Some(index) = start_chapter {
+                // Chapters aren't known until `start()`'s async resolve lands, so seeking to the
+                // tapped chapter polls for readiness the same bounded way (50 * 100ms)
+                // `PlayerController::start` itself already waits for the pipeline to become
+                // seekable before applying its own resume seek.
+                let controller = controller.clone();
+                glib::spawn_future_local(async move {
+                    for _ in 0..50 {
+                        if let Some(chapter) = controller.chapters().get(index) {
+                            controller.seek_to_seconds(chapter.start_seconds);
+                            return;
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                    }
+                });
+            }
         }
     };
 
@@ -204,10 +228,53 @@ pub fn build(
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
+    // Tapping a cover card opens Item Detail (ui-spec's real "tap -> Item detail -> Play" flow) by
+    // swapping the window's content in — the same content-swap mechanism the mini-bar's
+    // tap-to-expand already uses for Player (there's no `AdwNavigationView`/`AdwDialog` at this
+    // crate's libadwaita ceiling). Constructed on demand, per tap, exactly mirroring how the
+    // mini-bar gesture below builds a fresh `PlayerScreen` on every open rather than keeping one
+    // around; `on_back` restores `root` (this shell) the same way Player's `on_collapse` does.
+    let on_open = {
+        let window = window.clone();
+        let root = root.clone();
+        let pool = pool.clone();
+        let server = server.clone();
+        let account = account.clone();
+        let session = session.clone();
+        let download_manager = download_manager.clone();
+        let start_playback = Rc::new(start_playback);
+        move |request: PlayRequest| {
+            let on_play = {
+                let start_playback = start_playback.clone();
+                let request = request.clone();
+                move |item_id: String, start_chapter: Option<usize>| {
+                    debug_assert_eq!(item_id, request.item_id, "Item Detail should only ever report its own item id back");
+                    start_playback(request.clone(), start_chapter);
+                }
+            };
+            let on_back = {
+                let window = window.clone();
+                let root = root.clone();
+                move || window.set_content(Some(&root))
+            };
+            let item_detail_screen = screens::item_detail::build(
+                pool.clone(),
+                server.clone(),
+                account.clone(),
+                session.clone(),
+                download_manager.clone(),
+                request.item_id.clone(),
+                on_play,
+                on_back,
+            );
+            window.set_content(Some(&item_detail_screen.root));
+        }
+    };
+
     // Library is built before Home only so the tap-through closure below can capture the
     // already-built screen; the `add_titled_with_icon` calls (not build order) fix the
     // switcher's tab order — Home stays first.
-    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), offline_mode.clone(), on_play.clone(), on_relogin.clone());
+    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), offline_mode.clone(), on_open.clone(), on_relogin.clone());
 
     // Home's shelf headings' tap-through (ui-spec Home section): switch to Library and land on
     // the shelf's view — Recently Added pre-sorted by date added; Continue Listening pre-sorted
@@ -233,7 +300,7 @@ pub fn build(
             account.clone(),
             session.clone(),
             offline_mode.clone(),
-            on_play.clone(),
+            on_open.clone(),
             on_relogin,
             on_open_shelf,
         )
@@ -619,5 +686,171 @@ pub(crate) mod tests {
         assert!(!home_hooks.offline_banner.reveals_child());
         pump_until(|| count_children(&home_hooks.recent_row) == 2, std::time::Duration::from_secs(5));
         assert_eq!(flow_box_titles(&library_hooks.flow_box).len(), 2);
+    }
+
+    /// The full chain restored by this plan: tapping a Home card opens Item Detail (not
+    /// playback directly), Item Detail shows the tapped item's real metadata, and tapping its
+    /// Play button both starts real playback and returns the shell (mini bar now visible) —
+    /// same style as `run_offline_mode_toggle_is_shared_between_home_and_library`'s own
+    /// cross-screen coverage.
+    pub(crate) fn run_tapping_a_card_opens_item_detail_then_play_starts_playback_and_shows_the_shell_again(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::item_json;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+        // Item Detail's own chapters/tracks resolve, and the real audio Play actually loads.
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        let card_button = find_card_button(&home_root).expect("a synced item's card should render");
+        card_button.emit_clicked();
+
+        // Item Detail should now be the window's content, with the tapped item's real title —
+        // proving the tap opened Detail rather than starting playback directly.
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(!hooks.mini_bar.bar.is_visible(), "opening Item Detail must not itself start playback");
+
+        // Tapping Play should start real playback and hand control back to the shell.
+        let content = app_window.content().expect("Item Detail should be showing");
+        let play_button = find_button_labeled(&content, "Play").expect("Item Detail's Play button");
+        play_button.emit_clicked();
+
+        pump_until(|| hooks.mini_bar.bar.is_visible(), std::time::Duration::from_secs(10));
+        assert!(
+            app_window.content().is_some_and(|c| c == window.root),
+            "tapping Play should restore the shell"
+        );
+        assert_eq!(hooks.mini_bar.title_label.label(), "Project Hail Mary", "the mini bar should reflect the item Play just started");
+    }
+
+    /// Depth-first search for the first `GtkButton` that wraps an `item_card::build` card —
+    /// identified structurally (a `GtkBox` whose first child is a `GtkOverlay`, the cover
+    /// overlay every card has), since none of these buttons carry a name/id to search by.
+    fn find_card_button(root: &gtk4::Widget) -> Option<gtk4::Button> {
+        fn walk(widget: &gtk4::Widget, found: &mut Option<gtk4::Button>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                let is_card = button
+                    .child()
+                    .and_then(|child| child.downcast::<gtk4::Box>().ok())
+                    .and_then(|card_box| card_box.first_child())
+                    .and_then(|first| first.downcast::<gtk4::Overlay>().ok())
+                    .is_some();
+                if is_card {
+                    *found = Some(button.clone());
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, &mut found);
+        found
+    }
+
+    /// Depth-first search for a `GtkLabel` with exactly this text anywhere under `root`.
+    fn find_label_text(root: &gtk4::Widget, text: &str) -> bool {
+        fn walk(widget: &gtk4::Widget, text: &str, found: &mut bool) {
+            if *found {
+                return;
+            }
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                if label.label() == text {
+                    *found = true;
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, text, found);
+                if *found {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = false;
+        walk(root, text, &mut found);
+        found
+    }
+
+    /// Depth-first search for the first `GtkButton` with exactly this label anywhere under `root`.
+    fn find_button_labeled(root: &gtk4::Widget, label: &str) -> Option<gtk4::Button> {
+        fn walk(widget: &gtk4::Widget, label: &str, found: &mut Option<gtk4::Button>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if button.label().as_deref() == Some(label) {
+                    *found = Some(button.clone());
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, label, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, label, &mut found);
+        found
     }
 }

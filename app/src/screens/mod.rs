@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod downloads;
 pub mod home;
+pub mod item_detail;
 pub mod library;
 pub mod main_window;
 pub mod player;

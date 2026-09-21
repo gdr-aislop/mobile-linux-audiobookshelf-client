@@ -146,7 +146,7 @@ struct LibraryWidgets {
     /// already-built instance).
     offline_mode: crate::offline_mode::OfflineModeState,
     data: Rc<std::cell::RefCell<LibraryData>>,
-    on_play: Rc<dyn Fn(PlayRequest)>,
+    on_open: Rc<dyn Fn(PlayRequest)>,
     /// Header dropdown button — mutated only to reflect the filter state (funnel icon while a
     /// filter is active, Nautilus-style), never to *own* it.
     sort_menu_button: gtk4::MenuButton,
@@ -166,7 +166,7 @@ struct LibraryData {
 }
 
 /// Builds the screen. Signature mirrors `home::build`'s exactly — same reasoning: `server`/
-/// `account` are already-resolved rows the caller looks up once, and `on_play` is how tapping a
+/// `account` are already-resolved rows the caller looks up once, and `on_open` is how tapping a
 /// cover starts playback without this screen ever touching `abs-player`/`abs-core::streaming`
 /// itself. `on_relogin` routes the banner's "Log in again" action (authorization failures only)
 /// back to the shell, same as Home's.
@@ -178,7 +178,7 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     offline_mode: crate::offline_mode::OfflineModeState,
-    on_play: impl Fn(PlayRequest) + Clone + 'static,
+    on_open: impl Fn(PlayRequest) + Clone + 'static,
     on_relogin: impl Fn() + Clone + 'static,
 ) -> LibraryScreen {
     let header = adw::HeaderBar::new();
@@ -350,7 +350,7 @@ pub fn build(
         view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
         offline_mode,
         data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new(), downloaded: std::collections::HashSet::new(), last_listened: std::collections::HashMap::new() })),
-        on_play: Rc::new(on_play),
+        on_open: Rc::new(on_open),
         sort_menu_button: sort_menu_button.clone(),
         in_progress_check: in_progress_check.clone(),
         progress_banner: progress_banner.clone(),
@@ -789,13 +789,13 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
             clear_flow_box(&widgets.flow_box);
             for item in visible {
                 let subtitle = item_subtitle(item);
-                widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_play, true, data.downloaded.contains(&item.id)), -1);
+                widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id)), -1);
             }
         }
         LibraryViewMode::List => {
             clear_list_box(&widgets.list_box);
             for item in visible {
-                widgets.list_box.append(&library_list_row(item, &widgets.on_play));
+                widgets.list_box.append(&library_list_row(item, &widgets.on_open));
             }
         }
     }
@@ -822,7 +822,7 @@ fn item_subtitle(item: &Item) -> String {
 /// out horizontally per `docs/design/ui-spec.md`'s "useful for podcast episode-style feeds" framing.
 /// Mirrors `home.rs`'s `library_row()` shape (an `AdwActionRow` with a prefix), swapping the
 /// symbolic icon for a small cover thumbnail via the same `CoverImage` widget `item_card.rs` uses.
-fn library_list_row(item: &Item, on_play: &Rc<dyn Fn(PlayRequest)>) -> adw::ActionRow {
+fn library_list_row(item: &Item, on_open: &Rc<dyn Fn(PlayRequest)>) -> adw::ActionRow {
     const THUMBNAIL_SIZE: i32 = 48;
 
     let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
@@ -832,8 +832,8 @@ fn library_list_row(item: &Item, on_play: &Rc<dyn Fn(PlayRequest)>) -> adw::Acti
     row.add_prefix(cover.widget());
 
     let request = PlayRequest { item_id: item.id.clone(), title: item.title.clone(), author: item.author.clone() };
-    let on_play = on_play.clone();
-    row.connect_activated(move |_| on_play(request.clone()));
+    let on_open = on_open.clone();
+    row.connect_activated(move |_| on_open(request.clone()));
 
     row
 }
@@ -1332,7 +1332,7 @@ pub(crate) mod tests {
         assert!(hooks.status_page.is_visible(), "no libraries at all should show the empty state");
     }
 
-    pub(crate) fn run_tapping_a_card_invokes_on_play(runtime: &tokio::runtime::Runtime) {
+    pub(crate) fn run_tapping_a_card_invokes_on_open(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(
             Mock::given(method("GET"))
@@ -1354,15 +1354,15 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let played: Rc<std::cell::RefCell<Vec<PlayRequest>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let on_play = {
-            let played = played.clone();
-            move |request: PlayRequest| played.borrow_mut().push(request)
+        let opened: Rc<std::cell::RefCell<Vec<PlayRequest>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let on_open = {
+            let opened = opened.clone();
+            move |request: PlayRequest| opened.borrow_mut().push(request)
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_play, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1371,8 +1371,8 @@ pub(crate) mod tests {
         let button = child.child().and_then(|w| w.downcast::<gtk4::Button>().ok()).expect("flow box child wraps a button");
         button.emit_clicked();
 
-        assert_eq!(played.borrow().len(), 1);
-        assert_eq!(played.borrow()[0].item_id, "item-1");
+        assert_eq!(opened.borrow().len(), 1, "clicking the card should invoke on_open exactly once (opening Item Detail)");
+        assert_eq!(opened.borrow()[0].item_id, "item-1");
     }
 
     pub(crate) fn run_list_view_toggle_switches_visible_container(runtime: &tokio::runtime::Runtime) {
@@ -1458,7 +1458,7 @@ pub(crate) mod tests {
         assert_eq!(row.subtitle().unwrap(), "Andy Weir · 1.0h");
     }
 
-    pub(crate) fn run_tapping_a_list_row_invokes_on_play(runtime: &tokio::runtime::Runtime) {
+    pub(crate) fn run_tapping_a_list_row_invokes_on_open(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(
             Mock::given(method("GET"))
@@ -1480,15 +1480,15 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
-        let played: Rc<std::cell::RefCell<Vec<PlayRequest>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let on_play = {
-            let played = played.clone();
-            move |request: PlayRequest| played.borrow_mut().push(request)
+        let opened: Rc<std::cell::RefCell<Vec<PlayRequest>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let on_open = {
+            let opened = opened.clone();
+            move |request: PlayRequest| opened.borrow_mut().push(request)
         };
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_play, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1498,8 +1498,8 @@ pub(crate) mod tests {
         let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
         row.emit_by_name::<()>("activated", &[]);
 
-        assert_eq!(played.borrow().len(), 1);
-        assert_eq!(played.borrow()[0].item_id, "item-1");
+        assert_eq!(opened.borrow().len(), 1, "clicking the card should invoke on_open exactly once (opening Item Detail)");
+        assert_eq!(opened.borrow()[0].item_id, "item-1");
     }
 
     pub(crate) fn run_search_and_sort_apply_in_list_mode_too(runtime: &tokio::runtime::Runtime) {

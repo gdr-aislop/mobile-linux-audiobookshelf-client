@@ -50,8 +50,20 @@ pub enum ItemDownloadState {
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
-    TrackProgress { item_id: String, ino: String, bytes_downloaded: u64, total_bytes: Option<u64> },
-    ItemStateChanged { item_id: String, state: ItemDownloadState },
+    TrackProgress {
+        item_id: String,
+        ino: String,
+        bytes_downloaded: u64,
+        /// Not read by any current listener (every consumer derives its own total from cached
+        /// track sizes instead) — kept on the event since it's cheap to carry and a future
+        /// progress display may want it directly rather than re-deriving it.
+        #[allow(dead_code)]
+        total_bytes: Option<u64>,
+    },
+    ItemStateChanged {
+        item_id: String,
+        state: ItemDownloadState,
+    },
 }
 
 type EventListener = Box<dyn Fn(&DownloadEvent)>;

@@ -9,9 +9,8 @@
 //! smoothed speed), throttled so per-chunk events don't thrash the label — the spinner stays as
 //! the at-a-glance "something is moving" cue.
 //!
-//! No storage-used/free-space summary row (the spec's own "nice to have") — computing device free
-//! space needs `statvfs`-style OS calls with no existing precedent in this codebase, left as a
-//! documented follow-up rather than built here.
+//! No storage-used/free-space summary row (the spec's own "nice to have") — left as a documented
+//! follow-up rather than built here.
 //!
 //! Never imports `abs_api`: the only calls here are `abs_core::download_tracks` (read the
 //! downloaded-item list) and `DownloadManager` (cancel/clear) — same boundary every other screen
