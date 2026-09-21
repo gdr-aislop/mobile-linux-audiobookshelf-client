@@ -150,6 +150,7 @@ mod tests {
         (home_sync_now_toasts_failure, crate::screens::home::tests::run_sync_now_toasts_failure),
         (library_renders_all_synced_items, crate::screens::library::tests::run_renders_all_synced_items),
         (library_search_filters_by_title_and_author, crate::screens::library::tests::run_search_filters_by_title_and_author),
+        (library_search_ignores_national_characters, crate::screens::library::tests::run_search_ignores_national_characters),
         (library_sort_changes_order, crate::screens::library::tests::run_sort_changes_order),
         (library_sorts_by_last_listened, crate::screens::library::tests::run_sorts_by_last_listened),
         (library_in_progress_filter_is_manually_toggleable, crate::screens::library::tests::run_in_progress_filter_is_manually_toggleable),

@@ -741,7 +741,7 @@ fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk
 }
 
 fn render_from_current_data(widgets: &LibraryWidgets) {
-    let query = widgets.search_entry.text().to_lowercase();
+    let query = abs_core::search::normalize_for_search(&widgets.search_entry.text());
     let sort = widgets.sort.get();
     let data = widgets.data.borrow();
 
@@ -751,8 +751,8 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         .iter()
         .filter(|item| {
             query.is_empty()
-                || item.title.to_lowercase().contains(&query)
-                || item.author.as_deref().is_some_and(|author| author.to_lowercase().contains(&query))
+                || abs_core::search::normalize_for_search(&item.title).contains(&query)
+                || item.author.as_deref().is_some_and(|author| abs_core::search::normalize_for_search(author).contains(&query))
         })
         .filter(|item| !offline_mode || data.downloaded.contains(&item.id))
         // "In progress only" (Home's Continue Listening tap-through, or the popover's check):
@@ -1024,6 +1024,47 @@ pub(crate) mod tests {
 
         hooks.search_entry.set_text("dune");
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Dune".to_string()], Duration::from_secs(5));
+    }
+
+    /// A plain-ASCII query must still find a title with national characters, and vice versa —
+    /// the fix for the reported "laka"/"ląka" should both match "łąka" gap.
+    pub(crate) fn run_search_ignores_national_characters(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Łąka", "Autor Polski", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+
+        hooks.search_entry.set_text("laka");
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Łąka".to_string()], Duration::from_secs(5));
+
+        hooks.search_entry.set_text("ląka");
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Łąka".to_string()], Duration::from_secs(5));
+
+        hooks.search_entry.set_text("łąka");
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Łąka".to_string()], Duration::from_secs(5));
     }
 
     /// Toggling offline mode should narrow the grid to items with at least one completed
