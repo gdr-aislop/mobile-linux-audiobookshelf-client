@@ -51,6 +51,11 @@ pub struct TestHooks {
     pub stack: adw::ViewStack,
     pub switcher_bar: adw::ViewSwitcherBar,
     pub mini_bar: crate::player::MiniPlayerHooks,
+    /// Invokes the exact same navigation the mini bar's tap/swipe-up gesture triggers (MP-5/
+    /// MP-6), without needing to synthesize a real `GestureDrag` sequence — there's no existing
+    /// raw-gesture test harness in this codebase, so tests assert on the outcome of this shared
+    /// closure instead.
+    pub open_player: Rc<dyn Fn()>,
     /// The shell's keyboard actions (ui-spec §6), so tests can activate them directly — the
     /// accel-to-action mapping itself is GTK-level and needs real key events to exercise.
     pub switch_tab: gtk4::gio::SimpleAction,
@@ -70,6 +75,28 @@ impl MainWindow {
     pub fn test_hooks(&self) -> &TestHooks {
         &self.hooks
     }
+}
+
+/// Below this, a drag is treated as a tap (open); at or above `SWIPE_UP_MIN_DISTANCE_PX` of
+/// predominantly-upward movement, it's treated as a swipe-up (also open) — see
+/// `mini_bar_gesture_should_open`'s doc comment. First-pass calibration constants only: the
+/// ui-spec flags the mini bar's swipe-up hit-zone as not yet validated against phosh's own
+/// bottom-edge shell gestures on real Librem 5 hardware, so these are expected to be re-tuned
+/// once that on-device measurement happens.
+const TAP_MAX_MOVEMENT_PX: f64 = 8.0;
+const SWIPE_UP_MIN_DISTANCE_PX: f64 = 24.0;
+
+/// Whether a completed drag on the mini bar should open the full player — true for a tap
+/// (movement in every direction stayed within `TAP_MAX_MOVEMENT_PX`, MP-5's guaranteed fallback)
+/// or a predominantly-upward swipe that traveled at least `SWIPE_UP_MIN_DISTANCE_PX` (MP-6).
+/// `offset_x`/`offset_y` are `GestureDrag::offset()`'s values: the total displacement from press
+/// to release, with negative `offset_y` meaning "moved up." A drag that's mostly horizontal, or
+/// swipes down, does nothing — same as a `GestureClick` simply not recognizing anything but its
+/// own click.
+fn mini_bar_gesture_should_open(offset_x: f64, offset_y: f64) -> bool {
+    let is_tap = offset_x.abs() <= TAP_MAX_MOVEMENT_PX && offset_y.abs() <= TAP_MAX_MOVEMENT_PX;
+    let is_swipe_up = offset_y <= -SWIPE_UP_MIN_DISTANCE_PX && offset_y.abs() > offset_x.abs();
+    is_tap || is_swipe_up
 }
 
 /// A signed-in shell's construction from everything it needs. The argument count is the shell's
@@ -374,7 +401,7 @@ pub fn build(
     });
     window.add_action(&open_library_search_action);
 
-    // Tapping the mini bar opens the full player by swapping the window's content — there's no
+    // Opens the full player by swapping the window's content — there's no
     // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
     // so this is the same content-swap mechanism `application.rs` already uses for Welcome -> main
     // window. Collapsing restores `root` (this shell), not a fresh `build()` call — no state lost.
@@ -382,14 +409,16 @@ pub fn build(
     // The player screen's keyboard actions ride along: its `SimpleActionGroup` is merged under
     // the "player" prefix for exactly as long as the screen is open, and removed on collapse, so
     // the arrow-key/speed/`c`/`t`/Escape accelerators (ui-spec §6) are inert everywhere else.
-    let mini_bar_gesture = gtk4::GestureClick::new();
-    mini_bar_gesture.connect_released({
+    //
+    // Shared by both the mini bar's tap and swipe-up gestures below (ui-spec's "Player — mini",
+    // MP-5/MP-6) so the two triggers can never drift into opening the player differently.
+    let open_player: Rc<dyn Fn()> = Rc::new({
         let controller = mini_bar.controller.clone();
         let window = window.clone();
         let root = root.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
-        move |_, _, _, _| {
+        move || {
             let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
                 let window = window.clone();
                 let root = root.clone();
@@ -400,6 +429,28 @@ pub fn build(
             });
             window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
             crate::widgets::swap_content(&window, &player_screen.root);
+        }
+    });
+
+    // A single `GestureDrag` recognizes both a tap (negligible movement) and a swipe up past
+    // `SWIPE_UP_MIN_DISTANCE_PX` — one gesture controller, not two competing ones claiming the
+    // same touch sequence on `mini_bar.root`. Tap-to-open (MP-5) is the guaranteed fallback per
+    // the ui-spec regardless of how the swipe (MP-6) ends up calibrated, and the swipe threshold
+    // here is a first pass only: the ui-spec flags this hit-zone as "not yet validated" against
+    // phosh's own bottom-edge shell gestures, so it needs on-device calibration before being
+    // final, same posture `widgets/pull_to_refresh.rs` documents for its own hand-rolled gesture.
+    // Deliberately no live drag-follow animation: the spec only requires that a swipe opens the
+    // player "same as tapping," and building drag-following polish ahead of that calibration
+    // would likely just need to be re-tuned or thrown away once real hardware is measured.
+    let mini_bar_gesture = gtk4::GestureDrag::new();
+    mini_bar_gesture.connect_drag_end({
+        let open_player = open_player.clone();
+        move |gesture, _, _| {
+            if let Some((offset_x, offset_y)) = gesture.offset() {
+                if mini_bar_gesture_should_open(offset_x, offset_y) {
+                    open_player();
+                }
+            }
         }
     });
     mini_bar.root.add_controller(mini_bar_gesture);
@@ -414,6 +465,7 @@ pub fn build(
             stack,
             switcher_bar,
             mini_bar: mini_bar.hooks,
+            open_player: open_player.clone(),
             switch_tab: switch_tab_action,
             play_pause: play_pause_action,
             bookmark: bookmark_action,
@@ -766,6 +818,120 @@ pub(crate) mod tests {
             "tapping Play should restore the shell"
         );
         assert_eq!(hooks.mini_bar.title_label.label(), "Project Hail Mary", "the mini bar should reflect the item Play just started");
+    }
+
+    #[test]
+    fn mini_bar_gesture_recognizes_a_tap() {
+        assert!(mini_bar_gesture_should_open(0.0, 0.0));
+        assert!(mini_bar_gesture_should_open(TAP_MAX_MOVEMENT_PX, -TAP_MAX_MOVEMENT_PX));
+    }
+
+    #[test]
+    fn mini_bar_gesture_recognizes_a_clean_swipe_up() {
+        assert!(mini_bar_gesture_should_open(0.0, -SWIPE_UP_MIN_DISTANCE_PX));
+        assert!(mini_bar_gesture_should_open(2.0, -(SWIPE_UP_MIN_DISTANCE_PX + 1.0)));
+    }
+
+    #[test]
+    fn mini_bar_gesture_ignores_a_swipe_down() {
+        assert!(!mini_bar_gesture_should_open(0.0, SWIPE_UP_MIN_DISTANCE_PX));
+    }
+
+    #[test]
+    fn mini_bar_gesture_ignores_a_horizontal_swipe() {
+        assert!(!mini_bar_gesture_should_open(SWIPE_UP_MIN_DISTANCE_PX, 0.0));
+    }
+
+    #[test]
+    fn mini_bar_gesture_ignores_a_diagonal_drag_that_is_mostly_horizontal() {
+        // Crosses the vertical threshold, but the horizontal component dominates — not a clean
+        // upward swipe, so this must not open the player.
+        assert!(!mini_bar_gesture_should_open(SWIPE_UP_MIN_DISTANCE_PX * 2.0, -SWIPE_UP_MIN_DISTANCE_PX));
+    }
+
+    #[test]
+    fn mini_bar_gesture_requires_the_full_swipe_distance() {
+        assert!(!mini_bar_gesture_should_open(0.0, -(SWIPE_UP_MIN_DISTANCE_PX - 1.0)));
+    }
+
+    /// Direct proof that both of the mini bar's gesture outcomes — a tap (MP-5) and a swipe up
+    /// past the threshold (MP-6) — reach the exact same navigation. There's no raw-gesture test
+    /// harness in this codebase to synthesize a real `GestureDrag` sequence against, so this
+    /// asserts on `TestHooks::open_player`, the shared closure both gesture outcomes call — the
+    /// distance/direction decision itself is covered in isolation by the `mini_bar_gesture_*`
+    /// tests above.
+    pub(crate) fn run_mini_bar_open_player_swaps_to_the_full_player_screen(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::item_json;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        // Start real playback so the mini bar has something to open into.
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        find_card_button(&home_root).expect("a synced item's card should render").emit_clicked();
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("Item Detail should be showing");
+        find_button_labeled(&content, "Play").expect("Item Detail's Play button").emit_clicked();
+        pump_until(|| hooks.mini_bar.bar.is_visible(), std::time::Duration::from_secs(10));
+
+        // This is the same closure both the tap and swipe-up gesture outcomes call — invoking it
+        // directly is the seam this test exercises (see the doc comment above).
+        (hooks.open_player)();
+
+        pump_until(
+            || app_window.content().is_some_and(|content| content != window.root),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            "opening the player from the mini bar should show the currently-playing item"
+        );
     }
 
     /// Depth-first search for the first `GtkButton` that wraps an `item_card::build` card —

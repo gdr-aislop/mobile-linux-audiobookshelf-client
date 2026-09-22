@@ -181,6 +181,7 @@ mod tests {
         (main_window_call_interruption_wiring_pauses_playback, crate::screens::main_window::tests::run_call_interruption_wiring_pauses_playback),
         (main_window_headphone_route_events_follow_the_settings, crate::screens::main_window::tests::run_headphone_route_events_follow_the_settings),
         (main_window_tapping_a_card_opens_item_detail_then_play_starts_playback_and_shows_the_shell_again, crate::screens::main_window::tests::run_tapping_a_card_opens_item_detail_then_play_starts_playback_and_shows_the_shell_again),
+        (main_window_mini_bar_open_player_swaps_to_the_full_player_screen, crate::screens::main_window::tests::run_mini_bar_open_player_swaps_to_the_full_player_screen),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
