@@ -21,6 +21,16 @@
 //! would be a surprise, not a convenience. The view-options popover's Sort-by combo is the
 //! *persisted* sort preference the spec describes; it drives the exact same `sort` cell the
 //! header popover does, so there is still only one place sorting is actually applied.
+//!
+//! Search is debounced (`search_debounce` in `build()`) rather than re-rendering on every raw
+//! `search-changed` emission, and every render's cards are built with their cover decode
+//! deferred (`item_card::build_deferred`/`library_list_row_deferred`) rather than eager — only
+//! covers within (or near) the scrolled viewport actually decode, tracked via `pending_covers`
+//! and `decode_covers_in_viewport`, on scroll as well as right after a render. Both exist to fix
+//! a reported freeze: typing used to re-render (and thus redecode every visible cover from disk,
+//! synchronously) on every keystroke. `widgets::cover_image::CoverImage` itself now also decodes
+//! asynchronously and caches decoded textures — see that module's doc comment for the rest of the
+//! fix; this screen's half is just "don't ask for a cover before it's actually about to be seen."
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -173,6 +183,17 @@ enum CategoryFilter {
     Genre(String),
 }
 
+/// One render's worth of built-but-maybe-not-decoded card/row, tracked so
+/// `decode_covers_in_viewport` can look them up again later (on scroll) without re-deriving
+/// anything from `data`. Rebuilt fresh on every render, replacing whatever was tracked before —
+/// the previous render's cards/covers are dropped along with their widgets, same lifetime as
+/// before this existed.
+struct PendingCover {
+    widget: gtk4::Widget,
+    cover: crate::widgets::cover_image::CoverImage,
+    path: Option<std::path::PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct SortButtons {
     pub date_added: gtk4::Button,
@@ -223,6 +244,8 @@ struct LibraryWidgets {
     /// Genre category chip is active. The revealer that shows/hides this box is only ever driven
     /// from the chip handlers in `build()` (which already hold their own clone), not from here.
     genre_chip_box: gtk4::Box,
+    /// This render's cards/rows and their (maybe not yet decoded) covers — see [`PendingCover`].
+    pending_covers: Rc<std::cell::RefCell<Vec<PendingCover>>>,
 }
 
 struct LibraryData {
@@ -487,6 +510,7 @@ pub fn build(
         in_progress_check: in_progress_check.clone(),
         progress_banner: progress_banner.clone(),
         genre_chip_box: genre_chip_box.clone(),
+        pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
     };
 
     // The filter's two manual entry points: the popover's check and the banner's "Show all".
@@ -502,9 +526,44 @@ pub fn build(
         move |_| set_in_progress_only(&widgets, false)
     });
 
+    // Debounced (200ms, cancel-and-reschedule) rather than rendering on every raw
+    // `search-changed` emission — a full render rebuilds every visible card/row, and firing that
+    // on every keystroke (even with `GtkSearchEntry`'s own ~150ms internal coalescing) was the
+    // actual cause of a reported freeze-then-catch-up pattern while typing. Only the *last*
+    // keystroke within a quiet window ever triggers a render, so no stale intermediate query's
+    // results can flash on screen either.
+    let search_debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
     search_entry.connect_search_changed({
         let widgets = widgets.clone();
-        move |_| render_from_current_data(&widgets)
+        move |_| {
+            if let Some(id) = search_debounce.take() {
+                id.remove();
+            }
+            let widgets = widgets.clone();
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                render_from_current_data(&widgets);
+            });
+            search_debounce.set(Some(id));
+        }
+    });
+
+    // Debounced (100ms) recompute of which pending covers just scrolled into range — see
+    // `decode_covers_in_viewport`'s doc comment. Scroll events fire far more often than a search
+    // keystroke, so a shorter debounce than search's own is enough to avoid redundant recomputes
+    // without adding perceptible lag to when a newly-visible cover starts decoding.
+    let scroll_debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    widgets.scroller.vadjustment().connect_value_changed({
+        let widgets = widgets.clone();
+        move |_| {
+            if let Some(id) = scroll_debounce.take() {
+                id.remove();
+            }
+            let widgets = widgets.clone();
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                decode_covers_in_viewport(&widgets);
+            });
+            scroll_debounce.set(Some(id));
+        }
     });
 
     let view_toggle_handler = view_toggle.connect_toggled({
@@ -1219,6 +1278,11 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // Only the active container is rebuilt — same "full rebuild on every render, not incremental"
     // posture already used everywhere else in this file, just gated per mode so switching modes
     // (or searching/sorting while a mode is hidden) doesn't do wasted work on the other one.
+    // Every card/row's cover decode is *deferred* (`build_deferred`/`library_list_row_deferred`):
+    // building the widget itself is cheap (no I/O), so that still happens for everything matching
+    // the filter, but only covers within (or near) the visible viewport actually start decoding —
+    // see `decode_covers_in_viewport`, scheduled once right after this function returns.
+    let mut pending = Vec::new();
     match widgets.view_mode.get() {
         LibraryViewMode::Grid => {
             clear_flow_box(&widgets.flow_box);
@@ -1228,7 +1292,9 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
                 }
                 for item in bucket {
                     let subtitle = item_subtitle(item);
-                    widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id)), -1);
+                    let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id));
+                    widgets.flow_box.insert(&built.widget, -1);
+                    pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
                 }
             }
         }
@@ -1239,11 +1305,24 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
                     widgets.list_box.append(&list_group_header(key));
                 }
                 for item in bucket {
-                    widgets.list_box.append(&library_list_row(item, &widgets.on_open));
+                    let built = library_list_row_deferred(item, &widgets.on_open);
+                    widgets.list_box.append(&built.row);
+                    pending.push(PendingCover { widget: built.row.upcast(), cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
                 }
             }
         }
     }
+    *widgets.pending_covers.borrow_mut() = pending;
+
+    // Deferred past this function returning — the cards above were only just inserted, and
+    // `compute_bounds` (inside `decode_covers_in_viewport`) needs a completed layout/allocation
+    // pass to report real positions; `idle_add_local_once`'s default priority runs after GTK's
+    // own resize/allocate processing, same idiom `widgets::swap_content` already relies on
+    // elsewhere in this crate for "let GTK finish its own processing first."
+    glib::idle_add_local_once({
+        let widgets = widgets.clone();
+        move || decode_covers_in_viewport(&widgets)
+    });
 
     // Offline mode overrides the empty state with "No downloaded items" (ui-spec LB-7) rather than
     // whatever `apply()` last set from the unfiltered sync result — search/sort's own empty case
@@ -1255,6 +1334,33 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         widgets.scroller.set_visible(has_visible);
     } else if !data.items.is_empty() {
         widgets.status_page.set_title("No items yet");
+    }
+}
+
+/// Decodes the cover for every currently-tracked card/row (`widgets.pending_covers`) that's
+/// within, or close to, the scrolled viewport — called once, deferred, right after every render
+/// (`render_from_current_data`) and again, debounced, whenever `widgets.scroller` is scrolled.
+/// `CoverImage::set_path` is itself idempotent (a repeated call with the same path no-ops), so
+/// calling it unconditionally for everything in range on every invocation is safe and simple —
+/// items outside the range are just left alone, still showing whatever they showed before (their
+/// placeholder, the first time). Uses real widget allocations (`compute_bounds`), not an estimated
+/// row/column count, so it doesn't need to reproduce `GtkFlowBox`'s own wrapping logic to know
+/// what's actually on screen.
+fn decode_covers_in_viewport(widgets: &LibraryWidgets) {
+    // Roughly one further screen's worth of rows in either direction — covers just outside the
+    // visible area start decoding before they're actually scrolled into view, so they're ready
+    // (or already in flight) by the time they are.
+    const MARGIN_PX: f32 = 600.0;
+
+    let viewport_height = widgets.scroller.height() as f32;
+    let scroller = widgets.scroller.clone().upcast::<gtk4::Widget>();
+    for pending in widgets.pending_covers.borrow().iter() {
+        let Some(bounds) = pending.widget.compute_bounds(&scroller) else { continue };
+        let top = bounds.y();
+        let bottom = top + bounds.height();
+        if bottom > -MARGIN_PX && top < viewport_height + MARGIN_PX {
+            pending.cover.set_path(pending.path.as_deref());
+        }
     }
 }
 
@@ -1295,11 +1401,17 @@ fn list_group_header(title: &str) -> gtk4::ListBoxRow {
 /// out horizontally per `docs/design/ui-spec.md`'s "useful for podcast episode-style feeds" framing.
 /// Mirrors `home.rs`'s `library_row()` shape (an `AdwActionRow` with a prefix), swapping the
 /// symbolic icon for a small cover thumbnail via the same `CoverImage` widget `item_card.rs` uses.
-fn library_list_row(item: &Item, on_open: &Rc<dyn Fn(PlayRequest)>) -> adw::ActionRow {
+/// The cover is left on its placeholder — `render_from_current_data`'s viewport-aware lazy decode
+/// (see [`PendingCover`]/`decode_covers_in_viewport`) decides when to actually decode it.
+struct BuiltListRow {
+    row: adw::ActionRow,
+    cover: crate::widgets::cover_image::CoverImage,
+}
+
+fn library_list_row_deferred(item: &Item, on_open: &Rc<dyn Fn(PlayRequest)>) -> BuiltListRow {
     const THUMBNAIL_SIZE: i32 = 48;
 
     let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
-    cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
 
     let row = adw::ActionRow::builder().title(&item.title).subtitle(item_subtitle(item)).activatable(true).build();
     row.add_prefix(cover.widget());
@@ -1308,7 +1420,7 @@ fn library_list_row(item: &Item, on_open: &Rc<dyn Fn(PlayRequest)>) -> adw::Acti
     let on_open = on_open.clone();
     row.connect_activated(move |_| on_open(request.clone()));
 
-    row
+    BuiltListRow { row, cover }
 }
 
 fn clear_flow_box(fb: &gtk4::FlowBox) {
@@ -2169,6 +2281,161 @@ pub(crate) mod tests {
 
         assert!(second_hooks.list_box.is_visible(), "a freshly built screen should restore the persisted List mode");
         assert!(!second_hooks.flow_box.is_visible());
+    }
+
+    /// The fix for the reported freeze: typing must not synchronously re-render on every
+    /// `search-changed` emission — only after a quiet window.
+    pub(crate) fn run_search_is_debounced(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Dune", "Frank Herbert", 1_600_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+
+        hooks.search_entry.set_text("dune");
+        // Immediately after — well inside the 200ms debounce window — the render must not have
+        // happened yet: still both items, not just the match.
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "typing must not synchronously re-render");
+
+        // Comfortably past the debounce window, the filtered result should have landed.
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Dune".to_string()], Duration::from_secs(5));
+    }
+
+    /// A real, distinct 1x1 PNG per item — enough for `CoverImage`'s decode path to succeed
+    /// (content is sniffed, not extension-based), without needing real asset files in the repo.
+    /// Mirrors `widgets::cover_image::tests::write_1x1_png`, duplicated rather than shared since
+    /// that one is private to its own module and this is the only other place that needs it.
+    fn write_1x1_png(path: &std::path::Path) {
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
+            0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        std::fs::write(path, PNG_1X1).unwrap();
+    }
+
+    /// Seeds a library of `count` items, each with a real (tiny) cached cover file, entirely
+    /// locally (no wiremock — sync isn't needed for this test, only the local rows it reads).
+    fn seed_items_with_real_covers(runtime: &tokio::runtime::Runtime, pool: &SqlitePool, server_id: &str, count: usize, cover_dir: &std::path::Path) {
+        runtime.block_on(abs_storage::repo::libraries::upsert(
+            pool,
+            abs_storage::repo::libraries::UpsertLibrary { id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 },
+        ))
+        .unwrap();
+        for i in 0..count {
+            let id = format!("item-{i}");
+            let cover_path = cover_dir.join(format!("{id}.png"));
+            write_1x1_png(&cover_path);
+            let added_at = chrono::DateTime::from_timestamp_millis(1_700_000_000_000 - i as i64).unwrap();
+            runtime
+                .block_on(abs_storage::repo::items::upsert(
+                    pool,
+                    abs_storage::repo::items::UpsertItem {
+                        id: &id,
+                        server_id,
+                        library_id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b",
+                        title: &format!("Book {i}"),
+                        author: None,
+                        narrator: None,
+                        description: None,
+                        duration_seconds: 3600.0,
+                        added_at,
+                        series_name: None,
+                        genres: &[],
+                    },
+                ))
+                .unwrap();
+            runtime.block_on(abs_storage::repo::items::set_cover_cache_path(pool, server_id, &id, Some(cover_path.to_str().unwrap()))).unwrap();
+        }
+    }
+
+    /// The fix's other half: not every visible-in-principle item's cover decodes right away —
+    /// only ones near the scrolled viewport. A tall, narrow window with many items means most
+    /// of them start well below the fold and must still show their placeholder right after the
+    /// initial render.
+    pub(crate) fn run_deferred_decode_only_covers_items_near_the_viewport(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "libraries": [] })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let cover_dir = tempfile::tempdir().unwrap();
+        seed_items_with_real_covers(runtime, &pool, &server.id, 40, cover_dir.path());
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().default_width(300).default_height(400).build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        pump_until(|| hooks.flow_box.child_at_index(39).is_some(), Duration::from_secs(10));
+        // Give the deferred decode's idle callback, and whatever it kicks off, a real chance to
+        // run and settle.
+        pump_until(|| false, Duration::from_millis(500));
+
+        let last_card = hooks.flow_box.child_at_index(39).expect("40 items were seeded");
+        let last_button = last_card.child().and_then(|w| w.downcast::<gtk4::Button>().ok()).expect("card wraps a button");
+        let last_cover_picture = last_button
+            .child()
+            .and_then(|card_box| card_box.first_child())
+            .and_then(|cover_overlay| cover_overlay.first_child())
+            .and_then(|w| w.downcast::<gtk4::Picture>().ok());
+        assert!(
+            last_cover_picture.is_none_or(|picture| !picture.is_visible()),
+            "an item far below the fold should not have decoded its cover yet"
+        );
+
+        // Scroll all the way down and confirm the last item's cover eventually decodes.
+        hooks.scroller.vadjustment().set_value(hooks.scroller.vadjustment().upper());
+        pump_until(
+            || {
+                hooks
+                    .flow_box
+                    .child_at_index(39)
+                    .and_then(|child| child.child())
+                    .and_then(|w| w.downcast::<gtk4::Button>().ok())
+                    .and_then(|button| button.child())
+                    .and_then(|card_box| card_box.first_child())
+                    .and_then(|cover_overlay| cover_overlay.first_child())
+                    .and_then(|w| w.downcast::<gtk4::Picture>().ok())
+                    .is_some_and(|picture| picture.is_visible())
+            },
+            Duration::from_secs(5),
+        );
     }
 
     /// The view-options popover's "Hide finished" switch (LB-8) — independent of "In progress

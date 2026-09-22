@@ -17,8 +17,26 @@ use crate::widgets::cover_image::CoverImage;
 /// (`abs_core::download_tracks::downloaded_item_ids`) — read-only here; the actual download
 /// button/scope picker lives on the Item Detail (and Player) screen. `on_open` reports the tapped
 /// item's `PlayRequest` up to the caller, which opens Item Detail for it — this card never starts
-/// playback itself.
+/// playback itself. Decodes the cover immediately; for a screen that wants to defer decoding
+/// (Library's viewport-aware lazy decode — see `screens::library`), use [`build_deferred`], which
+/// this is a thin wrapper around.
 pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> gtk4::Widget {
+    let built = build_deferred(size, item, subtitle, on_open, wrap_title, is_downloaded);
+    built.cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
+    built.widget
+}
+
+/// A card and the `CoverImage` handle inside it, with the cover left showing its placeholder —
+/// the caller decides when (or whether) to call [`CoverImage::set_path`] on `cover`. Exists for
+/// `screens::library`'s viewport-aware lazy decode: building every visible item's card is cheap
+/// (no I/O), but deciding *which* cards should actually start decoding their cover right now
+/// needs the card already built (and inserted, so its allocation can be measured) first.
+pub struct BuiltItemCard {
+    pub widget: gtk4::Widget,
+    pub cover: CoverImage,
+}
+
+pub fn build_deferred(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> BuiltItemCard {
     // Every widget in this card is explicitly `hexpand(false)` — a `GtkBox`'s own hexpand is
     // computed from its children unless overridden, so a single stray `true` here would propagate
     // all the way up to the wrapping `GtkButton` and stretch a single-item shelf/row's card full
@@ -27,7 +45,6 @@ pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayReq
 
     let cover = CoverImage::new(size);
     cover.widget().set_hexpand(false);
-    cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
 
     // The badge sits in an `Overlay` rather than being part of `CoverImage` itself — `CoverImage`
     // is shared with the Player screen's large cover, which has no such badge, so keeping this
@@ -108,7 +125,7 @@ pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayReq
     let on_open = on_open.clone();
     button.connect_clicked(move |_| on_open(request.clone()));
 
-    button.upcast()
+    BuiltItemCard { widget: button.upcast(), cover }
 }
 
 #[cfg(test)]

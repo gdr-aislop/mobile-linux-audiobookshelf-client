@@ -4,24 +4,117 @@
 //! wrapper: a missing or corrupt cached file must never be treated as an error, only as "show the
 //! placeholder", since cover art is cosmetic and this codebase already shows a plain placeholder
 //! card everywhere covers aren't available yet.
+//!
+//! Decoding is asynchronous and cached process-wide. Library's search (and, more generally, any
+//! screen that rebuilds many cards on every render/scroll) used to redecode every visible cover
+//! from disk synchronously on the GTK main thread on every keystroke — the actual cause of a
+//! reported multi-second UI freeze while typing. `set_path` now checks a shared, byte-budgeted
+//! LRU texture cache first; on a miss it shows the placeholder immediately and decodes on a
+//! background thread (`tokio::task::spawn_blocking`, resumed on the main thread once done via
+//! `glib::spawn_future_local` — the same "start on the main loop, await a tokio-spawned task"
+//! idiom `screens::library`'s own sync pipeline already uses), so a cache miss never blocks.
 
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use adw::glib;
 use adw::prelude::*;
+
+/// Every cached texture is downscaled to exactly the requesting `CoverImage`'s `size`×`size` —
+/// the source cover files are cached to disk at whatever resolution the server sent (no
+/// resizing anywhere in `abs_core::covers`), and decoding them at native resolution into this
+/// cache would be a real problem on a memory-constrained device (the largest size this app uses,
+/// Player's full-screen cover, is 264px — a native-resolution book cover can easily be several
+/// times that). Capped by *bytes*, not entry count: this cache is shared across every screen's
+/// `CoverImage`, and different sizes cost wildly different amounts per entry, so an entry count
+/// alone wouldn't give a real RAM ceiling.
+const TEXTURE_CACHE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+
+/// How many cover decodes run at once. Bounds background CPU/thermal load when a burst of newly-
+/// visible covers all become eligible to decode at once (e.g. a fast scroll) — the decode is
+/// already off the main thread and thus non-blocking either way; this just stops it from
+/// saturating every core on a mobile SoC. Mirrors `app/src/downloads.rs`'s `DownloadManager`
+/// applying the same reasoning to concurrent track downloads.
+const MAX_CONCURRENT_COVER_DECODES: usize = 3;
+
+thread_local! {
+    // `gdk::Texture` isn't `Send`, and GTK only ever runs on the main thread in this app, so a
+    // `thread_local!` is the right tool here, not a `Mutex` — same reasoning already used
+    // elsewhere in this crate for main-thread-only state. Only ever touched from the main
+    // thread's own async continuations (see `set_path`), never from inside `spawn_blocking`.
+    static TEXTURE_CACHE: RefCell<LruTextureCache> = RefCell::new(LruTextureCache::new(TEXTURE_CACHE_BUDGET_BYTES));
+    static DECODE_SEMAPHORE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_COVER_DECODES));
+}
+
+/// Keyed by `(path, size)`, not just `path` — different screens request different sizes for the
+/// same item (a grid tile vs. a list thumbnail vs. Player's mini-bar vs. Item Detail's larger
+/// cover), and a texture correctly sized for one use would be blurry upscaled for another.
+struct LruTextureCache {
+    budget_bytes: usize,
+    used_bytes: usize,
+    /// Access order, oldest first — touched (moved to the back) on every hit *and* insert, so
+    /// the least-recently-shown entry is always what gets evicted first.
+    order: VecDeque<(PathBuf, i32)>,
+    entries: HashMap<(PathBuf, i32), gtk4::gdk::Texture>,
+}
+
+impl LruTextureCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self { budget_bytes, used_bytes: 0, order: VecDeque::new(), entries: HashMap::new() }
+    }
+
+    fn get(&mut self, key: &(PathBuf, i32)) -> Option<gtk4::gdk::Texture> {
+        let texture = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(texture)
+    }
+
+    fn touch(&mut self, key: &(PathBuf, i32)) {
+        if let Some(pos) = self.order.iter().position(|existing| existing == key) {
+            let key = self.order.remove(pos).expect("position came from this same deque");
+            self.order.push_back(key);
+        }
+    }
+
+    /// A concurrent decode of the same `(path, size)` landing twice (e.g. two cards for the same
+    /// item scrolled into view close together) just bumps recency the second time — no double
+    /// accounting.
+    fn insert(&mut self, key: (PathBuf, i32), texture: gtk4::gdk::Texture) {
+        if self.entries.contains_key(&key) {
+            self.touch(&key);
+            return;
+        }
+        let byte_size = texture_bytes(&texture);
+        self.entries.insert(key.clone(), texture);
+        self.order.push_back(key);
+        self.used_bytes += byte_size;
+        while self.used_bytes > self.budget_bytes {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(texture_bytes(&removed));
+            }
+        }
+    }
+}
+
+fn texture_bytes(texture: &gtk4::gdk::Texture) -> usize {
+    (texture.width() as usize) * (texture.height() as usize) * 4
+}
 
 #[derive(Clone)]
 pub struct CoverImage {
     overlay: gtk4::Overlay,
     placeholder: gtk4::Box,
     picture: gtk4::Picture,
-    /// The path whose image is currently rendered, shared across clones (the widget handle and
-    /// the closure it was cloned into must agree). Snapshots arrive ~4×/second while anything
-    /// is playing — the player's 250 ms tick republishes to advance the scrubber — and every
-    /// one re-runs `set_path`; `set_path` decodes from disk, so an unchanged path has to
-    /// short-circuit rather than re-decode the same file four times a second.
-    last_path: Rc<Cell<Option<PathBuf>>>,
+    /// The path whose image is currently requested, shared across clones (the widget handle and
+    /// the closure it was cloned into must agree). `RefCell`, not `Cell` — `set_path`'s async
+    /// decode continuation needs to *read* this without consuming it, to check it's still
+    /// current before applying a possibly-stale result (see `set_path`'s staleness guard).
+    last_path: Rc<RefCell<Option<PathBuf>>>,
+    /// Both the widget's fixed width/height and the cache key's size component.
+    size: i32,
 }
 
 impl CoverImage {
@@ -67,7 +160,7 @@ impl CoverImage {
             .build();
         overlay.add_overlay(&picture);
 
-        Self { overlay, placeholder, picture, last_path: Rc::new(Cell::new(None)) }
+        Self { overlay, placeholder, picture, last_path: Rc::new(RefCell::new(None)), size }
     }
 
     pub fn widget(&self) -> &gtk4::Widget {
@@ -83,16 +176,14 @@ impl CoverImage {
 
     /// Shows the cached image at `path`, or falls back to the placeholder if `path` is `None` or
     /// the file can't be decoded (missing, corrupt, unsupported format — none of these should
-    /// ever crash the player screen over cosmetic art). Repeated calls with the same path are a
-    /// no-op: the snapshot cadence (~4 Hz) would otherwise re-decode the same file from disk on
-    /// every tick.
+    /// ever crash a screen over cosmetic art). Repeated calls with the same path are a no-op —
+    /// needed both for the player's ~4Hz snapshot cadence (this widget instance is reused/
+    /// republished on every tick) and, now, to avoid kicking off a redundant decode.
+    ///
+    /// Never blocks: a cache hit is an in-memory texture clone; a miss shows the placeholder
+    /// immediately and decodes on a background thread, applying the result later if (and only
+    /// if) this `CoverImage` is still showing the path that was requested.
     pub fn set_path(&self, path: Option<&Path>) {
-        // `replace` stores the new value and hands back the previous one in a single step — the
-        // comparison can't precede the store, or a rapid A→A sequence (same path republished)
-        // would re-decode. Note a path whose *contents* changed under the same name therefore
-        // won't repaint until some other path lands; covers are cached item-keyed, so that
-        // only happens when a server replaces a cover in place, and the next session's decode
-        // picks the new bytes up.
         let previous = self.last_path.replace(path.map(Path::to_path_buf));
         if previous.as_deref() == path {
             return;
@@ -101,26 +192,56 @@ impl CoverImage {
             self.show_placeholder();
             return;
         };
-        // Fast path: gdk-pixbuf (via `Texture::from_filename`). Covers only the formats the
-        // host's pixbuf loaders support. Fallback path: decode in-process with the `image`
-        // crate — needed for WebP, which gdk-pixbuf has no loader for on the target distros
-        // (no WebP loader ships in Debian bookworm, PureOS Crimson's base, and Audiobookshelf
-        // serves plenty of WebP covers).
-        match gtk4::gdk::Texture::from_filename(path) {
-            Ok(texture) => {
-                self.show_texture(texture);
-            }
-            Err(pixbuf_err) => match decode_texture_in_process(path) {
-                Ok(texture) => {
-                    self.show_texture(texture);
+        let key = (path.to_path_buf(), self.size);
+
+        if let Some(texture) = TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
+            self.show_texture(texture);
+            return;
+        }
+
+        self.show_placeholder();
+
+        let picture = self.picture.clone();
+        let placeholder = self.placeholder.clone();
+        let last_path = self.last_path.clone();
+        let requested = path.to_path_buf();
+        let size = self.size;
+        glib::spawn_future_local(async move {
+            let semaphore = DECODE_SEMAPHORE.with(|semaphore| semaphore.clone());
+            let _permit = semaphore.acquire().await.expect("cover-decode semaphore is never closed");
+
+            let decoded = tokio::task::spawn_blocking({
+                let requested = requested.clone();
+                move || decode_and_crop_to_cover(&requested, size)
+            })
+            .await;
+
+            let (bytes, side) = match decoded {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, ?requested, "couldn't decode the cached cover image");
+                    return;
                 }
                 Err(err) => {
-                    tracing::warn!(%err, ?path, "couldn't decode the cached cover image");
-                    self.show_placeholder();
-                    let _ = pixbuf_err; // both errors are interesting; the fallback's is logged
+                    tracing::warn!(%err, ?requested, "cover decode task panicked");
+                    return;
                 }
-            },
-        }
+            };
+
+            let texture: gtk4::gdk::Texture =
+                gtk4::gdk::MemoryTexture::new(side as i32, side as i32, gtk4::gdk::MemoryFormat::R8g8b8a8, &gtk4::glib::Bytes::from_owned(bytes), (side * 4) as usize).into();
+
+            TEXTURE_CACHE.with(|cache| cache.borrow_mut().insert((requested.clone(), size), texture.clone()));
+
+            // Staleness guard: this `CoverImage` may have been rebound to a different path while
+            // this decode was in flight (the player's mini-bar reuses one instance across ticks,
+            // sometimes onto a genuinely new track) — only apply if nothing newer superseded it.
+            if last_path.borrow().as_deref() == Some(requested.as_path()) {
+                picture.set_paintable(Some(&texture));
+                picture.set_visible(true);
+                placeholder.set_visible(false);
+            }
+        });
     }
 
     fn show_texture(&self, texture: gtk4::gdk::Texture) {
@@ -135,29 +256,40 @@ impl CoverImage {
     }
 }
 
-/// Decodes an image file in-process (format sniffed from the content, so the cached file's
-/// extension can't lie) and wraps the pixels in a `gdk::MemoryTexture`.
-fn decode_texture_in_process(path: &Path) -> Result<gtk4::gdk::Texture, image::ImageError> {
+/// Decodes an image file (format sniffed from the content, so the cached file's extension can't
+/// lie — needed for WebP, which gdk-pixbuf has no loader for on the target distros: no WebP
+/// loader ships in Debian bookworm, PureOS Crimson's base, and Audiobookshelf serves plenty of
+/// WebP covers) and scales+crops it to exactly `side`x`side`, matching `GtkContentFit::Cover`'s
+/// aspect-preserving crop rather than a naive stretch — scaling up until both dimensions are at
+/// least `side` (preserving aspect ratio), then center-cropping the overflow. Runs on a
+/// `spawn_blocking` thread; returns plain, `Send`-safe bytes rather than a `gdk::Texture`
+/// (a GObject) deliberately — constructing/touching one off the thread that owns the GTK main
+/// context is exactly the kind of thing that can crash unpredictably under Wayland/EGL, so the
+/// `gdk::MemoryTexture` itself is always built back on the main thread, in `set_path`.
+fn decode_and_crop_to_cover(path: &Path, side: i32) -> Result<(Vec<u8>, u32), image::ImageError> {
+    let side = side as u32;
     let bytes = std::fs::read(path)?;
-    let decoded = image::load_from_memory(&bytes)?.into_rgba8();
-    let (width, height) = decoded.dimensions();
-    Ok(gtk4::gdk::MemoryTexture::new(
-        width as i32,
-        height as i32,
-        gtk4::gdk::MemoryFormat::R8g8b8a8,
-        &gtk4::glib::Bytes::from_owned(decoded.into_raw()),
-        (width * 4) as usize,
-    )
-    .into())
+    let decoded = image::load_from_memory(&bytes)?;
+    let (width, height) = (decoded.width(), decoded.height());
+    let scale = (side as f64 / width as f64).max(side as f64 / height as f64);
+    let scaled_width = ((width as f64 * scale).ceil() as u32).max(side);
+    let scaled_height = ((height as f64 * scale).ceil() as u32).max(side);
+    let scaled = decoded.resize_exact(scaled_width, scaled_height, image::imageops::FilterType::Triangle);
+    let x = (scaled_width - side) / 2;
+    let y = (scaled_height - side) / 2;
+    let cropped = scaled.crop_imm(x, y, side, side).into_rgba8();
+    Ok((cropped.into_raw(), side))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_support::pump_until;
+    use std::time::Duration;
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
     /// scenario in this binary has to run from one single entry point.
-    pub(crate) fn run() {
+    pub(crate) fn run(_runtime: &tokio::runtime::Runtime) {
         let cover = CoverImage::new(64);
         assert!(cover.placeholder.is_visible(), "starts showing the placeholder");
         assert!(!cover.picture.is_visible());
@@ -169,13 +301,17 @@ pub(crate) mod tests {
         let corrupt = tmp.path().join("not-an-image.png");
         std::fs::write(&corrupt, b"not actually a png").unwrap();
         cover.set_path(Some(&corrupt));
+        // A corrupt file fails inside the background decode — pump the main loop for a moment
+        // (letting the spawned decode task actually resolve) and confirm it settles back on the
+        // placeholder rather than panicking or hanging.
+        pump_until(|| false, Duration::from_millis(200));
         assert!(cover.placeholder.is_visible(), "a corrupt file should fall back to the placeholder, not panic");
         assert!(!cover.picture.is_visible());
 
         let valid = tmp.path().join("real.png");
         write_1x1_png(&valid);
         cover.set_path(Some(&valid));
-        assert!(cover.picture.is_visible(), "a valid image should show the picture");
+        pump_until(|| cover.picture.is_visible(), Duration::from_secs(5));
         assert!(!cover.placeholder.is_visible());
 
         // WebP has no gdk-pixbuf loader on the target distros — the in-process fallback must
@@ -183,11 +319,112 @@ pub(crate) mod tests {
         let webp = tmp.path().join("real.webp");
         write_1x1_webp(&webp);
         cover.set_path(Some(&webp));
+        pump_until(|| cover.picture.is_visible(), Duration::from_secs(5));
         assert!(cover.picture.is_visible(), "a WebP cover should decode via the image-crate fallback");
         assert!(!cover.placeholder.is_visible());
 
         cover.set_path(None);
         assert!(cover.placeholder.is_visible(), "clearing the path restores the placeholder");
+    }
+
+    /// The whole point of caching downscaled textures rather than native-resolution ones: the
+    /// cached (and displayed) texture must always come out at exactly the requested size, never
+    /// the source image's own resolution.
+    pub(crate) fn run_decodes_at_the_requested_size_not_the_source_size(runtime: &tokio::runtime::Runtime) {
+        let cover = CoverImage::new(64);
+        let tmp = tempfile::tempdir().unwrap();
+        let large = tmp.path().join("large.png");
+        write_nxn_png(&large, 400);
+
+        cover.set_path(Some(&large));
+        pump_until(|| cover.picture.is_visible(), Duration::from_secs(5));
+
+        let texture = cover.picture.paintable().and_then(|p| p.downcast::<gtk4::gdk::Texture>().ok()).expect("a texture should be showing");
+        assert_eq!(texture.width(), 64);
+        assert_eq!(texture.height(), 64);
+        let _ = runtime;
+    }
+
+    /// A cache hit must never touch disk — decode a real file via one `CoverImage`, delete the
+    /// file, then decode the *same* path+size via a second, independent instance. If the second
+    /// instance re-read from disk it would fail (the file is gone) and fall back to the
+    /// placeholder; showing the picture instead proves the cache served it.
+    pub(crate) fn run_cache_hit_avoids_re_reading_disk(runtime: &tokio::runtime::Runtime) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cached.png");
+        write_1x1_png(&path);
+
+        let first = CoverImage::new(64);
+        first.set_path(Some(&path));
+        pump_until(|| first.picture.is_visible(), Duration::from_secs(5));
+
+        std::fs::remove_file(&path).unwrap();
+
+        let second = CoverImage::new(64);
+        second.set_path(Some(&path));
+        pump_until(|| second.picture.is_visible(), Duration::from_secs(5));
+        assert!(second.picture.is_visible(), "a cache hit must show the picture even though the file is gone");
+        let _ = runtime;
+    }
+
+    /// A late-landing decode for a path this widget has since moved on from must never clobber
+    /// whatever it was rebound to — the exact scenario `last_path`'s `RefCell` (checked, not
+    /// just replaced) guards against.
+    pub(crate) fn run_a_stale_decode_does_not_clobber_a_newer_path(_runtime: &tokio::runtime::Runtime) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_a = tmp.path().join("a.png");
+        let path_b = tmp.path().join("b.png");
+        write_1x1_png(&path_a);
+        write_1x1_png(&path_b);
+
+        let cover = CoverImage::new(64);
+        cover.set_path(Some(&path_a));
+        // Immediately move on to B before A's background decode can possibly have landed.
+        cover.set_path(Some(&path_b));
+
+        pump_until(|| cover.picture.is_visible(), Duration::from_secs(5));
+        // Give A's decode every chance to land too, then confirm B is still what's showing.
+        pump_until(|| false, Duration::from_millis(200));
+        assert_eq!(cover.last_path.borrow().as_deref(), Some(path_b.as_path()));
+        assert!(cover.picture.is_visible());
+    }
+
+    /// Filling the cache past its byte budget must evict the least-recently-*used* entry, not
+    /// simply the oldest-inserted one — re-accessing the first entry before pushing the budget
+    /// again should save it from eviction.
+    pub(crate) fn run_lru_eviction_keeps_recently_accessed_entries(runtime: &tokio::runtime::Runtime) {
+        TEXTURE_CACHE.with(|cache| *cache.borrow_mut() = LruTextureCache::new(3 * 64 * 64 * 4));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let path = tmp.path().join(name);
+            write_1x1_png(&path);
+            path
+        };
+        let paths: Vec<_> = ["a.png", "b.png", "c.png"].iter().map(|name| make(name)).collect();
+
+        for path in &paths {
+            let cover = CoverImage::new(64);
+            cover.set_path(Some(path));
+            pump_until(|| cover.picture.is_visible(), Duration::from_secs(5));
+        }
+        // Budget holds exactly 3 entries' worth — re-access "a" so it's the most recently used.
+        let touch = CoverImage::new(64);
+        touch.set_path(Some(&paths[0]));
+        pump_until(|| touch.picture.is_visible(), Duration::from_secs(5));
+
+        // A fourth distinct entry must evict "b" (now the least-recently-used), not "a".
+        let d_path = make("d.png");
+        let filler = CoverImage::new(64);
+        filler.set_path(Some(&d_path));
+        pump_until(|| filler.picture.is_visible(), Duration::from_secs(5));
+
+        std::fs::remove_file(&paths[0]).unwrap();
+        let recheck_a = CoverImage::new(64);
+        recheck_a.set_path(Some(&paths[0]));
+        pump_until(|| recheck_a.picture.is_visible(), Duration::from_secs(5));
+        assert!(recheck_a.picture.is_visible(), "\"a\" was recently touched, so it should still be cached even after the file is gone");
+        let _ = runtime;
     }
 
     /// The smallest possible valid WebP (1x1, lossy VP8) — generated once with `cwebp`, so no
@@ -202,8 +439,8 @@ pub(crate) mod tests {
         std::fs::write(path, WEBP_1X1).unwrap();
     }
 
-    /// The smallest possible valid PNG (1x1, black pixel) — enough for `gdk::Texture::from_filename`
-    /// to succeed without needing a real asset file in the repo.
+    /// The smallest possible valid PNG (1x1, black pixel) — enough to decode without needing a
+    /// real asset file in the repo.
     fn write_1x1_png(path: &std::path::Path) {
         const PNG_1X1: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
@@ -212,5 +449,13 @@ pub(crate) mod tests {
             0x42, 0x60, 0x82,
         ];
         std::fs::write(path, PNG_1X1).unwrap();
+    }
+
+    /// A real `n`x`n` PNG, built in-process via the `image` crate — used where the test needs a
+    /// specific, larger-than-target source resolution (the 1x1 fixture above can't demonstrate a
+    /// resize).
+    fn write_nxn_png(path: &std::path::Path, n: u32) {
+        let image = image::RgbaImage::from_pixel(n, n, image::Rgba([200, 100, 50, 255]));
+        image.save(path).unwrap();
     }
 }
