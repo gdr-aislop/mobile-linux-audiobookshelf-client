@@ -13,6 +13,12 @@
 //! background thread (`tokio::task::spawn_blocking`, resumed on the main thread once done via
 //! `glib::spawn_future_local` — the same "start on the main loop, await a tokio-spawned task"
 //! idiom `screens::library`'s own sync pipeline already uses), so a cache miss never blocks.
+//!
+//! The decode target is the widget's *physical* pixel size (`size` scaled by the surface's
+//! `scale-factor`), not just its logical `size` — decoding at logical size only and letting a
+//! HiDPI/scaled output (e.g. a phosh integer-scaled display) stretch it to fill the physical
+//! surface blurs every cover uniformly, regardless of how small the slot is. See
+//! `CoverImage::decode_pixels`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -103,6 +109,13 @@ fn texture_bytes(texture: &gtk4::gdk::Texture) -> usize {
     (texture.width() as usize) * (texture.height() as usize) * 4
 }
 
+/// Pure so it's unit-testable without a real, possibly-scaled display (Xvfb always reports scale
+/// factor 1, so a GTK-level test can't exercise the HiDPI case at all). `scale_factor` is clamped
+/// to at least 1 — GTK never reports less, but an unrealized widget's default shouldn't either.
+fn decode_pixels_for(size: i32, scale_factor: i32) -> i32 {
+    size * scale_factor.max(1)
+}
+
 #[derive(Clone)]
 pub struct CoverImage {
     overlay: gtk4::Overlay,
@@ -167,6 +180,15 @@ impl CoverImage {
         self.overlay.upcast_ref()
     }
 
+    /// The pixel resolution to actually decode at: `size` (logical) scaled by this widget's
+    /// current physical scale factor, so a HiDPI/phosh-style scaled output gets a texture with
+    /// enough real pixels to fill its physical surface without the compositor upscaling (and
+    /// blurring) it. Falls back to 1x if unrealized (not yet attached to a surface) — decoding
+    /// too small in that edge case just means a possible one-time re-decode later, never a crash.
+    fn decode_pixels(&self) -> i32 {
+        decode_pixels_for(self.size, self.overlay.scale_factor())
+    }
+
     /// Test-only view of the underlying `GtkPicture` — scenarios assert visibility on it to pin,
     /// end to end, that a cached cover actually rendered rather than stayed a placeholder.
     #[cfg(test)]
@@ -192,7 +214,8 @@ impl CoverImage {
             self.show_placeholder();
             return;
         };
-        let key = (path.to_path_buf(), self.size);
+        let decode_pixels = self.decode_pixels();
+        let key = (path.to_path_buf(), decode_pixels);
 
         if let Some(texture) = TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
             self.show_texture(texture);
@@ -205,7 +228,7 @@ impl CoverImage {
         let placeholder = self.placeholder.clone();
         let last_path = self.last_path.clone();
         let requested = path.to_path_buf();
-        let size = self.size;
+        let size = decode_pixels;
         glib::spawn_future_local(async move {
             let semaphore = DECODE_SEMAPHORE.with(|semaphore| semaphore.clone());
             let _permit = semaphore.acquire().await.expect("cover-decode semaphore is never closed");
@@ -325,6 +348,26 @@ pub(crate) mod tests {
 
         cover.set_path(None);
         assert!(cover.placeholder.is_visible(), "clearing the path restores the placeholder");
+    }
+
+    /// The regression this fix guards against: decoding at logical `size` alone (ignoring the
+    /// display's scale factor) produces a texture with fewer physical pixels than a HiDPI/
+    /// scaled surface needs to fill without upscaling — which is what made every cover look
+    /// blurry, uniformly, regardless of how small the slot was. A plain unit test on the pure
+    /// function, not a GTK scenario, since Xvfb always reports scale factor 1 and can't exercise
+    /// a scaled display at all.
+    #[test]
+    fn decode_pixels_scales_with_the_display_scale_factor() {
+        assert_eq!(decode_pixels_for(64, 1), 64);
+        assert_eq!(decode_pixels_for(64, 2), 128);
+        assert_eq!(decode_pixels_for(48, 3), 144);
+    }
+
+    /// GTK never reports a scale factor below 1, but an unrealized widget's default shouldn't
+    /// either — this is what keeps a not-yet-attached `CoverImage` from decoding at size 0.
+    #[test]
+    fn decode_pixels_never_scales_down_below_1x() {
+        assert_eq!(decode_pixels_for(64, 0), 64);
     }
 
     /// The whole point of caching downscaled textures rather than native-resolution ones: the
