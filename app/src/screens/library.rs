@@ -531,19 +531,17 @@ pub fn build(
     // on every keystroke (even with `GtkSearchEntry`'s own ~150ms internal coalescing) was the
     // actual cause of a reported freeze-then-catch-up pattern while typing. Only the *last*
     // keystroke within a quiet window ever triggers a render, so no stale intermediate query's
-    // results can flash on screen either.
-    let search_debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    // results can flash on screen either. `crate::widgets::Debouncer`, not a hand-rolled
+    // `SourceId` cell — see its doc comment for why a hand-rolled version of this exact thing
+    // crashed the app.
+    let search_debounce = crate::widgets::Debouncer::default();
     search_entry.connect_search_changed({
         let widgets = widgets.clone();
         move |_| {
-            if let Some(id) = search_debounce.take() {
-                id.remove();
-            }
             let widgets = widgets.clone();
-            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            search_debounce.schedule(std::time::Duration::from_millis(200), move || {
                 render_from_current_data(&widgets);
             });
-            search_debounce.set(Some(id));
         }
     });
 
@@ -551,18 +549,14 @@ pub fn build(
     // `decode_covers_in_viewport`'s doc comment. Scroll events fire far more often than a search
     // keystroke, so a shorter debounce than search's own is enough to avoid redundant recomputes
     // without adding perceptible lag to when a newly-visible cover starts decoding.
-    let scroll_debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    let scroll_debounce = crate::widgets::Debouncer::default();
     widgets.scroller.vadjustment().connect_value_changed({
         let widgets = widgets.clone();
         move |_| {
-            if let Some(id) = scroll_debounce.take() {
-                id.remove();
-            }
             let widgets = widgets.clone();
-            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            scroll_debounce.schedule(std::time::Duration::from_millis(100), move || {
                 decode_covers_in_viewport(&widgets);
             });
-            scroll_debounce.set(Some(id));
         }
     });
 
@@ -2323,6 +2317,13 @@ pub(crate) mod tests {
 
         // Comfortably past the debounce window, the filtered result should have landed.
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Dune".to_string()], Duration::from_secs(5));
+
+        // The actual reported crash: typing again *after* the first debounce already fired (so
+        // its one-shot GLib source has already self-destroyed) used to panic inside
+        // `SourceId::remove` — a panic that aborts the whole process, since it's raised from a
+        // GTK signal handler. Regression guard for `crate::widgets::Debouncer`'s fix.
+        hooks.search_entry.set_text("");
+        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 2, Duration::from_secs(5));
     }
 
     /// A real, distinct 1x1 PNG per item — enough for `CoverImage`'s decode path to succeed
@@ -2436,6 +2437,13 @@ pub(crate) mod tests {
             },
             Duration::from_secs(5),
         );
+
+        // The actual reported crash: scrolling again *after* the first scroll's debounce already
+        // fired (so its one-shot GLib source has already self-destroyed) used to panic inside
+        // `SourceId::remove`, aborting the process. Regression guard for
+        // `crate::widgets::Debouncer`'s fix — this must simply not crash.
+        hooks.scroller.vadjustment().set_value(0.0);
+        pump_until(|| false, Duration::from_millis(300));
     }
 
     /// The view-options popover's "Hide finished" switch (LB-8) — independent of "In progress

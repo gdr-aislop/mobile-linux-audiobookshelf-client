@@ -235,6 +235,8 @@ mod tests {
         (cover_image_cache_hit_avoids_re_reading_disk, crate::widgets::cover_image::tests::run_cache_hit_avoids_re_reading_disk),
         (cover_image_a_stale_decode_does_not_clobber_a_newer_path, crate::widgets::cover_image::tests::run_a_stale_decode_does_not_clobber_a_newer_path),
         (cover_image_lru_eviction_keeps_recently_accessed_entries, crate::widgets::cover_image::tests::run_lru_eviction_keeps_recently_accessed_entries),
+        (debouncer_fires_again_after_a_previous_debounce_already_fired, crate::widgets::tests::run_fires_again_after_a_previous_debounce_already_fired),
+        (debouncer_only_the_last_schedule_within_the_delay_runs, crate::widgets::tests::run_only_the_last_schedule_within_the_delay_runs),
         (downloads_engine_start_fetches_only_the_needed_track_and_reaches_complete, crate::downloads::tests::run_start_download_fetches_only_the_needed_track_and_reaches_complete),
         (downloads_engine_cancel_item_stops_the_track_from_reaching_complete, crate::downloads::tests::run_cancel_item_stops_the_track_from_reaching_complete),
         (downloads_engine_wifi_only_blocks_a_download_on_a_metered_connection, crate::downloads::tests::run_wifi_only_blocks_a_download_on_a_metered_connection),

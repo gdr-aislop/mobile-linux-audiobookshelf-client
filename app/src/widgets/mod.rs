@@ -11,8 +11,9 @@ pub mod download_scope_menu;
 pub mod item_card;
 pub mod pull_to_refresh;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::glib;
 use adw::prelude::*;
@@ -109,5 +110,91 @@ impl ManualSync {
         self.in_flight.set(false);
         let message = if ok { "Sync complete" } else { "Sync failed" };
         self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+}
+
+/// A cancel-and-reschedule debounce over a one-shot GLib timeout — call [`Self::schedule`] on
+/// every raw event (a keystroke, a scroll position change); only the last call within `delay`
+/// of the previous one actually runs its `action`.
+///
+/// Correctness invariant this exists to enforce: `pending` holds a `SourceId` only while that
+/// source is still genuinely alive. A GLib `_once` source destroys itself right after its
+/// callback returns — so the callback must clear `pending` *before* running `action`, not after.
+/// Getting this backwards (as an earlier version of this debounce did, once per call site,
+/// hand-rolled) means a later `schedule` calls `take()`, finds the dead id still sitting there,
+/// and calls `.remove()` on it — which GLib rejects (`Source ID … was not found`) and glib-rs
+/// turns into a panic. That panic fires from inside a GTK signal handler, which can't unwind
+/// across the C boundary, so the whole process aborts. This happened for real: scrolling twice
+/// (or typing twice) with more than the debounce delay between each action reliably crashed the
+/// app. One correct implementation, used by every debounced call site, instead of every call
+/// site getting this ordering right (or wrong) on its own.
+#[derive(Clone, Default)]
+pub(crate) struct Debouncer {
+    pending: Rc<RefCell<Option<glib::SourceId>>>,
+}
+
+impl Debouncer {
+    pub(crate) fn schedule(&self, delay: Duration, action: impl FnOnce() + 'static) {
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
+        let pending = self.pending.clone();
+        let id = glib::timeout_add_local_once(delay, move || {
+            // The source is about to be destroyed (this is a `_once` timeout) — forget its id
+            // first, so nothing can later try to remove an id GLib is about to invalidate.
+            pending.borrow_mut().take();
+            action();
+        });
+        *self.pending.borrow_mut() = Some(id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::test_support::pump_until;
+
+    /// The exact sequence that used to abort the process: schedule, let it fire, schedule
+    /// *again* — the second `schedule` must not try to remove the first (already self-destroyed)
+    /// source. Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast
+    /// GTK-touching scenario in this binary has to run from one single entry point.
+    pub(crate) fn run_fires_again_after_a_previous_debounce_already_fired(_runtime: &tokio::runtime::Runtime) {
+        let debouncer = Debouncer::default();
+        let first_ran = Rc::new(Cell::new(false));
+        debouncer.schedule(Duration::from_millis(20), {
+            let first_ran = first_ran.clone();
+            move || first_ran.set(true)
+        });
+        pump_until(|| first_ran.get(), Duration::from_secs(5));
+
+        // This is the call that used to panic (and abort the whole process, since it happens
+        // inside a GLib source callback) — the first schedule's `_once` source already
+        // destroyed itself once it fired above.
+        let second_ran = Rc::new(Cell::new(false));
+        debouncer.schedule(Duration::from_millis(20), {
+            let second_ran = second_ran.clone();
+            move || second_ran.set(true)
+        });
+        pump_until(|| second_ran.get(), Duration::from_secs(5));
+        assert!(second_ran.get(), "a second, later schedule must still fire normally");
+    }
+
+    /// The actual debounce behavior: scheduling again before the delay elapses cancels the
+    /// first action rather than running both.
+    pub(crate) fn run_only_the_last_schedule_within_the_delay_runs(_runtime: &tokio::runtime::Runtime) {
+        let debouncer = Debouncer::default();
+        let runs: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        debouncer.schedule(Duration::from_millis(200), {
+            let runs = runs.clone();
+            move || runs.borrow_mut().push("first")
+        });
+        debouncer.schedule(Duration::from_millis(200), {
+            let runs = runs.clone();
+            move || runs.borrow_mut().push("second")
+        });
+
+        pump_until(|| !runs.borrow().is_empty(), Duration::from_secs(5));
+        assert_eq!(*runs.borrow(), vec!["second"], "only the later schedule should have run");
     }
 }
