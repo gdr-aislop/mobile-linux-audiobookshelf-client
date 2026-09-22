@@ -97,6 +97,8 @@ pub async fn sync_items_for_library(
                 description: item.description.as_deref(),
                 duration_seconds: item.duration_seconds,
                 added_at,
+                series_name: item.series_name.as_deref(),
+                genres: &item.genres,
             },
         )
         .await?;
@@ -367,6 +369,37 @@ mod tests {
         let stored = items::list_for_library(&pool, &server_id, "lib-1").await.unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].author.as_deref(), Some("Andy Weir"));
+    }
+
+    #[tokio::test]
+    async fn sync_items_for_library_stores_series_and_genres() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "id": "item-1",
+                    "addedAt": 1_700_000_000_000i64,
+                    "media": {
+                        "duration": 3600.0,
+                        "metadata": {
+                            "title": "Wizard's First Rule",
+                            "seriesName": "Sword of Truth",
+                            "genres": ["Fantasy", "Sci-Fi"],
+                        }
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let (pool, server_id) = pool_with_server_and_library(&mock_server.uri(), "lib-1").await;
+        let api = abs_api::Client::new(&mock_server.uri());
+        sync_items_for_library(&pool, &api, &server_id, "lib-1").await.unwrap();
+
+        let stored = items::list_for_library(&pool, &server_id, "lib-1").await.unwrap();
+        assert_eq!(stored[0].series_name.as_deref(), Some("Sword of Truth"));
+        assert_eq!(stored[0].genres(), vec!["Fantasy".to_string(), "Sci-Fi".to_string()]);
     }
 
     #[tokio::test]

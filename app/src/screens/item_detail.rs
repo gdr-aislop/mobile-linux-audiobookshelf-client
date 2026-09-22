@@ -435,7 +435,7 @@ pub(crate) mod tests {
         .unwrap();
         abs_storage::repo::items::upsert(
             pool,
-            abs_storage::repo::items::UpsertItem { id: item_id, server_id, library_id: "lib-1", title, author, narrator, description, duration_seconds, added_at: chrono::Utc::now() },
+            abs_storage::repo::items::UpsertItem { id: item_id, server_id, library_id: "lib-1", title, author, narrator, description, duration_seconds, added_at: chrono::Utc::now(), series_name: None, genres: &[] },
         )
         .await
         .unwrap();

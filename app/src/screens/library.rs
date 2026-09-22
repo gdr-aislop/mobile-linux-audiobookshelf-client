@@ -2,20 +2,25 @@
 //! library, per `docs/design/ui-spec.md`'s "Library browse" section. Unlike Home's two curated
 //! 10-item shelves, this shows everything.
 //!
-//! Deliberately out of scope for this pass (see the implementation plan): category chips (author/
-//! series/genre — this app doesn't model series/genre at all yet), the view-options bottom sheet
-//! ("Downloaded only", "Hide finished", "Grouping"), and sticky section headers when grouped (no
-//! "group by" concept exists yet, and `GtkListBox` — used for list mode here, see
-//! `abs_core::settings::LibraryViewMode` — has no native section-header support the way the
-//! spec's literal `GtkListView` would). Search and sort are client-side over the already-synced
-//! local table — neither `abs-storage` nor the real Audiobookshelf API surface this client uses
-//! expose search/sort/pagination query params, so there is nothing server-side to delegate to yet.
+//! Category chips (All/Author/Series/Genre) and the view-options popover (Downloaded only/Hide
+//! finished/Grouping/Sort by/Application settings) both read and write
+//! `abs_core::settings::LibraryViewOptions` — persisted, unlike the header's own "Sort & filter"
+//! popover and search box, which stay session-only (see below). Grouped section headers (by
+//! author or series) are *grouped*, not *sticky*: true sticky-while-scrolling headers need a
+//! `GtkListView`/`GListModel`-bound render model, which this screen doesn't use anywhere (every
+//! render fully rebuilds `flow_box`/`list_box` from scratch) — a documented simplification, not
+//! attempted here. Search and sort are client-side over the already-synced local table — neither
+//! `abs-storage` nor the real Audiobookshelf API surface this client uses expose search/sort/
+//! pagination query params, so there is nothing server-side to delegate to yet.
 //!
 //! The grid/list choice is persisted via `abs_core::settings::{load,save}_library_view_mode` (a
 //! plain key/value setting, same pattern as every other typed setting in that module) — restored
-//! at startup and re-saved whenever the header's view toggle changes. Search text and sort order
-//! are session-only, not persisted — the ui-spec doesn't ask for that, and a stale search filter
-//! silently narrowing a freshly-opened Library screen would be a surprise, not a convenience.
+//! at startup and re-saved whenever the header's view toggle changes. Search text, and the header
+//! "Sort & filter" popover's own choices, are session-only, not persisted — the ui-spec doesn't
+//! ask for that, and a stale search filter silently narrowing a freshly-opened Library screen
+//! would be a surprise, not a convenience. The view-options popover's Sort-by combo is the
+//! *persisted* sort preference the spec describes; it drives the exact same `sort` cell the
+//! header popover does, so there is still only one place sorting is actually applied.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -25,12 +30,12 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use abs_core::error::{CoreError, Result as CoreResult};
-use abs_core::settings::LibraryViewMode;
+use abs_core::settings::{Grouping, LibraryViewMode, LibraryViewOptions, SortBy};
 use abs_storage::models::{Account, Item, Progress, Server};
 use abs_storage::AppPaths;
 
 use crate::player::PlayRequest;
-use crate::widgets::item_card;
+use crate::widgets::{combo_row, item_card};
 
 // Small enough that at least 2 columns fit at this app's default phone width (390px, see
 // `application.rs`) once the flat button's own padding and the `GtkFlowBoxChild` wrapper's
@@ -92,6 +97,19 @@ pub struct TestHooks {
     pub sync_now_button: gtk4::Button,
     pub toast_overlay: adw::ToastOverlay,
     pub scroller: gtk4::ScrolledWindow,
+    pub view_options_button: gtk4::MenuButton,
+    pub view_options_popover: gtk4::Popover,
+    pub downloaded_only_switch: gtk4::Switch,
+    pub hide_finished_switch: gtk4::Switch,
+    pub grouping_row: adw::ComboRow,
+    pub sort_by_row: adw::ComboRow,
+    pub settings_row: adw::ActionRow,
+    pub category_all: gtk4::ToggleButton,
+    pub category_author: gtk4::ToggleButton,
+    pub category_series: gtk4::ToggleButton,
+    pub category_genre: gtk4::ToggleButton,
+    pub genre_chip_box: gtk4::Box,
+    pub genre_chip_revealer: gtk4::Revealer,
 }
 
 #[cfg(test)]
@@ -112,6 +130,47 @@ pub(crate) enum SortKey {
     /// never-played items after them in stable order. Backs Home's "Continue Listening"
     /// tap-through and the popover's "Last listened" entry.
     LastListened,
+}
+
+impl SortKey {
+    /// The 4 variants `SortKey` and `abs_core::settings::SortBy` share — `SortBy` has no
+    /// `LastListened` equivalent (the persisted view-options sheet's own Sort-by combo
+    /// deliberately excludes it, per the ui-spec), so this is a lossy one-way map used only when
+    /// the sheet's combo needs to express itself as a `SortKey` to drive the shared `sort` cell.
+    fn from_sort_by(sort_by: SortBy) -> Self {
+        match sort_by {
+            SortBy::DateOfCreation => SortKey::DateAdded,
+            SortBy::Title => SortKey::Title,
+            SortBy::Author => SortKey::Author,
+            SortBy::Duration => SortKey::Duration,
+        }
+    }
+
+    /// The reverse of [`Self::from_sort_by`] — `LastListened` has no `SortBy` equivalent, so it
+    /// falls back to `DateOfCreation` (the sheet's own default) rather than failing to persist at
+    /// all; this only matters if a future combo row lets `LastListened` reach the sheet, which it
+    /// doesn't today.
+    fn to_sort_by(self) -> SortBy {
+        match self {
+            SortKey::DateAdded | SortKey::LastListened => SortBy::DateOfCreation,
+            SortKey::Title => SortBy::Title,
+            SortKey::Author => SortBy::Author,
+            SortKey::Duration => SortBy::Duration,
+        }
+    }
+}
+
+/// Which category chip is active (ui-spec "Library browse": All/Author/Series/Genre). Author and
+/// Series just mirror the persisted `Grouping` choice (see [`sync_grouping_and_category`]); Genre
+/// is a session-only filter — there's no `Grouping::ByGenre` (a book has several genres, not one
+/// grouping-per-genre) and no genre field in `LibraryViewOptions`.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum CategoryFilter {
+    #[default]
+    All,
+    Author,
+    Series,
+    Genre(String),
 }
 
 #[derive(Clone)]
@@ -140,6 +199,14 @@ struct LibraryWidgets {
     /// [`set_in_progress_only`] so they can't drift apart. Session-transient like `sort`.
     in_progress_only: Rc<Cell<bool>>,
     view_mode: Rc<Cell<LibraryViewMode>>,
+    /// Persisted (unlike `sort`/`in_progress_only` above) — the view-options popover's "Hide
+    /// finished" switch and "Grouping" combo, plus the category chip row, read/write these two
+    /// alongside `sort` through [`persist_view_options`].
+    hide_finished: Rc<Cell<bool>>,
+    grouping: Rc<Cell<Grouping>>,
+    /// `RefCell`, not `Cell`, because `CategoryFilter::Genre` carries a `String` — not `Copy`,
+    /// so `Cell::get` isn't available for it.
+    category_filter: Rc<std::cell::RefCell<CategoryFilter>>,
     /// Shared, live-updating state per `docs/design/ui-spec.md` ("not a per-screen setting") —
     /// see `crate::offline_mode::OfflineModeState`'s doc for why this can't be a screen-local
     /// `Cell` (that was the actual bug: toggling on one screen never reached the other's
@@ -152,6 +219,10 @@ struct LibraryWidgets {
     sort_menu_button: gtk4::MenuButton,
     in_progress_check: gtk4::CheckButton,
     progress_banner: gtk4::Revealer,
+    /// Rebuilt from scratch (`rebuild_genre_chips`) whenever `data` reloads; shown only while the
+    /// Genre category chip is active. The revealer that shows/hides this box is only ever driven
+    /// from the chip handlers in `build()` (which already hold their own clone), not from here.
+    genre_chip_box: gtk4::Box,
 }
 
 struct LibraryData {
@@ -180,6 +251,7 @@ pub fn build(
     offline_mode: crate::offline_mode::OfflineModeState,
     on_open: impl Fn(PlayRequest) + Clone + 'static,
     on_relogin: impl Fn() + Clone + 'static,
+    on_open_settings: impl Fn() + Clone + 'static,
 ) -> LibraryScreen {
     let header = adw::HeaderBar::new();
 
@@ -240,18 +312,73 @@ pub fn build(
     progress_banner_row.append(&progress_show_all);
     let progress_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&progress_banner_row).reveal_child(false).build();
 
-    // The spec's real toggle lives inside a not-yet-built "view options" bottom sheet (see this
-    // module's doc comment) — matching how sort was already implemented as a plain popover instead
-    // of that full sheet, this is a single toggle button rather than the sheet. Starts showing the
-    // "switch to list" icon since Grid is the default mode.
+    // Grid/list toggle — a plain header-bar button per the ui-spec's own wording ("toggle between
+    // the two via header bar button"), separate from the view-options popover below. Starts
+    // showing the "switch to list" icon since Grid is the default mode.
     let view_toggle = gtk4::ToggleButton::builder().icon_name("view-list-symbolic").tooltip_text("List view").build();
     header.pack_end(&view_toggle);
+
+    // The view-options popover (ui-spec "Library browse": Downloaded only/Hide finished/
+    // Grouping/Sort by/Application settings) — same "popover approximates `AdwBottomSheet`"
+    // convention `widgets::download_scope_menu` already uses (this crate's libadwaita ceiling is
+    // `v1_2`; `AdwBottomSheet` needs 1.6). `AdwSwitchRow` also needs 1.4 (out of reach), so the
+    // two switch rows use the same `AdwActionRow` + `gtk4::Switch` substitution
+    // `screens::settings`'s headphone-behavior rows already establish.
+    let downloaded_only_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
+    let downloaded_only_row = adw::ActionRow::builder().title("Downloaded only").build();
+    downloaded_only_row.add_suffix(&downloaded_only_switch);
+
+    let hide_finished_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
+    let hide_finished_row = adw::ActionRow::builder().title("Hide finished").build();
+    hide_finished_row.add_suffix(&hide_finished_switch);
+
+    let grouping_row = combo_row("Grouping", "", &["None".to_string(), "By Series".to_string(), "By Author".to_string()]);
+    let sort_by_row = combo_row("Sort by", "", &["Date of creation".to_string(), "Title".to_string(), "Author".to_string(), "Duration".to_string()]);
+
+    let settings_row = adw::ActionRow::builder().title("Application settings").activatable(true).build();
+    settings_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+
+    // A `GtkListBox` (the "boxed list" convention `settings.rs`'s own preference groups use),
+    // not a plain `GtkBox` — `AdwActionRow`/`AdwComboRow` (every row here) expect a `GtkListBox`
+    // ancestor for their internal focus/activation handling; without one, activating a row logs
+    // a `gtk_list_box_row_grab_focus: assertion 'box != NULL' failed` critical.
+    let view_options_box = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).width_request(260).build();
+    view_options_box.append(&downloaded_only_row);
+    view_options_box.append(&hide_finished_row);
+    view_options_box.append(&grouping_row);
+    view_options_box.append(&sort_by_row);
+    view_options_box.append(&settings_row);
+    let view_options_popover = gtk4::Popover::builder().child(&view_options_box).build();
+    let view_options_button = gtk4::MenuButton::builder().icon_name("preferences-other-symbolic").tooltip_text("View options").popover(&view_options_popover).build();
+    header.pack_end(&view_options_button);
 
     // Offline-mode toggle (ui-spec: "leading side, opposite the avatar" on Home; mirrored here on
     // the leading side too, alongside the search entry). Shared persisted state with Home's own
     // toggle, not a per-screen setting — see `offline_mode`'s field doc.
     let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
     header.pack_start(&offline_toggle);
+
+    // Category chips (ui-spec "Library browse": All/Author/Series/Genre), a horizontally
+    // scrolling row below the header, independent of the main scroller. Author/Series just set
+    // `grouping` — the same persisted value the popover's own combo drives, via [`set_grouping`]
+    // — mirroring exactly what the combo does; Genre reveals a second row of the distinct genre
+    // values currently loaded (see [`rebuild_genre_chips`]) rather than grouping, since a book
+    // has several genres, not one grouping-per-genre (see [`CategoryFilter`]'s doc comment).
+    let category_all = gtk4::ToggleButton::builder().label("All").active(true).build();
+    let category_author = gtk4::ToggleButton::builder().label("Author").group(&category_all).build();
+    let category_series = gtk4::ToggleButton::builder().label("Series").group(&category_all).build();
+    let category_genre = gtk4::ToggleButton::builder().label("Genre").group(&category_all).build();
+    let category_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(4).build();
+    for chip in [&category_all, &category_author, &category_series, &category_genre] {
+        category_row.append(chip);
+    }
+    let category_scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Automatic).vscrollbar_policy(gtk4::PolicyType::Never).child(&category_row).build();
+
+    // Populated fresh from `data.items` whenever it reloads (`rebuild_genre_chips`), same
+    // full-rebuild convention as `flow_box`/`list_box`. Hidden until the Genre chip is active.
+    let genre_chip_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_bottom(6).build();
+    let genre_chip_scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Automatic).vscrollbar_policy(gtk4::PolicyType::Never).child(&genre_chip_box).build();
+    let genre_chip_revealer = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&genre_chip_scroller).reveal_child(false).build();
 
     // "Sync now" (ui-spec Library browse) — the same header-bar ⋯ overflow as Home's, forcing
     // an immediate resync; the pull-to-refresh gesture on the main scroller (wired below) runs
@@ -331,6 +458,8 @@ pub fn build(
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
+    root.append(&category_scroller);
+    root.append(&genre_chip_revealer);
     root.append(&body);
 
     // Toasts float over the whole screen, header bar included — same shape as the player
@@ -348,12 +477,16 @@ pub fn build(
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
         in_progress_only: Rc::new(Cell::new(false)),
         view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
+        hide_finished: Rc::new(Cell::new(false)),
+        grouping: Rc::new(Cell::new(Grouping::None)),
+        category_filter: Rc::new(std::cell::RefCell::new(CategoryFilter::All)),
         offline_mode,
         data: Rc::new(std::cell::RefCell::new(LibraryData { items: Vec::new(), downloaded: std::collections::HashSet::new(), last_listened: std::collections::HashMap::new() })),
         on_open: Rc::new(on_open),
         sort_menu_button: sort_menu_button.clone(),
         in_progress_check: in_progress_check.clone(),
         progress_banner: progress_banner.clone(),
+        genre_chip_box: genre_chip_box.clone(),
     };
 
     // The filter's two manual entry points: the popover's check and the banner's "Show all".
@@ -424,22 +557,40 @@ pub fn build(
         move |toggle| offline_mode.set(toggle.is_active())
     });
 
+    // The view-options popover's "Downloaded only" switch is the exact same shared state as
+    // `offline_toggle` (ui-spec: "matching Home's offline-mode behavior... scoped to this
+    // library") — a second widget over one boolean, not an independent setting.
+    let downloaded_only_switch_handler = downloaded_only_switch.connect_state_set({
+        let offline_mode = widgets.offline_mode.clone();
+        move |_, active| {
+            offline_mode.set(active);
+            glib::signal::Propagation::Proceed
+        }
+    });
+
     widgets.offline_mode.add_listener({
         let pool = pool.clone();
         let widgets = widgets.clone();
         let offline_toggle = offline_toggle.clone();
+        let downloaded_only_switch = downloaded_only_switch.clone();
         let offline_banner = offline_banner.clone();
         let server_id = offline_toggle_server_id;
         let toast_overlay = toast_overlay.clone();
         move |active| {
-            // Sync the toggle widget's visual state without re-triggering `connect_toggled`. When
-            // this screen's own toggle caused the change, `is_active()` already equals `active`
-            // (GTK flips it before `connect_toggled` runs), so this is a no-op here and only
-            // actually touches the widget when the *other* screen changed it.
+            // Sync both widgets' visual state without re-triggering their own handlers. When one
+            // of them caused the change, its own `is_active()` already equals `active` (GTK
+            // flips it before the handler runs), so this is a no-op there and only actually
+            // touches a widget when a *different* trigger (the other switch, or Home's own
+            // toggle) changed it.
             if offline_toggle.is_active() != active {
                 offline_toggle.block_signal(&offline_toggle_handler);
                 offline_toggle.set_active(active);
                 offline_toggle.unblock_signal(&offline_toggle_handler);
+            }
+            if downloaded_only_switch.is_active() != active {
+                downloaded_only_switch.block_signal(&downloaded_only_switch_handler);
+                downloaded_only_switch.set_active(active);
+                downloaded_only_switch.unblock_signal(&downloaded_only_switch_handler);
             }
             offline_banner.set_reveal_child(active);
             // Rendered synchronously, before any DB work: the visible filter change must not be
@@ -477,6 +628,172 @@ pub fn build(
                     }
                 }
             });
+        }
+    });
+
+    // "Hide finished" — the sheet's own switch, persisted via `spawn_persist_view_options`
+    // exactly like the grouping/sort-by combos below.
+    hide_finished_switch.connect_state_set({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, active| {
+            set_hide_finished(&widgets, active);
+            spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+            glib::signal::Propagation::Proceed
+        }
+    });
+
+    // Category chips (Author/Series) and the popover's own "Grouping" combo both drive the one
+    // persisted `grouping` Cell through `set_grouping` — see this function group's doc comments.
+    category_all.connect_toggled({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        let genre_chip_revealer = genre_chip_revealer.clone();
+        move |toggle| {
+            if toggle.is_active() {
+                genre_chip_revealer.set_reveal_child(false);
+                *widgets.category_filter.borrow_mut() = CategoryFilter::All;
+                set_grouping(&widgets, Grouping::None);
+                spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+            }
+        }
+    });
+    category_author.connect_toggled({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        let genre_chip_revealer = genre_chip_revealer.clone();
+        move |toggle| {
+            if toggle.is_active() {
+                genre_chip_revealer.set_reveal_child(false);
+                *widgets.category_filter.borrow_mut() = CategoryFilter::Author;
+                set_grouping(&widgets, Grouping::ByAuthor);
+                spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+            }
+        }
+    });
+    category_series.connect_toggled({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        let genre_chip_revealer = genre_chip_revealer.clone();
+        move |toggle| {
+            if toggle.is_active() {
+                genre_chip_revealer.set_reveal_child(false);
+                *widgets.category_filter.borrow_mut() = CategoryFilter::Series;
+                set_grouping(&widgets, Grouping::BySeries);
+                spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+            }
+        }
+    });
+    // Genre doesn't set `grouping` at all (see `CategoryFilter`'s doc) — just reveals the
+    // second row of actual genre values; picking one of *those* is what actually filters (see
+    // `rebuild_genre_chips`), and it's session-only (`LibraryViewOptions` has no genre field).
+    category_genre.connect_toggled({
+        let genre_chip_revealer = genre_chip_revealer.clone();
+        move |toggle| genre_chip_revealer.set_reveal_child(toggle.is_active())
+    });
+
+    grouping_row.connect_selected_notify({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        let category_all = category_all.clone();
+        let category_author = category_author.clone();
+        let category_series = category_series.clone();
+        move |row| {
+            let grouping = match row.selected() {
+                1 => Grouping::BySeries,
+                2 => Grouping::ByAuthor,
+                _ => Grouping::None,
+            };
+            // Keep the category chips visually consistent with the combo — activating a grouped
+            // toggle button deactivates its siblings automatically (see their own handlers
+            // above), and `set_active(true)` on one already active is a no-op, so this can't
+            // loop back into re-persisting from here.
+            match grouping {
+                Grouping::None => category_all.set_active(true),
+                Grouping::BySeries => category_series.set_active(true),
+                Grouping::ByAuthor => category_author.set_active(true),
+            }
+            set_grouping(&widgets, grouping);
+            spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+        }
+    });
+
+    // The sheet's persisted "Sort by" — drives the exact same `sort` Cell the header's own
+    // "Sort & filter" popover does (see this module's doc comment), so there is still only one
+    // place sorting is actually applied.
+    sort_by_row.connect_selected_notify({
+        let pool = pool.clone();
+        let widgets = widgets.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |row| {
+            let sort_by = match row.selected() {
+                1 => SortBy::Title,
+                2 => SortBy::Author,
+                3 => SortBy::Duration,
+                _ => SortBy::DateOfCreation,
+            };
+            widgets.sort.set(SortKey::from_sort_by(sort_by));
+            render_from_current_data(&widgets);
+            spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
+        }
+    });
+
+    settings_row.connect_activated({
+        let view_options_popover = view_options_popover.clone();
+        let on_open_settings = on_open_settings.clone();
+        move |_| {
+            view_options_popover.popdown();
+            on_open_settings();
+        }
+    });
+
+    // Refreshes every sheet row's *displayed* selection from the live Cells right as the popover
+    // opens, rather than trying to keep them permanently in sync with every possible writer (the
+    // category chips, Home's shelf tap-through, a future launch's persisted load) — simpler, and
+    // the sheet is only ever looked at while it's open.
+    view_options_popover.connect_visible_notify({
+        let widgets = widgets.clone();
+        let downloaded_only_switch = downloaded_only_switch.clone();
+        let hide_finished_switch = hide_finished_switch.clone();
+        let grouping_row = grouping_row.clone();
+        let sort_by_row = sort_by_row.clone();
+        move |popover| {
+            if !popover.is_visible() {
+                return;
+            }
+            downloaded_only_switch.set_active(widgets.offline_mode.get());
+            hide_finished_switch.set_active(widgets.hide_finished.get());
+            grouping_row.set_selected(match widgets.grouping.get() {
+                Grouping::None => 0,
+                Grouping::BySeries => 1,
+                Grouping::ByAuthor => 2,
+            });
+            sort_by_row.set_selected(match widgets.sort.get().to_sort_by() {
+                SortBy::DateOfCreation => 0,
+                SortBy::Title => 1,
+                SortBy::Author => 2,
+                SortBy::Duration => 3,
+            });
+        }
+    });
+
+    // Loaded once, alongside the view mode above — seeds `sort`/`hide_finished`/`grouping` from
+    // whatever was last persisted, instead of always starting from the same hardcoded defaults.
+    glib::spawn_future_local({
+        let widgets = widgets.clone();
+        let pool = pool.clone();
+        async move {
+            if let Ok(options) = abs_core::settings::load_library_view_options(&pool).await {
+                widgets.sort.set(SortKey::from_sort_by(options.sort_by));
+                widgets.hide_finished.set(options.hide_finished);
+                widgets.grouping.set(options.grouping);
+                render_from_current_data(&widgets);
+            }
         }
     });
 
@@ -551,6 +868,19 @@ pub fn build(
             sync_now_button,
             toast_overlay,
             scroller,
+            view_options_button,
+            view_options_popover,
+            downloaded_only_switch,
+            hide_finished_switch,
+            grouping_row,
+            sort_by_row,
+            settings_row,
+            category_all,
+            category_author,
+            category_series,
+            category_genre,
+            genre_chip_box,
+            genre_chip_revealer,
         },
     }
 }
@@ -702,6 +1032,79 @@ fn set_in_progress_only(widgets: &LibraryWidgets, active: bool) {
     render_from_current_data(widgets);
 }
 
+/// The single writer behind the view-options popover's "Hide finished" switch — just the Cell
+/// and a re-render; persistence is the caller's job (`spawn_persist_view_options`), same split
+/// `apply_view_mode`/the view-mode toggle's save already use.
+fn set_hide_finished(widgets: &LibraryWidgets, active: bool) {
+    widgets.hide_finished.set(active);
+    render_from_current_data(widgets);
+}
+
+/// The single writer behind both grouping surfaces — the popover's "Grouping" combo and the
+/// Author/Series category chips — mirroring `set_in_progress_only`'s "one Cell, every surface
+/// funnels through here" shape. Genre selections never call this (see `CategoryFilter`'s doc).
+fn set_grouping(widgets: &LibraryWidgets, grouping: Grouping) {
+    widgets.grouping.set(grouping);
+    render_from_current_data(widgets);
+}
+
+/// Persists the sheet's three lasting fields as one `LibraryViewOptions` row — called after
+/// every sheet/chip change meant to survive a restart (not after a genre pick, which is
+/// deliberately session-only). Fire-and-forget with toast-on-failure, the same posture the
+/// existing view-mode toggle's own save already uses.
+fn spawn_persist_view_options(pool: SqlitePool, toast_overlay: adw::ToastOverlay, widgets: LibraryWidgets) {
+    glib::spawn_future_local(async move {
+        let options = LibraryViewOptions {
+            downloaded_only: widgets.offline_mode.get(),
+            hide_finished: widgets.hide_finished.get(),
+            grouping: widgets.grouping.get(),
+            sort_by: widgets.sort.get().to_sort_by(),
+        };
+        if let Err(err) = abs_core::settings::save_library_view_options(&pool, &options).await {
+            crate::error_reporting::report_background_error(&toast_overlay, "Saving view options", err);
+        }
+    });
+}
+
+/// Rebuilds the Genre category chip's second row from whatever genres are actually present
+/// across `data.items` right now — called from `apply()` alongside every other full rebuild in
+/// this file, so a genre that's no longer in any synced item can't linger as a stale chip.
+/// Picking a chip sets the session-only genre filter (see `CategoryFilter`); it does not touch
+/// `grouping` or persist anything.
+fn rebuild_genre_chips(widgets: &LibraryWidgets) {
+    while let Some(child) = widgets.genre_chip_box.first_child() {
+        widgets.genre_chip_box.remove(&child);
+    }
+
+    let mut genres: Vec<String> = widgets.data.borrow().items.iter().flat_map(|item| item.genres()).collect();
+    genres.sort();
+    genres.dedup();
+
+    // Each chip joins the *first* chip's group rather than a separate throwaway anchor widget —
+    // every chip here is parented into `genre_chip_box` right after creation, so (unlike a
+    // never-parented anchor) nothing here can be finalized out from under GTK's group tracking.
+    let mut group_anchor: Option<gtk4::ToggleButton> = None;
+    for genre in genres {
+        let chip = gtk4::ToggleButton::builder().label(&genre).build();
+        if let Some(anchor) = &group_anchor {
+            chip.set_group(Some(anchor));
+        } else {
+            group_anchor = Some(chip.clone());
+        }
+        chip.connect_toggled({
+            let widgets = widgets.clone();
+            let genre = genre.clone();
+            move |toggle| {
+                if toggle.is_active() {
+                    *widgets.category_filter.borrow_mut() = CategoryFilter::Genre(genre.clone());
+                    render_from_current_data(&widgets);
+                }
+            }
+        });
+        widgets.genre_chip_box.append(&chip);
+    }
+}
+
 /// Reads whatever's currently cached locally across every synced library — never talks to the
 /// network. Unlike Home's `load()`, nothing is truncated or pre-sorted here: filtering/sorting for
 /// display happens in `render_visible` against the search text, the filter and the chosen
@@ -723,6 +1126,7 @@ fn apply(data: LibraryData, widgets: &LibraryWidgets) {
     *widgets.data.borrow_mut() = data;
     widgets.status_page.set_visible(!has_any_item);
     widgets.scroller.set_visible(has_any_item);
+    rebuild_genre_chips(widgets);
     render_from_current_data(widgets);
 }
 
@@ -762,6 +1166,17 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
             !widgets.in_progress_only.get()
                 || data.last_listened.get(&item.id).is_some_and(|progress| !progress.is_finished)
         })
+        // "Hide finished" (the view-options sheet's own switch) — the inverse condition from
+        // "In progress only" above, and independently settable from it.
+        .filter(|item| {
+            !widgets.hide_finished.get() || !data.last_listened.get(&item.id).is_some_and(|progress| progress.is_finished)
+        })
+        // The Genre category chip's own filter — session-only, see `CategoryFilter`'s doc.
+        // Author/Series chips never reach here: they set `grouping` instead (below), not this.
+        .filter(|item| match &*widgets.category_filter.borrow() {
+            CategoryFilter::Genre(genre) => item.genres().iter().any(|g| g == genre),
+            CategoryFilter::All | CategoryFilter::Author | CategoryFilter::Series => true,
+        })
         .collect();
 
     match sort {
@@ -783,6 +1198,23 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     }
 
     let has_visible = !visible.is_empty();
+    let grouping = widgets.grouping.get();
+
+    // Grouped section headers (ui-spec: "sticky ... when sorted/grouped by author or series" —
+    // *grouped*, not sticky, here; see this module's doc comment for why). A stable sort by
+    // group key makes same-key items contiguous without disturbing their relative order from
+    // the sort above, so each bucket is still internally sorted by `sort`.
+    if grouping != Grouping::None {
+        visible.sort_by_key(|item| group_key_for(item, grouping));
+    }
+    let mut groups: Vec<(String, Vec<&Item>)> = Vec::new();
+    for item in visible {
+        let key = group_key_for(item, grouping);
+        match groups.last_mut() {
+            Some((last_key, bucket)) if grouping == Grouping::None || *last_key == key => bucket.push(item),
+            _ => groups.push((key, vec![item])),
+        }
+    }
 
     // Only the active container is rebuilt — same "full rebuild on every render, not incremental"
     // posture already used everywhere else in this file, just gated per mode so switching modes
@@ -790,15 +1222,25 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     match widgets.view_mode.get() {
         LibraryViewMode::Grid => {
             clear_flow_box(&widgets.flow_box);
-            for item in visible {
-                let subtitle = item_subtitle(item);
-                widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id)), -1);
+            for (key, bucket) in &groups {
+                if grouping != Grouping::None {
+                    widgets.flow_box.insert(&grid_group_header(key), -1);
+                }
+                for item in bucket {
+                    let subtitle = item_subtitle(item);
+                    widgets.flow_box.insert(&item_card::build(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id)), -1);
+                }
             }
         }
         LibraryViewMode::List => {
             clear_list_box(&widgets.list_box);
-            for item in visible {
-                widgets.list_box.append(&library_list_row(item, &widgets.on_open));
+            for (key, bucket) in &groups {
+                if grouping != Grouping::None {
+                    widgets.list_box.append(&list_group_header(key));
+                }
+                for item in bucket {
+                    widgets.list_box.append(&library_list_row(item, &widgets.on_open));
+                }
             }
         }
     }
@@ -819,6 +1261,34 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
 fn item_subtitle(item: &Item) -> String {
     let hours = item.duration_seconds / 3600.0;
     format!("{} · {hours:.1}h", item.author.as_deref().unwrap_or("Unknown author"))
+}
+
+/// The section an item falls into under a given `Grouping` — `Grouping::None` is never actually
+/// consulted (every item lands in the render loop's single un-headered bucket regardless of what
+/// this returns), so its `String::new()` here is just a harmless placeholder.
+fn group_key_for(item: &Item, grouping: Grouping) -> String {
+    match grouping {
+        Grouping::None => String::new(),
+        Grouping::ByAuthor => item.author.clone().unwrap_or_else(|| "Unknown author".to_string()),
+        Grouping::BySeries => item.series_name.clone().unwrap_or_else(|| "Other".to_string()),
+    }
+}
+
+/// A grouped (not sticky — see this module's doc comment) section header for grid mode, built to
+/// occupy its own line among `GtkFlowBox`'s wrapped tiles: giving it `hexpand` plus a minimum
+/// width wider than any single tile makes FlowBox's own wrapping place it alone on its row.
+/// Returned as a plain `GtkLabel`, not a `GtkFlowBoxChild` — `FlowBox::insert` already wraps
+/// whatever widget it's given in its own `FlowBoxChild` (the same way every item card here is
+/// inserted), so wrapping it again here would nest two `FlowBoxChild`s per header.
+fn grid_group_header(title: &str) -> gtk4::Label {
+    gtk4::Label::builder().label(title).xalign(0.0).css_classes(["heading"]).hexpand(true).width_request(TILE_SIZE * 3).can_focus(false).build()
+}
+
+/// The list-mode equivalent of [`grid_group_header`] — a plain, non-activatable/non-selectable
+/// full-width row, which `GtkListBox` hosts natively (unlike `GtkFlowBox`, no width trick needed).
+fn list_group_header(title: &str) -> gtk4::ListBoxRow {
+    let label = gtk4::Label::builder().label(title).xalign(0.0).css_classes(["heading"]).margin_start(4).margin_top(8).margin_bottom(4).build();
+    gtk4::ListBoxRow::builder().child(&label).activatable(false).selectable(false).build()
 }
 
 /// A list-mode row — same information as a grid tile (cover thumbnail, title, subtitle), just laid
@@ -874,7 +1344,7 @@ pub(crate) mod tests {
         .unwrap();
         abs_storage::repo::items::upsert(
             pool,
-            abs_storage::repo::items::UpsertItem { id: item_id, server_id, library_id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::DateTime::from_timestamp_millis(added_at_ms).unwrap() },
+            abs_storage::repo::items::UpsertItem { id: item_id, server_id, library_id: "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::DateTime::from_timestamp_millis(added_at_ms).unwrap(), series_name: None, genres: &[] },
         )
         .await
         .unwrap();
@@ -899,6 +1369,17 @@ pub(crate) mod tests {
             "media": {
                 "duration": duration,
                 "metadata": { "title": title, "authorName": author }
+            }
+        })
+    }
+
+    fn item_json_with_series_and_genres(id: &str, title: &str, series_name: Option<&str>, genres: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "addedAt": 1_700_000_000_000i64,
+            "media": {
+                "duration": 3600.0,
+                "metadata": { "title": title, "seriesName": series_name, "genres": genres }
             }
         })
     }
@@ -929,6 +1410,42 @@ pub(crate) mod tests {
             index += 1;
         }
         titles
+    }
+
+    /// Like `flow_box_titles`, but also reports grouped section headers (`grid_group_header`) —
+    /// each one prefixed with `§` so a test can assert both headers and card order in one list
+    /// without confusing a header's text for an item title.
+    fn flow_box_entries(flow_box: &gtk4::FlowBox) -> Vec<String> {
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while let Some(child) = flow_box.child_at_index(index) {
+            let inner = child.child().expect("flow box child has content");
+            if let Ok(button) = inner.clone().downcast::<gtk4::Button>() {
+                let card_box = button.child().and_then(|w| w.downcast::<gtk4::Box>().ok()).expect("button wraps the card box");
+                let title_label = card_box.first_child().and_then(|cover| cover.next_sibling()).and_then(|w| w.downcast::<gtk4::Label>().ok()).expect("card's second child is the title label");
+                entries.push(title_label.text().to_string());
+            } else if let Ok(label) = inner.downcast::<gtk4::Label>() {
+                entries.push(format!("§{}", label.text()));
+            }
+            index += 1;
+        }
+        entries
+    }
+
+    /// Like `list_box_titles`, but also reports grouped section headers (`list_group_header`) —
+    /// see `flow_box_entries`'s doc comment for the `§` prefix convention.
+    fn list_box_entries(list_box: &gtk4::ListBox) -> Vec<String> {
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while let Some(row) = list_box.row_at_index(index) {
+            if let Ok(action_row) = row.clone().downcast::<adw::ActionRow>() {
+                entries.push(action_row.title().to_string());
+            } else if let Some(label) = row.child().and_then(|w| w.downcast::<gtk4::Label>().ok()) {
+                entries.push(format!("§{}", label.text()));
+            }
+            index += 1;
+        }
+        entries
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
@@ -971,7 +1488,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1011,7 +1528,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1052,7 +1569,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1096,7 +1613,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
@@ -1153,7 +1670,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1204,7 +1721,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
@@ -1253,7 +1770,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
@@ -1297,7 +1814,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -1340,7 +1857,7 @@ pub(crate) mod tests {
         };
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, on_relogin);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, on_relogin, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
@@ -1368,7 +1885,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| false, Duration::from_millis(500));
@@ -1406,7 +1923,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1446,7 +1963,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1490,7 +2007,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1532,7 +2049,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
@@ -1573,7 +2090,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
@@ -1615,7 +2132,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
 
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {});
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
         let first_hooks = first_screen.test_hooks();
         pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
         assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
@@ -1646,12 +2163,289 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let second_hooks = second_screen.test_hooks();
         pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
         assert!(second_hooks.list_box.is_visible(), "a freshly built screen should restore the persisted List mode");
         assert!(!second_hooks.flow_box.is_visible());
+    }
+
+    /// The view-options popover's "Hide finished" switch (LB-8) — independent of "In progress
+    /// only" above, and driven the same way `settings.rs`'s own switch tests are (`state-set`,
+    /// not `set_active` — see that file's tests for why).
+    pub(crate) fn run_hide_finished_switch_filters_finished_items(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Still Reading", "Author A", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Already Finished", "Author B", 1_600_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let now = chrono::Utc::now();
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-1", "Still Reading", 1_700_000_000_000, Some((600.0, false, now))));
+        runtime.block_on(seed_item_with_progress(&pool, &server.id, &account.id, "item-2", "Already Finished", 1_600_000_000_000, Some((3600.0, true, now))));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+
+        let _: bool = hooks.hide_finished_switch.emit_by_name("state-set", &[&true]);
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Still Reading".to_string()], Duration::from_secs(5));
+
+        let _: bool = hooks.hide_finished_switch.emit_by_name("state-set", &[&false]);
+        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 2, Duration::from_secs(5));
+
+        // The sheet's "Downloaded only" switch is the exact same shared state as the header's
+        // own offline-mode toggle (see `build`'s doc comment on `downloaded_only_switch_handler`)
+        // — flipping one must flip the other, same "one boolean, two widgets" proof the existing
+        // cross-screen offline-mode test already gives Home vs. Library.
+        assert!(!hooks.downloaded_only_switch.is_active());
+        let _: bool = hooks.downloaded_only_switch.emit_by_name("state-set", &[&true]);
+        pump_until(|| hooks.offline_toggle.is_active(), Duration::from_secs(5));
+    }
+
+    /// The Author category chip (LB-4/LB-9): activating it sets `Grouping::ByAuthor` — the same
+    /// persisted value the popover's own "Grouping" combo drives — and the grid grows a section
+    /// header per author. Not sticky (see this module's doc comment), just grouped and ordered.
+    pub(crate) fn run_author_category_chip_groups_items_with_headers(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Book By Weir", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Book By Herbert", "Frank Herbert", 1_600_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        // A popover needs a mapped toplevel to show without crashing (`gtk_native_get_surface`
+        // asserts otherwise) — same reasoning `run_sync_now_and_pull_to_refresh` documents for
+        // its own popover.
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+
+        hooks.category_author.set_active(true);
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 4, Duration::from_secs(5));
+
+        let entries = flow_box_entries(&hooks.flow_box);
+        assert_eq!(
+            entries,
+            vec!["§Andy Weir".to_string(), "Book By Weir".to_string(), "§Frank Herbert".to_string(), "Book By Herbert".to_string()],
+            "grouping by author should insert one alphabetically-ordered header per author"
+        );
+
+        // The popover's own "Grouping" combo must reflect the chip's choice once it's opened —
+        // the two are one persisted value, refreshed on `connect_visible_notify` (see `build`).
+        hooks.view_options_button.popover().unwrap().set_visible(true);
+        assert_eq!(hooks.grouping_row.selected(), 2, "the combo should show 'By Author' after the chip set it");
+        hooks.view_options_button.popover().unwrap().set_visible(false);
+
+        // List mode groups the same way, via a plain non-activatable `GtkListBoxRow` header.
+        hooks.view_toggle.set_active(true);
+        pump_until(|| list_box_entries(&hooks.list_box).len() == 4, Duration::from_secs(5));
+        assert_eq!(
+            list_box_entries(&hooks.list_box),
+            vec!["§Andy Weir".to_string(), "Book By Weir".to_string(), "§Frank Herbert".to_string(), "Book By Herbert".to_string()]
+        );
+        hooks.view_toggle.set_active(false);
+
+        // The Series chip drives the same Cell via a different trigger — every item here has no
+        // series, so it all falls into one "Other" bucket rather than one per book.
+        hooks.category_series.set_active(true);
+        pump_until(|| flow_box_entries(&hooks.flow_box) == vec!["§Other".to_string(), "Book By Weir".to_string(), "Book By Herbert".to_string()], Duration::from_secs(5));
+
+        // Switching back to All must ungroup and clear the headers.
+        hooks.category_all.set_active(true);
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 2, Duration::from_secs(5));
+    }
+
+    /// The view-options popover's "Application settings" row (LB-11) — closes the popover and
+    /// calls the screen's `on_open_settings` callback, the seam `main_window.rs` wires to
+    /// `stack.set_visible_child_name("settings")`; this screen only owns the callback contract.
+    pub(crate) fn run_application_settings_row_calls_on_open_settings(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "libraries": [] })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let opened = Rc::new(Cell::new(false));
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, {
+            let opened = opened.clone();
+            move || opened.set(true)
+        });
+        let hooks = screen.test_hooks();
+
+        // A popover needs a mapped toplevel to show without crashing — see
+        // `run_author_category_chip_groups_items_with_headers`'s identical setup.
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        hooks.view_options_popover.set_visible(true);
+        adw::prelude::ActionRowExt::activate(&hooks.settings_row);
+        assert!(opened.get(), "activating the row should call on_open_settings");
+        assert!(!hooks.view_options_popover.is_visible(), "activating the row should also close the popover");
+    }
+
+    /// The persisted "Sort by" combo (LB-10) — drives the same `sort` Cell the header's own
+    /// popover does, and survives a rebuild, same style as `run_view_mode_is_remembered_across_screen_rebuilds`.
+    pub(crate) fn run_sort_by_combo_persists_and_is_honored_on_rebuild(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Zed Book", "Author A", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Alpha Book", "Author B", 1_600_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
+        let first_hooks = first_screen.test_hooks();
+        pump_until(|| first_hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        assert_eq!(flow_box_titles(&first_hooks.flow_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
+
+        first_hooks.sort_by_row.set_selected(1); // Title
+        pump_until(|| flow_box_titles(&first_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
+
+        let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        glib::spawn_future_local({
+            let pool = pool.clone();
+            let persisted = persisted.clone();
+            async move {
+                loop {
+                    if abs_core::settings::load_library_view_options(&pool).await.ok().map(|o| o.sort_by) == Some(abs_core::settings::SortBy::Title) {
+                        persisted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    glib::timeout_future(Duration::from_millis(20)).await;
+                }
+            }
+        });
+        pump_until(|| persisted.load(std::sync::atomic::Ordering::SeqCst), Duration::from_secs(5));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let second_hooks = second_screen.test_hooks();
+        pump_until(|| flow_box_titles(&second_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(10));
+    }
+
+    /// The Genre category chip (LB-4): picking a specific genre filters the list without
+    /// grouping and without persisting anything — `LibraryViewOptions` has no genre field, and
+    /// this is deliberately session-only (see `CategoryFilter`'s doc comment).
+    pub(crate) fn run_genre_chip_filters_without_persisting(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json_with_series_and_genres("item-1", "Fantasy Book", None, &["Fantasy"]),
+                        item_json_with_series_and_genres("item-2", "Sci-Fi Book", None, &["Sci-Fi"])
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+
+        hooks.category_genre.set_active(true);
+        pump_until(|| hooks.genre_chip_box.first_child().is_some(), Duration::from_secs(5));
+        assert!(hooks.genre_chip_revealer.reveals_child(), "the genre row should reveal once the Genre chip is active");
+
+        let fantasy_chip = hooks
+            .genre_chip_box
+            .first_child()
+            .and_then(|w| w.downcast::<gtk4::ToggleButton>().ok())
+            .expect("first genre chip");
+        assert_eq!(fantasy_chip.label().as_deref(), Some("Fantasy"), "genre chips should be sorted alphabetically");
+        fantasy_chip.set_active(true);
+
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Fantasy Book".to_string()], Duration::from_secs(5));
+
+        let options = runtime.block_on(abs_core::settings::load_library_view_options(&pool)).unwrap();
+        assert_eq!(options.grouping, abs_core::settings::Grouping::None, "a genre pick must never touch the persisted grouping");
     }
 
     /// End-to-end against the real public demo server, mirroring `welcome.rs`/`home.rs`'s live
@@ -1672,7 +2466,7 @@ pub(crate) mod tests {
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(20));
@@ -1734,7 +2528,7 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {});
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         let app_window = adw::ApplicationWindow::builder().build();

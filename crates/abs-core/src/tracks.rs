@@ -71,6 +71,8 @@ mod tests {
                 description: None,
                 duration_seconds: 3600.0,
                 added_at: chrono::Utc::now(),
+                series_name: None,
+                genres: &[],
             },
         )
         .await

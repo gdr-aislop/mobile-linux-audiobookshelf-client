@@ -1392,6 +1392,8 @@ pub(crate) mod tests {
                 description: None,
                 duration_seconds: 0.0,
                 added_at: chrono::Utc::now(),
+                series_name: None,
+                genres: &[],
             },
         )
         .await

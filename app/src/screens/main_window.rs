@@ -301,7 +301,20 @@ pub fn build(
     // Library is built before Home only so the tap-through closure below can capture the
     // already-built screen; the `add_titled_with_icon` calls (not build order) fix the
     // switcher's tab order — Home stays first.
-    let library_screen = screens::library::build(pool.clone(), paths.clone(), server.clone(), account.clone(), session.clone(), offline_mode.clone(), on_open.clone(), on_relogin.clone());
+    let library_screen = screens::library::build(
+        pool.clone(),
+        paths.clone(),
+        server.clone(),
+        account.clone(),
+        session.clone(),
+        offline_mode.clone(),
+        on_open.clone(),
+        on_relogin.clone(),
+        {
+            let stack = stack.clone();
+            move || stack.set_visible_child_name("settings")
+        },
+    );
 
     // Home's shelf headings' tap-through (ui-spec Home section): switch to Library and land on
     // the shelf's view — Recently Added pre-sorted by date added; Continue Listening pre-sorted
@@ -712,6 +725,7 @@ pub(crate) mod tests {
             session,
             offline_mode,
             |_| {},
+            || {},
             || {},
         );
         let home_hooks = home_screen.test_hooks();

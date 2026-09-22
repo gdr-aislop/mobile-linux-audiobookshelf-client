@@ -59,6 +59,19 @@ pub struct Item {
     pub duration_seconds: f64,
     pub added_at: DateTime<Utc>,
     pub synced_at: DateTime<Utc>,
+    pub series_name: Option<String>,
+    /// The `genres` column, JSON-encoded (SQLite has no array type) — same "encode a compound
+    /// value into one TEXT column" convention `servers.custom_headers_json` already uses. Decode
+    /// via [`Item::genres`] rather than parsing this directly.
+    pub genres_json: String,
+}
+
+impl Item {
+    /// Decodes [`Item::genres_json`]. Malformed JSON (which should never happen — this app is the
+    /// only writer) degrades to an empty list rather than failing the whole render.
+    pub fn genres(&self) -> Vec<String> {
+        serde_json::from_str(&self.genres_json).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]

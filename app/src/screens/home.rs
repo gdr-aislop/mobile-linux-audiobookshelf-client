@@ -993,7 +993,7 @@ pub(crate) mod tests {
         let library_id = "e4bb1afb-4a4f-4dd6-8be0-e615d233185b";
         runtime.block_on(abs_storage::repo::libraries::upsert(&pool, UpsertLibrary { id: library_id, server_id: &server.id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 })).unwrap();
         for (id, title) in [("item-1", "Project Hail Mary"), ("item-2", "Dune")] {
-            runtime.block_on(abs_storage::repo::items::upsert(&pool, abs_storage::repo::items::UpsertItem { id, server_id: &server.id, library_id, title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::Utc::now() })).unwrap();
+            runtime.block_on(abs_storage::repo::items::upsert(&pool, abs_storage::repo::items::UpsertItem { id, server_id: &server.id, library_id, title, author: None, narrator: None, description: None, duration_seconds: 3600.0, added_at: chrono::Utc::now(), series_name: None, genres: &[] })).unwrap();
         }
 
         // The finished book's row is the *newer* one, so without the finished filter it would be

@@ -16,15 +16,18 @@ pub struct UpsertItem<'a> {
     pub description: Option<&'a str>,
     pub duration_seconds: f64,
     pub added_at: chrono::DateTime<Utc>,
+    pub series_name: Option<&'a str>,
+    pub genres: &'a [String],
 }
 
 pub async fn upsert(pool: &SqlitePool, item: UpsertItem<'_>) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let genres_json = serde_json::to_string(item.genres).unwrap_or_else(|_| "[]".to_string());
     sqlx::query(
         "INSERT INTO items
             (id, server_id, library_id, title, author, narrator, description,
-             duration_seconds, added_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             duration_seconds, added_at, synced_at, series_name, genres)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(server_id, id) DO UPDATE SET
             library_id = excluded.library_id,
             title = excluded.title,
@@ -33,7 +36,9 @@ pub async fn upsert(pool: &SqlitePool, item: UpsertItem<'_>) -> Result<()> {
             description = excluded.description,
             duration_seconds = excluded.duration_seconds,
             added_at = excluded.added_at,
-            synced_at = excluded.synced_at",
+            synced_at = excluded.synced_at,
+            series_name = excluded.series_name,
+            genres = excluded.genres",
     )
     .bind(item.id)
     .bind(item.server_id)
@@ -45,6 +50,8 @@ pub async fn upsert(pool: &SqlitePool, item: UpsertItem<'_>) -> Result<()> {
     .bind(item.duration_seconds)
     .bind(item.added_at.to_rfc3339())
     .bind(now)
+    .bind(item.series_name)
+    .bind(genres_json)
     .execute(pool)
     .await?;
     Ok(())
@@ -53,7 +60,8 @@ pub async fn upsert(pool: &SqlitePool, item: UpsertItem<'_>) -> Result<()> {
 pub async fn get(pool: &SqlitePool, server_id: &str, id: &str) -> Result<Item> {
     sqlx::query_as(
         "SELECT id, server_id, library_id, title, author, narrator, description,
-                cover_cache_path, duration_seconds, added_at, synced_at
+                cover_cache_path, duration_seconds, added_at, synced_at,
+                series_name, genres AS genres_json
          FROM items WHERE server_id = ? AND id = ?",
     )
     .bind(server_id)
@@ -66,7 +74,8 @@ pub async fn get(pool: &SqlitePool, server_id: &str, id: &str) -> Result<Item> {
 pub async fn list_for_library(pool: &SqlitePool, server_id: &str, library_id: &str) -> Result<Vec<Item>> {
     let items = sqlx::query_as(
         "SELECT id, server_id, library_id, title, author, narrator, description,
-                cover_cache_path, duration_seconds, added_at, synced_at
+                cover_cache_path, duration_seconds, added_at, synced_at,
+                series_name, genres AS genres_json
          FROM items WHERE server_id = ? AND library_id = ? ORDER BY added_at DESC",
     )
     .bind(server_id)
@@ -146,6 +155,8 @@ mod tests {
             description: Some("A lone astronaut..."),
             duration_seconds: 58230.0,
             added_at: Utc::now(),
+            series_name: None,
+            genres: &[],
         }
     }
 
@@ -160,6 +171,22 @@ mod tests {
         assert_eq!(found.title, "Project Hail Mary");
         assert_eq!(found.author.as_deref(), Some("Andy Weir"));
         assert_eq!(found.cover_cache_path, None);
+        assert_eq!(found.series_name, None);
+        assert_eq!(found.genres(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn upsert_then_get_round_trips_series_and_genres() {
+        let (pool, server_id, library_id) = pool_with_library().await;
+        let genres = ["Fantasy".to_string(), "Sci-Fi".to_string()];
+        let mut with_series = item(&server_id, &library_id, "item-1", "Wizard's First Rule");
+        with_series.series_name = Some("Sword of Truth");
+        with_series.genres = &genres;
+        upsert(&pool, with_series).await.unwrap();
+
+        let found = get(&pool, &server_id, "item-1").await.unwrap();
+        assert_eq!(found.series_name.as_deref(), Some("Sword of Truth"));
+        assert_eq!(found.genres(), vec!["Fantasy".to_string(), "Sci-Fi".to_string()]);
     }
 
     #[tokio::test]

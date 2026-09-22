@@ -254,12 +254,18 @@ Shown between login and Home only when the server exposes **more than one** libr
 
 ---
 
-## 5. Library browse (LB) — 🚧 partially implemented
+## 5. Library browse (LB) — ✅ implemented
 
 Built: search, sort (incl. "Last listened"), the in-progress filter with its funnel indicator and
-banner, grid/list toggle, offline toggle, download badges, and Sync now. Not yet built: the view
-options sheet (LB-6's "Downloaded only"/"Hide finished"/"Grouping" rows — LB-7/LB-8/LB-9),
-category chips (LB-4), and the "Application settings" shortcut (LB-11).
+banner, grid/list toggle, offline toggle, download badges, Sync now, the view options popover
+(Downloaded only/Hide finished/Grouping/Sort by/Application settings), category chips (All/
+Author/Series/Genre), and grouped section headers. One documented simplification: LB-9's headers
+are *grouped*, not *sticky*-while-scrolling — this crate's rendering model fully rebuilds the grid/
+list on every change rather than binding a `GListModel`, which is what real sticky headers need
+(`GtkListView` section headers); a plain grouped header is what's actually implemented. The Genre
+chip is a session-only filter, not a `Grouping` mode (a book has several genres, not one grouping-
+per-genre) — picking a genre reveals a second row of the genres actually present and filters to
+one of them, per LB-4 below.
 
 - [ ] **LB-1 — Header layout.** Open the Library tab.
       *Expected:* header bar with a **persistent, always-visible search field** (not hidden
@@ -298,9 +304,9 @@ category chips (LB-4), and the "Application settings" shortcut (LB-11).
       *Expected:* fully-listened items disappear from the grid; turning it off brings them back.
 
 - [ ] **LB-9 — Grouping.** Set Grouping to "By Series", then "By Author", then "None".
-      *Expected:* with grouping active, the list sections under sticky headers named for the
-      series/author; "None" removes the sectioning. The headers stay visible while scrolling
-      their section.
+      *Expected:* with grouping active, the list sections under headers named for the series/
+      author; "None" removes the sectioning. Not sticky-while-scrolling (see this section's
+      intro) — a documented simplification, not a bug.
 
 - [ ] **LB-10 — Sorting.** Set Sort by to each of: "Date of creation", "Title", "Author",
       "Duration".

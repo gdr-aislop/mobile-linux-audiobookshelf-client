@@ -169,6 +169,10 @@ struct RawMetadata {
     #[serde(rename = "narratorName")]
     narrator_name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "seriesName")]
+    series_name: Option<String>,
+    #[serde(default)]
+    genres: Vec<String>,
 }
 
 /// Connection-level options applied to every request a minted [`Client`] sends — the transport
@@ -373,6 +377,8 @@ pub struct LibraryItemSummary {
     /// one field; callers (`abs-core`) already depend on `chrono` for the storage layer's models
     /// and can convert.
     pub added_at_ms: i64,
+    pub series_name: Option<String>,
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +612,8 @@ impl Client {
                     description: metadata.description,
                     duration_seconds: media.duration.unwrap_or(0.0),
                     added_at_ms: item.added_at.unwrap_or(0),
+                    series_name: metadata.series_name,
+                    genres: metadata.genres,
                 })
             })
             .collect())
@@ -1282,6 +1290,8 @@ mod tests {
                             "authorName": "Andy Weir",
                             "narratorName": "Ray Porter",
                             "description": "A lone astronaut...",
+                            "seriesName": "Standalone Series",
+                            "genres": ["Sci-Fi", "Thriller"],
                         }
                     }
                 }]
@@ -1299,6 +1309,30 @@ mod tests {
         assert_eq!(items[0].narrator.as_deref(), Some("Ray Porter"));
         assert_eq!(items[0].duration_seconds, 3600.5);
         assert_eq!(items[0].added_at_ms, 1_700_000_000_000);
+        assert_eq!(items[0].series_name.as_deref(), Some("Standalone Series"));
+        assert_eq!(items[0].genres, vec!["Sci-Fi".to_string(), "Thriller".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_library_items_with_media_defaults_series_and_genres_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "id": "item-1",
+                    "media": { "metadata": { "title": "No Series Or Genres" } }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let items = client.get_library_items_with_media("lib-1").await.unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].series_name, None);
+        assert_eq!(items[0].genres, Vec::<String>::new());
     }
 
     #[tokio::test]

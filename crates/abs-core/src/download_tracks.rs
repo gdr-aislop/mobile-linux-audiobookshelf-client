@@ -534,7 +534,7 @@ mod tests {
         abs_storage::repo::libraries::upsert(&pool, abs_storage::repo::libraries::UpsertLibrary { id: "lib-1", server_id: &server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 }).await.unwrap();
         abs_storage::repo::items::upsert(
             &pool,
-            abs_storage::repo::items::UpsertItem { id: "item-1", server_id: &server_id, library_id: "lib-1", title: "Test Item", author: None, narrator: None, description: None, duration_seconds: 0.0, added_at: chrono::Utc::now() },
+            abs_storage::repo::items::UpsertItem { id: "item-1", server_id: &server_id, library_id: "lib-1", title: "Test Item", author: None, narrator: None, description: None, duration_seconds: 0.0, added_at: chrono::Utc::now(), series_name: None, genres: &[] },
         )
         .await
         .unwrap();
@@ -579,6 +579,8 @@ mod tests {
                 description: None,
                 duration_seconds: 0.0,
                 added_at: chrono::Utc::now(),
+                series_name: None,
+                genres: &[],
             },
         )
         .await

@@ -1,0 +1,2 @@
+ALTER TABLE items ADD COLUMN series_name TEXT;
+ALTER TABLE items ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';

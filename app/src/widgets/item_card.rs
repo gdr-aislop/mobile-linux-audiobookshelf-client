@@ -129,6 +129,8 @@ pub(crate) mod tests {
             duration_seconds: 3600.0,
             added_at: chrono::Utc::now(),
             synced_at: chrono::Utc::now(),
+            series_name: None,
+            genres_json: "[]".to_string(),
         }
     }
 

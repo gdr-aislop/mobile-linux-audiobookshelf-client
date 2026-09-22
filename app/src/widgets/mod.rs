@@ -48,6 +48,19 @@ pub(crate) fn find_descendant<T: glib::object::IsA<gtk4::Widget>>(root: &gtk4::W
     None
 }
 
+/// An `AdwComboRow` over a plain list of option labels — the string expression is what makes the
+/// row display the selected option's text in its trailing slot. Shared by `screens::settings` and
+/// `screens::library`'s view-options popover, so both build combo rows the same way.
+pub(crate) fn combo_row(title: &str, subtitle: &str, options: &[String]) -> adw::ComboRow {
+    let model = gtk4::StringList::new(&[]);
+    for option in options {
+        model.append(option);
+    }
+    let row = adw::ComboRow::builder().title(title).subtitle(subtitle).model(&model).build();
+    row.set_expression(Some(gtk4::StringObject::this_expression("string")));
+    row
+}
+
 /// Sets `GtkEditable:input-purpose` on an `AdwEntryRow` — which libadwaita doesn't expose as a
 /// row property: the purpose lives on the row's internal `GtkText` editable delegate. The
 /// on-screen keyboard picks its layout from this (squeekboard shows its URL layout — `/`, `:`,

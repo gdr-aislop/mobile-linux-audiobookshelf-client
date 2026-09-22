@@ -18,6 +18,8 @@ use sqlx::SqlitePool;
 use abs_core::playback::SPEED_PRESETS;
 use abs_core::settings::{PlaybackSettings, Theme};
 use abs_storage::models::{Account, Server};
+
+use crate::widgets::combo_row;
 use abs_storage::AppPaths;
 
 use crate::downloads::DownloadManager;
@@ -590,18 +592,6 @@ pub(crate) fn confirm(
         }
     });
     dialog.present();
-}
-
-/// An `AdwComboRow` over a plain list of option labels — the string expression is what makes the
-/// row display the selected option's text in its trailing slot.
-fn combo_row(title: &str, subtitle: &str, options: &[String]) -> adw::ComboRow {
-    let model = gtk4::StringList::new(&[]);
-    for option in options {
-        model.append(option);
-    }
-    let row = adw::ComboRow::builder().title(title).subtitle(subtitle).model(&model).build();
-    row.set_expression(Some(gtk4::StringObject::this_expression("string")));
-    row
 }
 
 fn speed_labels() -> Vec<String> {
