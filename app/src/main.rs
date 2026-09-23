@@ -169,6 +169,8 @@ mod tests {
         (library_hide_finished_switch_filters_finished_items, crate::screens::library::tests::run_hide_finished_switch_filters_finished_items),
         (library_author_category_chip_groups_items_with_headers, crate::screens::library::tests::run_author_category_chip_groups_items_with_headers),
         (library_sort_by_combo_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_sort_by_combo_persists_and_is_honored_on_rebuild),
+        (library_last_listened_sort_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_last_listened_sort_persists_and_is_honored_on_rebuild),
+        (library_in_progress_only_switch_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_in_progress_only_switch_persists_and_is_honored_on_rebuild),
         (library_genre_chip_filters_without_persisting, crate::screens::library::tests::run_genre_chip_filters_without_persisting),
         (library_application_settings_row_calls_on_open_settings, crate::screens::library::tests::run_application_settings_row_calls_on_open_settings),
         (library_sync_now_and_pull_to_refresh, crate::screens::library::tests::run_sync_now_and_pull_to_refresh),

@@ -59,6 +59,7 @@ mod keys {
     pub const HIDE_FINISHED: &str = "library.hide_finished";
     pub const GROUPING: &str = "library.grouping";
     pub const SORT_BY: &str = "library.sort_by";
+    pub const IN_PROGRESS_ONLY: &str = "library.in_progress_only";
     pub const VIEW_MODE: &str = "library.view_mode";
     pub const OFFLINE_MODE: &str = "browse.offline_mode";
 }
@@ -194,6 +195,11 @@ pub enum SortBy {
     Title,
     Author,
     Duration,
+    /// Not a metadata field but a playback one — items with a progress row first, newest
+    /// last-listen first, never-played items after. Mirrors `app::screens::library::SortKey::LastListened`
+    /// one-to-one; unlike the other variants here it has no direct database column, so applying it
+    /// is entirely the Library screen's own job (this crate just persists the choice).
+    LastListened,
 }
 
 impl std::str::FromStr for SortBy {
@@ -204,6 +210,7 @@ impl std::str::FromStr for SortBy {
             "title" => Ok(SortBy::Title),
             "author" => Ok(SortBy::Author),
             "duration" => Ok(SortBy::Duration),
+            "last_listened" => Ok(SortBy::LastListened),
             _ => Err(()),
         }
     }
@@ -216,15 +223,17 @@ impl SortBy {
             SortBy::Title => "title",
             SortBy::Author => "author",
             SortBy::Duration => "duration",
+            SortBy::LastListened => "last_listened",
         }
     }
 }
 
-/// The Library browse screen's view-options sheet: Downloaded only, Hide finished, Grouping,
-/// Sort by (see `docs/design/ui-spec.md`).
+/// The Library browse screen's view-options sheet: Downloaded only, In progress only, Hide
+/// finished, Grouping, Sort by (see `docs/design/ui-spec.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LibraryViewOptions {
     pub downloaded_only: bool,
+    pub in_progress_only: bool,
     pub hide_finished: bool,
     pub grouping: Grouping,
     pub sort_by: SortBy,
@@ -233,6 +242,7 @@ pub struct LibraryViewOptions {
 pub async fn load_library_view_options(pool: &SqlitePool) -> Result<LibraryViewOptions> {
     Ok(LibraryViewOptions {
         downloaded_only: parse_or_default(pool, keys::DOWNLOADED_ONLY, false).await?,
+        in_progress_only: parse_or_default(pool, keys::IN_PROGRESS_ONLY, false).await?,
         hide_finished: parse_or_default(pool, keys::HIDE_FINISHED, false).await?,
         grouping: parse_or_default(pool, keys::GROUPING, Grouping::default()).await?,
         sort_by: parse_or_default(pool, keys::SORT_BY, SortBy::default()).await?,
@@ -241,6 +251,7 @@ pub async fn load_library_view_options(pool: &SqlitePool) -> Result<LibraryViewO
 
 pub async fn save_library_view_options(pool: &SqlitePool, options: &LibraryViewOptions) -> Result<()> {
     kv::set(pool, keys::DOWNLOADED_ONLY, &options.downloaded_only.to_string()).await?;
+    kv::set(pool, keys::IN_PROGRESS_ONLY, &options.in_progress_only.to_string()).await?;
     kv::set(pool, keys::HIDE_FINISHED, &options.hide_finished.to_string()).await?;
     kv::set(pool, keys::GROUPING, options.grouping.as_str()).await?;
     kv::set(pool, keys::SORT_BY, options.sort_by.as_str()).await?;
@@ -377,6 +388,7 @@ mod tests {
         let pool = pool().await;
         let options = load_library_view_options(&pool).await.unwrap();
         assert!(!options.downloaded_only);
+        assert!(!options.in_progress_only);
         assert!(!options.hide_finished);
         assert_eq!(options.grouping, Grouping::None);
         assert_eq!(options.sort_by, SortBy::DateOfCreation);
@@ -387,6 +399,7 @@ mod tests {
         let pool = pool().await;
         let options = LibraryViewOptions {
             downloaded_only: true,
+            in_progress_only: true,
             hide_finished: true,
             grouping: Grouping::BySeries,
             sort_by: SortBy::Title,
@@ -396,16 +409,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_view_options_round_trip_last_listened_sort() {
+        let pool = pool().await;
+        let options = LibraryViewOptions { sort_by: SortBy::LastListened, ..Default::default() };
+        save_library_view_options(&pool, &options).await.unwrap();
+        assert_eq!(load_library_view_options(&pool).await.unwrap(), options);
+    }
+
+    #[tokio::test]
     async fn set_downloaded_only_touches_only_that_field() {
         let pool = pool().await;
-        let options = LibraryViewOptions { downloaded_only: false, hide_finished: true, grouping: Grouping::ByAuthor, sort_by: SortBy::Duration };
+        let options = LibraryViewOptions { downloaded_only: false, in_progress_only: true, hide_finished: true, grouping: Grouping::ByAuthor, sort_by: SortBy::Duration };
         save_library_view_options(&pool, &options).await.unwrap();
 
         set_downloaded_only(&pool, true).await.unwrap();
 
         let after = load_library_view_options(&pool).await.unwrap();
         assert!(after.downloaded_only, "set_downloaded_only must flip the flag");
-        assert_eq!(after.hide_finished, options.hide_finished, "other fields must be left alone");
+        assert_eq!(after.in_progress_only, options.in_progress_only, "other fields must be left alone");
+        assert_eq!(after.hide_finished, options.hide_finished);
         assert_eq!(after.grouping, options.grouping);
         assert_eq!(after.sort_by, options.sort_by);
     }
@@ -415,7 +437,7 @@ mod tests {
         for g in [Grouping::None, Grouping::BySeries, Grouping::ByAuthor] {
             assert_eq!(g.as_str().parse::<Grouping>().unwrap(), g);
         }
-        for s in [SortBy::DateOfCreation, SortBy::Title, SortBy::Author, SortBy::Duration] {
+        for s in [SortBy::DateOfCreation, SortBy::Title, SortBy::Author, SortBy::Duration, SortBy::LastListened] {
             assert_eq!(s.as_str().parse::<SortBy>().unwrap(), s);
         }
     }
