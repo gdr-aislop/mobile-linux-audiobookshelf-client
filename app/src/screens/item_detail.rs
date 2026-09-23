@@ -10,9 +10,11 @@
 //! start playback directly (see its git history), a stand-in for this screen not existing yet.
 //! Player itself stays a separate screen, reached only from the mini-bar, per the ui-spec's
 //! navigation model — this screen never touches `abs-player`/`PlayerController` directly; starting
-//! playback (`on_play`) and returning to the shelf (`on_back`) are both owned by the caller
-//! (`main_window`), the same "screens report intent, the shell acts on it" shape `home.rs`/
-//! `library.rs` already use for their own `on_open`.
+//! playback is owned entirely by the caller (`main_window`) via `on_play`, the same "screens report
+//! intent, the shell acts on it" shape `home.rs`/`library.rs` already use for their own `on_open`.
+//! `on_play` is also where navigation away from this screen happens on the Play/Resume and
+//! chapter-tap paths — the caller's `on_play` opens the full Player screen directly, so this screen
+//! never calls `on_back` itself except from its own header back button.
 //!
 //! Renders in two passes, same "show now, refine once the async bit lands" shape `home.rs`'s cover
 //! art and `screens::player`'s chapters popover already use: metadata + progress come from a
@@ -66,9 +68,10 @@ impl ItemDetailScreen {
 
 /// Builds the screen for `item_id`. `on_play` fires when Play/Resume or a chapter row is tapped —
 /// `None` for Play/Resume (resume from whatever progress the player itself resolves, same as
-/// today), `Some(index)` for a chapter tap (seek to that chapter once playback starts). Both cases
-/// call `on_back` right after, mirroring today's existing behavior where starting playback reveals
-/// the mini bar and returns you to the shelf.
+/// today), `Some(index)` for a chapter tap (seek to that chapter once playback starts). Neither
+/// case calls `on_back` afterward: the caller's `on_play` is expected to take over navigation
+/// itself (opening the full Player screen), not hand it back to this screen. `on_back` is used
+/// only by the header's own back button.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
@@ -223,7 +226,6 @@ pub fn build(
         let session = session.clone();
         let item_id = item_id.clone();
         let on_play = on_play.clone();
-        let on_back = on_back.clone();
         let chapter_ranges_cell = chapter_ranges_cell.clone();
         let current_chapter_index_cell = current_chapter_index_cell.clone();
         async move {
@@ -324,11 +326,9 @@ pub fn build(
                 }
                 row.connect_activated({
                     let on_play = on_play.clone();
-                    let on_back = on_back.clone();
                     let item_id = item_id.clone();
                     move |_| {
                         on_play(item_id.clone(), Some(index));
-                        on_back();
                     }
                 });
                 chapters_list.append(&row);
@@ -351,11 +351,9 @@ pub fn build(
 
     play_button.connect_clicked({
         let on_play = on_play.clone();
-        let on_back = on_back.clone();
         let item_id = item_id.clone();
         move |_| {
             on_play(item_id.clone(), None);
-            on_back();
         }
     });
 
@@ -546,7 +544,8 @@ pub(crate) mod tests {
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Chapter rows list title + duration,
     /// show the offline glyph only for chapters whose tracks are fully downloaded (ID-5, ID-15),
-    /// and tapping a row starts playback at that chapter and returns to the shelf (`on_back`).
+    /// and tapping a row starts playback at that chapter — navigation is the caller's job now
+    /// (`on_play` opens the full Player screen itself), so this screen never calls `on_back` here.
     pub(crate) fn run_chapter_rows_show_offline_glyphs_and_seek_on_tap(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 10.0, &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)]));
@@ -584,13 +583,14 @@ pub(crate) mod tests {
 
         row1.emit_by_name::<()>("activated", &[]);
         assert_eq!(*played.borrow(), vec![("item-1".to_string(), Some(1))], "tapping a chapter row should start playback at that chapter");
-        assert!(went_back.get(), "tapping a chapter row should return to the shelf");
+        assert!(!went_back.get(), "tapping a chapter row should leave navigation to the caller's on_play, not call on_back itself");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Tapping Play calls through to
-    /// `on_play` with no chapter override and returns to the shelf (`on_back`) — the standard
-    /// Play/Resume path (ID-3).
-    pub(crate) fn run_tapping_play_invokes_on_play_and_on_back(runtime: &tokio::runtime::Runtime) {
+    /// `on_play` with no chapter override — the standard Play/Resume path (ID-3). The caller's
+    /// `on_play` is expected to take over navigation itself (opening the full Player screen), so
+    /// this screen never calls `on_back` here.
+    pub(crate) fn run_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
 
@@ -614,7 +614,7 @@ pub(crate) mod tests {
         hooks.play_button.emit_clicked();
 
         assert_eq!(*played.borrow(), vec![("item-1".to_string(), None)]);
-        assert!(went_back.get());
+        assert!(!went_back.get(), "tapping Play should leave navigation to the caller's on_play, not call on_back itself");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The back button calls `on_back`.

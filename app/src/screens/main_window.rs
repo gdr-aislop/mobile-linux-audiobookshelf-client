@@ -195,15 +195,54 @@ pub fn build(
 
     let stack = adw::ViewStack::new();
 
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    // Opens the full player by swapping the window's content — there's no
+    // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
+    // so this is the same content-swap mechanism `application.rs` already uses for Welcome -> main
+    // window. Collapsing restores `root` (this shell), not a fresh `build()` call — no state lost.
+    //
+    // The player screen's keyboard actions ride along: its `SimpleActionGroup` is merged under
+    // the "player" prefix for exactly as long as the screen is open, and removed on collapse, so
+    // the arrow-key/speed/`c`/`t`/Escape accelerators (ui-spec §6) are inert everywhere else.
+    //
+    // Shared by the mini bar's tap and swipe-up gestures below (ui-spec's "Player — mini",
+    // MP-5/MP-6) *and* by `start_playback` below (Item Detail's Play/Resume/chapter-tap path), so
+    // every trigger can never drift into opening the player differently. Defined here, ahead of
+    // `start_playback`, specifically so it can capture this too. `screens::player::build` requires
+    // something to already be playing (see its own doc comment), so every caller of this must
+    // only invoke it once that's actually true.
+    let open_player: Rc<dyn Fn()> = Rc::new({
+        let controller = mini_bar.controller.clone();
+        let window = window.clone();
+        let root = root.clone();
+        let pool = pool.clone();
+        let download_manager = download_manager.clone();
+        move || {
+            let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
+                let window = window.clone();
+                let root = root.clone();
+                move || {
+                    crate::widgets::swap_content(&window, &root);
+                    window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
+                }
+            });
+            window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
+            crate::widgets::swap_content(&window, &player_screen.root);
+        }
+    });
+
     // Starts real playback (`PlayerController::start`) for a request, optionally seeking to a
-    // chapter once it's ready — the one place in the shell that actually calls into
-    // `abs-player`/`abs-core::streaming` on a card's behalf. Used below both as Item Detail's own
-    // `on_play` (a chapter tap or Play/Resume) — Item Detail itself never touches the controller
-    // directly, same "screens report intent, the shell acts on it" boundary `home.rs`/`library.rs`
-    // already draw for `on_open`.
+    // chapter once it's ready, then opens the full Player screen once playback has actually
+    // started — the one place in the shell that actually calls into `abs-player`/
+    // `abs-core::streaming` on a card's behalf. Used below as Item Detail's own `on_play` (a
+    // chapter tap or Play/Resume) — Item Detail itself never touches the controller directly,
+    // same "screens report intent, the shell acts on it" boundary `home.rs`/`library.rs` already
+    // draw for `on_open`.
     let start_playback = {
         let controller = mini_bar.controller.clone();
         let session = session.clone();
+        let open_player = open_player.clone();
         move |request: PlayRequest, start_chapter: Option<usize>| {
             // The default speed is read at call time, not captured — a "Default speed" change in
             // Settings applies to the next playback without rebuilding the shell.
@@ -224,6 +263,22 @@ pub fn build(
                     }
                 });
             }
+            // `controller.start()` above resolves asynchronously (network + stream resolution),
+            // so there's nothing playing yet the instant this call returns — `open_player` (via
+            // `screens::player::build`) requires that there already is. Poll for readiness the
+            // same bounded way (50 * 100ms) the chapter seek above already does, rather than
+            // opening the shelf and waiting for the mini bar to catch up a moment later.
+            let controller = controller.clone();
+            let open_player = open_player.clone();
+            glib::spawn_future_local(async move {
+                for _ in 0..50 {
+                    if controller.current_download_context().is_some() {
+                        open_player();
+                        return;
+                    }
+                    glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                }
+            });
         }
     };
 
@@ -253,14 +308,16 @@ pub fn build(
         }
     };
 
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
     // Tapping a cover card opens Item Detail (ui-spec's real "tap -> Item detail -> Play" flow) by
     // swapping the window's content in — the same content-swap mechanism the mini-bar's
     // tap-to-expand already uses for Player (there's no `AdwNavigationView`/`AdwDialog` at this
     // crate's libadwaita ceiling). Constructed on demand, per tap, exactly mirroring how the
     // mini-bar gesture below builds a fresh `PlayerScreen` on every open rather than keeping one
     // around; `on_back` restores `root` (this shell) the same way Player's `on_collapse` does.
+    // Tapping Play/Resume or a chapter row, though, doesn't go through `on_back` at all — `on_play`
+    // (below) is `start_playback`, which opens the full Player screen itself once playback has
+    // actually started, rather than returning to the shelf and waiting for the mini bar to catch
+    // up a moment later.
     let on_open = {
         let window = window.clone();
         let root = root.clone();
@@ -413,37 +470,6 @@ pub fn build(
         }
     });
     window.add_action(&open_library_search_action);
-
-    // Opens the full player by swapping the window's content — there's no
-    // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
-    // so this is the same content-swap mechanism `application.rs` already uses for Welcome -> main
-    // window. Collapsing restores `root` (this shell), not a fresh `build()` call — no state lost.
-    //
-    // The player screen's keyboard actions ride along: its `SimpleActionGroup` is merged under
-    // the "player" prefix for exactly as long as the screen is open, and removed on collapse, so
-    // the arrow-key/speed/`c`/`t`/Escape accelerators (ui-spec §6) are inert everywhere else.
-    //
-    // Shared by both the mini bar's tap and swipe-up gestures below (ui-spec's "Player — mini",
-    // MP-5/MP-6) so the two triggers can never drift into opening the player differently.
-    let open_player: Rc<dyn Fn()> = Rc::new({
-        let controller = mini_bar.controller.clone();
-        let window = window.clone();
-        let root = root.clone();
-        let pool = pool.clone();
-        let download_manager = download_manager.clone();
-        move || {
-            let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
-                let window = window.clone();
-                let root = root.clone();
-                move || {
-                    crate::widgets::swap_content(&window, &root);
-                    window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
-                }
-            });
-            window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
-            crate::widgets::swap_content(&window, &player_screen.root);
-        }
-    });
 
     // A single `GestureDrag` recognizes both a tap (negligible movement) and a swipe up past
     // `SWIPE_UP_MIN_DISTANCE_PX` — one gesture controller, not two competing ones claiming the
@@ -756,10 +782,11 @@ pub(crate) mod tests {
 
     /// The full chain restored by this plan: tapping a Home card opens Item Detail (not
     /// playback directly), Item Detail shows the tapped item's real metadata, and tapping its
-    /// Play button both starts real playback and returns the shell (mini bar now visible) —
-    /// same style as `run_offline_mode_toggle_is_shared_between_home_and_library`'s own
-    /// cross-screen coverage.
-    pub(crate) fn run_tapping_a_card_opens_item_detail_then_play_starts_playback_and_shows_the_shell_again(runtime: &tokio::runtime::Runtime) {
+    /// Play button both starts real playback and opens the full Player screen directly (not the
+    /// shelf — the mini bar catching up a moment later no longer matters, since the user is
+    /// already looking at the real Player screen) — same style as
+    /// `run_offline_mode_toggle_is_shared_between_home_and_library`'s own cross-screen coverage.
+    pub(crate) fn run_tapping_a_card_opens_item_detail_then_play_opens_the_player_screen(runtime: &tokio::runtime::Runtime) {
         use crate::screens::home::tests::item_json;
 
         let mock_server = runtime.block_on(wiremock::MockServer::start());
@@ -821,15 +848,21 @@ pub(crate) mod tests {
         );
         assert!(!hooks.mini_bar.bar.is_visible(), "opening Item Detail must not itself start playback");
 
-        // Tapping Play should start real playback and hand control back to the shell.
+        // Tapping Play should start real playback and open the full Player screen directly.
         let content = app_window.content().expect("Item Detail should be showing");
         let play_button = find_button_labeled(&content, "Play").expect("Item Detail's Play button");
         play_button.emit_clicked();
 
         pump_until(|| hooks.mini_bar.bar.is_visible(), std::time::Duration::from_secs(10));
+        pump_until(
+            || app_window.content().is_some_and(|c| c != window.root && find_button_with_icon(&c, "go-down-symbolic").is_some()),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("the Player screen should be showing");
+        assert!(content != window.root, "tapping Play should open the full Player screen, not restore the shell");
         assert!(
-            app_window.content().is_some_and(|c| c == window.root),
-            "tapping Play should restore the shell"
+            find_button_with_icon(&content, "go-down-symbolic").is_some(),
+            "the Player screen's collapse button should be present"
         );
         assert_eq!(hooks.mini_bar.title_label.label(), "Project Hail Mary", "the mini bar should reflect the item Play just started");
     }
@@ -1031,6 +1064,35 @@ pub(crate) mod tests {
         }
         let mut found = None;
         walk(root, label, &mut found);
+        found
+    }
+
+    /// Depth-first search for the first `GtkButton` constructed from exactly this icon name
+    /// anywhere under `root` — used to prove the Player screen (not Item Detail or the shell) is
+    /// showing, via its collapse button (`player.rs`'s `gtk4::Button::from_icon_name
+    /// ("go-down-symbolic")`).
+    fn find_button_with_icon(root: &gtk4::Widget, icon_name: &str) -> Option<gtk4::Button> {
+        fn walk(widget: &gtk4::Widget, icon_name: &str, found: &mut Option<gtk4::Button>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if button.icon_name().as_deref() == Some(icon_name) {
+                    *found = Some(button.clone());
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, icon_name, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, icon_name, &mut found);
         found
     }
 }
