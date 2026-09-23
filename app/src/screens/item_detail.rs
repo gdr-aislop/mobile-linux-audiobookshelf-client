@@ -135,11 +135,16 @@ pub fn build(
 
     let progress_bar = gtk4::ProgressBar::builder().margin_top(10).visible(false).build();
 
-    let play_button = gtk4::Button::builder().label("Play").css_classes(["pill", "suggested-action"]).halign(gtk4::Align::Center).margin_top(14).build();
+    let play_button = gtk4::Button::builder().label("Play").css_classes(["pill", "suggested-action"]).halign(gtk4::Align::Center).build();
 
     let toast_overlay = adw::ToastOverlay::new();
 
-    let actions_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).halign(gtk4::Align::Center).margin_top(0).build();
+    // The 14px gap above the actions row lives on the row itself, never on one of its children: a
+    // one-sided child margin still adds to the row's height, which the (margin-less) download
+    // button — a default Fill-valign child — then stretches to fill, making it taller than the
+    // pill beside it. With the spacing here instead, the row's height is just the tallest child's
+    // natural height and both buttons are allocated exactly that.
+    let actions_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).halign(gtk4::Align::Center).margin_top(14).build();
     actions_row.append(&play_button);
 
     // Description: truncated text (ui-spec: `AdwExpanderRow` or plain text block, whichever is
@@ -254,6 +259,10 @@ pub fn build(
         },
         toast_overlay.clone(),
     );
+    // Same `pill` treatment as the primary button, so the row reads as one pair of matched
+    // controls (the shared widget keeps its plain icon-button look in Player's row — this is a
+    // per-call-site style, and the widget is built fresh here).
+    download_menu.widget.add_css_class("pill");
     actions_row.append(&download_menu.widget);
 
     glib::spawn_future_local({
@@ -650,6 +659,36 @@ pub(crate) mod tests {
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
         assert!(hooks.progress_bar.is_visible());
         assert!((hooks.progress_bar.fraction() - 0.5).abs() < 0.01, "1800s of 3600s should be a 50% progress bar");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The actions row's two buttons must
+    /// render at the same height: the spacing above the row lives on the row itself, so the
+    /// download `MenuButton` (a default Fill-valign child, like every widget) can't be stretched
+    /// taller than the pill beside it by a one-sided child margin — the on-device bug this guards.
+    /// Needs a mapped window: heights are only meaningful once the row has been allocated.
+    pub(crate) fn run_action_buttons_render_equal_heights(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), None, None, 3600.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+        pump_until(|| hooks.play_button.allocated_height() > 0, Duration::from_secs(5));
+
+        assert_eq!(
+            hooks.play_button.allocated_height(),
+            hooks.download_button.allocated_height(),
+            "the Play/Resume and Download buttons must render at the same height"
+        );
+        window.destroy();
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A long description truncates to a few

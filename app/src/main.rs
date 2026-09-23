@@ -190,6 +190,7 @@ mod tests {
         (item_detail_series_button_shows_the_plain_name_then_fills_in_the_real_numbers, crate::screens::item_detail::tests::run_series_button_shows_the_plain_name_then_fills_in_the_real_numbers),
         (item_detail_series_button_keeps_the_plain_name_when_the_network_call_fails, crate::screens::item_detail::tests::run_series_button_keeps_the_plain_name_when_the_network_call_fails),
         (item_detail_series_button_stays_hidden_when_the_item_has_no_series, crate::screens::item_detail::tests::run_series_button_stays_hidden_when_the_item_has_no_series),
+        (item_detail_action_buttons_render_equal_heights, crate::screens::item_detail::tests::run_action_buttons_render_equal_heights),
         (item_card_renders, |_rt| crate::widgets::item_card::tests::run()),
         (item_card_wrap_title_shows_the_full_title_without_ellipsizing, |_rt| crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing()),
         (item_card_downloaded_badge_shows_only_when_downloaded, |_rt| crate::widgets::item_card::tests::run_downloaded_badge_shows_only_when_downloaded()),
