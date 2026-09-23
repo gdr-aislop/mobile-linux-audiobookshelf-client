@@ -1,7 +1,8 @@
 //! The Item Detail screen — `docs/design/ui-spec.md` §3's "Item detail" section and
 //! `docs/ui-test-plan.md` §6 (ID-1 through ID-16): cover, metadata, progress, a primary
 //! Play/Resume button, the shared download-scope menu (`widgets::download_scope_menu`), a
-//! truncated description, and a tappable chapter list. Pushed by `main_window` swapping window
+//! truncated description, a tappable chapter list, and — at the bottom, same as Home/Library —
+//! the mini bar reflecting whatever is currently playing. Pushed by `main_window` swapping window
 //! content in — same content-swap mechanism `screens::player` already uses (there's no
 //! `AdwNavigationView`/`AdwDialog` at this crate's libadwaita `v1_2` ceiling) — when a cover card
 //! on Home/Library is tapped; the back button calls `on_back` to swap the shell back in.
@@ -57,6 +58,7 @@ pub struct TestHooks {
     pub download_button: gtk4::MenuButton,
     pub download_popover: gtk4::Popover,
     pub download_popover_box: gtk4::Box,
+    pub mini_bar: crate::player::MiniPlayerHooks,
 }
 
 #[cfg(test)]
@@ -72,6 +74,12 @@ impl ItemDetailScreen {
 /// case calls `on_back` afterward: the caller's `on_play` is expected to take over navigation
 /// itself (opening the full Player screen), not hand it back to this screen. `on_back` is used
 /// only by the header's own back button.
+///
+/// `controller` is the shell's already-live `PlayerController`, shared (not duplicated) with the
+/// mini bar this screen shows at the bottom — see `crate::player::build_mini_bar_for`'s doc for
+/// why this reflects real playback state rather than a second, independent copy of it. Tapping or
+/// swiping up on that mini bar calls `on_open_player`, exactly mirroring the shell's own mini
+/// bar's tap/swipe-up-to-open gesture (`main_window::mini_bar_gesture_should_open`).
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
@@ -79,9 +87,11 @@ pub fn build(
     account: Account,
     session: abs_core::auth::Session,
     download_manager: DownloadManager,
+    controller: crate::player::PlayerController,
     item_id: String,
     on_play: impl Fn(String, Option<usize>) + 'static,
     on_back: impl Fn() + 'static,
+    on_open_player: impl Fn() + 'static,
 ) -> ItemDetailScreen {
     let on_play = Rc::new(on_play);
     let on_back = Rc::new(on_back);
@@ -176,9 +186,27 @@ pub fn build(
 
     let scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&content).build();
 
+    // The mini bar, at the bottom, same as Home/Library — bound to the shell's already-live
+    // controller (see this function's own doc comment), not a second independent one. Tap or
+    // swipe-up opens the full player, reusing the shell's own gesture decision exactly.
+    let mini_bar = crate::player::build_mini_bar_for(controller);
+    let mini_bar_gesture = gtk4::GestureDrag::new();
+    mini_bar_gesture.connect_drag_end({
+        let on_open_player = Rc::new(on_open_player);
+        move |gesture, _, _| {
+            if let Some((offset_x, offset_y)) = gesture.offset() {
+                if crate::screens::main_window::mini_bar_gesture_should_open(offset_x, offset_y) {
+                    on_open_player();
+                }
+            }
+        }
+    });
+    mini_bar.root.add_controller(mini_bar_gesture);
+
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&scroller);
+    root.append(&mini_bar.root);
     toast_overlay.set_child(Some(&root));
 
     // The download menu is built right away (synchronously, below), not once chapters resolve —
@@ -373,6 +401,7 @@ pub fn build(
             download_button: download_menu.widget,
             download_popover: download_menu.popover,
             download_popover_box: download_menu.popover_box,
+            mini_bar: mini_bar.hooks,
         },
     }
 }
@@ -400,6 +429,13 @@ pub(crate) mod tests {
 
     fn test_download_manager(pool: SqlitePool) -> DownloadManager {
         DownloadManager::new(pool, crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false)
+    }
+
+    /// A `PlayerController` with nothing playing — enough for tests that don't exercise the mini
+    /// bar's reflected state (that's covered by `run_shows_the_mini_bar_for_whatever_is_currently_
+    /// playing` below, against a real, already-playing controller).
+    fn test_controller(pool: SqlitePool) -> crate::player::PlayerController {
+        crate::player::PlayerController::new(pool, crate::test_support::test_paths(), crate::player::tests::test_backend(), |_| {})
     }
 
     /// `on_play` calls recorded by the tests below — `(item_id, start_chapter)`.
@@ -466,7 +502,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), Some("Ray Porter"), Some("A lone astronaut."), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Project Hail Mary", Duration::from_secs(5));
@@ -490,7 +526,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Meditations", Some("Marcus Aurelius"), Some(""), None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Meditations", Duration::from_secs(5));
@@ -509,7 +545,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
@@ -530,7 +566,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(&long_description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.label() == long_description, Duration::from_secs(5));
@@ -565,13 +601,13 @@ pub(crate) mod tests {
         let played: PlayCalls = Rc::new(std::cell::RefCell::new(Vec::new()));
         let went_back = Rc::new(Cell::new(false));
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), {
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), {
             let played = played.clone();
             move |item_id: String, chapter: Option<usize>| played.borrow_mut().push((item_id, chapter))
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.chapters_list.row_at_index(1).is_some(), Duration::from_secs(5));
@@ -601,13 +637,13 @@ pub(crate) mod tests {
         let played: PlayCalls = Rc::new(std::cell::RefCell::new(Vec::new()));
         let went_back = Rc::new(Cell::new(false));
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), {
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), {
             let played = played.clone();
             move |item_id: String, chapter: Option<usize>| played.borrow_mut().push((item_id, chapter))
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Test Item", Duration::from_secs(5));
@@ -628,10 +664,10 @@ pub(crate) mod tests {
 
         let went_back = Rc::new(Cell::new(false));
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, {
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         hooks.back_button.emit_clicked();
@@ -651,7 +687,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 10.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.download_button.is_sensitive(), Duration::from_secs(5));
@@ -670,6 +706,52 @@ pub(crate) mod tests {
         );
         pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
         window.destroy();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The direct regression test for the
+    /// reported bug: Item Detail's own mini bar must reflect the exact same live
+    /// `PlayerController` the shell's mini bar shows — not a second, independent copy of it — and
+    /// tapping it should open the full player.
+    pub(crate) fn run_shows_the_mini_bar_for_whatever_is_currently_playing(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 5));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 5.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let controller = test_controller(pool.clone());
+        controller.start(
+            session.clone(),
+            crate::player::PlayRequest { item_id: "item-1".to_string(), title: "Test Item".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        let opened_player = Rc::new(Cell::new(false));
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, {
+            let opened_player = opened_player.clone();
+            move || opened_player.set(true)
+        });
+        let hooks = screen.test_hooks();
+
+        // The mini bar is primed immediately from `controller.snapshot()` at build time — no need
+        // to wait for the next tick to see it reflect what's already playing.
+        assert!(hooks.mini_bar.bar.is_visible(), "the mini bar should show once something is playing");
+        assert_eq!(hooks.mini_bar.title_label.label(), "Test Item");
+
+        hooks.mini_bar.play_button.emit_clicked();
+        pump_until(|| !controller.snapshot().unwrap().is_playing, Duration::from_secs(5));
+        assert!(!controller.snapshot().unwrap().is_playing, "the mini bar's play button should control the exact same shared controller");
+
+        // No new assertion for the tap/swipe-to-open gesture itself: `GestureDrag::offset()`
+        // depends on the controller's own tracked pointer state from a real press/motion/release,
+        // which nothing in this codebase can synthesize (the same limitation `main_window`'s own
+        // mini-bar swipe-up gesture tests hit) — its decision logic
+        // (`mini_bar_gesture_should_open`) is already unit-tested there, and the wiring here is
+        // the same one-line `if` calling an already-tested callback.
+        controller.stop();
     }
 
     fn for_each_descendant(root: &gtk4::Widget, f: &mut dyn FnMut(&gtk4::Widget)) {

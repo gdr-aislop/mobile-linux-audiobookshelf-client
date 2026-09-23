@@ -92,8 +92,9 @@ const SWIPE_UP_MIN_DISTANCE_PX: f64 = 24.0;
 /// `offset_x`/`offset_y` are `GestureDrag::offset()`'s values: the total displacement from press
 /// to release, with negative `offset_y` meaning "moved up." A drag that's mostly horizontal, or
 /// swipes down, does nothing — same as a `GestureClick` simply not recognizing anything but its
-/// own click.
-fn mini_bar_gesture_should_open(offset_x: f64, offset_y: f64) -> bool {
+/// own click. `pub(crate)` so `screens::item_detail`'s own mini bar reuses the identical decision
+/// rather than a second copy.
+pub(crate) fn mini_bar_gesture_should_open(offset_x: f64, offset_y: f64) -> bool {
     let is_tap = offset_x.abs() <= TAP_MAX_MOVEMENT_PX && offset_y.abs() <= TAP_MAX_MOVEMENT_PX;
     let is_swipe_up = offset_y <= -SWIPE_UP_MIN_DISTANCE_PX && offset_y.abs() > offset_x.abs();
     is_tap || is_swipe_up
@@ -326,6 +327,8 @@ pub fn build(
         let account = account.clone();
         let session = session.clone();
         let download_manager = download_manager.clone();
+        let controller = mini_bar.controller.clone();
+        let open_player = open_player.clone();
         let start_playback = Rc::new(start_playback);
         move |request: PlayRequest| {
             let on_play = {
@@ -341,15 +344,21 @@ pub fn build(
                 let root = root.clone();
                 move || crate::widgets::swap_content(&window, &root)
             };
+            let on_open_player = {
+                let open_player = open_player.clone();
+                move || open_player()
+            };
             let item_detail_screen = screens::item_detail::build(
                 pool.clone(),
                 server.clone(),
                 account.clone(),
                 session.clone(),
                 download_manager.clone(),
+                controller.clone(),
                 request.item_id.clone(),
                 on_play,
                 on_back,
+                on_open_player,
             );
             crate::widgets::swap_content(&window, &item_detail_screen.root);
         }

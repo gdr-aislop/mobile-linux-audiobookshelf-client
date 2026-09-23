@@ -183,6 +183,7 @@ mod tests {
         (item_detail_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller, crate::screens::item_detail::tests::run_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller),
         (item_detail_back_button_invokes_on_back, crate::screens::item_detail::tests::run_back_button_invokes_on_back),
         (item_detail_download_menu_starts_a_real_download, crate::screens::item_detail::tests::run_download_menu_starts_a_real_download),
+        (item_detail_shows_the_mini_bar_for_whatever_is_currently_playing, crate::screens::item_detail::tests::run_shows_the_mini_bar_for_whatever_is_currently_playing),
         (item_card_renders, |_rt| crate::widgets::item_card::tests::run()),
         (item_card_wrap_title_shows_the_full_title_without_ellipsizing, |_rt| crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing()),
         (item_card_downloaded_badge_shows_only_when_downloaded, |_rt| crate::widgets::item_card::tests::run_downloaded_badge_shows_only_when_downloaded()),

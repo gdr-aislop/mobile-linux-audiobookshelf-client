@@ -1050,9 +1050,23 @@ pub struct MiniPlayerHooks {
     pub progress: gtk4::ProgressBar,
 }
 
-/// The mini-player bar from `docs/design/ui-spec.md`'s "Player — mini" section: cover placeholder,
-/// title/author, play/pause, a thin progress line — hidden until something has actually played.
-pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_player::AudioBackend>) -> MiniPlayerBar {
+/// The widgets shared by `build_mini_bar` (owns a freshly created `PlayerController`) and
+/// `build_mini_bar_for` (binds to an already-live one) — everything about the mini bar except how
+/// the resulting snapshot closure reaches its controller (constructor argument vs.
+/// `PlayerController::add_listener`) is identical between the two.
+struct MiniBarWidgets {
+    bar: gtk4::Box,
+    cover: CoverImage,
+    title_label: gtk4::Label,
+    author_label: gtk4::Label,
+    play_icon: gtk4::Image,
+    play_button: gtk4::Button,
+    progress: gtk4::ProgressBar,
+}
+
+/// From `docs/design/ui-spec.md`'s "Player — mini" section: cover placeholder, title/author,
+/// play/pause, a thin progress line — hidden until something has actually played.
+fn build_mini_bar_widgets() -> MiniBarWidgets {
     let cover = CoverImage::new(40);
 
     let title_label = gtk4::Label::builder()
@@ -1083,51 +1097,81 @@ pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_pl
     bar.append(&content_row);
     bar.append(&progress);
 
-    let controller = PlayerController::new(pool, paths, backend, {
-        let bar = bar.clone();
-        let title_label = title_label.clone();
-        let author_label = author_label.clone();
-        let play_icon = play_icon.clone();
-        let progress = progress.clone();
-        let cover = cover.clone();
-        move |snapshot: &PlayerSnapshot| {
-            bar.set_visible(true);
-            title_label.set_label(&snapshot.title);
-            author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
-            author_label.set_visible(snapshot.author.is_some());
-            cover.set_path(snapshot.cover_path.as_deref());
-            play_icon.set_icon_name(Some(if snapshot.is_playing {
-                "media-playback-pause-symbolic"
-            } else {
-                "media-playback-start-symbolic"
-            }));
-            let fraction = if snapshot.duration_seconds > 0.0 {
-                (snapshot.position_seconds / snapshot.duration_seconds).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            progress.set_fraction(fraction);
-        }
-    });
+    MiniBarWidgets { bar, cover, title_label, author_label, play_icon, play_button, progress }
+}
 
-    play_button.connect_clicked({
+/// The closure that applies a snapshot to `widgets` — shared between `build_mini_bar` (registered
+/// via `PlayerController::new`) and `build_mini_bar_for` (registered via `add_listener`, and also
+/// called once immediately to prime from whatever's already playing).
+fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapshot) + 'static {
+    let bar = widgets.bar.clone();
+    let title_label = widgets.title_label.clone();
+    let author_label = widgets.author_label.clone();
+    let play_icon = widgets.play_icon.clone();
+    let progress = widgets.progress.clone();
+    let cover = widgets.cover.clone();
+    move |snapshot: &PlayerSnapshot| {
+        bar.set_visible(true);
+        title_label.set_label(&snapshot.title);
+        author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
+        author_label.set_visible(snapshot.author.is_some());
+        cover.set_path(snapshot.cover_path.as_deref());
+        play_icon.set_icon_name(Some(if snapshot.is_playing {
+            "media-playback-pause-symbolic"
+        } else {
+            "media-playback-start-symbolic"
+        }));
+        let fraction = if snapshot.duration_seconds > 0.0 {
+            (snapshot.position_seconds / snapshot.duration_seconds).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        progress.set_fraction(fraction);
+    }
+}
+
+fn mini_bar_from_widgets(widgets: MiniBarWidgets, controller: PlayerController) -> MiniPlayerBar {
+    widgets.play_button.connect_clicked({
         let controller = controller.clone();
         move |_| controller.toggle_play_pause()
     });
 
     MiniPlayerBar {
-        root: bar.clone().upcast(),
+        root: widgets.bar.clone().upcast(),
         controller,
         #[cfg(test)]
         hooks: MiniPlayerHooks {
-            bar,
-            cover_picture: cover.picture().clone(),
-            title_label,
-            author_label,
-            play_button,
-            progress,
+            bar: widgets.bar,
+            cover_picture: widgets.cover.picture().clone(),
+            title_label: widgets.title_label,
+            author_label: widgets.author_label,
+            play_button: widgets.play_button,
+            progress: widgets.progress,
         },
     }
+}
+
+pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_player::AudioBackend>) -> MiniPlayerBar {
+    let widgets = build_mini_bar_widgets();
+    let apply_snapshot = mini_bar_snapshot_applier(&widgets);
+    let controller = PlayerController::new(pool, paths, backend, apply_snapshot);
+    mini_bar_from_widgets(widgets, controller)
+}
+
+/// Same mini-bar widget, bound to an already-live `PlayerController` via `add_listener` instead of
+/// owning construction — used by screens (Item Detail) that need to reflect the exact same
+/// playback state the shell's own mini bar shows, without creating a second, independent
+/// controller. Primes immediately from `controller.snapshot()`: `add_listener` only fires on the
+/// *next* published snapshot, and unlike the shell's own bar (always built before anything can be
+/// playing) this can be built well after playback already started.
+pub fn build_mini_bar_for(controller: PlayerController) -> MiniPlayerBar {
+    let widgets = build_mini_bar_widgets();
+    let apply_snapshot = mini_bar_snapshot_applier(&widgets);
+    if let Some(snapshot) = controller.snapshot() {
+        apply_snapshot(&snapshot);
+    }
+    controller.add_listener(apply_snapshot);
+    mini_bar_from_widgets(widgets, controller)
 }
 
 /// Implements `abs_player::mpris::MprisCommands` by calling back into a real `PlayerController`
