@@ -1402,9 +1402,24 @@ fn grid_group_header(title: &str) -> gtk4::Label {
 }
 
 /// The list-mode equivalent of [`grid_group_header`] — a plain, non-activatable/non-selectable
-/// full-width row, which `GtkListBox` hosts natively (unlike `GtkFlowBox`, no width trick needed).
+/// full-width row, which `GtkListBox` hosts natively (unlike `GtkFlowBox`, no homogeneous-sizing
+/// trick needed). Still needs the same `max_width_chars`/`ellipsize` cap `grid_group_header` uses,
+/// though: `list_box` isn't in its own scroller — it shares the outer `scroller`'s
+/// `hscrollbar_policy(Never)` with `flow_box` via `scroll_content` — so an unclamped label's
+/// natural width bubbles straight up into the window's own size the same way, just through
+/// `ListBoxRow` instead of a homogeneous `FlowBox` cell. Missed once already (a real-device
+/// report after grouping by series in list mode); don't drop it a second time.
 fn list_group_header(title: &str) -> gtk4::ListBoxRow {
-    let label = gtk4::Label::builder().label(title).xalign(0.0).css_classes(["heading"]).margin_start(4).margin_top(8).margin_bottom(4).build();
+    let label = gtk4::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .margin_start(4)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
     gtk4::ListBoxRow::builder().child(&label).activatable(false).selectable(false).build()
 }
 
@@ -2596,6 +2611,21 @@ pub(crate) mod tests {
             list_box_entries(&hooks.list_box),
             vec!["§Andy Weir".to_string(), "Book By Weir".to_string(), "§Frank Herbert".to_string(), "Book By Herbert".to_string()]
         );
+
+        // Regression guard for the real-device bug where this exact header, in list mode, still
+        // forced the window wider than the screen after the grid-mode header was fixed (`list_box`
+        // shares the same non-scrolling outer `scroller` as `flow_box` — see `list_group_header`'s
+        // doc comment). Xvfb can't reproduce the actual overflow, so check the underlying cause
+        // directly: the header label must be capped, not left to ask for its full natural width.
+        let list_header = hooks
+            .list_box
+            .row_at_index(0)
+            .and_then(|row| row.child())
+            .and_then(|w| w.downcast::<gtk4::Label>().ok())
+            .expect("the first list box row is the 'Andy Weir' header label");
+        assert_eq!(list_header.max_width_chars(), 1, "the list-mode header must cap its natural width, same as the grid-mode header");
+        assert_eq!(list_header.ellipsize(), gtk4::pango::EllipsizeMode::End);
+
         hooks.view_toggle.set_active(false);
 
         // The Series chip drives the same Cell via a different trigger — every item here has no
