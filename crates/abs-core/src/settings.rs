@@ -272,8 +272,8 @@ pub async fn set_downloaded_only(pool: &SqlitePool, downloaded_only: bool) -> Re
 /// choice toggles via its own header-bar button, a distinct control from that sheet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LibraryViewMode {
-    #[default]
     Grid,
+    #[default]
     List,
 }
 
@@ -443,9 +443,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn library_view_mode_defaults_to_grid() {
+    async fn library_view_mode_defaults_to_list() {
         let pool = pool().await;
-        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::Grid);
+        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::List);
     }
 
     #[tokio::test]
@@ -461,7 +461,7 @@ mod tests {
     async fn library_view_mode_falls_back_to_default_on_unrecognized_value() {
         let pool = pool().await;
         kv::set(&pool, "library.view_mode", "masonry").await.unwrap();
-        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::Grid);
+        assert_eq!(load_library_view_mode(&pool).await.unwrap(), LibraryViewMode::List);
     }
 
     #[tokio::test]

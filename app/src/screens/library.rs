@@ -122,6 +122,7 @@ pub struct TestHooks {
     pub category_genre: gtk4::ToggleButton,
     pub genre_chip_box: gtk4::Box,
     pub genre_chip_revealer: gtk4::Revealer,
+    pub view_switch_spinner: gtk4::Spinner,
 }
 
 #[cfg(test)]
@@ -240,6 +241,9 @@ struct LibraryWidgets {
     genre_chip_box: gtk4::Box,
     /// This render's cards/rows and their (maybe not yet decoded) covers — see [`PendingCover`].
     pending_covers: Rc<std::cell::RefCell<Vec<PendingCover>>>,
+    /// Shown for the one main-loop tick between a view-mode toggle and the rebuild it triggers —
+    /// see [`apply_view_mode`]/[`set_view_switch_busy`].
+    view_switch_spinner: gtk4::Spinner,
 }
 
 struct LibraryData {
@@ -300,8 +304,8 @@ pub fn build(
 
     // Grid/list toggle — a plain header-bar button per the ui-spec's own wording ("toggle between
     // the two via header bar button"), separate from the view-options popover below. Starts
-    // showing the "switch to list" icon since Grid is the default mode.
-    let view_toggle = gtk4::ToggleButton::builder().icon_name("view-list-symbolic").tooltip_text("List view").build();
+    // active, showing the "switch to grid" icon, since List is the default mode.
+    let view_toggle = gtk4::ToggleButton::builder().active(true).icon_name("view-grid-symbolic").tooltip_text("Grid view").build();
     header.pack_end(&view_toggle);
 
     // The view-options popover (ui-spec "Library browse": Downloaded only/In progress only/Hide
@@ -407,6 +411,7 @@ pub fn build(
         move |_| on_relogin()
     });
 
+    // Hidden until the user switches to Grid mode — List is the default (see `LibraryViewMode`).
     let flow_box = gtk4::FlowBox::builder()
         .homogeneous(true)
         .column_spacing(8)
@@ -417,12 +422,13 @@ pub fn build(
         .margin_bottom(16)
         .selection_mode(gtk4::SelectionMode::None)
         .valign(gtk4::Align::Start)
+        .visible(false)
         .build();
 
     // List mode: a plain `GtkListBox` of `AdwActionRow`s (same "boxed list" pattern `home.rs`'s
     // `libraries_list` already uses), not the spec's literal `GtkListView` — this codebase already
-    // substitutes a simpler widget for the grid too (`GtkFlowBox`, not `GtkGridView`). Hidden until
-    // the user switches to List mode.
+    // substitutes a simpler widget for the grid too (`GtkFlowBox`, not `GtkGridView`). List is the
+    // default mode, so this starts visible.
     let list_box = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -430,7 +436,6 @@ pub fn build(
         .margin_end(16)
         .margin_top(12)
         .margin_bottom(16)
-        .visible(false)
         .build();
 
     let scroll_content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
@@ -438,6 +443,15 @@ pub fn build(
     scroll_content.append(&list_box);
 
     let scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&scroll_content).build();
+
+    // Immediate feedback for the grid/list toggle (see `apply_view_mode`): the rebuild that
+    // happens on tap can take a couple of seconds on a large library, so this spinner is shown
+    // on the very next painted frame, before that rebuild ever runs, rather than leaving the
+    // screen looking unresponsive in the meantime. Overlaid rather than swapped in so the stale
+    // grid/list stays visible underneath instead of vanishing to blank.
+    let view_switch_spinner = gtk4::Spinner::builder().halign(gtk4::Align::Center).valign(gtk4::Align::Center).visible(false).build();
+    let content_overlay = gtk4::Overlay::builder().child(&scroller).build();
+    content_overlay.add_overlay(&view_switch_spinner);
 
     let status_page = adw::StatusPage::builder()
         .icon_name("folder-music-symbolic")
@@ -456,7 +470,7 @@ pub fn build(
     body.append(&offline_banner);
     body.append(&progress_banner);
     body.append(banner.widget());
-    body.append(&scroller);
+    body.append(&content_overlay);
     body.append(&status_page);
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -479,7 +493,7 @@ pub fn build(
         search_entry: search_entry.clone(),
         sort: Rc::new(Cell::new(SortKey::DateAdded)),
         in_progress_only: Rc::new(Cell::new(false)),
-        view_mode: Rc::new(Cell::new(LibraryViewMode::Grid)),
+        view_mode: Rc::new(Cell::new(LibraryViewMode::List)),
         hide_finished: Rc::new(Cell::new(false)),
         grouping: Rc::new(Cell::new(Grouping::None)),
         category_filter: Rc::new(std::cell::RefCell::new(CategoryFilter::All)),
@@ -491,6 +505,7 @@ pub fn build(
         progress_banner: progress_banner.clone(),
         genre_chip_box: genre_chip_box.clone(),
         pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
+        view_switch_spinner: view_switch_spinner.clone(),
     };
 
     // The filter's two manual entry points that don't persist: the banner's "Show all", and (via
@@ -920,6 +935,7 @@ pub fn build(
             category_genre,
             genre_chip_box,
             genre_chip_revealer,
+            view_switch_spinner,
         },
     }
 }
@@ -1185,18 +1201,38 @@ fn apply(data: LibraryData, widgets: &LibraryWidgets) {
     render_from_current_data(widgets);
 }
 
+/// Shows or hides the spinner overlaid on the library content — see `apply_view_mode`'s doc for
+/// why this exists.
+fn set_view_switch_busy(widgets: &LibraryWidgets, busy: bool) {
+    widgets.view_switch_spinner.set_visible(busy);
+    widgets.view_switch_spinner.set_spinning(busy);
+}
+
 /// Applies a view mode to every widget it affects — the toggle button's own icon/tooltip, which
 /// container is visible, and a re-render — and updates `widgets.view_mode` first so that
 /// re-render sees the new mode. Shared by the toggle's `connect_toggled` handler and by restoring
 /// the persisted mode at startup, so both paths stay in sync by construction rather than by
 /// keeping two copies of this logic in step by hand.
+///
+/// The actual container swap + rebuild is deferred by one main-loop idle tick, rather than run
+/// synchronously here: on a large library that rebuild (destroying and reconstructing every
+/// visible card/row) can take a couple of seconds, and running it inline would freeze the screen
+/// before GTK ever gets a chance to paint the icon flip or the busy spinner this function shows
+/// first. Deferring it one tick lets that feedback actually reach the screen before the freeze,
+/// same `glib::idle_add_local_once` idiom `render_from_current_data` already uses to defer cover
+/// decoding until after layout.
 fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk4::ToggleButton) {
     widgets.view_mode.set(mode);
     toggle.set_icon_name(if mode == LibraryViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
     toggle.set_tooltip_text(Some(if mode == LibraryViewMode::List { "Grid view" } else { "List view" }));
-    widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
-    widgets.list_box.set_visible(mode == LibraryViewMode::List);
-    render_from_current_data(widgets);
+    set_view_switch_busy(widgets, true);
+    let widgets = widgets.clone();
+    glib::idle_add_local_once(move || {
+        widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
+        widgets.list_box.set_visible(mode == LibraryViewMode::List);
+        render_from_current_data(&widgets);
+        set_view_switch_busy(&widgets, false);
+    });
 }
 
 fn render_from_current_data(widgets: &LibraryWidgets) {
@@ -1539,7 +1575,7 @@ pub(crate) mod tests {
         titles
     }
 
-    fn list_box_titles(list_box: &gtk4::ListBox) -> Vec<String> {
+    pub(crate) fn list_box_titles(list_box: &gtk4::ListBox) -> Vec<String> {
         let mut titles = Vec::new();
         let mut index = 0;
         while let Some(row) = list_box.row_at_index(index) {
@@ -1629,6 +1665,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
 
         assert!(!hooks.status_page.is_visible(), "should have left the empty state once items synced");
@@ -1669,6 +1707,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         hooks.search_entry.set_text("weir");
@@ -1710,6 +1750,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
 
         hooks.search_entry.set_text("laka");
@@ -1753,6 +1795,8 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         // Mark "item-1" as downloaded (one complete track) directly in storage — this test is
@@ -1811,6 +1855,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
@@ -1862,6 +1908,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(2).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
         assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Zed Book", "Alpha Book", "Middle Book"], "default sort is date-added descending");
 
@@ -1911,6 +1959,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(2).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
         assert_eq!(flow_box_titles(&hooks.flow_box).len(), 3, "no filter is active initially");
         assert!(!hooks.progress_banner.reveals_child(), "the filter banner stays hidden while no filter is active");
@@ -2064,6 +2114,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
 
         let child = hooks.flow_box.child_at_index(0).unwrap();
@@ -2104,21 +2156,66 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
-        assert!(hooks.flow_box.is_visible(), "grid should be visible by default");
-        assert!(!hooks.list_box.is_visible());
-
-        hooks.view_toggle.set_active(true);
-        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(5));
-
-        assert!(!hooks.flow_box.is_visible(), "switching to list mode should hide the grid");
-        assert!(hooks.list_box.is_visible());
-        assert_eq!(list_box_titles(&hooks.list_box).len(), 2);
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        assert!(hooks.list_box.is_visible(), "list should be visible by default");
+        assert!(!hooks.flow_box.is_visible());
 
         hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(5));
-        assert!(hooks.flow_box.is_visible(), "switching back to grid mode should show it again");
-        assert!(!hooks.list_box.is_visible());
+
+        assert!(!hooks.list_box.is_visible(), "switching to grid mode should hide the list");
+        assert!(hooks.flow_box.is_visible());
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2);
+
+        hooks.view_toggle.set_active(true);
+        // `list_box` still holds its stale rows from the default render above (only the active
+        // container is rebuilt on a switch), so waiting on row presence alone could return
+        // immediately without the deferred re-render (and its visibility flip) ever running —
+        // wait on visibility instead, which only the deferred callback can flip.
+        pump_until(|| hooks.list_box.is_visible(), Duration::from_secs(5));
+        assert!(!hooks.flow_box.is_visible());
+    }
+
+    pub(crate) fn run_switching_view_mode_shows_a_spinner_immediately(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(!hooks.view_switch_spinner.is_visible());
+
+        hooks.view_toggle.set_active(false);
+        // Before pumping the main loop at all: the spinner must already be showing and the
+        // rebuild must not have happened yet — proving the feedback lands on the same frame as
+        // the tap, ahead of the (deferred) rebuild, not after it.
+        assert!(hooks.view_switch_spinner.is_visible(), "the spinner should appear before the rebuild runs");
+        assert!(hooks.list_box.is_visible(), "the old mode's container should still be showing");
+
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(5));
+        assert!(!hooks.view_switch_spinner.is_visible(), "the spinner should hide once the rebuild is done");
+        assert!(hooks.flow_box.is_visible());
     }
 
     pub(crate) fn run_list_view_rows_show_title_and_subtitle(runtime: &tokio::runtime::Runtime) {
@@ -2148,9 +2245,7 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
-        hooks.view_toggle.set_active(true);
-        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
         let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
         assert_eq!(row.title(), "Project Hail Mary");
@@ -2190,9 +2285,7 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), on_open, || {}, || {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
-        hooks.view_toggle.set_active(true);
-        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
 
         let row = hooks.list_box.row_at_index(0).unwrap().downcast::<adw::ActionRow>().unwrap();
         row.emit_by_name::<()>("activated", &[]);
@@ -2231,9 +2324,7 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
-        hooks.view_toggle.set_active(true);
-        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(5));
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
 
         assert_eq!(list_box_titles(&hooks.list_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
 
@@ -2272,16 +2363,16 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
         let first_hooks = first_screen.test_hooks();
-        pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
-        assert!(first_hooks.flow_box.is_visible(), "starts in grid mode with nothing persisted yet");
+        pump_until(|| first_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(first_hooks.list_box.is_visible(), "starts in list mode with nothing persisted yet");
 
-        first_hooks.view_toggle.set_active(true);
-        pump_until(|| first_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+        first_hooks.view_toggle.set_active(false);
+        pump_until(|| first_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(5));
 
-        // The toggle's save is a fire-and-forget `spawn_future_local` (and the list rows render
-        // synchronously), so the rows appearing proves nothing about the write having committed.
+        // The toggle's save is a fire-and-forget `spawn_future_local` (and the grid cards render
+        // synchronously), so the cards appearing proves nothing about the write having committed.
         // Probe the persisted value on the same main context — a future queued after the save —
-        // and only rebuild once it reads back List, so the second screen's load can't race the
+        // and only rebuild once it reads back Grid, so the second screen's load can't race the
         // first screen's save.
         let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         glib::spawn_future_local({
@@ -2289,7 +2380,7 @@ pub(crate) mod tests {
             let persisted = persisted.clone();
             async move {
                 loop {
-                    if abs_core::settings::load_library_view_mode(&pool).await.ok() == Some(abs_core::settings::LibraryViewMode::List) {
+                    if abs_core::settings::load_library_view_mode(&pool).await.ok() == Some(abs_core::settings::LibraryViewMode::Grid) {
                         persisted.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
@@ -2303,10 +2394,10 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let second_hooks = second_screen.test_hooks();
-        pump_until(|| second_hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        pump_until(|| second_hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
 
-        assert!(second_hooks.list_box.is_visible(), "a freshly built screen should restore the persisted List mode");
-        assert!(!second_hooks.flow_box.is_visible());
+        assert!(second_hooks.flow_box.is_visible(), "a freshly built screen should restore the persisted Grid mode");
+        assert!(!second_hooks.list_box.is_visible());
     }
 
     /// The fix for the reported freeze: typing must not synchronously re-render on every
@@ -2340,6 +2431,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         hooks.search_entry.set_text("dune");
@@ -2435,6 +2528,8 @@ pub(crate) mod tests {
         app_window.present();
         pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
 
+        pump_until(|| hooks.list_box.row_at_index(39).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(39).is_some(), Duration::from_secs(10));
         // Give the deferred decode's idle callback, and whatever it kicks off, a real chance to
         // run and settle.
@@ -2514,6 +2609,8 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         let _: bool = hooks.hide_finished_switch.emit_by_name("state-set", &[&true]);
@@ -2571,6 +2668,8 @@ pub(crate) mod tests {
         app_window.present();
         pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         hooks.category_author.set_active(true);
@@ -2704,11 +2803,11 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
         let first_hooks = first_screen.test_hooks();
-        pump_until(|| first_hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
-        assert_eq!(flow_box_titles(&first_hooks.flow_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
+        pump_until(|| first_hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        assert_eq!(list_box_titles(&first_hooks.list_box), vec!["Zed Book", "Alpha Book"], "default sort is date-added descending");
 
         first_hooks.sort_by_row.set_selected(1); // Title
-        pump_until(|| flow_box_titles(&first_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
+        pump_until(|| list_box_titles(&first_hooks.list_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
 
         let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         glib::spawn_future_local({
@@ -2730,7 +2829,7 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let second_hooks = second_screen.test_hooks();
-        pump_until(|| flow_box_titles(&second_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(10));
+        pump_until(|| list_box_titles(&second_hooks.list_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(10));
     }
 
     /// The direct regression test for the old lossy `SortKey::to_sort_by` fallback this fix
@@ -2768,10 +2867,10 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
         let first_hooks = first_screen.test_hooks();
-        pump_until(|| first_hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        pump_until(|| first_hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
 
         first_hooks.sort_by_row.set_selected(4); // Last listened
-        pump_until(|| flow_box_titles(&first_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
+        pump_until(|| list_box_titles(&first_hooks.list_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(5));
 
         let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         glib::spawn_future_local({
@@ -2793,7 +2892,7 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let second_hooks = second_screen.test_hooks();
-        pump_until(|| flow_box_titles(&second_hooks.flow_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(10));
+        pump_until(|| list_box_titles(&second_hooks.list_box) == vec!["Alpha Book".to_string(), "Zed Book".to_string()], Duration::from_secs(10));
 
         // The combo's *displayed* selection is only refreshed on `connect_visible_notify` (see
         // `build`'s doc comment there), not kept live — so it must be opened once before
@@ -2840,10 +2939,10 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let first_screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account.clone(), abs_core::auth::Session::new(pool.clone(), &server, &account), offline_mode.clone(), |_| {}, || {}, || {});
         let first_hooks = first_screen.test_hooks();
-        pump_until(|| first_hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        pump_until(|| first_hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
 
         let _: bool = first_hooks.in_progress_only_switch.emit_by_name("state-set", &[&true]);
-        pump_until(|| flow_box_titles(&first_hooks.flow_box) == vec!["Reading Now".to_string()], Duration::from_secs(5));
+        pump_until(|| list_box_titles(&first_hooks.list_box) == vec!["Reading Now".to_string()], Duration::from_secs(5));
 
         let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         glib::spawn_future_local({
@@ -2865,7 +2964,7 @@ pub(crate) mod tests {
         let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
         let second_screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let second_hooks = second_screen.test_hooks();
-        pump_until(|| flow_box_titles(&second_hooks.flow_box) == vec!["Reading Now".to_string()], Duration::from_secs(10));
+        pump_until(|| list_box_titles(&second_hooks.list_box) == vec!["Reading Now".to_string()], Duration::from_secs(10));
         assert!(second_hooks.progress_banner.reveals_child(), "the filter banner should already be up since the filter was persisted active");
     }
 
@@ -2901,6 +3000,8 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
 
         hooks.category_genre.set_active(true);
@@ -2942,10 +3043,10 @@ pub(crate) mod tests {
         let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(20));
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(20));
 
         assert!(!hooks.status_page.is_visible(), "the live demo server has at least one item, so the empty state should clear");
-        assert!(hooks.flow_box.child_at_index(0).is_some());
+        assert!(hooks.list_box.row_at_index(0).is_some());
     }
 
     /// "Sync now" via the ⋯ menu, then pull-to-refresh — the two manual triggers share one sync
@@ -3010,8 +3111,8 @@ pub(crate) mod tests {
         app_window.present();
         pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
 
-        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
-        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 1);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        assert_eq!(list_box_titles(&hooks.list_box).len(), 1);
         assert!(
             !crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the automatic cycle reports through the banner/status page, not a toast"
@@ -3020,7 +3121,7 @@ pub(crate) mod tests {
         // Each trigger's round-trip lands a distinct response (1 → 2 → 3 items, via the stacked
         // `up_to_n_times` mocks above), so every stage's render is its own observable.
         hooks.sync_now_button.emit_clicked();
-        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 2, Duration::from_secs(10));
+        pump_until(|| list_box_titles(&hooks.list_box).len() == 2, Duration::from_secs(10));
         // The toast lands at the cycle's resolve step — after its cover-fetch stage — so wait
         // on it, don't assert it immediately.
         pump_until(
@@ -3033,7 +3134,7 @@ pub(crate) mod tests {
         );
 
         hooks.scroller.emit_by_name::<()>("edge-overshot", &[&gtk4::PositionType::Top]);
-        pump_until(|| flow_box_titles(&hooks.flow_box).len() == 3, Duration::from_secs(10));
+        pump_until(|| list_box_titles(&hooks.list_box).len() == 3, Duration::from_secs(10));
         pump_until(
             || crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             Duration::from_secs(10),

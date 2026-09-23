@@ -680,7 +680,7 @@ pub(crate) mod tests {
     /// update live, with neither screen being rebuilt.
     pub(crate) fn run_offline_mode_toggle_is_shared_between_home_and_library(runtime: &tokio::runtime::Runtime) {
         use crate::screens::home::tests::{account_and_server, count_children, item_json};
-        use crate::screens::library::tests::flow_box_titles;
+        use crate::screens::library::tests::list_box_titles;
 
         let mock_server = runtime.block_on(wiremock::MockServer::start());
         runtime.block_on(
@@ -732,7 +732,7 @@ pub(crate) mod tests {
         let library_hooks = library_screen.test_hooks();
 
         pump_until(|| count_children(&home_hooks.recent_row) == 2, std::time::Duration::from_secs(10));
-        pump_until(|| library_hooks.flow_box.child_at_index(1).is_some(), std::time::Duration::from_secs(10));
+        pump_until(|| library_hooks.list_box.row_at_index(1).is_some(), std::time::Duration::from_secs(10));
 
         // Mark "item-1" downloaded, same setup as each screen's own single-screen offline test.
         runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
@@ -743,7 +743,7 @@ pub(crate) mod tests {
         home_hooks.offline_toggle.set_active(true);
         pump_until(|| library_hooks.offline_toggle.is_active(), std::time::Duration::from_secs(5));
         assert!(library_hooks.offline_banner.reveals_child(), "Library's banner should reveal from a Home-driven toggle, with no rebuild");
-        pump_until(|| flow_box_titles(&library_hooks.flow_box) == vec!["Project Hail Mary".to_string()], std::time::Duration::from_secs(5));
+        pump_until(|| list_box_titles(&library_hooks.list_box) == vec!["Project Hail Mary".to_string()], std::time::Duration::from_secs(5));
         assert!(home_hooks.offline_banner.reveals_child());
 
         // Toggle back off from LIBRARY's widget — Home must pick up the reverse.
@@ -751,7 +751,7 @@ pub(crate) mod tests {
         pump_until(|| !home_hooks.offline_toggle.is_active(), std::time::Duration::from_secs(5));
         assert!(!home_hooks.offline_banner.reveals_child());
         pump_until(|| count_children(&home_hooks.recent_row) == 2, std::time::Duration::from_secs(5));
-        assert_eq!(flow_box_titles(&library_hooks.flow_box).len(), 2);
+        assert_eq!(list_box_titles(&library_hooks.list_box).len(), 2);
     }
 
     /// The full chain restored by this plan: tapping a Home card opens Item Detail (not
