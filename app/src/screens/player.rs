@@ -2,7 +2,9 @@
 //! a secondary row of speed/sleep-timer/chapters controls, and a header `⋯` menu for "Add
 //! bookmark", "Mark as finished", and "Reset progress". Opened by `main_window` swapping window
 //! content in (there's no `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita
-//! ceiling, both v1.4+); the down-chevron header button calls `on_collapse` to swap back.
+//! ceiling, both v1.4+); the down-chevron header button, the `Esc` key, and a downward swipe
+//! anywhere on the screen (mirroring the mini bar's own swipe-up gesture, minus the tap
+//! component — see `player_gesture_should_collapse`) all call `on_collapse` to swap back.
 //!
 //! The keyboard-only equivalents of the on-screen controls (ui-spec §6's full-player set:
 //! arrow-key skip, speed stepping, `c`/`t`/Escape) are registered into the `SimpleActionGroup`
@@ -258,6 +260,26 @@ pub fn build(
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&content);
+
+    // Swipe-down-to-collapse — the counterpart to the mini bar's own swipe-up-to-open gesture
+    // (see `main_window`'s `mini_bar_gesture_should_open`). Added directly on `root`, the same
+    // "gesture on an ancestor, button/scale descendants keep working" arrangement already proven
+    // there: a click on `collapse_button`/`menu_button` or a drag on `scrubber` claims its own
+    // touch sequence, so this ancestor `GestureDrag` never sees a `drag-end` for those.
+    let player_gesture = gtk4::GestureDrag::new();
+    player_gesture.connect_drag_end({
+        let controller = controller.clone();
+        let on_collapse = on_collapse.clone();
+        move |gesture, _, _| {
+            if let Some((offset_x, offset_y)) = gesture.offset() {
+                if player_gesture_should_collapse(offset_x, offset_y) {
+                    controller.clear_full_update();
+                    on_collapse();
+                }
+            }
+        }
+    });
+    root.add_controller(player_gesture);
 
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&root));
@@ -599,6 +621,22 @@ fn format_hms(total_seconds: f64) -> String {
     } else {
         format!("{minutes}:{seconds:02}")
     }
+}
+
+/// Below this, a downward drag is ignored; at or above it, a predominantly-downward drag
+/// collapses the screen back to the mini bar. Unlike the mini bar's own swipe-up gesture (which
+/// also treats a tap as "open"), there is deliberately no tap component here — a plain tap on the
+/// full player's background (cover, title, empty space) must not collapse it. First-pass
+/// calibration only, same as `main_window::SWIPE_UP_MIN_DISTANCE_PX`: the ui-spec flags this as
+/// "not yet validated" against real hardware.
+const SWIPE_DOWN_MIN_DISTANCE_PX: f64 = 24.0;
+
+/// Whether a completed drag on the full player should collapse it — a predominantly-downward
+/// drag that traveled at least `SWIPE_DOWN_MIN_DISTANCE_PX`. `offset_x`/`offset_y` are
+/// `GestureDrag::offset()`'s values (total displacement from press to release); a mostly
+/// horizontal drag, an upward swipe, or a drag short of the threshold does nothing.
+fn player_gesture_should_collapse(offset_x: f64, offset_y: f64) -> bool {
+    offset_y >= SWIPE_DOWN_MIN_DISTANCE_PX && offset_y.abs() > offset_x.abs()
 }
 
 #[cfg(test)]
@@ -1058,4 +1096,38 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn player_gesture_ignores_a_tap() {
+        // Deliberately asymmetric with the mini bar's swipe-up gesture: a tap must not collapse
+        // the full player.
+        assert!(!player_gesture_should_collapse(0.0, 0.0));
+    }
+
+    #[test]
+    fn player_gesture_recognizes_a_clean_swipe_down() {
+        assert!(player_gesture_should_collapse(0.0, SWIPE_DOWN_MIN_DISTANCE_PX));
+        assert!(player_gesture_should_collapse(2.0, SWIPE_DOWN_MIN_DISTANCE_PX + 1.0));
+    }
+
+    #[test]
+    fn player_gesture_ignores_a_swipe_up() {
+        assert!(!player_gesture_should_collapse(0.0, -SWIPE_DOWN_MIN_DISTANCE_PX));
+    }
+
+    #[test]
+    fn player_gesture_ignores_a_horizontal_swipe() {
+        assert!(!player_gesture_should_collapse(SWIPE_DOWN_MIN_DISTANCE_PX, 0.0));
+    }
+
+    #[test]
+    fn player_gesture_ignores_a_mostly_horizontal_diagonal_drag() {
+        // Crosses the vertical threshold, but the horizontal component dominates — not a clean
+        // downward swipe, so this must not collapse the screen.
+        assert!(!player_gesture_should_collapse(SWIPE_DOWN_MIN_DISTANCE_PX * 2.0, SWIPE_DOWN_MIN_DISTANCE_PX));
+    }
+
+    #[test]
+    fn player_gesture_requires_the_full_swipe_distance() {
+        assert!(!player_gesture_should_collapse(0.0, SWIPE_DOWN_MIN_DISTANCE_PX - 1.0));
+    }
 }
