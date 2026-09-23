@@ -94,9 +94,14 @@ impl EmptyState {
             .build();
         // Raw error text for the failed mode: a self-hosted user debugging TLS/proxy setups gets
         // the real cause (selectable, so it can be copied), same posture as the ErrorBanner's
-        // details expander. Hidden unless `show_error` says otherwise.
+        // details expander. Hidden unless `show_error` says otherwise. `max_width_chars(1)` caps
+        // this label's natural width regardless of `wrap` — this `EmptyState` sits directly in
+        // `body` with no horizontal scroller in its ancestry, so an unclamped long error message
+        // could otherwise force the window wider than the screen (see `widgets::banner`'s
+        // identical fix for the same reasoning).
         let details = gtk4::Label::builder()
             .wrap(true)
+            .max_width_chars(1)
             .justify(gtk4::Justification::Center)
             .selectable(true)
             .css_classes(["dim-label", "caption"])

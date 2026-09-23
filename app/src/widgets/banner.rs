@@ -25,8 +25,16 @@ pub struct ErrorBanner {
 impl ErrorBanner {
     pub fn new() -> Self {
         let icon = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+        // `max_width_chars(1)` caps this label's *natural* width request regardless of `wrap` —
+        // an unclamped label asks Pango for enough room to lay out the whole message on one line
+        // before wrapping, and this banner sits in a plain `Box` with no horizontal scroller
+        // anywhere in its ancestry (`home.rs`/`library.rs` append it straight to their root
+        // `Box`), so a long server/network error message could otherwise force the whole window
+        // wider than the screen — the exact failure mode `widgets::item_card`'s `title_label` doc
+        // comment already documents once, for a different label.
         let label = gtk4::Label::builder()
             .wrap(true)
+            .max_width_chars(1)
             .xalign(0.0)
             .hexpand(true)
             .css_classes(["error"])
@@ -54,6 +62,7 @@ impl ErrorBanner {
         // collapsed — when there's nothing to show (see `set_details`).
         let details_label = gtk4::Label::builder()
             .wrap(true)
+            .max_width_chars(1)
             .xalign(0.0)
             .selectable(true)
             .css_classes(["dim-label", "caption"])

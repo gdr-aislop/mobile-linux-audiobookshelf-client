@@ -96,8 +96,12 @@ pub fn build(
     cover.widget().set_halign(gtk4::Align::Center);
     cover.widget().set_margin_top(14);
 
-    let title_label = gtk4::Label::builder().wrap(true).justify(gtk4::Justification::Center).css_classes(["title-2"]).margin_top(18).build();
-    let author_label = gtk4::Label::builder().wrap(true).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).visible(false).build();
+    // `max_width_chars(1)` caps each label's natural width regardless of `wrap` — this content
+    // sits in a `ScrolledWindow` with `hscrollbar_policy(Never)` (see below), so an unclamped,
+    // fully server-controlled title/author string could otherwise force the whole window wider
+    // than the screen (see `widgets::banner`'s identical fix for the same reasoning).
+    let title_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["title-2"]).margin_top(18).build();
+    let author_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).visible(false).build();
     let duration_label = gtk4::Label::builder().css_classes(["caption", "dim-label"]).margin_top(4).build();
 
     let progress_bar = gtk4::ProgressBar::builder().margin_top(10).visible(false).build();

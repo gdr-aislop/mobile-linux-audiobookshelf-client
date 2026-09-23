@@ -400,7 +400,10 @@ fn save_cancel_dialog(
     let dialog = gtk4::Dialog::builder().title(title).modal(true).transient_for(window).build();
     dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
     dialog.add_button("Save", gtk4::ResponseType::Ok);
-    let error_label = gtk4::Label::builder().css_classes(["error"]).wrap(true).visible(false).halign(gtk4::Align::Start).build();
+    // `max_width_chars(1)` caps this label's natural width regardless of `wrap`, so a long
+    // validation error can't force this dialog window wider than the screen (see
+    // `widgets::banner`'s identical fix for the same reasoning).
+    let error_label = gtk4::Label::builder().css_classes(["error"]).wrap(true).max_width_chars(1).visible(false).halign(gtk4::Align::Start).build();
     let response_label = error_label.clone();
     dialog.connect_response(move |dialog, response| {
         if response == gtk4::ResponseType::Ok {
@@ -565,7 +568,9 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
     content.append(&file_label);
     content.append(&choose_button);
     content.append(&gtk4::PasswordEntry::builder().show_peek_icon(true).placeholder_text("Export password").build());
-    content.append(&gtk4::Label::builder().css_classes(["error"]).wrap(true).visible(false).halign(gtk4::Align::Start).build());
+    // `max_width_chars(1)` caps this label's natural width regardless of `wrap` (see the
+    // `error_label` above in `save_cancel_dialog` for the same reasoning).
+    content.append(&gtk4::Label::builder().css_classes(["error"]).wrap(true).max_width_chars(1).visible(false).halign(gtk4::Align::Start).build());
 
     if current_path.is_some() {
         let remove_button = gtk4::Button::builder().label("Remove Certificate").css_classes(["destructive-action"]).halign(gtk4::Align::Start).build();

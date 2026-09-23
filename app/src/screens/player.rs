@@ -115,14 +115,20 @@ pub fn build(
     let cover = crate::widgets::cover_image::CoverImage::new(264);
     cover.widget().set_halign(gtk4::Align::Center);
     cover.widget().set_margin_top(14);
+    // `max_width_chars(1)` caps each label's natural width regardless of `wrap` — this screen's
+    // main content sits in a plain `Box` with no `ScrolledWindow` anywhere in its layout (only
+    // the chapters popover scrolls), so an unclamped, fully server-controlled title/author
+    // string could otherwise force the whole window wider than the screen (see
+    // `widgets::banner`'s identical fix for the same reasoning).
     let title_label = gtk4::Label::builder()
         .wrap(true)
+        .max_width_chars(1)
         .justify(gtk4::Justification::Center)
         .css_classes(["title-2"])
         .margin_top(22)
         .build();
     let author_label =
-        gtk4::Label::builder().wrap(true).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).build();
+        gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).build();
 
     let scrubber = gtk4::Scale::builder().orientation(gtk4::Orientation::Horizontal).hexpand(true).build();
     scrubber.set_range(0.0, 1.0);

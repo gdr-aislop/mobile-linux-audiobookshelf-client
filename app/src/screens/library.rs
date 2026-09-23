@@ -1376,14 +1376,29 @@ fn group_key_for(item: &Item, grouping: Grouping) -> String {
     }
 }
 
-/// A grouped (not sticky — see this module's doc comment) section header for grid mode, built to
-/// occupy its own line among `GtkFlowBox`'s wrapped tiles: giving it `hexpand` plus a minimum
-/// width wider than any single tile makes FlowBox's own wrapping place it alone on its row.
-/// Returned as a plain `GtkLabel`, not a `GtkFlowBoxChild` — `FlowBox::insert` already wraps
-/// whatever widget it's given in its own `FlowBoxChild` (the same way every item card here is
-/// inserted), so wrapping it again here would nest two `FlowBoxChild`s per header.
+/// A grouped (not sticky — see this module's doc comment) section header for grid mode. Returned
+/// as a plain `GtkLabel`, not a `GtkFlowBoxChild` — `FlowBox::insert` already wraps whatever
+/// widget it's given in its own `FlowBoxChild` (the same way every item card here is inserted),
+/// so wrapping it again here would nest two `FlowBoxChild`s per header.
+///
+/// Deliberately does **not** try to force itself onto its own full-width line via `hexpand` +
+/// an oversized `width_request` — an earlier version did exactly that, and it overflowed the
+/// whole window on a real (narrow-phone) device: `flow_box` is `.homogeneous(true)`, which
+/// resizes *every* child to the natural width of the single widest one, so a header wider than a
+/// tile balloons every tile too, and `flow_box`'s own natural-width request balloons with it;
+/// with the outer `scroller`'s `hscrollbar_policy(Never)`, there's no scrollbar to absorb that,
+/// so it propagates straight into the window's size. This is the exact same failure mode
+/// `widgets::item_card`'s `title_label` doc comment already documents once for a different
+/// child in this same box — `max_width_chars` is what actually prevents it, not a width fight.
 fn grid_group_header(title: &str) -> gtk4::Label {
-    gtk4::Label::builder().label(title).xalign(0.0).css_classes(["heading"]).hexpand(true).width_request(TILE_SIZE * 3).can_focus(false).build()
+    gtk4::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .can_focus(false)
+        .build()
 }
 
 /// The list-mode equivalent of [`grid_group_header`] — a plain, non-activatable/non-selectable
@@ -2552,6 +2567,21 @@ pub(crate) mod tests {
             vec!["§Andy Weir".to_string(), "Book By Weir".to_string(), "§Frank Herbert".to_string(), "Book By Herbert".to_string()],
             "grouping by author should insert one alphabetically-ordered header per author"
         );
+
+        // Regression guard for the real-device bug where a header forced the whole window wider
+        // than the screen: `flow_box` is `.homogeneous(true)`, so a header with an oversized
+        // `width_request`/`hexpand` balloons every tile's width, and the box's own natural-width
+        // request, right along with it (see `grid_group_header`'s doc comment). Xvfb can't
+        // reproduce the actual window-width overflow this caused on a real phone, so this checks
+        // the underlying cause directly: the header must not carry a forced minimum width.
+        let header = hooks
+            .flow_box
+            .child_at_index(0)
+            .and_then(|child| child.child())
+            .and_then(|w| w.downcast::<gtk4::Label>().ok())
+            .expect("the first flow box child is the 'Andy Weir' header label");
+        assert_eq!(header.width_request(), -1, "the header must not force a minimum width onto the homogeneous flow box");
+        assert!(!header.hexpands(), "the header must not try to force itself onto its own line via hexpand");
 
         // The popover's own "Grouping" combo must reflect the chip's choice once it's opened —
         // the two are one persisted value, refreshed on `connect_visible_notify` (see `build`).
