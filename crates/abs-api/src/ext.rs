@@ -364,6 +364,42 @@ impl Client {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LibrarySeriesResponseBody {
+    results: Vec<RawLibrarySeries>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLibrarySeries {
+    id: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    books: Vec<RawSeriesBook>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSeriesBook {
+    id: Option<String>,
+    /// The book's position within this one series — a nullable **string** on the wire (e.g.
+    /// `"5"`, or `"5.5"` for an inserted novella), not a number; Audiobookshelf's own schema
+    /// (`third_party/audiobookshelf-openapi/openapi.json`'s `sequence` schema) documents it this
+    /// way, so this is passed through as-is rather than parsed into an integer.
+    sequence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesBookSummary {
+    pub item_id: String,
+    pub sequence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibrarySeriesSummary {
+    pub id: String,
+    pub name: String,
+    pub books: Vec<SeriesBookSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LibraryItemSummary {
     pub id: String,
@@ -615,6 +651,54 @@ impl Client {
                     series_name: metadata.series_name,
                     genres: metadata.genres,
                 })
+            })
+            .collect())
+    }
+
+    /// Fetch a library's series list, each with its books and their per-series `sequence` (e.g.
+    /// `"5"`, or `"5.5"` for an inserted novella) — the only place Audiobookshelf's API actually
+    /// exposes a book's position within a series; `media.metadata.seriesName` (used above) is a
+    /// flat convenience string with no number attached.
+    ///
+    /// Named `_summaries` rather than plain `get_library_series` — that name is already taken by
+    /// the *generated* client method (this endpoint isn't an outright gap like
+    /// `get_library_items_with_media`'s). This hand-written version exists anyway: the generated
+    /// response types (`SeriesId`, `LibraryItemId`) require every id to be a syntactically valid
+    /// UUID, deserializing the *whole* response as an error otherwise — inconsistent with how
+    /// this crate treats item/series ids everywhere else, as opaque strings (see
+    /// `LibraryItemSummary.id: String` above), and needlessly fragile against a server that ever
+    /// sends a non-UUID id. This mirrors `get_library_items_with_media`'s own `filter_map`
+    /// posture instead: a series or book entry missing its id is skipped rather than failing the
+    /// whole page. `GET /api/libraries/{id}/series` is unpaginated here too, same as
+    /// `get_library_items_with_media` — no `limit`/`page` params sent, relying on the server
+    /// returning everything in one response.
+    pub async fn get_library_series_summaries(&self, library_id: &str) -> Result<Vec<LibrarySeriesSummary>, LibraryItemsError> {
+        let response = self.client().get(format!("{}/api/libraries/{library_id}/series", self.baseurl())).send().await?;
+
+        if is_auth_status(response.status()) {
+            return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
+        if !response.status().is_success() {
+            return Err(LibraryItemsError::UnexpectedResponse(format!(
+                "GET /api/libraries/{library_id}/series returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let body: LibrarySeriesResponseBody = response.json().await?;
+
+        Ok(body
+            .results
+            .into_iter()
+            .filter_map(|series| {
+                let id = series.id?;
+                let name = series.name?;
+                let books = series
+                    .books
+                    .into_iter()
+                    .filter_map(|book| Some(SeriesBookSummary { item_id: book.id?, sequence: book.sequence }))
+                    .collect();
+                Some(LibrarySeriesSummary { id, name, books })
             })
             .collect())
     }
@@ -1372,6 +1456,78 @@ mod tests {
 
         let client = Client::new(&server.uri());
         let err = client.get_library_items_with_media("lib-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_library_series_summaries_parses_series_and_book_sequences() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/series"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "id": "series-1",
+                    "name": "Foundation",
+                    "books": [
+                        { "id": "item-1", "sequence": "1" },
+                        { "id": "item-2", "sequence": null }
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let series = client.get_library_series_summaries("lib-1").await.unwrap();
+
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].id, "series-1");
+        assert_eq!(series[0].name, "Foundation");
+        assert_eq!(series[0].books.len(), 2);
+        assert_eq!(series[0].books[0].item_id, "item-1");
+        assert_eq!(series[0].books[0].sequence.as_deref(), Some("1"));
+        assert_eq!(series[0].books[1].item_id, "item-2");
+        assert_eq!(series[0].books[1].sequence, None, "a null sequence is a real, if less common, server-side possibility");
+    }
+
+    #[tokio::test]
+    async fn get_library_series_summaries_skips_a_series_or_book_missing_its_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/series"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    { "name": "No Id Series", "books": [{ "id": "item-1", "sequence": "1" }] },
+                    {
+                        "id": "series-1",
+                        "name": "Foundation",
+                        "books": [{ "sequence": "1" }, { "id": "item-2", "sequence": "2" }]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let series = client.get_library_series_summaries("lib-1").await.unwrap();
+
+        assert_eq!(series.len(), 1, "the id-less series must be skipped entirely, not just its malformed book");
+        assert_eq!(series[0].id, "series-1");
+        assert_eq!(series[0].books.len(), 1, "the id-less book within a valid series is skipped without failing the series");
+        assert_eq!(series[0].books[0].item_id, "item-2");
+    }
+
+    #[tokio::test]
+    async fn get_library_series_summaries_propagates_server_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries/lib-1/series"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_library_series_summaries("lib-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
     }
 

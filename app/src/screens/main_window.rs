@@ -11,6 +11,7 @@
 //! wide-screen sidebar layout (`AdwNavigationSplitView`/`AdwBreakpoint`, both v1.4+) — phone-width
 //! single-pane only, left as a documented follow-up.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
@@ -319,6 +320,15 @@ pub fn build(
     // (below) is `start_playback`, which opens the full Player screen itself once playback has
     // actually started, rather than returning to the shelf and waiting for the mini bar to catch
     // up a moment later.
+    // Filled in right after `library_screen` is actually built, below — `on_open` (this closure)
+    // needs to call a method on it from inside Item Detail's series-button callback, but
+    // `library_screen` itself is built from a call that takes `on_open.clone()` as its own
+    // card-tap handler, so it can't exist yet when `on_open` is defined. Safe because
+    // `library_screen` is always built synchronously later in this same `build()` call, before
+    // the event loop ever runs — no tap into Item Detail's series button can happen before this
+    // cell is populated.
+    let library_screen_cell: Rc<RefCell<Option<screens::library::LibraryScreen>>> = Rc::new(RefCell::new(None));
+
     let on_open = {
         let window = window.clone();
         let root = root.clone();
@@ -329,6 +339,8 @@ pub fn build(
         let download_manager = download_manager.clone();
         let controller = mini_bar.controller.clone();
         let open_player = open_player.clone();
+        let stack = stack.clone();
+        let library_screen_cell = library_screen_cell.clone();
         let start_playback = Rc::new(start_playback);
         move |request: PlayRequest| {
             let on_play = {
@@ -348,6 +360,22 @@ pub fn build(
                 let open_player = open_player.clone();
                 move || open_player()
             };
+            // Closes Item Detail, restores the shell, switches to the Library tab, and filters
+            // it to just this series — the same "close this screen, land on a specific Library
+            // state" shape `on_open_shelf` (below) already uses for Home's shelf tap-through.
+            let on_open_series = {
+                let window = window.clone();
+                let root = root.clone();
+                let stack = stack.clone();
+                let library_screen_cell = library_screen_cell.clone();
+                move |series_name: String| {
+                    crate::widgets::swap_content(&window, &root);
+                    stack.set_visible_child_name("library");
+                    if let Some(library_screen) = library_screen_cell.borrow().as_ref() {
+                        library_screen.apply_series_filter(&series_name);
+                    }
+                }
+            };
             let item_detail_screen = screens::item_detail::build(
                 pool.clone(),
                 server.clone(),
@@ -359,6 +387,7 @@ pub fn build(
                 on_play,
                 on_back,
                 on_open_player,
+                on_open_series,
             );
             crate::widgets::swap_content(&window, &item_detail_screen.root);
         }
@@ -381,6 +410,7 @@ pub fn build(
             move || stack.set_visible_child_name("settings")
         },
     );
+    *library_screen_cell.borrow_mut() = Some(library_screen.clone());
 
     // Home's shelf headings' tap-through (ui-spec Home section): switch to Library and land on
     // the shelf's view — Recently Added pre-sorted by date added; Continue Listening pre-sorted
@@ -876,6 +906,97 @@ pub(crate) mod tests {
         assert_eq!(hooks.mini_bar.title_label.label(), "Project Hail Mary", "the mini bar should reflect the item Play just started");
     }
 
+    /// End-to-end proof of Item Detail's series-button tap-through: tap a card with series
+    /// metadata, open Item Detail, tap its series button once the real "N/M" has resolved,
+    /// confirm the shell is restored, the Library tab is active, and the visible list is
+    /// filtered to just that series.
+    pub(crate) fn run_tapping_the_series_button_opens_library_filtered_to_that_series(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "item-1",
+                        "addedAt": 1_700_000_000_000i64,
+                        "media": { "duration": 3600.0, "metadata": { "title": "Foundation Book", "authorName": "Isaac Asimov", "seriesName": "Foundation" } }
+                    }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 5));
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/series"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "id": "series-1", "name": "Foundation", "books": [{ "id": "item-1", "sequence": "1" }] }]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        let card_button = find_card_button(&home_root).expect("a synced item's card should render");
+        card_button.emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Foundation Book")),
+            std::time::Duration::from_secs(5),
+        );
+
+        // Pass 1 shows the plain name first; wait for Pass 2's real "1/1" before tapping, so the
+        // click is against the finished, network-refined state.
+        pump_until(
+            || app_window.content().is_some_and(|content| find_button_containing_label(&content, "Foundation, 1/1").is_some()),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("Item Detail should be showing");
+        let series_button = find_button_containing_label(&content, "Foundation, 1/1").expect("the series button should show the real sequence/total");
+        series_button.emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|content| content == window.root),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(hooks.stack.visible_child_name().as_deref(), Some("library"), "tapping the series button should switch to the Library tab");
+        let library_root = hooks.stack.child_by_name("library").expect("library tab exists");
+        pump_until(|| find_label_text(&library_root, "Foundation Book"), std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn mini_bar_gesture_recognizes_a_tap() {
         assert!(mini_bar_gesture_should_open(0.0, 0.0));
@@ -1073,6 +1194,36 @@ pub(crate) mod tests {
         }
         let mut found = None;
         walk(root, label, &mut found);
+        found
+    }
+
+    /// Like [`find_button_labeled`], but for a button built with a custom `Label` child (via
+    /// `set_child`, not the `label` convenience property) — Item Detail's series button is
+    /// exactly this shape, since its text updates in place across two render passes.
+    fn find_button_containing_label(root: &gtk4::Widget, text: &str) -> Option<gtk4::Button> {
+        fn walk(widget: &gtk4::Widget, text: &str, found: &mut Option<gtk4::Button>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if let Some(child) = button.child() {
+                    if find_label_text(&child, text) {
+                        *found = Some(button.clone());
+                        return;
+                    }
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, text, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, text, &mut found);
         found
     }
 

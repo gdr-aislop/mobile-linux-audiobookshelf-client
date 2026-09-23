@@ -1,5 +1,7 @@
 //! The Item Detail screen — `docs/design/ui-spec.md` §3's "Item detail" section and
-//! `docs/ui-test-plan.md` §6 (ID-1 through ID-16): cover, metadata, progress, a primary
+//! `docs/ui-test-plan.md` §6 (ID-1 through ID-16): cover, metadata, progress, series info (name
+//! and position — "Name, 5/8" — with a tap-through to Library filtered to that series, via
+//! `on_open_series`; see `abs_core::series` for where the real numbers come from), a primary
 //! Play/Resume button, the shared download-scope menu (`widgets::download_scope_menu`), a
 //! truncated description, a tappable chapter list, and — at the bottom, same as Home/Library —
 //! the mini bar reflecting whatever is currently playing. Pushed by `main_window` swapping window
@@ -49,6 +51,8 @@ pub struct TestHooks {
     pub back_button: gtk4::Button,
     pub title_label: gtk4::Label,
     pub author_label: gtk4::Label,
+    pub series_button: gtk4::Button,
+    pub series_button_label: gtk4::Label,
     pub duration_label: gtk4::Label,
     pub progress_bar: gtk4::ProgressBar,
     pub play_button: gtk4::Button,
@@ -79,7 +83,9 @@ impl ItemDetailScreen {
 /// mini bar this screen shows at the bottom — see `crate::player::build_mini_bar_for`'s doc for
 /// why this reflects real playback state rather than a second, independent copy of it. Tapping or
 /// swiping up on that mini bar calls `on_open_player`, exactly mirroring the shell's own mini
-/// bar's tap/swipe-up-to-open gesture (`main_window::mini_bar_gesture_should_open`).
+/// bar's tap/swipe-up-to-open gesture (`main_window::mini_bar_gesture_should_open`). `on_open_series`
+/// fires when the series button (below the author line) is tapped, with the item's plain series
+/// name — the caller is expected to close this screen and land on Library filtered to that series.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
@@ -92,8 +98,10 @@ pub fn build(
     on_play: impl Fn(String, Option<usize>) + 'static,
     on_back: impl Fn() + 'static,
     on_open_player: impl Fn() + 'static,
+    on_open_series: impl Fn(String) + 'static,
 ) -> ItemDetailScreen {
     let on_play = Rc::new(on_play);
+    let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);
 
     let header = adw::HeaderBar::new();
@@ -115,6 +123,14 @@ pub fn build(
     // than the screen (see `widgets::banner`'s identical fix for the same reasoning).
     let title_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["title-2"]).margin_top(18).build();
     let author_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).visible(false).build();
+    // One widget, whose *text* changes in place from the plain series name (Pass 1, local) to
+    // "Name, N/M" (Pass 2, once the network call resolves) — never swapped for a different widget
+    // and never allowed to wrap to a second line (`max_width_chars` + `ellipsize` on the label,
+    // same device `title_label`/`author_label` above use), so filling in the numbers later can't
+    // shift the chapters list/mini bar below it. Hidden entirely when the item has no series.
+    let series_button = gtk4::Button::builder().css_classes(["flat"]).halign(gtk4::Align::Center).margin_top(4).visible(false).build();
+    let series_button_label = gtk4::Label::builder().max_width_chars(1).ellipsize(gtk4::pango::EllipsizeMode::End).build();
+    series_button.set_child(Some(&series_button_label));
     let duration_label = gtk4::Label::builder().css_classes(["caption", "dim-label"]).margin_top(4).build();
 
     let progress_bar = gtk4::ProgressBar::builder().margin_top(10).visible(false).build();
@@ -178,6 +194,7 @@ pub fn build(
     content.append(cover.widget());
     content.append(&title_label);
     content.append(&author_label);
+    content.append(&series_button);
     content.append(&duration_label);
     content.append(&progress_bar);
     content.append(&actions_row);
@@ -243,6 +260,9 @@ pub fn build(
         let pool = pool.clone();
         let title_label = title_label.clone();
         let author_label = author_label.clone();
+        let series_button = series_button.clone();
+        let series_button_label = series_button_label.clone();
+        let on_open_series = on_open_series.clone();
         let duration_label = duration_label.clone();
         let progress_bar = progress_bar.clone();
         let play_button = play_button.clone();
@@ -275,6 +295,19 @@ pub fn build(
                     author_label.set_label(&subtitle);
                     author_label.set_visible(true);
                 }
+                // Series: shown immediately with just the plain name (already cached on the
+                // item itself, no network needed); Pass 2 below fills the real "N/M" into this
+                // same label once the series-list call resolves. Clickable right away — jumping
+                // to Library filtered by name doesn't need the numbers.
+                if let Some(series_name) = item.series_name.as_deref().filter(|s| !s.is_empty()) {
+                    series_button_label.set_label(series_name);
+                    series_button.set_visible(true);
+                    series_button.connect_clicked({
+                        let on_open_series = on_open_series.clone();
+                        let series_name = series_name.to_string();
+                        move |_| on_open_series(series_name.clone())
+                    });
+                }
                 duration_label.set_label(&format_duration(item.duration_seconds));
                 cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
                 if let Some(description) = item.description.as_deref().filter(|d| !d.is_empty()) {
@@ -299,7 +332,42 @@ pub fn build(
                 }
             }
 
-            // Pass 2: chapters + tracks, via the same `resolve_stream_target` call Player's own
+            // Pass 2 (series): fetches the real "N/M" from the network, async and non-blocking —
+            // `series_button` is already visible and clickable from Pass 1 above (plain name
+            // only); this just updates its label text in place once the call resolves. A failure
+            // here (offline, server hiccup, library not yet fetched) just leaves the Pass-1 label
+            // as-is — never regresses a working local render because of a network error, same
+            // posture the chapters fallback right below already has. See `abs_core::series`'s own
+            // doc comment for why this call lives here rather than in the general sync cycle.
+            if let Some(item) = &item {
+                if item.series_name.as_deref().is_some_and(|s| !s.is_empty()) {
+                    let library_id = item.library_id.clone();
+                    let synced = match session.connection_target().await {
+                        Ok(connection) => match connection.api_client_with_timeout(&session.access_token().await, std::time::Duration::from_secs(5)) {
+                            Ok(api) => abs_core::series::sync_library_series(&pool, &api, &server_id, &library_id).await.is_ok(),
+                            Err(err) => {
+                                tracing::info!(%err, item_id = %item_id, "couldn't build an API client to refresh series info");
+                                false
+                            }
+                        },
+                        Err(err) => {
+                            tracing::info!(%err, item_id = %item_id, "couldn't load connection settings to refresh series info");
+                            false
+                        }
+                    };
+                    if synced {
+                        if let Ok(Some(info)) = abs_core::series::series_info_for_item(&pool, &server_id, &item_id).await {
+                            let label = match &info.sequence {
+                                Some(seq) => format!("{}, {seq}/{}", info.series_name, info.total_books),
+                                None => format!("{} ({} books)", info.series_name, info.total_books),
+                            };
+                            series_button_label.set_label(&label);
+                        }
+                    }
+                }
+            }
+
+            // Pass 2 (chapters + tracks): via the same `resolve_stream_target` call Player's own
             // `start()` makes. Falls back to whatever's already cached locally (a previous play
             // or download) if the server can't be reached, so the page still works offline —
             // same posture `PlayerController::start`'s own offline fallback already has.
@@ -392,6 +460,8 @@ pub fn build(
             back_button,
             title_label,
             author_label,
+            series_button,
+            series_button_label,
             duration_label,
             progress_bar,
             play_button,
@@ -479,6 +549,35 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// Like [`insert_synced_item`], but with a `series_name` set — the series tests below don't
+    /// need narrator/description, just a title and a series to look up.
+    async fn insert_synced_item_with_series(pool: &SqlitePool, server_id: &str, item_id: &str, title: &str, series_name: &str, duration_seconds: f64) {
+        abs_storage::repo::libraries::upsert(
+            pool,
+            abs_storage::repo::libraries::UpsertLibrary { id: "lib-1", server_id, name: "Audiobooks", media_type: "book", icon: None, display_order: 1 },
+        )
+        .await
+        .unwrap();
+        abs_storage::repo::items::upsert(
+            pool,
+            abs_storage::repo::items::UpsertItem {
+                id: item_id,
+                server_id,
+                library_id: "lib-1",
+                title,
+                author: None,
+                narrator: None,
+                description: None,
+                duration_seconds,
+                added_at: chrono::Utc::now(),
+                series_name: Some(series_name),
+                genres: &[],
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     async fn mock_item_with_chapters(mock_server: &MockServer, item_id: &str, seconds: f64, chapters: &[(&str, f64, f64)]) {
         let chapters_json: Vec<_> = chapters.iter().enumerate().map(|(i, (title, start, end))| serde_json::json!({ "id": i, "start": start, "end": end, "title": title })).collect();
         Mock::given(method("GET"))
@@ -502,7 +601,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), Some("Ray Porter"), Some("A lone astronaut."), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Project Hail Mary", Duration::from_secs(5));
@@ -526,7 +625,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Meditations", Some("Marcus Aurelius"), Some(""), None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Meditations", Duration::from_secs(5));
@@ -545,7 +644,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
@@ -566,7 +665,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(&long_description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.label() == long_description, Duration::from_secs(5));
@@ -607,7 +706,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {});
+        }, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.chapters_list.row_at_index(1).is_some(), Duration::from_secs(5));
@@ -643,7 +742,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {});
+        }, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Test Item", Duration::from_secs(5));
@@ -667,7 +766,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {});
+        }, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         hooks.back_button.emit_clicked();
@@ -687,7 +786,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 10.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {});
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.download_button.is_sensitive(), Duration::from_secs(5));
@@ -733,7 +832,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, {
             let opened_player = opened_player.clone();
             move || opened_player.set(true)
-        });
+        }, |_| {});
         let hooks = screen.test_hooks();
 
         // The mini bar is primed immediately from `controller.snapshot()` at build time — no need
@@ -752,6 +851,117 @@ pub(crate) mod tests {
         // (`mini_bar_gesture_should_open`) is already unit-tested there, and the wiring here is
         // the same one-line `if` calling an already-tested callback.
         controller.stop();
+    }
+
+    /// The series button (ID: series info + tap-through) — Pass 1 shows the plain name
+    /// immediately from the local item row; Pass 2 fills in the real "N/M" once the network call
+    /// resolves, updating the *same* widget's text in place, never swapping it or letting it wrap
+    /// to a second line (the `max_width_chars`/`ellipsize` cap is what actually prevents the
+    /// "lower part of the screen jumps" regression this test guards against). The button is
+    /// already clickable during the brief window before Pass 2 lands.
+    pub(crate) fn run_series_button_shows_the_plain_name_then_fills_in_the_real_numbers(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/lib-1/series"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "series-1",
+                        "name": "Foundation",
+                        "books": [
+                            { "id": "item-1", "sequence": "2" },
+                            { "id": "item-2", "sequence": "1" },
+                            { "id": "item-3", "sequence": "3" }
+                        ]
+                    }]
+                })))
+                .mount(&mock_server)
+                .await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item_with_series(&pool, &server.id, "item-1", "Foundation", "Foundation", 3600.0));
+
+        let opened_series: Rc<std::cell::RefCell<Vec<String>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, {
+            let opened_series = opened_series.clone();
+            move |name: String| opened_series.borrow_mut().push(name)
+        });
+        let hooks = screen.test_hooks();
+
+        // Pass 1 lands: title and the series button's plain name are set in the same
+        // uninterrupted stretch of async code (no `.await` between them), so once the title is
+        // there, the series button is guaranteed to be too — proof it didn't wait on Pass 2's
+        // network call.
+        pump_until(|| hooks.title_label.label() == "Foundation", Duration::from_secs(5));
+        assert!(hooks.series_button.is_visible(), "the series button should appear as soon as Pass 1's local read lands");
+        assert_eq!(hooks.series_button_label.label(), "Foundation", "Pass 1 shows just the plain name, no numbers yet");
+
+        // Clickable right away, before Pass 2 has had any chance to resolve.
+        hooks.series_button.emit_clicked();
+        assert_eq!(*opened_series.borrow(), vec!["Foundation".to_string()], "tapping the button before Pass 2 lands should still open the series by name");
+
+        // Pass 2 lands: the same widget's text updates in place to include the real numbers.
+        pump_until(|| hooks.series_button_label.label() == "Foundation, 2/3", Duration::from_secs(5));
+        assert!(hooks.series_button.is_visible(), "the button must not be hidden/rebuilt when Pass 2 updates its text");
+        // The label is capped to one line regardless of which pass set its text — this is the
+        // actual mechanism that prevents the reported "lower part of the screen jumps" bug: a
+        // capped, non-wrapping label can only truncate/extend within a fixed-height row.
+        assert_eq!(hooks.series_button_label.max_width_chars(), 1);
+        assert_eq!(hooks.series_button_label.ellipsize(), gtk4::pango::EllipsizeMode::End);
+        assert!(!hooks.series_button_label.wraps(), "the series label must never wrap to a second line");
+    }
+
+    /// A network failure (or the library's series list simply not existing yet) must leave the
+    /// Pass-1 plain-name label exactly as it was — never an error state, never hidden.
+    pub(crate) fn run_series_button_keeps_the_plain_name_when_the_network_call_fails(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+        runtime.block_on(async {
+            Mock::given(method("GET")).and(path("/api/libraries/lib-1/series")).respond_with(ResponseTemplate::new(500)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item_with_series(&pool, &server.id, "item-1", "Foundation", "Foundation", 3600.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.title_label.label() == "Foundation", Duration::from_secs(5));
+        assert!(hooks.series_button.is_visible());
+        assert_eq!(hooks.series_button_label.label(), "Foundation");
+
+        // Give Pass 2 a real chance to run and fail; the label must be unchanged afterward.
+        // (`false` never becomes true, so `pump_until` keeps pumping the main loop for the full
+        // timeout rather than returning on its very first, trivially-true check.)
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(hooks.series_button_label.label(), "Foundation", "a failed network call must never regress a working local render");
+        assert!(hooks.series_button.is_visible());
+    }
+
+    /// An item with no series at all never shows the button, and never makes a series-list
+    /// request in the first place.
+    pub(crate) fn run_series_button_stays_hidden_when_the_item_has_no_series(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "No Series Book", None, None, None, 3600.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.title_label.label() == "No Series Book", Duration::from_secs(5));
+        assert!(!hooks.series_button.is_visible());
+
+        assert_eq!(runtime.block_on(mock_server.received_requests()).unwrap().iter().filter(|r| r.url.path().contains("/series")).count(), 0, "no series request should ever be made for a series-less item");
     }
 
     fn for_each_descendant(root: &gtk4::Widget, f: &mut dyn FnMut(&gtk4::Widget)) {

@@ -90,6 +90,18 @@ impl LibraryScreen {
         // `set_in_progress_only` re-renders with both the new sort and the new filter.
         set_in_progress_only(&self.widgets, in_progress_only);
     }
+
+    /// Item Detail's series-button tap-through (docs/design/ui-spec.md): filters to exactly one
+    /// series by name, same session-only navigation-with-intent contract as `apply_view` — no
+    /// persistence, and no grouping headers (`Grouping::None`), since this is a single-series
+    /// view, not a grouped one. None of the four category chips shows as "active" while this
+    /// filter is applied — the same acceptable gap `apply_view` already has (no sort button
+    /// highlights after Home's tap-through either).
+    pub(crate) fn apply_series_filter(&self, series_name: &str) {
+        *self.widgets.category_filter.borrow_mut() = CategoryFilter::OneSeries(series_name.to_string());
+        self.widgets.grouping.set(Grouping::None);
+        render_from_current_data(&self.widgets);
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +185,10 @@ impl SortKey {
 /// Which category chip is active (ui-spec "Library browse": All/Author/Series/Genre). Author and
 /// Series just mirror the persisted `Grouping` choice (see [`sync_grouping_and_category`]); Genre
 /// is a session-only filter — there's no `Grouping::ByGenre` (a book has several genres, not one
-/// grouping-per-genre) and no genre field in `LibraryViewOptions`.
+/// grouping-per-genre) and no genre field in `LibraryViewOptions`. `OneSeries` is a third, distinct
+/// mode with no chip of its own: Item Detail's series-button tap-through
+/// (`LibraryScreen::apply_series_filter`) filters to exactly one series by name, unlike the bare
+/// `Series` chip above (which only groups, showing every series' books under a header each).
 #[derive(Clone, Debug, Default, PartialEq)]
 enum CategoryFilter {
     #[default]
@@ -181,6 +196,7 @@ enum CategoryFilter {
     Author,
     Series,
     Genre(String),
+    OneSeries(String),
 }
 
 /// One render's worth of built-but-maybe-not-decoded card/row, tracked so
@@ -1262,10 +1278,12 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         .filter(|item| {
             !widgets.hide_finished.get() || !data.last_listened.get(&item.id).is_some_and(|progress| progress.is_finished)
         })
-        // The Genre category chip's own filter — session-only, see `CategoryFilter`'s doc.
-        // Author/Series chips never reach here: they set `grouping` instead (below), not this.
+        // The Genre category chip's own filter, and `OneSeries`'s exact-match — both session-only,
+        // see `CategoryFilter`'s doc. The Author/Series chips never reach here: they set
+        // `grouping` instead (below), not this.
         .filter(|item| match &*widgets.category_filter.borrow() {
             CategoryFilter::Genre(genre) => item.genres().iter().any(|g| g == genre),
+            CategoryFilter::OneSeries(name) => item.series_name.as_deref() == Some(name.as_str()),
             CategoryFilter::All | CategoryFilter::Author | CategoryFilter::Series => true,
         })
         .collect();
@@ -2833,6 +2851,53 @@ pub(crate) mod tests {
             "named series should sort case-insensitively ahead of the fallback 'Other' bucket, \
              which must always land last regardless of where it would fall alphabetically"
         );
+    }
+
+    /// Item Detail's series-button tap-through (`LibraryScreen::apply_series_filter`): filters to
+    /// exactly one series by name, across two different series and a series-less item, without
+    /// grouping headers (unlike the bare Series chip, which groups every series' books).
+    pub(crate) fn run_apply_series_filter_shows_only_that_series(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json_with_series_and_genres("item-1", "Foundation Book", Some("Foundation"), &[]),
+                        item_json_with_series_and_genres("item-2", "Dune Book", Some("Dune"), &[]),
+                        item_json_with_series_and_genres("item-3", "Standalone Book", None, &[])
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+        // Library defaults to List view; switch to Grid so `flow_box_entries` sees anything.
+        pump_until(|| hooks.list_box.row_at_index(2).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
+
+        screen.apply_series_filter("Foundation");
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 1, Duration::from_secs(5));
+        assert_eq!(flow_box_entries(&hooks.flow_box), vec!["Foundation Book".to_string()], "only the exact-matching series' item should show, with no grouping header");
     }
 
     /// The `ByAuthor` counterpart of the Series test above — items missing author metadata must

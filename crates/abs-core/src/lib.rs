@@ -15,6 +15,7 @@ pub mod media_type;
 pub mod playback;
 pub mod progress_sync;
 pub mod search;
+pub mod series;
 pub mod settings;
 pub mod streaming;
 pub mod sync;
