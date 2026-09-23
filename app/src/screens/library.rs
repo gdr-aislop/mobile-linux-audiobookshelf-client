@@ -1296,9 +1296,9 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // group key makes same-key items contiguous without disturbing their relative order from
     // the sort above, so each bucket is still internally sorted by `sort`.
     if grouping != Grouping::None {
-        visible.sort_by_key(|item| group_key_for(item, grouping));
+        visible.sort_by_key(|item| group_key_for(item, grouping).sort_rank());
     }
-    let mut groups: Vec<(String, Vec<&Item>)> = Vec::new();
+    let mut groups: Vec<(GroupKey, Vec<&Item>)> = Vec::new();
     for item in visible {
         let key = group_key_for(item, grouping);
         match groups.last_mut() {
@@ -1320,7 +1320,7 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
             clear_flow_box(&widgets.flow_box);
             for (key, bucket) in &groups {
                 if grouping != Grouping::None {
-                    widgets.flow_box.insert(&grid_group_header(key), -1);
+                    widgets.flow_box.insert(&grid_group_header(key.label()), -1);
                 }
                 for item in bucket {
                     let subtitle = item_subtitle(item);
@@ -1334,7 +1334,7 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
             clear_list_box(&widgets.list_box);
             for (key, bucket) in &groups {
                 if grouping != Grouping::None {
-                    widgets.list_box.append(&list_group_header(key));
+                    widgets.list_box.append(&list_group_header(key.label()));
                 }
                 for item in bucket {
                     let built = library_list_row_deferred(item, &widgets.on_open);
@@ -1401,14 +1401,50 @@ fn item_subtitle(item: &Item) -> String {
     format!("{} · {hours:.1}h", item.author.as_deref().unwrap_or("Unknown author"))
 }
 
-/// The section an item falls into under a given `Grouping` — `Grouping::None` is never actually
-/// consulted (every item lands in the render loop's single un-headered bucket regardless of what
-/// this returns), so its `String::new()` here is just a harmless placeholder.
-fn group_key_for(item: &Item, grouping: Grouping) -> String {
+/// The section an item falls into under a given `Grouping`. `Named` carries a real author/series
+/// name; `Fallback` is the catch-all bucket ("Unknown author"/"Other") for items missing that
+/// metadata. Kept as a distinct variant (rather than folding the fallback text into `Named`) so
+/// [`GroupKey::sort_rank`] can always place it last, however its label happens to compare
+/// alphabetically — see that method's doc for why.
+#[derive(Clone, PartialEq, Eq)]
+enum GroupKey {
+    Named(String),
+    Fallback(String),
+}
+
+impl GroupKey {
+    fn label(&self) -> &str {
+        match self {
+            GroupKey::Named(s) | GroupKey::Fallback(s) => s,
+        }
+    }
+
+    /// Sorts every named group alphabetically (case-insensitive) ahead of the fallback bucket,
+    /// which always sorts last regardless of its label. Without this, a plain alphabetical sort
+    /// over the label text alone lets "Other"/"Unknown author" land in an arbitrary slot among
+    /// real names — and since most items in a typical library lack series metadata, that one
+    /// bucket is usually the largest, so it dominates the list and grouping looks like it did
+    /// nothing (the reported bug).
+    fn sort_rank(&self) -> (u8, String) {
+        match self {
+            GroupKey::Named(s) => (0, s.to_lowercase()),
+            GroupKey::Fallback(s) => (1, s.to_lowercase()),
+        }
+    }
+}
+
+/// `Grouping::None` is never actually consulted (every item lands in the render loop's single
+/// un-headered bucket regardless of what this returns), so its `Named(String::new())` here is
+/// just a harmless placeholder.
+fn group_key_for(item: &Item, grouping: Grouping) -> GroupKey {
     match grouping {
-        Grouping::None => String::new(),
-        Grouping::ByAuthor => item.author.clone().unwrap_or_else(|| "Unknown author".to_string()),
-        Grouping::BySeries => item.series_name.clone().unwrap_or_else(|| "Other".to_string()),
+        Grouping::None => GroupKey::Named(String::new()),
+        Grouping::ByAuthor => {
+            item.author.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback("Unknown author".to_string()))
+        }
+        Grouping::BySeries => {
+            item.series_name.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback("Other".to_string()))
+        }
     }
 }
 
@@ -2735,6 +2771,127 @@ pub(crate) mod tests {
         // Switching back to All must ungroup and clear the headers.
         hooks.category_all.set_active(true);
         pump_until(|| flow_box_entries(&hooks.flow_box).len() == 2, Duration::from_secs(5));
+    }
+
+    /// Regression test for the reported bug: grouping by Series with a realistic mix of items
+    /// (some with real series metadata, some without) must not bury the real series among a
+    /// dominant "Other" bucket — the fallback group must always sort last, and real series names
+    /// must compare case-insensitively (`"apple"` vs `"Banana"` would sort "Banana" first under a
+    /// plain byte-wise `String` sort, which is the wrong alphabetical order).
+    pub(crate) fn run_series_grouping_sorts_named_groups_before_the_fallback_bucket(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json_with_series_and_genres("item-1", "Book B", Some("Banana"), &[]),
+                        item_json_with_series_and_genres("item-2", "Book A", Some("apple"), &[]),
+                        item_json_with_series_and_genres("item-3", "Book None", None, &[])
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+        // Library defaults to List view; switch to Grid so `flow_box_entries` sees anything.
+        pump_until(|| hooks.list_box.row_at_index(2).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(10));
+
+        hooks.category_series.set_active(true);
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 6, Duration::from_secs(5));
+
+        assert_eq!(
+            flow_box_entries(&hooks.flow_box),
+            vec![
+                "§apple".to_string(),
+                "Book A".to_string(),
+                "§Banana".to_string(),
+                "Book B".to_string(),
+                "§Other".to_string(),
+                "Book None".to_string(),
+            ],
+            "named series should sort case-insensitively ahead of the fallback 'Other' bucket, \
+             which must always land last regardless of where it would fall alphabetically"
+        );
+    }
+
+    /// The `ByAuthor` counterpart of the Series test above — items missing author metadata must
+    /// fall into an "Unknown author" bucket that sorts last, not wherever it lands alphabetically.
+    pub(crate) fn run_author_grouping_sorts_named_authors_before_unknown_author_bucket(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Book By Weir", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        serde_json::json!({
+                            "id": "item-2",
+                            "addedAt": 1_600_000_000_000i64,
+                            "media": { "duration": 3600.0, "metadata": { "title": "Book With No Author" } }
+                        })
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+        // Library defaults to List view; switch to Grid so `flow_box_entries` sees anything.
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+
+        hooks.category_author.set_active(true);
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 4, Duration::from_secs(5));
+
+        assert_eq!(
+            flow_box_entries(&hooks.flow_box),
+            vec![
+                "§Andy Weir".to_string(),
+                "Book By Weir".to_string(),
+                "§Unknown author".to_string(),
+                "Book With No Author".to_string(),
+            ],
+            "the 'Unknown author' fallback bucket must sort last, not wherever it lands alphabetically"
+        );
     }
 
     /// The view-options popover's "Application settings" row (LB-11) — closes the popover and

@@ -169,6 +169,8 @@ mod tests {
         (library_deferred_decode_only_covers_items_near_the_viewport, crate::screens::library::tests::run_deferred_decode_only_covers_items_near_the_viewport),
         (library_hide_finished_switch_filters_finished_items, crate::screens::library::tests::run_hide_finished_switch_filters_finished_items),
         (library_author_category_chip_groups_items_with_headers, crate::screens::library::tests::run_author_category_chip_groups_items_with_headers),
+        (library_series_grouping_sorts_named_groups_before_the_fallback_bucket, crate::screens::library::tests::run_series_grouping_sorts_named_groups_before_the_fallback_bucket),
+        (library_author_grouping_sorts_named_authors_before_unknown_author_bucket, crate::screens::library::tests::run_author_grouping_sorts_named_authors_before_unknown_author_bucket),
         (library_sort_by_combo_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_sort_by_combo_persists_and_is_honored_on_rebuild),
         (library_last_listened_sort_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_last_listened_sort_persists_and_is_honored_on_rebuild),
         (library_in_progress_only_switch_persists_and_is_honored_on_rebuild, crate::screens::library::tests::run_in_progress_only_switch_persists_and_is_honored_on_rebuild),
