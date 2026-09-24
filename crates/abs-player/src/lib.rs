@@ -5,6 +5,7 @@
 //! device or a GLib main loop.
 
 pub mod call_watch;
+pub mod connectivity_watch;
 mod error;
 pub mod mpris;
 pub mod network_watch;

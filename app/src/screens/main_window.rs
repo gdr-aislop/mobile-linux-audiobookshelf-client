@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
+use abs_player::connectivity_watch::ConnectivityWatcher;
 use abs_player::route_watch::RouteWatcher;
 use adw::glib;
 use adw::prelude::*;
@@ -37,6 +38,10 @@ pub struct MainWindow {
     /// (PulseAudio/PipeWire) was reachable — headphone unplug/replug reaction is then simply
     /// unavailable, never a fatal error.
     _route_watcher: Option<abs_player::route_watch::PulseRouteWatcher>,
+    /// Same lifetime contract as `_call_watcher`: retained forever, `None` when no system bus (or
+    /// no NetworkManager on it) was reachable — reconnect-triggered progress sync is then simply
+    /// unavailable, never a fatal error.
+    _connectivity_watcher: Option<abs_player::connectivity_watch::NetworkManagerConnectivityWatcher>,
     /// Kept alive for the app's whole lifetime, same reasoning as `_call_watcher` — dropping it
     /// would lose every in-flight track's cancel flag and listener. Every screen that needs it
     /// (Downloads, Settings, Item Detail, Player) is handed its own clone at build time; this
@@ -174,6 +179,22 @@ pub fn build(
         }
         Err(err) => {
             tracing::warn!(%err, "couldn't watch the audio server for headphone changes; unplug-pause will be unavailable");
+            None
+        }
+    };
+
+    // Reconnect-triggered progress sync — best-effort in the same way as call-watching/route-
+    // watching above: no system bus (or no NetworkManager on it) must never be fatal, it just
+    // means a device that goes offline while paused/idle won't push its pending local position
+    // until the user does something else that happens to trigger a sync.
+    let connectivity_watcher = match abs_player::connectivity_watch::NetworkManagerConnectivityWatcher::new() {
+        Ok(mut watcher) => {
+            let controller = mini_bar.controller.clone();
+            watcher.start(Box::new(move || controller.sync_pending_progress()));
+            Some(watcher)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "couldn't watch NetworkManager for connectivity changes; reconnect-triggered progress sync will be unavailable");
             None
         }
     };
@@ -537,6 +558,7 @@ pub fn build(
         root: root.upcast(),
         _call_watcher: call_watcher,
         _route_watcher: route_watcher,
+        _connectivity_watcher: connectivity_watcher,
         download_manager,
         #[cfg(test)]
         hooks: TestHooks {
@@ -653,6 +675,50 @@ pub(crate) mod tests {
         on_call_active();
 
         assert!(!controller.snapshot().unwrap().is_playing, "a call becoming active should pause playback");
+        controller.stop();
+    }
+
+    /// Same convention as `run_call_interruption_wiring_pauses_playback` above: `FakeConnectivityWatcher`
+    /// is `#[cfg(test)]`-only inside `abs-player`, so this reproduces `build()`'s exact one-line
+    /// closure (`move || controller.sync_pending_progress()`) and invokes it directly, rather than
+    /// injecting a fake watcher into `MainWindow::build`.
+    pub(crate) fn run_connectivity_restored_wiring_syncs_pending_progress(runtime: &tokio::runtime::Runtime) {
+        use crate::player::tests::{account_and_server, insert_synced_item, mock_playable_item, test_backend};
+        use crate::player::PlayRequest;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/me/progress/item-1"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
+        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        controller.pause();
+        crate::test_support::pump_until(|| false, std::time::Duration::from_millis(300));
+
+        let requests_before = runtime.block_on(mock_server.received_requests()).unwrap().len();
+
+        let on_connectivity_restored: Box<dyn Fn()> = {
+            let controller = controller.clone();
+            Box::new(move || controller.sync_pending_progress())
+        };
+        on_connectivity_restored();
+        crate::test_support::pump_until(|| false, std::time::Duration::from_millis(500));
+
+        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
+        let new_patches = requests_after[requests_before..]
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+            .count();
+        assert_eq!(new_patches, 1, "connectivity being restored should push exactly one pending progress update");
         controller.stop();
     }
 

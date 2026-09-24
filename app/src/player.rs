@@ -554,6 +554,18 @@ impl PlayerController {
     /// `PlaybackSettings::default_speed`, applied once at the start of every session (the user can
     /// change it afterwards via `set_speed`).
     pub fn start(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64) {
+        // Flush whatever was loaded before it's replaced below — otherwise switching to a new
+        // item while another is still actively playing loses up to `PROGRESS_WRITE_INTERVAL`'s
+        // worth of the outgoing item's progress (the only other writes are the periodic tick and
+        // an explicit `pause()`, neither of which fires on a session switch). Harmless if the
+        // outgoing item was already paused/up to date — same blind-push shape `pause()` already
+        // uses, not a new risk.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.now_playing.is_some() {
+                inner.write_progress(false);
+            }
+        }
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let (pool, paths) = {
@@ -787,6 +799,49 @@ impl PlayerController {
         }
         inner.publish();
         inner.write_progress(false);
+    }
+
+    /// For when connectivity returns while paused/idle — the only place progress otherwise syncs
+    /// is the periodic tick (only while playing) and `pause()`/`start()`, none of which fire on
+    /// their own just because the network came back. Reconciles first (in case another device
+    /// moved this item's progress further while this device was offline) and only pushes this
+    /// device's local position if reconciling did NOT just overwrite it with something newer from
+    /// the server — pushing unconditionally would silently undo that correction. A no-op if
+    /// nothing is loaded.
+    pub fn sync_pending_progress(&self) {
+        let Some((pool, account_id, server_id, item_id, session)) = ({
+            let inner = self.inner.borrow();
+            inner.now_playing.as_ref().map(|np| (inner.pool.clone(), np.account_id.clone(), np.server_id.clone(), np.item_id.clone(), np.session.clone()))
+        }) else {
+            return;
+        };
+        let inner_rc = self.inner.clone();
+        glib::spawn_future_local(async move {
+            let before = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
+            let connection = match session.connection_target().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; still offline");
+                    return;
+                }
+            };
+            let access_token = session.access_token().await;
+            if let Err(err) =
+                abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, &account_id, &server_id, &item_id).await
+            {
+                tracing::info!(%err, item_id = %item_id, "couldn't reconcile progress on reconnect; still offline");
+                return;
+            }
+            let after = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
+            let server_had_something_newer = match (&before, &after) {
+                (Some(b), Some(a)) => a.updated_at > b.updated_at,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if !server_had_something_newer {
+                inner_rc.borrow_mut().write_progress(false);
+            }
+        });
     }
 
     /// Applies Settings → Playback's headphone behavior switches (persisted; the live controller
@@ -1494,6 +1549,161 @@ pub(crate) mod tests {
             .expect("pausing should also sync progress to the server");
         let body: serde_json::Value = progress_sync.body_json().unwrap();
         assert_eq!(body["isFinished"], false);
+        controller.stop();
+    }
+
+    /// Regression test for the "no flush on teardown" gap: switching to a new item while another
+    /// is still actively playing used to lose whatever progress had accrued since the last
+    /// periodic 5s write (the only other write paths are the tick and an explicit `pause()`,
+    /// neither of which fires on a session switch). `start()` now flushes the outgoing item first.
+    pub(crate) fn run_starting_a_new_item_flushes_the_previous_items_progress(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+        runtime.block_on(mock_playable_item(&mock_server, "item-2", 5));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "First Book"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Second Book"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "First Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        // Let some real playback time accrue, but nowhere near `PROGRESS_WRITE_INTERVAL` (5s) —
+        // if the periodic tick were what persisted this, the test would be proving nothing.
+        pump_until(|| false, Duration::from_millis(1200));
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-2".to_string(), title: "Second Book".to_string(), author: None },
+            1.0,
+        );
+        // The flush is a synchronous call inside `start()`, but the DB write/server sync it
+        // spawns still needs a pump to land.
+        pump_until(|| false, Duration::from_millis(300));
+
+        let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap();
+        let progress = progress.expect("switching items should flush the outgoing item's progress locally");
+        assert!(progress.current_time_seconds > 0.0, "the flushed position should reflect real elapsed playback, got {}", progress.current_time_seconds);
+
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            requests.iter().any(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1"),
+            "switching items should also sync the outgoing item's progress to the server"
+        );
+        controller.stop();
+    }
+
+    /// Regression test for the "no reconnect-triggered sync" gap:
+    /// `PlayerController::sync_pending_progress` is the one-line closure
+    /// `screens::main_window::build` wires to `NetworkManagerConnectivityWatcher`'s "connectivity
+    /// restored" callback (see `run_connectivity_restored_wiring_syncs_pending_progress` in
+    /// `screens::main_window::tests` for the wiring itself) — this covers the method's own logic:
+    /// when the server has nothing newer, the local (paused) position gets pushed.
+    pub(crate) fn run_sync_pending_progress_pushes_the_current_position_while_paused(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+        // No existing server-side progress — the reconcile GET should just find nothing to pull.
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        controller.pause();
+        pump_until(|| false, Duration::from_millis(300));
+
+        let requests_before_reconnect = runtime.block_on(mock_server.received_requests()).unwrap().len();
+
+        controller.sync_pending_progress();
+        pump_until(|| false, Duration::from_millis(500));
+
+        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
+        let new_patches = requests_after[requests_before_reconnect..]
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+            .count();
+        assert_eq!(new_patches, 1, "reconnecting while paused should push exactly one pending progress update");
+        controller.stop();
+    }
+
+    /// The direct regression test for the collision risk raised while reviewing this fix: if
+    /// another device advanced this item's progress on the server while this device sat
+    /// paused/offline, `sync_pending_progress` must NOT blindly push this device's stale local
+    /// position over it — it must reconcile first and skip the push once the newer server value
+    /// has been applied locally.
+    pub(crate) fn run_sync_pending_progress_does_not_clobber_a_newer_server_value(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 500));
+        // The server's own record is far ahead of (and newer than) whatever this device paused
+        // at — as if another device kept listening while this one was offline.
+        let newer_update = chrono::Utc::now().timestamp_millis() + 60_000;
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraryItemId": "item-1",
+                    "currentTime": 400.0,
+                    "duration": 500.0,
+                    "isFinished": false,
+                    "lastUpdate": newer_update,
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        controller.pause();
+        pump_until(|| false, Duration::from_millis(300));
+
+        let requests_before_reconnect = runtime.block_on(mock_server.received_requests()).unwrap().len();
+
+        controller.sync_pending_progress();
+        pump_until(|| false, Duration::from_millis(500));
+
+        let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert_eq!(progress.current_time_seconds, 400.0, "reconciling should have pulled the newer server-side position locally");
+
+        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
+        let new_patches = requests_after[requests_before_reconnect..]
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+            .count();
+        assert_eq!(new_patches, 0, "the stale local position must never be pushed back over a newer server value");
+        controller.stop();
+    }
+
+    /// `sync_pending_progress` is a no-op if nothing is loaded — must not panic.
+    pub(crate) fn run_sync_pending_progress_is_a_no_op_when_nothing_is_loaded(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let controller = PlayerController::new(pool, crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.sync_pending_progress();
+        pump_until(|| false, Duration::from_millis(100));
         controller.stop();
     }
 
