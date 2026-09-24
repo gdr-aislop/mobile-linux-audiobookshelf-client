@@ -821,13 +821,16 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), None, None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), "item-1".to_string(), |_, _| {}, || {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
         window.present();
         pump_until(|| window.is_mapped(), Duration::from_secs(5));
-        pump_until(|| hooks.play_button.allocated_height() > 0, Duration::from_secs(5));
+        // Both buttons need their own allocation pass before comparing — the download button's
+        // icon can lag a frame behind the pill's label (icon-theme lookup vs. plain text layout),
+        // so waiting on the pill alone flakes with a spurious `0` for the download button.
+        pump_until(|| hooks.play_button.allocated_height() > 0 && hooks.download_button.allocated_height() > 0, Duration::from_secs(5));
 
         assert_eq!(
             hooks.play_button.allocated_height(),
@@ -878,7 +881,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
         let hooks = screen.test_hooks();
 
-        pump_until(|| hooks.description_label.use_markup(), Duration::from_secs(5));
+        pump_until(|| hooks.description_label.uses_markup(), Duration::from_secs(5));
         assert_eq!(hooks.description_label.label(), "First para\n\nSecond <b>bold &amp; <i>unclosed</i></b>");
         assert_eq!(hooks.description_label.text(), "First para\n\nSecond bold & unclosed");
         assert!(!hooks.more_button.is_visible(), "a short description should show no 'more' toggle");
