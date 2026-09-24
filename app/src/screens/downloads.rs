@@ -25,6 +25,7 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
+use crate::screens::settings::confirm;
 use abs_storage::models::DownloadStatus;
 
 /// Minimum gap between live subtitle writes for one item — `TrackProgress` fires per chunk
@@ -46,6 +47,7 @@ pub struct TestHooks {
     pub status_page: adw::StatusPage,
     pub list_box: gtk4::ListBox,
     pub scroller: gtk4::ScrolledWindow,
+    pub clear_all_button: gtk4::Button,
 }
 
 #[cfg(test)]
@@ -70,6 +72,9 @@ struct Widgets {
     list_box: gtk4::ListBox,
     status_page: adw::StatusPage,
     scroller: gtk4::ScrolledWindow,
+    /// Only sensitive once there's actually something to clear — toggled alongside
+    /// `status_page`/`scroller` in `spawn_refresh`, from the same `any_row`.
+    clear_all_button: gtk4::Button,
     download_manager: DownloadManager,
     /// Item ids this screen has itself observed going into `Downloading` — the persisted
     /// `downloaded_item_ids` query only ever reflects *complete* tracks, so a download still in
@@ -94,9 +99,17 @@ pub fn build(
     _account: abs_storage::models::Account,
     _session: abs_core::auth::Session,
     download_manager: DownloadManager,
+    window: adw::ApplicationWindow,
 ) -> DownloadsScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Downloads", "")));
+
+    // Starts insensitive — nothing to clear until the first refresh below finds at least one
+    // row; `spawn_refresh` toggles this the same place it already toggles
+    // `status_page`/`scroller` from `any_row`. A single icon button rather than a menu: unlike
+    // Player/Item Detail's `⋯` menus, there's only ever one action here.
+    let clear_all_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Clear all downloads").css_classes(["flat"]).sensitive(false).build();
+    header.pack_end(&clear_all_button);
 
     let status_page = adw::StatusPage::builder().icon_name("folder-download-symbolic").title("No downloads yet").vexpand(true).visible(false).build();
 
@@ -114,11 +127,32 @@ pub fn build(
         list_box: list_box.clone(),
         status_page: status_page.clone(),
         scroller: scroller.clone(),
+        clear_all_button: clear_all_button.clone(),
         download_manager: download_manager.clone(),
         downloading: Rc::new(RefCell::new(HashSet::new())),
         track_bytes: Rc::new(RefCell::new(HashMap::new())),
         speeds: Rc::new(RefCell::new(HashMap::new())),
         live_rows: Rc::new(RefCell::new(HashMap::new())),
+    });
+
+    // Confirmed via the same shared `GtkMessageDialog` helper Settings/Connection use for their
+    // own big destructive actions — unlike per-item Remove (recoverable, one book, tucked in a
+    // secondary control), this wipes every downloaded file on the device at once.
+    clear_all_button.connect_clicked({
+        let window = window.clone();
+        let download_manager = download_manager.clone();
+        let server_id = widgets.server_id.clone();
+        move |_| {
+            let download_manager = download_manager.clone();
+            let server_id = server_id.clone();
+            confirm(
+                &window,
+                "Clear all downloads?",
+                "Every downloaded chapter for every book on this device will be removed — nothing on the server is affected.",
+                "Clear Downloads",
+                Rc::new(move || download_manager.clear_all(&server_id)),
+            );
+        }
     });
 
     // Registered once, for the manager's whole lifetime — same permanent-listener shape
@@ -183,7 +217,7 @@ pub fn build(
     DownloadsScreen {
         root: root.upcast(),
         #[cfg(test)]
-        hooks: TestHooks { status_page, list_box, scroller },
+        hooks: TestHooks { status_page, list_box, scroller, clear_all_button },
     }
 }
 
@@ -250,6 +284,7 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
 
         widgets.status_page.set_visible(!any_row);
         widgets.scroller.set_visible(any_row);
+        widgets.clear_all_button.set_sensitive(any_row);
     });
 }
 
@@ -423,7 +458,8 @@ pub(crate) mod tests {
         let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
 
         let manager = test_download_manager(pool.clone());
-        let screen = build(pool, test_paths(), server, account, session, manager);
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool, test_paths(), server, account, session, manager, app_window);
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
@@ -441,7 +477,8 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let manager = test_download_manager(pool.clone());
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone());
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -464,7 +501,8 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let manager = test_download_manager(pool.clone());
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone());
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -508,7 +546,8 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
         let manager = test_download_manager(pool.clone());
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone());
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
         let hooks = screen.test_hooks();
 
         let events: Rc<RefCell<Vec<DownloadEvent>>> = Rc::new(RefCell::new(Vec::new()));
@@ -564,7 +603,8 @@ pub(crate) mod tests {
             Duration::from_secs(10),
         );
 
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone());
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
         let hooks = screen.test_hooks();
         pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
 
@@ -572,5 +612,105 @@ pub(crate) mod tests {
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(10));
         assert!(hooks.status_page.is_visible(), "removing the only completed download should return to the empty state");
         assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Clear all downloads" button
+    /// starts disabled with nothing downloaded, and becomes enabled once something completes.
+    pub(crate) fn run_clear_all_button_is_disabled_until_something_is_downloaded(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
+        assert!(!hooks.clear_all_button.is_sensitive(), "nothing to clear yet");
+
+        manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(10));
+        assert!(hooks.clear_all_button.is_sensitive(), "a completed download should enable the button");
+    }
+
+    fn find_message_dialog() -> Option<gtk4::MessageDialog> {
+        gtk4::Window::list_toplevels().into_iter().find_map(|window| window.downcast::<gtk4::MessageDialog>().ok())
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Cancelling the confirmation dialog
+    /// must leave every downloaded row, DB row, and file exactly as it was.
+    pub(crate) fn run_clear_all_cancelled_leaves_downloads_intact(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        manager.start_download(session.clone(), "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
+
+        hooks.clear_all_button.emit_clicked();
+        pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+        find_message_dialog().unwrap().response(gtk4::ResponseType::Cancel);
+        pump_until(|| find_message_dialog().is_none(), Duration::from_secs(5));
+
+        // Give any (wrongly fired) clearing work a chance to run, then assert nothing changed.
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(hooks.scroller.is_visible(), "a cancelled confirmation must leave the row in place");
+        assert!(!runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty(), "a cancelled confirmation must not touch the DB rows");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Confirming "Clear all downloads"
+    /// removes every downloaded item's rows and files, across every item — not just one.
+    pub(crate) fn run_clear_all_confirmed_removes_every_download_and_its_files(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        runtime.block_on(mock_single_track_item(&mock_server, "item-2", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item 1"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Test Item 2"));
+
+        let manager = test_download_manager(pool.clone());
+        manager.start_download(session.clone(), "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        manager.start_download(session.clone(), "item-2".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(
+            || {
+                [("item-1", &pool), ("item-2", &pool)].iter().all(|(item_id, pool)| {
+                    runtime.block_on(abs_storage::repo::download_tracks::get(pool, &server.id, item_id, "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false)
+                })
+            },
+            Duration::from_secs(10),
+        );
+        let file_path = runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().unwrap().file_path;
+        assert!(std::path::Path::new(&file_path).exists(), "the download should have actually written a file");
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
+
+        hooks.clear_all_button.emit_clicked();
+        pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+        find_message_dialog().unwrap().response(gtk4::ResponseType::Ok);
+
+        pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(10));
+        assert!(hooks.status_page.is_visible(), "clearing everything should return to the empty state");
+        assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty());
+        assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-2")).unwrap().is_empty());
+        pump_until(|| !std::path::Path::new(&file_path).exists(), Duration::from_secs(5));
+        assert!(!std::path::Path::new(&file_path).exists(), "the file on disk should be deleted too");
     }
 }

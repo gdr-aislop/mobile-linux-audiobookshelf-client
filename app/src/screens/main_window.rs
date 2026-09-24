@@ -467,7 +467,7 @@ pub fn build(
         "go-home-symbolic",
     );
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone());
+    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
     let settings_screen = screens::settings::build(
         pool.clone(),

@@ -169,6 +169,19 @@ pub async fn remove_for_item(pool: &SqlitePool, server_id: &str, item_id: &str) 
     Ok(removed)
 }
 
+/// "Clear all downloads": remove every download-track row for a server (every item), returning
+/// what was removed so the caller can delete the actual files — the server-scoped mirror of
+/// [`remove_for_item`].
+pub async fn remove_for_server(pool: &SqlitePool, server_id: &str) -> Result<Vec<DownloadTrack>> {
+    let rows: Vec<Row> = sqlx::query_as(&format!("SELECT {SELECT_COLUMNS} FROM download_tracks WHERE server_id = ?"))
+        .bind(server_id)
+        .fetch_all(pool)
+        .await?;
+    let removed: Vec<DownloadTrack> = rows.into_iter().map(DownloadTrack::from).collect();
+    sqlx::query("DELETE FROM download_tracks WHERE server_id = ?").bind(server_id).execute(pool).await?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

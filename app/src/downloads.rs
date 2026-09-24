@@ -399,6 +399,36 @@ impl DownloadManager {
             inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Idle });
         });
     }
+
+    /// Cancels anything in flight for this server, then deletes every downloaded track file and
+    /// row across every item — the server-scoped mirror of `clear_item`, with the same known
+    /// cooperative-cancel race documented there.
+    pub fn clear_all(&self, server_id: &str) {
+        {
+            let inner = self.inner.borrow();
+            for (key, batch) in inner.batches.iter() {
+                if key.0 == server_id {
+                    for flag in &batch.cancel_flags {
+                        flag.set(true);
+                    }
+                }
+            }
+        }
+        let inner_rc = self.inner.clone();
+        let server_id = server_id.to_string();
+        glib::spawn_future_local(async move {
+            let pool = inner_rc.borrow().pool.clone();
+            match abs_core::download_tracks::clear_all_downloads(&pool, &server_id).await {
+                Ok(item_ids) => {
+                    let inner = inner_rc.borrow();
+                    for item_id in item_ids {
+                        inner.publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Idle });
+                    }
+                }
+                Err(err) => tracing::warn!(%err, server_id, "couldn't clear all downloaded tracks"),
+            }
+        });
+    }
 }
 
 #[cfg(test)]

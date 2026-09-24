@@ -273,6 +273,9 @@ mod tests {
         (downloads_screen_in_progress_download_shows_progress_and_speed, crate::screens::downloads::tests::run_in_progress_download_shows_progress_and_speed),
         (downloads_screen_stop_keeps_completed_chapters_and_stops_the_job, crate::screens::downloads::tests::run_stop_keeps_completed_chapters_and_stops_the_job),
         (downloads_screen_completed_download_can_be_removed, crate::screens::downloads::tests::run_completed_download_can_be_removed),
+        (downloads_screen_clear_all_button_is_disabled_until_something_is_downloaded, crate::screens::downloads::tests::run_clear_all_button_is_disabled_until_something_is_downloaded),
+        (downloads_screen_clear_all_cancelled_leaves_downloads_intact, crate::screens::downloads::tests::run_clear_all_cancelled_leaves_downloads_intact),
+        (downloads_screen_clear_all_confirmed_removes_every_download_and_its_files, crate::screens::downloads::tests::run_clear_all_confirmed_removes_every_download_and_its_files),
     }
 
     /// The only `#[test]` a plain `cargo test` runs in this binary: re-executes this same binary

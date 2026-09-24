@@ -225,6 +225,24 @@ pub async fn clear_item_downloads(pool: &SqlitePool, server_id: &str, item_id: &
     Ok(())
 }
 
+/// "Clear all downloads" for a server: delete every download-track row and its backing file
+/// (same best-effort file cleanup as [`clear_item_downloads`]), returning the distinct item ids
+/// that were affected so the caller can tell the UI each of those items is now idle.
+pub async fn clear_all_downloads(pool: &SqlitePool, server_id: &str) -> Result<Vec<String>> {
+    let removed = abs_storage::repo::download_tracks::remove_for_server(pool, server_id).await?;
+    let mut item_ids: Vec<String> = removed.iter().map(|row| row.item_id.clone()).collect();
+    item_ids.sort();
+    item_ids.dedup();
+    for row in removed {
+        if let Err(err) = tokio::fs::remove_file(&row.file_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%err, item_id = %row.item_id, ino = %row.ino, "couldn't delete a downloaded track file");
+            }
+        }
+    }
+    Ok(item_ids)
+}
+
 /// A transfer that ended with an unknown total size (`None`) is trusted — there's nothing to
 /// verify it against. One with a known size is only complete if every expected byte actually
 /// arrived; a connection that closes early has fewer bytes than promised and must not be mistaken
