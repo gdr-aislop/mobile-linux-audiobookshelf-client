@@ -461,6 +461,14 @@ impl PlayerController {
         self.inner.borrow().snapshot()
     }
 
+    /// The item id currently loaded (playing or paused), if any — lets a caller that only knows
+    /// an item id (Item Detail) decide whether acting on "the current item" (`mark_as_finished`,
+    /// `reset_progress`, below) would actually affect the item it means, since neither of those
+    /// checks the id itself.
+    pub fn current_item_id(&self) -> Option<String> {
+        self.inner.borrow().now_playing.as_ref().map(|np| np.item_id.clone())
+    }
+
     /// The currently-playing item's chapters, if any — for the chapters sheet. Empty if nothing
     /// is playing or the item has no chapter data.
     pub fn chapters(&self) -> Vec<ChapterInfo> {

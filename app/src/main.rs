@@ -193,6 +193,9 @@ mod tests {
         (item_detail_series_button_keeps_the_plain_name_when_the_network_call_fails, crate::screens::item_detail::tests::run_series_button_keeps_the_plain_name_when_the_network_call_fails),
         (item_detail_series_button_stays_hidden_when_the_item_has_no_series, crate::screens::item_detail::tests::run_series_button_stays_hidden_when_the_item_has_no_series),
         (item_detail_action_buttons_render_equal_heights, crate::screens::item_detail::tests::run_action_buttons_render_equal_heights),
+        (item_detail_options_menu_marks_finished_via_direct_write_when_not_currently_playing, crate::screens::item_detail::tests::run_options_menu_marks_finished_via_direct_write_when_not_currently_playing),
+        (item_detail_options_menu_resets_progress_via_direct_write_when_not_currently_playing, crate::screens::item_detail::tests::run_options_menu_resets_progress_via_direct_write_when_not_currently_playing),
+        (item_detail_options_menu_delegates_to_the_live_controller_when_this_item_is_playing, crate::screens::item_detail::tests::run_options_menu_delegates_to_the_live_controller_when_this_item_is_playing),
         (item_card_renders, |_rt| crate::widgets::item_card::tests::run()),
         (item_card_wrap_title_shows_the_full_title_without_ellipsizing, |_rt| crate::widgets::item_card::tests::run_wrap_title_shows_the_full_title_without_ellipsizing()),
         (item_card_downloaded_badge_shows_only_when_downloaded, |_rt| crate::widgets::item_card::tests::run_downloaded_badge_shows_only_when_downloaded()),
@@ -244,6 +247,9 @@ mod tests {
         (download_scope_menu_rows_show_size_estimates_that_track_the_stepper, crate::widgets::download_scope_menu::tests::run_rows_show_size_estimates_that_track_the_stepper),
 
         (download_scope_menu_rows_block_when_free_space_is_insufficient, crate::widgets::download_scope_menu::tests::run_rows_block_when_free_space_is_insufficient),
+
+        (item_options_menu_buttons_invoke_their_callback_and_popdown, crate::widgets::item_options_menu::tests::run_buttons_invoke_their_callback_and_popdown),
+        (item_options_menu_leading_widget_is_inserted_when_given, crate::widgets::item_options_menu::tests::run_leading_widget_is_inserted_when_given),
         (player_screen_speed_popover_changes_playback_speed, crate::screens::player::tests::run_speed_popover_changes_playback_speed),
         (player_screen_sleep_timer_end_of_chapter_pauses_at_the_boundary, crate::screens::player::tests::run_sleep_timer_end_of_chapter_pauses_at_the_boundary),
         (player_screen_add_bookmark_button_persists_a_row, crate::screens::player::tests::run_add_bookmark_button_persists_a_row),

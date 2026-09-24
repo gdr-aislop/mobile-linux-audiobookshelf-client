@@ -9,6 +9,7 @@ pub mod banner;
 pub mod cover_image;
 pub mod download_scope_menu;
 pub mod item_card;
+pub mod item_options_menu;
 pub mod pull_to_refresh;
 
 use std::cell::{Cell, RefCell};

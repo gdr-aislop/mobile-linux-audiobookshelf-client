@@ -48,6 +48,29 @@ pub async fn reconcile_item_progress(
     apply_if_newer(pool, account_id, server_id, item_id, &server_progress).await
 }
 
+/// Writes an item's progress directly — local storage first, then a best-effort push to the
+/// server (a failure here is the caller's to log; never fatal, same posture
+/// `sync_progress_to_server` itself documents) — for a caller that isn't necessarily driving live
+/// playback for this item (e.g. Item Detail's "Mark as finished"/"Reset progress" acting on a
+/// book that isn't the one currently loaded into the player). The player's own write path
+/// (`app::player::PlayerController`) has the identical two steps for whatever item it currently
+/// has loaded; this is the same shape for an arbitrary item id.
+#[allow(clippy::too_many_arguments)]
+pub async fn push_item_progress(
+    pool: &sqlx::SqlitePool,
+    connection: &crate::connection::ConnectionTarget,
+    access_token: &str,
+    account_id: &str,
+    server_id: &str,
+    item_id: &str,
+    position_seconds: f64,
+    duration_seconds: f64,
+    is_finished: bool,
+) -> Result<()> {
+    abs_storage::repo::progress::set(pool, account_id, server_id, item_id, position_seconds, is_finished).await?;
+    crate::streaming::sync_progress_to_server(connection, access_token, item_id, position_seconds, duration_seconds, is_finished).await
+}
+
 /// Bulk version of [`reconcile_item_progress`] for Home's "Continue Listening" shelf — one
 /// `/api/me` call instead of one per item. Progress for an item this client hasn't synced into
 /// its local `items` table yet (e.g. a library it hasn't opened) is skipped rather than erroring:
@@ -271,5 +294,33 @@ mod tests {
         assert_eq!(known.unwrap().current_time_seconds, 42.0);
         let unknown = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-unknown").await.unwrap();
         assert!(unknown.is_none(), "progress for an item Home hasn't synced yet should be skipped, not error");
+    }
+
+    #[tokio::test]
+    async fn push_item_progress_writes_locally_and_pushes_to_the_server() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+
+        let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
+        push_item_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, "item-1", 400.0, 400.0, true)
+            .await
+            .unwrap();
+
+        let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap().unwrap();
+        assert_eq!(progress.current_time_seconds, 400.0);
+        assert!(progress.is_finished);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.iter().filter(|r| r.method.as_str() == "PATCH").count(), 1, "the local write should also be pushed to the server");
+    }
+
+    #[tokio::test]
+    async fn push_item_progress_still_writes_locally_when_the_server_is_unreachable() {
+        let (pool, server_id, account_id) = pool_with_synced_item("http://127.0.0.1:1", "item-1").await;
+        let result = push_item_progress(&pool, &ConnectionTarget::direct("http://127.0.0.1:1"), "token", &account_id, &server_id, "item-1", 0.0, 400.0, false).await;
+        assert!(result.is_err(), "a failed server push should still surface as an error to the caller");
+
+        let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap().unwrap();
+        assert_eq!(progress.current_time_seconds, 0.0, "the local write must land even though the server push failed");
     }
 }

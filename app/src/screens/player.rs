@@ -91,28 +91,10 @@ pub fn build(
 
     // The spec's `⋯` menu is dropped down to "Add bookmark" plus two testing/recovery actions —
     // speed and sleep timer live as secondary-row buttons instead (see the scope decision in this
-    // plan). Plain `GtkMenuButton`/`GtkPopover`/`GtkButton`, same convention as the other popovers
-    // on this screen, not `GMenu`/`GAction`. "Reset progress" is styled destructive (it throws
-    // away the current listening position) but, matching the spec's own precedent for "Clear
-    // downloaded chapters", isn't behind a confirmation dialog — `AdwAlertDialog` isn't available
-    // at this crate's libadwaita v1.2 ceiling anyway, and being tucked inside a secondary menu is
-    // enough friction for something this recoverable (nothing about the book itself is deleted).
+    // plan). "Mark as finished"/"Reset progress" themselves are the shared `item_options_menu`
+    // widget (also used by Item Detail); only "Add bookmark" is built here, since bookmarking only
+    // makes sense while something is actively loaded for playback.
     let add_bookmark_button = gtk4::Button::builder().label("Add bookmark").css_classes(["flat"]).halign(gtk4::Align::Start).build();
-    let mark_as_finished_button = gtk4::Button::builder().label("Mark as finished").css_classes(["flat"]).halign(gtk4::Align::Start).build();
-    // `destructive-action` combined with `flat` renders invisible (background-matching) text in
-    // this popover's context — confirmed live: the button worked when clicked, but its label was
-    // blank. `destructive-action` is meant for a solid filled button, not a flat text row, so
-    // this one skips `flat` and gets its own margin to read as a distinct, deliberately separate
-    // action rather than a fourth identical-looking menu row.
-    let reset_progress_button = gtk4::Button::builder().label("Reset progress").css_classes(["destructive-action"]).margin_top(6).build();
-    let menu_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    menu_popover_box.append(&add_bookmark_button);
-    menu_popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    menu_popover_box.append(&mark_as_finished_button);
-    menu_popover_box.append(&reset_progress_button);
-    let menu_popover = gtk4::Popover::builder().child(&menu_popover_box).build();
-    let menu_button = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").popover(&menu_popover).build();
-    header.pack_end(&menu_button);
 
     let cover = crate::widgets::cover_image::CoverImage::new(264);
     cover.widget().set_halign(gtk4::Align::Center);
@@ -314,37 +296,30 @@ pub fn build(
     );
     secondary_row.append(&download_menu.widget);
 
+    let options_menu = crate::widgets::item_options_menu::build(
+        toast_overlay.clone(),
+        Some(add_bookmark_button.clone().upcast()),
+        {
+            let controller = controller.clone();
+            move || controller.mark_as_finished()
+        },
+        {
+            let controller = controller.clone();
+            move || controller.reset_progress()
+        },
+    );
+    header.pack_end(&options_menu.widget);
+
     add_bookmark_button.connect_clicked({
         let controller = controller.clone();
-        let menu_popover = menu_popover.clone();
+        let options_popover = options_menu.popover.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
             controller.add_bookmark();
-            menu_popover.popdown();
+            options_popover.popdown();
             toast_overlay.add_toast(adw::Toast::new("Bookmark added"));
         }
     });
-    mark_as_finished_button.connect_clicked({
-        let controller = controller.clone();
-        let menu_popover = menu_popover.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            controller.mark_as_finished();
-            menu_popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
-        }
-    });
-    reset_progress_button.connect_clicked({
-        let controller = controller.clone();
-        let menu_popover = menu_popover.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            controller.reset_progress();
-            menu_popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Progress reset"));
-        }
-    });
-
     // The skip intervals are read at click time from the controller (Settings → Playback's live
     // config) rather than captured from `playback_settings` at build — a Settings edit applies to
     // the very next skip, here and in the keyboard actions below.
@@ -538,11 +513,14 @@ pub fn build(
             sleep_timer_button,
             sleep_timer_popover,
             sleep_timer_popover_box,
-            menu_button,
             add_bookmark_button,
-            mark_as_finished_button,
-            reset_progress_button,
             toast_overlay,
+            #[cfg(test)]
+            menu_button: options_menu.widget,
+            #[cfg(test)]
+            mark_as_finished_button: options_menu.mark_as_finished_button,
+            #[cfg(test)]
+            reset_progress_button: options_menu.reset_progress_button,
             #[cfg(test)]
             download_button: download_menu.widget,
             #[cfg(test)]
