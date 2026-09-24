@@ -89,7 +89,7 @@ impl PlaybackStatus {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackMetadata {
     pub title: String,
     pub artist: Option<String>,
@@ -215,7 +215,12 @@ impl MprisHandle {
     /// `org.freedesktop.DBus.Properties.PropertiesChanged` signal — this is what keeps a
     /// lock-screen media card in sync with real playback.
     pub fn update(&self, new_state: PlayerState) {
+        let previous = self.state.borrow().clone();
         *self.state.borrow_mut() = new_state.clone();
+
+        if !player_state_changed(&previous, &new_state) {
+            return;
+        }
 
         let changed = glib::VariantDict::new(None);
         changed.insert("PlaybackStatus", new_state.status.as_str());
@@ -234,6 +239,12 @@ impl MprisHandle {
             tracing::warn!(%err, "couldn't emit MPRIS PropertiesChanged");
         }
     }
+}
+
+/// Whether any MPRIS-relevant field changed. `position_micros` is deliberately excluded —
+/// see the comment in `MprisHandle::update` on why `Position` never triggers a signal.
+fn player_state_changed(previous: &PlayerState, new: &PlayerState) -> bool {
+    previous.status != new.status || previous.metadata != new.metadata || previous.rate != new.rate
 }
 
 fn media_player2_property(property: &str, app_name: &str) -> glib::Variant {
@@ -459,5 +470,27 @@ mod tests {
         let dict = glib::VariantDict::new(Some(&variant));
         assert_eq!(dict.lookup_value("xesam:title", None).and_then(|v| v.str().map(str::to_string)), Some("A Book".to_string()));
         assert_eq!(dict.lookup_value("mpris:length", None).and_then(|v| v.get::<i64>()), Some(42));
+    }
+
+    #[test]
+    fn player_state_changed_is_false_when_only_position_differs() {
+        let previous = PlayerState { status: PlaybackStatus::Playing, position_micros: 0, ..PlayerState::default() };
+        let new = PlayerState { status: PlaybackStatus::Playing, position_micros: 250_000, ..PlayerState::default() };
+        assert!(!player_state_changed(&previous, &new));
+    }
+
+    #[test]
+    fn player_state_changed_is_true_when_status_or_metadata_or_rate_differs() {
+        let base = PlayerState::default();
+
+        let status_changed = PlayerState { status: PlaybackStatus::Playing, ..base.clone() };
+        assert!(player_state_changed(&base, &status_changed));
+
+        let metadata_changed =
+            PlayerState { metadata: TrackMetadata { title: "New Title".to_string(), ..TrackMetadata::default() }, ..base.clone() };
+        assert!(player_state_changed(&base, &metadata_changed));
+
+        let rate_changed = PlayerState { rate: 1.5, ..base.clone() };
+        assert!(player_state_changed(&base, &rate_changed));
     }
 }
