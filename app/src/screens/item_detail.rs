@@ -320,13 +320,19 @@ pub fn build(
                 duration_label.set_label(&format_duration(item.duration_seconds));
                 cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
                 if let Some(description) = item.description.as_deref().filter(|d| !d.is_empty()) {
-                    description_label.set_label(description);
-                    description_section.set_visible(true);
-                    // A rough "does this need truncating" heuristic (no layout pass has run yet
-                    // to know the real line count) — long enough that a short blurb never shows a
-                    // pointless "more" button, short enough that a genuinely long description
-                    // reliably gets one.
-                    more_button.set_visible(description.chars().count() > 240);
+                    // Descriptions are (sanitized) HTML server-side — Audiobookshelf's allowlist is
+                    // `p, ol, ul, li, a, strong, em, del, br, b, i` — so render via Pango markup
+                    // (`crate::rich_text` mirrors that allowlist and escapes everything else).
+                    let markup = crate::rich_text::html_to_pango(description);
+                    if !markup.is_empty() {
+                        description_label.set_markup(&markup);
+                        description_section.set_visible(true);
+                        // A rough "does this need truncating" heuristic (no layout pass has run yet
+                        // to know the real line count) — long enough that a short blurb never shows a
+                        // pointless "more" button, short enough that a genuinely long description
+                        // reliably gets one.
+                        more_button.set_visible(description.chars().count() > 240);
+                    }
                 }
             }
 
@@ -714,6 +720,28 @@ pub(crate) mod tests {
         hooks.more_button.emit_clicked();
         assert_eq!(hooks.description_label.lines(), -1, "tapping 'more' should expand to the full text");
         assert_eq!(hooks.more_button.label().as_deref(), Some("less"));
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Descriptions are (sanitized) HTML
+    /// server-side, so the label renders via Pango markup: paragraphs break, `&amp;` decodes —
+    /// and malformed HTML (unclosed `<b>`/`<i>` here) still renders every word of text.
+    pub(crate) fn run_description_renders_html_as_markup(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let description = "<p>First para</p><p>Second <b>bold &amp; <i>unclosed";
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(description), 3600.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.description_label.use_markup(), Duration::from_secs(5));
+        assert_eq!(hooks.description_label.label(), "First para\n\nSecond <b>bold &amp; <i>unclosed</i></b>");
+        assert_eq!(hooks.description_label.text(), "First para\n\nSecond bold & unclosed");
+        assert!(!hooks.more_button.is_visible(), "a short description should show no 'more' toggle");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Chapter rows list title + duration,

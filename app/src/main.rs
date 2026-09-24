@@ -3,6 +3,7 @@ mod downloads;
 mod error_reporting;
 mod offline_mode;
 mod player;
+mod rich_text;
 mod screens;
 #[cfg(test)]
 mod test_support;
@@ -182,6 +183,7 @@ mod tests {
         (item_detail_empty_narrator_falls_back_to_author_only, crate::screens::item_detail::tests::run_empty_narrator_falls_back_to_author_only),
         (item_detail_partially_listened_book_shows_resume_and_progress, crate::screens::item_detail::tests::run_partially_listened_book_shows_resume_and_progress),
         (item_detail_description_truncation_and_more_toggle, crate::screens::item_detail::tests::run_description_truncation_and_more_toggle),
+        (item_detail_description_renders_html_as_markup, crate::screens::item_detail::tests::run_description_renders_html_as_markup),
         (item_detail_chapter_rows_show_offline_glyphs_and_seek_on_tap, crate::screens::item_detail::tests::run_chapter_rows_show_offline_glyphs_and_seek_on_tap),
         (item_detail_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller, crate::screens::item_detail::tests::run_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller),
         (item_detail_back_button_invokes_on_back, crate::screens::item_detail::tests::run_back_button_invokes_on_back),
