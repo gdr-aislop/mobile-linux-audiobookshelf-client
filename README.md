@@ -35,3 +35,21 @@ Output lands in `build/appimage/abs-app-<version>-<arch>.AppImage`.
 `scripts/build-appimage.sh --help` documents environment overrides
 (`ABS_APP_BIN`, `LINUXDEPLOY`, `APPIMAGE_TOOLS_DIR`); the docker wrapper
 mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfile`.
+
+## Diagnosing a crash report
+
+The app never phones home; everything below stays on the user's device. If
+someone reports a crash, ask for whatever exists under
+`~/.local/state/io.github.gdr_aislop.Audiobookshelf/`:
+
+- `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
+  A Rust panic always logs its full backtrace here, even without
+  `RUST_BACKTRACE` set.
+- `crashes/crash-<timestamp>-<pid>.dmp` — a Breakpad-format minidump written
+  for a native (signal-level) crash a Rust panic hook can't catch (a
+  segfault/abort inside GTK/GStreamer/glib). It's binary, not directly
+  readable: turn it into a stack trace with
+  [`minidump-stackwalk`](https://crates.io/crates/minidump-stackwalk)
+  (`cargo install minidump-stackwalk`), which also needs debug symbols from
+  a build matching the exact version that crashed (an unstripped binary, or
+  a separately retained `.debug` file).

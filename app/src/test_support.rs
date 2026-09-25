@@ -24,7 +24,7 @@ pub async fn pool() -> SqlitePool {
 /// (cover-art caching needs somewhere to write) — same leak-the-tempdir approach as `pool()`.
 pub fn test_paths() -> abs_storage::AppPaths {
     let tmp = tempfile::tempdir().unwrap();
-    let paths = abs_storage::AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
+    let paths = abs_storage::AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
     std::mem::forget(tmp);
     paths
 }

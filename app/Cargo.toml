@@ -20,6 +20,7 @@ sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 
 # Feature-gated to the API surface available in libadwaita 1.2 / GTK4 4.8 (PureOS Crimson's
 # actual shipped versions — see docs/architecture note in the plan). This is a compile-time
@@ -35,6 +36,12 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_2"] }
 # Audiobookshelf serves many covers as WebP. Decoded in-process and turned
 # into a `gdk::MemoryTexture` when pixbuf can't handle a file.
 image.workspace = true
+
+# Local, Breakpad-format crash dumps for native (signal-level) crashes a Rust panic hook can't
+# catch — a segfault/abort inside the GTK/GStreamer/glib C code this binary links against. See
+# `crash_reporting.rs`'s doc comment for the out-of-process client/server design.
+crash-handler.workspace = true
+minidumper.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

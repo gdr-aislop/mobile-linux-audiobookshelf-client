@@ -1,6 +1,8 @@
 //! Resolves the on-disk locations this app uses, following the XDG Base Directory layout
-//! documented in the architecture plan: durable state under `$XDG_DATA_HOME`, evictable cache
-//! under `$XDG_CACHE_HOME`. Nothing outside this module computes one of these paths directly.
+//! documented in the architecture plan: durable user data under `$XDG_DATA_HOME`, evictable
+//! cache under `$XDG_CACHE_HOME`, and operational state (logs, crash dumps — not user data, not
+//! safe to evict like a cache) under `$XDG_STATE_HOME`. Nothing outside this module computes one
+//! of these paths directly.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +21,7 @@ pub const APP_ID: &str = "io.github.gdr_aislop.Audiobookshelf";
 pub struct AppPaths {
     data_dir: PathBuf,
     cache_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -29,15 +32,20 @@ impl AppPaths {
         Some(Self {
             data_dir: dirs.data_dir().join(APP_ID),
             cache_dir: dirs.cache_dir().join(APP_ID),
+            // `state_dir()` is `None` on platforms with no `$XDG_STATE_HOME` equivalent — falls
+            // back to `data_dir` (durable-adjacent) rather than `cache_dir` (evictable), matching
+            // why logs/crash dumps don't belong in the cache dir in the first place.
+            state_dir: dirs.state_dir().unwrap_or_else(|| dirs.data_dir()).join(APP_ID),
         })
     }
 
     /// Build an instance rooted at arbitrary directories — used by tests (and could be used for
     /// a future multi-profile mode) instead of touching the real user environment.
-    pub fn rooted_at(data_dir: impl Into<PathBuf>, cache_dir: impl Into<PathBuf>) -> Self {
+    pub fn rooted_at(data_dir: impl Into<PathBuf>, cache_dir: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
             cache_dir: cache_dir.into(),
+            state_dir: state_dir.into(),
         }
     }
 
@@ -47,6 +55,21 @@ impl AppPaths {
 
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Rotating application logs — see `crash_reporting::init_logging` in the `app` crate.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_dir.join("logs")
+    }
+
+    /// Local Breakpad-format `.dmp` files written on a native (signal-level) crash — see
+    /// `crash_reporting::attach_crash_handler` in the `app` crate.
+    pub fn crash_dumps_dir(&self) -> PathBuf {
+        self.state_dir.join("crashes")
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -84,12 +107,37 @@ impl AppPaths {
             .join(format!("{item_id}.{extension}"))
     }
 
+    /// Every directory this `AppPaths` might write into — the single list `ensure_dirs` (async,
+    /// called once `setup()` has a Tokio runtime) and `main.rs`'s early synchronous creation of
+    /// just the logging/crash-dump dirs (needed before a runtime exists) both draw from, so the
+    /// two can't drift apart.
+    fn all_dirs(&self) -> [PathBuf; 6] {
+        [
+            self.data_dir.clone(),
+            self.downloads_dir(),
+            self.cache_dir.clone(),
+            self.covers_dir(),
+            self.logs_dir(),
+            self.crash_dumps_dir(),
+        ]
+    }
+
     /// Create every directory this `AppPaths` might write into. Idempotent.
     pub async fn ensure_dirs(&self) -> std::io::Result<()> {
-        tokio::fs::create_dir_all(&self.data_dir).await?;
-        tokio::fs::create_dir_all(self.downloads_dir()).await?;
-        tokio::fs::create_dir_all(&self.cache_dir).await?;
-        tokio::fs::create_dir_all(self.covers_dir()).await?;
+        for dir in self.all_dirs() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Synchronous, `logs_dir`/`crash_dumps_dir`-only subset of `ensure_dirs` — for `main.rs` to
+    /// call before a Tokio runtime exists, since logging and crash-dump capture must be wired up
+    /// before the rest of async setup runs (so they can catch failures during that setup too).
+    /// `ensure_dirs` still creates these same two directories again later (idempotent) alongside
+    /// everything else.
+    pub fn ensure_early_dirs(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.logs_dir())?;
+        std::fs::create_dir_all(self.crash_dumps_dir())?;
         Ok(())
     }
 
@@ -131,7 +179,7 @@ mod tests {
 
     fn test_paths() -> (tempfile::TempDir, AppPaths) {
         let tmp = tempfile::tempdir().expect("create temp dir");
-        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
+        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
         (tmp, paths)
     }
 
@@ -180,6 +228,17 @@ mod tests {
     }
 
     #[test]
+    fn logs_dir_and_crash_dumps_dir_live_under_state_dir_not_cache_or_data() {
+        let (_tmp, paths) = test_paths();
+        for dir in [paths.logs_dir(), paths.crash_dumps_dir()] {
+            assert!(dir.starts_with(paths.state_dir()));
+            assert!(!dir.starts_with(paths.cache_dir()));
+            assert!(!dir.starts_with(paths.data_dir()));
+        }
+        assert_ne!(paths.logs_dir(), paths.crash_dumps_dir());
+    }
+
+    #[test]
     fn cover_cache_path_uses_the_given_extension() {
         let (_tmp, paths) = test_paths();
         let cover = paths.cover_cache_path("server-a", "item-1", "webp");
@@ -195,6 +254,18 @@ mod tests {
         assert!(paths.downloads_dir().is_dir());
         assert!(paths.cache_dir().is_dir());
         assert!(paths.covers_dir().is_dir());
+        assert!(paths.logs_dir().is_dir());
+        assert!(paths.crash_dumps_dir().is_dir());
+    }
+
+    #[test]
+    fn ensure_early_dirs_creates_only_logs_and_crash_dumps() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_early_dirs().expect("ensure_early_dirs succeeds");
+
+        assert!(paths.logs_dir().is_dir());
+        assert!(paths.crash_dumps_dir().is_dir());
+        assert!(!paths.data_dir().exists(), "ensure_early_dirs must not create the other, async-created dirs");
     }
     #[tokio::test]
     async fn ensure_dirs_is_idempotent() {
@@ -238,12 +309,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_produces_distinct_data_and_cache_dirs() {
+    fn resolve_produces_distinct_data_cache_and_state_dirs() {
         // This touches the real environment (HOME/XDG_*), so just check internal consistency
         // rather than asserting a specific path — the sandbox running this test may not have a
         // conventional home directory.
         if let Some(paths) = AppPaths::resolve() {
             assert_ne!(paths.data_dir(), paths.cache_dir());
+            assert_ne!(paths.data_dir(), paths.state_dir());
+            assert_ne!(paths.cache_dir(), paths.state_dir());
         }
     }
 
@@ -257,6 +330,7 @@ mod tests {
         if let Some(paths) = AppPaths::resolve() {
             assert_eq!(paths.data_dir().file_name().unwrap(), APP_ID);
             assert_eq!(paths.cache_dir().file_name().unwrap(), APP_ID);
+            assert_eq!(paths.state_dir().file_name().unwrap(), APP_ID);
         }
     }
 }

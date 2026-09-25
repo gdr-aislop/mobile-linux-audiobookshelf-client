@@ -1,4 +1,5 @@
 mod application;
+mod crash_reporting;
 mod downloads;
 mod error_reporting;
 mod offline_mode;
@@ -13,6 +14,15 @@ use adw::prelude::*;
 use application::AppState;
 
 fn main() -> adw::glib::ExitCode {
+    // Checked before *everything* else, including `--version` — a real user never passes this
+    // flag; it exists only so this same binary can re-exec itself as the crash-dump IPC server
+    // (see `crash_reporting`'s module doc comment). The spawned server must never run `setup()`,
+    // touch the database, or init GStreamer/GTK, so this has to come first.
+    if let Some(socket_name) = crash_reporting::crash_server_socket_name() {
+        let paths = abs_storage::AppPaths::resolve().expect("resolve XDG application directories");
+        crash_reporting::run_crash_server(&socket_name, paths.crash_dumps_dir());
+    }
+
     // `--version` / `-v`: print and exit before *any* side effect — notably before setup()
     // resolves XDG paths and opens/migrates the user's database, which a version query has no
     // business doing. Parsed by hand here rather than via GApplication's option machinery
@@ -24,7 +34,20 @@ fn main() -> adw::glib::ExitCode {
         return 0.into();
     }
 
-    tracing_subscriber::fmt::init();
+    // Resolved here, synchronously, rather than inside `setup()` — logging and the panic hook
+    // below need `AppPaths` (specifically `logs_dir()`) before a Tokio runtime exists, so they
+    // can also catch failures during the async setup that follows. `ensure_early_dirs` covers
+    // only what's needed for that; `setup()`'s own `ensure_dirs()` call still creates every
+    // directory (redundantly but harmlessly for these two).
+    let paths = abs_storage::AppPaths::resolve().expect("resolve XDG application directories");
+    paths.ensure_early_dirs().expect("create the logging/crash-dump directories");
+
+    let log_handle = crash_reporting::init_logging(&paths);
+    crash_reporting::install_panic_hook(log_handle.clone());
+    // Failure here degrades to a warning inside `attach_crash_handler` itself — crash-dump
+    // capture must never block the app from starting (e.g. under a sandboxed/seccomp environment
+    // that blocks spawning a subprocess or installing a signal handler).
+    let _crash_client = crash_reporting::attach_crash_handler();
 
     // One shared Tokio runtime for the whole app (see the architecture plan's async-runtime
     // note): GTK runs on GLib's main loop, but abs-api/abs-storage are async. Setup that must
@@ -41,18 +64,19 @@ fn main() -> adw::glib::ExitCode {
     // exercises this file's setup.
     let runtime = tokio::runtime::Runtime::new().expect("build the Tokio runtime");
     let _runtime_guard = runtime.enter();
-    let state = runtime.block_on(setup());
+    let state = runtime.block_on(setup(paths));
 
     if let Err(err) = abs_player::init() {
         tracing::warn!(%err, "GStreamer failed to initialize; playback will be unavailable");
     }
 
     let app = application::build_application(state);
-    app.run()
+    let exit_code = app.run();
+    log_handle.flush();
+    exit_code
 }
 
-async fn setup() -> AppState {
-    let paths = abs_storage::AppPaths::resolve().expect("resolve XDG application directories");
+async fn setup(paths: abs_storage::AppPaths) -> AppState {
     paths.ensure_dirs().await.expect("create application directories");
 
     let pool = abs_storage::connect_and_migrate(&paths.db_path())
