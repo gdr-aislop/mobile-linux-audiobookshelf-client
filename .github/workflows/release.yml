@@ -1,4 +1,4 @@
-name: Release debs and AppImages
+name: Release debs, AppImages, and Flatpaks
 
 # Builds distribution artifacts for every release tag:
 #   - arm64: PureOS Crimson on the Librem 5 (built against Debian bookworm
