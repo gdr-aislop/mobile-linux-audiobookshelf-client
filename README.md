@@ -16,6 +16,9 @@ Three artifact types are built for every `v*` tag by
 - **Flatpak** — built against `org.gnome.Platform`, published both as a
   downloadable `.flatpak` bundle attached to the release and as a live,
   signed remote hosted on GitHub Pages (see below).
+- **`.deb`** is, likewise, also published as a live, signed APT repository
+  on the same GitHub Pages site, alongside the downloadable file attached
+  to the release.
 
 The `.deb` and `.AppImage` are built inside a Debian bookworm container so
 they link against the library baseline of the target distros.
@@ -37,6 +40,25 @@ Alternatively, download the `.flatpak` file from a
 ```sh
 flatpak install --user ./abs-app-<version>-<arch>.flatpak
 ```
+
+### Installing the .deb via APT
+
+The recommended way — adds the repo once, then `apt upgrade` picks up every
+new tagged release automatically (arm64 and amd64 only):
+
+```sh
+sudo curl -fsSL https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/apt/abs-app.asc \
+  -o /etc/apt/keyrings/abs-app.asc
+echo "deb [signed-by=/etc/apt/keyrings/abs-app.asc] https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/abs-app.list
+sudo apt update
+sudo apt install abs-app
+```
+
+This repo always carries the *latest* tagged release only (not a full
+version history) — older `.deb`s stay available from
+[past releases](../../releases) directly, via `sudo apt install
+./abs-app_<version>_<arch>.deb`.
 
 ### Building an AppImage manually
 

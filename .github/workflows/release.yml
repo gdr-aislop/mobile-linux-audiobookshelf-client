@@ -20,9 +20,12 @@ name: Release debs, AppImages, and Flatpaks
 #
 # The two arch-specific Flatpak repos are also signed, merged, and published as a live remote on
 # GitHub Pages (combine-flatpak-repo + deploy-pages) — see flatpak/io.github.gdr-aislop.abs-app.
-# flatpakrepo and README.md's "Installing the Flatpak" section. Requires two repo secrets
-# (FLATPAK_GPG_PRIVATE_KEY, FLATPAK_GPG_KEY_ID) and the repo's Settings → Pages source set to
-# "GitHub Actions" — both one-time manual setup, not something this workflow can do for itself.
+# flatpakrepo and README.md's "Installing the Flatpak" section. The .debs get the same treatment
+# via a minimal hand-built APT repo (build-apt-repo), published alongside the Flatpak repo under
+# the same site's /apt/ path — see README.md's "Installing the .deb via APT" section. Both reuse
+# the same signing key (secrets.FLATPAK_GPG_PRIVATE_KEY/FLATPAK_GPG_KEY_ID — named for the first
+# thing they signed, now used for both) and need the repo's Settings → Pages source set to
+# "GitHub Actions" — one-time manual setup, not something this workflow can do for itself.
 
 on:
   push:
@@ -312,10 +315,93 @@ jobs:
           path: flatpak-repo
           if-no-files-found: error
 
-  deploy-pages:
-    name: Publish the Flatpak repo to GitHub Pages
+  build-apt-repo:
+    name: Build the APT repo
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: combine-flatpak-repo
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install apt-ftparchive and GPG
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils gnupg
+
+      - name: Import the signing key
+        run: echo "$SIGNING_GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          SIGNING_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+
+      # A minimal from-scratch repo (no reprepro/aptly state to maintain — this is rebuilt fresh
+      # every release, same "stateless, republished whole" shape as the Flatpak repo above), built
+      # by hand the way a repo this small doesn't need a heavier tool for: one shared pool
+      # (real Debian repos mix every arch's .deb in the same pool dir too — the split into
+      # binary-<arch>/Packages is purely an index-level thing), one Packages listing per
+      # architecture generated from a filtered view of that pool, and a signed Release covering
+      # both. Only the current release's .debs are ever present — apt/upgrade always gets the
+      # latest; older versions stay downloadable from the GitHub Release itself, just not via this
+      # live repo (the same tradeoff the Flatpak repo above already makes by rebuilding fresh
+      # rather than accumulating OSTree history each run).
+      - name: Assemble the repo
+        run: |
+          set -eux
+          mkdir -p apt-repo/pool/main/a/abs-app
+          cp debs/deb-arm64/*.deb debs/deb-amd64/*.deb apt-repo/pool/main/a/abs-app/
+
+          cd apt-repo
+          for arch in arm64 amd64; do
+            mkdir -p "dists/stable/main/binary-$arch" "work/$arch"
+            cp "../debs/deb-$arch"/*.deb "work/$arch/"
+            apt-ftparchive packages "work/$arch" \
+              | sed "s#^Filename: work/$arch/#Filename: pool/main/a/abs-app/#" \
+              > "dists/stable/main/binary-$arch/Packages"
+            gzip -9c "dists/stable/main/binary-$arch/Packages" > "dists/stable/main/binary-$arch/Packages.gz"
+          done
+          rm -rf work
+
+          # apt-ftparchive release's own output already includes a Date field and the hash
+          # listings for every regular file it finds under dists/stable — which must NOT include
+          # Release itself (a stub Release present in that directory before this scan would get
+          # hashed as if it were a distributable index, which real Debian Release files never do),
+          # hence writing its output to a separate file first and only concatenating after.
+          {
+            echo "Origin: abs-app"
+            echo "Label: Audiobookshelf GTK4 client"
+            echo "Suite: stable"
+            echo "Codename: stable"
+            echo "Architectures: arm64 amd64"
+            echo "Components: main"
+            echo "Description: Audiobookshelf GTK4 client APT repository"
+          } > Release.header
+          ( cd dists/stable && apt-ftparchive release . ) > Release.hashes
+          cat Release.header Release.hashes > dists/stable/Release
+          rm -f Release.header Release.hashes
+
+      - name: Sign the repo
+        run: |
+          set -eux
+          cd apt-repo/dists/stable
+          gpg --default-key "$SIGNING_GPG_KEY_ID" --clearsign -o InRelease Release
+          gpg --default-key "$SIGNING_GPG_KEY_ID" --detach-sign --armor -o Release.gpg Release
+          gpg --armor --export "$SIGNING_GPG_KEY_ID" > ../../abs-app.asc
+        env:
+          SIGNING_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apt-repo
+          path: apt-repo
+          if-no-files-found: error
+
+  deploy-pages:
+    name: Publish the Flatpak + APT repos to GitHub Pages
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [combine-flatpak-repo, build-apt-repo]
     runs-on: ubuntu-latest
     # This is the one job that needs Pages-deploy access — everything upstream of it keeps the
     # default read-only permissions. Requires the repo's Settings → Pages → "Build and deployment"
@@ -328,10 +414,18 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # The Flatpak repo (OSTree objects/refs/config/summary + the .flatpakrepo file) sits at the
+      # Pages root; the APT repo sits under /apt/ alongside it — nothing in either tree's top level
+      # is named "apt", so the two coexist with no path collisions.
       - uses: actions/download-artifact@v4
         with:
           name: flatpak-pages
           path: pages
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: apt-repo
+          path: pages/apt
 
       - uses: actions/upload-pages-artifact@v5
         with:
