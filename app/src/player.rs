@@ -82,6 +82,12 @@ pub struct PlayerSnapshot {
     pub speed: f64,
     pub sleep_timer_active: bool,
     pub cover_path: Option<std::path::PathBuf>,
+    /// The most recent playback failure, if any — `None` means the last load/play attempt (or the
+    /// current one, if nothing has failed) is fine. Set by every failure path in `Inner` (a bus
+    /// error mid-playback, a failed track load, a failed synchronous `play`/`pause`), cleared
+    /// whenever the corresponding action next succeeds. `screens::player`'s error banner and the
+    /// mini bar's warning glyph are this field's only two readers.
+    pub last_error: Option<abs_player::PlaybackError>,
 }
 
 /// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
@@ -132,6 +138,9 @@ struct NowPlaying {
     speed: f64,
     sleep_timer: SleepTimerState,
     cover_path: Option<std::path::PathBuf>,
+    /// See [`PlayerSnapshot::last_error`]'s doc comment — same field, mirrored here since
+    /// `NowPlaying` is what `snapshot()` actually reads from.
+    last_error: Option<abs_player::PlaybackError>,
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
@@ -178,6 +187,7 @@ impl Inner {
             speed: now_playing.speed,
             sleep_timer_active: now_playing.sleep_timer != SleepTimerState::Off,
             cover_path: now_playing.cover_path.clone(),
+            last_error: now_playing.last_error.clone(),
         })
     }
 
@@ -324,6 +334,11 @@ impl Inner {
                     if let Some(now_playing) = &mut inner.now_playing {
                         if now_playing.item_id == item_id {
                             now_playing.is_playing = false;
+                            now_playing.last_error = Some(abs_player::PlaybackError {
+                                kind: abs_player::PlaybackErrorKind::Network,
+                                message: err.to_string(),
+                                debug: None,
+                            });
                         }
                     }
                     inner.publish();
@@ -346,6 +361,7 @@ impl Inner {
                     if let Some(now_playing) = &mut inner.now_playing {
                         if now_playing.item_id == item_id {
                             now_playing.is_playing = false;
+                            now_playing.last_error = Some((&err).into());
                         }
                     }
                     inner.publish();
@@ -371,6 +387,11 @@ impl Inner {
             }
 
             let mut inner = inner_rc.borrow_mut();
+            if let Some(now_playing) = &mut inner.now_playing {
+                if now_playing.item_id == item_id {
+                    now_playing.last_error = None;
+                }
+            }
             if inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.is_playing) {
                 let _ = inner.backend.play();
             }
@@ -674,55 +695,76 @@ impl PlayerController {
 
             let start_url = resolve_playable_url(&pool, &connection, session.server_id(), &item.item_id, &target.tracks[start_track].ino, &session).await;
 
-            {
+            let load_result = {
                 let mut inner = inner_rc.borrow_mut();
                 // As in `spawn_load_track`: transport properties go on before the load, so the
                 // HTTP source created during it is set up with the connection's settings.
                 inner.backend.apply_connection(&playback_properties(&connection));
-                if let Err(err) = inner.backend.load(&start_url) {
-                    tracing::warn!(%err, "couldn't load the audio stream");
-                    return;
-                }
-                // A seek needs the pipeline to have actually *reached* PAUSED, not just been
-                // asked to — pausing is itself an async state change, and for a network-streamed
-                // source (connecting, buffering) it can take a real moment. Requesting the seek
-                // before that lands is not an error `AudioBackend` reports; it silently no-ops,
-                // which used to mean "resume mid-book" quietly resumed from 0 instead.
-                let _ = inner.backend.pause();
-            }
-            // A non-default speed also needs a seek internally (`AudioBackend::set_speed` is
-            // implemented as a seek-with-rate, GStreamer having no rate-only call), so it has the
-            // same readiness requirement as the resume seek below.
-            let needs_seek_ready = start_within > 0.0 || (default_speed - 1.0).abs() > f64::EPSILON;
-            if needs_seek_ready {
-                // `duration()` can come back `Some` from container metadata alone, before the
-                // pipeline has actually finished prerolling into `PAUSED` — which is what seeking
-                // actually requires. `position()` only starts returning a value once preroll has
-                // genuinely completed, so it's the more accurate "ready to seek" signal.
-                for _ in 0..50 {
-                    if inner_rc.borrow().backend.position().is_some() {
-                        break;
+                inner.backend.load(&start_url)
+            };
+
+            // Everything needed to show this item (title/author/cover/duration/chapters) is
+            // already resolved above regardless of whether the load below succeeds — so
+            // `now_playing` is always constructed, even on a load failure, rather than bailing out
+            // silently. That used to leave `now_playing` (and `current_download_context()`,
+            // `main_window`'s `start_playback` polls on exactly that) `None` forever whenever the
+            // audio engine couldn't come up at all (e.g. no GStreamer plugins for this format, no
+            // PulseAudio/PipeWire) — the Full Player screen would then never open at all, and
+            // tapping Play looked like it silently did nothing. Constructing `now_playing` with
+            // `last_error` set instead means the screen opens showing the real item info plus why
+            // it isn't playing, exactly like a mid-playback failure does once one is already open.
+            let (is_playing, applied_speed, last_error) = match load_result {
+                Ok(()) => {
+                    // A seek needs the pipeline to have actually *reached* PAUSED, not just been
+                    // asked to — pausing is itself an async state change, and for a
+                    // network-streamed source (connecting, buffering) it can take a real moment.
+                    // Requesting the seek before that lands is not an error `AudioBackend`
+                    // reports; it silently no-ops, which used to mean "resume mid-book" quietly
+                    // resumed from 0 instead.
+                    let _ = inner_rc.borrow_mut().backend.pause();
+                    // A non-default speed also needs a seek internally (`AudioBackend::set_speed`
+                    // is implemented as a seek-with-rate, GStreamer having no rate-only call), so
+                    // it has the same readiness requirement as the resume seek below.
+                    let needs_seek_ready = start_within > 0.0 || (default_speed - 1.0).abs() > f64::EPSILON;
+                    if needs_seek_ready {
+                        // `duration()` can come back `Some` from container metadata alone, before
+                        // the pipeline has actually finished prerolling into `PAUSED` — which is
+                        // what seeking actually requires. `position()` only starts returning a
+                        // value once preroll has genuinely completed, so it's the more accurate
+                        // "ready to seek" signal.
+                        for _ in 0..50 {
+                            if inner_rc.borrow().backend.position().is_some() {
+                                break;
+                            }
+                            glib::timeout_future(Duration::from_millis(100)).await;
+                        }
                     }
-                    glib::timeout_future(Duration::from_millis(100)).await;
+
+                    let mut inner = inner_rc.borrow_mut();
+                    if start_within > 0.0 {
+                        let _ = inner.backend.seek(Duration::from_secs_f64(start_within));
+                    }
+                    // `set_speed` is itself a seek-with-rate (see `abs-player`'s own doc comment)
+                    // — even setting it to the already-default 1.0 would perform a redundant seek
+                    // that queries `position()` and re-seeks to it, which can race the resume seek
+                    // just above (if the resume seek's position update hasn't propagated yet, this
+                    // would re-seek back to the stale pre-resume position). Skip it entirely when
+                    // there's nothing to change.
+                    let applied_speed = if (default_speed - 1.0).abs() > f64::EPSILON {
+                        if inner.backend.set_speed(default_speed).is_ok() { default_speed } else { 1.0 }
+                    } else {
+                        1.0
+                    };
+                    let _ = inner.backend.play();
+                    (true, applied_speed, None)
                 }
-            }
+                Err(err) => {
+                    tracing::warn!(%err, "couldn't load the audio stream");
+                    (false, 1.0, Some(abs_player::PlaybackError::from(&err)))
+                }
+            };
 
             let mut inner = inner_rc.borrow_mut();
-            if start_within > 0.0 {
-                let _ = inner.backend.seek(Duration::from_secs_f64(start_within));
-            }
-            // `set_speed` is itself a seek-with-rate (see `abs-player`'s own doc comment) — even
-            // setting it to the already-default 1.0 would perform a redundant seek that queries
-            // `position()` and re-seeks to it, which can race the resume seek just above (if the
-            // resume seek's position update hasn't propagated yet, this would re-seek back to the
-            // stale pre-resume position). Skip it entirely when there's nothing to change.
-            let applied_speed = if (default_speed - 1.0).abs() > f64::EPSILON {
-                if inner.backend.set_speed(default_speed).is_ok() { default_speed } else { 1.0 }
-            } else {
-                1.0
-            };
-            let _ = inner.backend.play();
-
             inner.now_playing = Some(NowPlaying {
                 item_id: item.item_id,
                 server_id: session.server_id().to_string(),
@@ -733,7 +775,7 @@ impl PlayerController {
                 duration_seconds: target.duration_seconds,
                 tracks: target.tracks,
                 current_track: start_track,
-                is_playing: true,
+                is_playing,
                 chapters,
                 speed: applied_speed,
                 sleep_timer: SleepTimerState::Off,
@@ -742,6 +784,7 @@ impl PlayerController {
                 // task below ever replaces it, and only with a valid, different downloaded
                 // cover — a failed fetch simply leaves the cached one in place.
                 cover_path: cached_cover,
+                last_error,
             });
             inner.last_progress_write = Instant::now();
             inner.publish();
@@ -789,9 +832,23 @@ impl PlayerController {
 
     pub fn play(&self) {
         let mut inner = self.inner.borrow_mut();
-        if inner.backend.play().is_ok() {
-            if let Some(now_playing) = &mut inner.now_playing {
-                now_playing.is_playing = true;
+        match inner.backend.play() {
+            Ok(()) => {
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.is_playing = true;
+                    now_playing.last_error = None;
+                }
+            }
+            // A synchronous failure here means the pipeline itself is broken (e.g. a prior load
+            // failed and left `now_playing` in the error state `start()`/`spawn_load_track` build
+            // — see their own doc comments) — this is the retry path a banner's "Retry" action and
+            // a plain re-tap of Play both go through, so it must also (re-)populate `last_error`
+            // rather than silently doing nothing, which is what made a broken Play button
+            // indistinguishable from a working one before this existed.
+            Err(err) => {
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.last_error = Some((&err).into());
+                }
             }
         }
         inner.publish();
@@ -800,9 +857,16 @@ impl PlayerController {
     pub fn pause(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.paused_by_unplug = false;
-        if inner.backend.pause().is_ok() {
-            if let Some(now_playing) = &mut inner.now_playing {
-                now_playing.is_playing = false;
+        match inner.backend.pause() {
+            Ok(()) => {
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.is_playing = false;
+                }
+            }
+            Err(err) => {
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.last_error = Some((&err).into());
+                }
             }
         }
         inner.publish();
@@ -1061,10 +1125,11 @@ impl PlayerController {
                     }
                 }
                 abs_player::PlayerEvent::Error(err) => {
-                    tracing::warn!(%err, "playback error");
+                    tracing::warn!(?err, "playback error");
                     let _ = inner.backend.pause();
                     if let Some(now_playing) = &mut inner.now_playing {
                         now_playing.is_playing = false;
+                        now_playing.last_error = Some(err);
                     }
                 }
             }
@@ -1111,6 +1176,7 @@ pub struct MiniPlayerHooks {
     pub author_label: gtk4::Label,
     pub play_button: gtk4::Button,
     pub progress: gtk4::ProgressBar,
+    pub error_icon: gtk4::Image,
 }
 
 /// The widgets shared by `build_mini_bar` (owns a freshly created `PlayerController`) and
@@ -1125,6 +1191,7 @@ struct MiniBarWidgets {
     play_icon: gtk4::Image,
     play_button: gtk4::Button,
     progress: gtk4::ProgressBar,
+    error_icon: gtk4::Image,
 }
 
 /// From `docs/design/ui-spec.md`'s "Player — mini" section: cover placeholder, title/author,
@@ -1149,9 +1216,17 @@ fn build_mini_bar_widgets() -> MiniBarWidgets {
     let play_icon = gtk4::Image::from_icon_name("media-playback-pause-symbolic");
     let play_button = gtk4::Button::builder().css_classes(["circular", "flat"]).child(&play_icon).build();
 
+    // A persistent, lightweight indicator that the last playback attempt failed — see
+    // `PlayerSnapshot::last_error`'s doc comment. There's no room in this compact bar for the
+    // Full Player screen's full banner text, so this is deliberately just a glyph: enough for a
+    // glance to know something needs attention, with "tap to open the full player" (already the
+    // mini bar's own established gesture) as the way to actually see why.
+    let error_icon = gtk4::Image::builder().icon_name("dialog-warning-symbolic").tooltip_text("Playback error — tap for details").visible(false).build();
+
     let content_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).margin_start(10).margin_end(10).margin_top(6).build();
     content_row.append(cover.widget());
     content_row.append(&text_box);
+    content_row.append(&error_icon);
     content_row.append(&play_button);
 
     let progress = gtk4::ProgressBar::builder().build();
@@ -1160,7 +1235,7 @@ fn build_mini_bar_widgets() -> MiniBarWidgets {
     bar.append(&content_row);
     bar.append(&progress);
 
-    MiniBarWidgets { bar, cover, title_label, author_label, play_icon, play_button, progress }
+    MiniBarWidgets { bar, cover, title_label, author_label, play_icon, play_button, progress, error_icon }
 }
 
 /// The closure that applies a snapshot to `widgets` — shared between `build_mini_bar` (registered
@@ -1173,6 +1248,7 @@ fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapsho
     let play_icon = widgets.play_icon.clone();
     let progress = widgets.progress.clone();
     let cover = widgets.cover.clone();
+    let error_icon = widgets.error_icon.clone();
     move |snapshot: &PlayerSnapshot| {
         bar.set_visible(true);
         title_label.set_label(&snapshot.title);
@@ -1184,6 +1260,7 @@ fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapsho
         } else {
             "media-playback-start-symbolic"
         }));
+        error_icon.set_visible(snapshot.last_error.is_some());
         let fraction = if snapshot.duration_seconds > 0.0 {
             (snapshot.position_seconds / snapshot.duration_seconds).clamp(0.0, 1.0)
         } else {
@@ -1210,6 +1287,7 @@ fn mini_bar_from_widgets(widgets: MiniBarWidgets, controller: PlayerController) 
             author_label: widgets.author_label,
             play_button: widgets.play_button,
             progress: widgets.progress,
+            error_icon: widgets.error_icon,
         },
     }
 }
@@ -1379,6 +1457,41 @@ pub(crate) mod tests {
     pub(crate) fn test_backend() -> Box<dyn abs_player::AudioBackend> {
         abs_player::init().expect("gstreamer should initialize in this environment");
         Box::new(abs_player::GstBackend::new_with_sink("fakesink").expect("build a playbin with a fake sink"))
+    }
+
+    /// A backend that fails every operation with `NoSourceLoaded` — the same shape as
+    /// `crate::player::real_backend`'s private `NullBackend` fallback (used when `GstBackend::new`
+    /// fails entirely, e.g. no GStreamer plugins at all), reproduced here since that type isn't
+    /// exported: this crate has no seam to make a *real* `GstBackend` fail synchronously (its
+    /// `load()` only ever fails via the async bus, not its `Result`), so this is the only way to
+    /// exercise `start()`'s "the audio engine itself is unavailable" branch deterministically.
+    struct FailingBackend;
+    impl abs_player::AudioBackend for FailingBackend {
+        fn load(&mut self, _uri: &str) -> abs_player::Result<()> {
+            Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn apply_connection(&mut self, _properties: &abs_player::ConnectionProperties) {}
+        fn play(&mut self) -> abs_player::Result<()> {
+            Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn pause(&mut self) -> abs_player::Result<()> {
+            Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn seek(&mut self, _position: Duration) -> abs_player::Result<()> {
+            Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn set_speed(&mut self, _speed: f64) -> abs_player::Result<()> {
+            Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn position(&self) -> Option<Duration> {
+            None
+        }
+        fn duration(&self) -> Option<Duration> {
+            None
+        }
+        fn poll_event(&self) -> Option<abs_player::PlayerEvent> {
+            None
+        }
     }
 
     /// Responds to a `Range: bytes=START-[END]` request with `206 Partial Content` and the
@@ -1557,6 +1670,44 @@ pub(crate) mod tests {
             .expect("pausing should also sync progress to the server");
         let body: serde_json::Value = progress_sync.body_json().unwrap();
         assert_eq!(body["isFinished"], false);
+        controller.stop();
+    }
+
+    /// Regression test for the "Play button silently does nothing" gap: when the audio engine
+    /// itself is unavailable (no GStreamer plugins at all — `real_backend`'s `NullBackend`
+    /// fallback, reproduced here as `FailingBackend` since `load()` always fails), `start()` used
+    /// to `return` before ever constructing `now_playing` — leaving `current_download_context()`
+    /// permanently `None` and, with it, `main_window`'s `start_playback` polling loop (which waits
+    /// on exactly that) silently giving up after 5s with the Full Player screen never opening.
+    /// `start()` now always builds `now_playing` (every piece of metadata it needs resolves before
+    /// the load is even attempted) and records the failure on it instead.
+    pub(crate) fn run_start_with_no_working_audio_engine_still_opens_with_an_error(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(FailingBackend), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
+            1.0,
+        );
+
+        pump_until(|| controller.current_download_context().is_some(), Duration::from_secs(10));
+        assert!(
+            controller.current_download_context().is_some(),
+            "now_playing must exist even when the backend can't load anything — this is what \
+             unblocks the shell from opening the Full Player screen at all"
+        );
+        let snapshot = controller.snapshot().expect("now_playing should exist");
+        assert_eq!(snapshot.title, "Test Book", "the real item metadata should still show, not a blank screen");
+        assert!(!snapshot.is_playing);
+        let err = snapshot.last_error.expect("a failed load must populate last_error");
+        assert_eq!(err.kind, abs_player::PlaybackErrorKind::Unavailable);
+
         controller.stop();
     }
 
@@ -2443,6 +2594,34 @@ pub(crate) mod tests {
             !mini_bar.controller.snapshot().unwrap().is_playing,
             "the mini bar's play/pause button should control the real controller"
         );
+        mini_bar.controller.stop();
+    }
+
+    /// The mini bar's warning glyph is the persistent, at-a-glance indicator of the same
+    /// `last_error` the Full Player screen's banner explains in full — `FailingBackend` (not a
+    /// real pipeline failure) is used here since this test is only about the glyph's visibility
+    /// toggling correctly, which the end-to-end banner test (`screens::player::tests`) doesn't
+    /// cover on its own.
+    pub(crate) fn run_mini_bar_shows_a_warning_glyph_on_playback_error(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 3));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let mini_bar = build_mini_bar(pool.clone(), crate::test_support::test_paths(), Box::new(FailingBackend));
+        let hooks = &mini_bar.hooks;
+        assert!(!hooks.error_icon.is_visible(), "no error before anything has been attempted");
+
+        mini_bar.controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| hooks.error_icon.is_visible(), Duration::from_secs(10));
+        assert!(hooks.error_icon.is_visible(), "a failed load must show the mini bar's warning glyph");
+
         mini_bar.controller.stop();
     }
 }

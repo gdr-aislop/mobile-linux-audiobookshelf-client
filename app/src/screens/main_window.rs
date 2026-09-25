@@ -74,6 +74,9 @@ pub struct TestHooks {
     /// activation (the row-tap path) without reaching into the screen's internals.
     pub pause_on_unplug_switch: gtk4::Switch,
     pub resume_on_replug_switch: gtk4::Switch,
+    /// Hosts the one-shot playback-error toast (see `build`'s `last_toasted_error` listener) —
+    /// shared by every tab, unlike each screen's own per-screen `AdwToastOverlay`.
+    pub toast_overlay: adw::ToastOverlay,
 }
 
 #[cfg(test)]
@@ -135,6 +138,13 @@ pub fn build(
         }
         Err(err) => tracing::warn!(%err, "couldn't register MPRIS media player; system media integration will be unavailable"),
     }
+
+    // One toast per *new* playback failure (never a repeat of the same ongoing one — every
+    // snapshot while the error persists would otherwise re-fire this on every 250ms tick) — the
+    // shell-wide heads-up for whichever tab is open when it happens; the mini bar's own warning
+    // glyph is the persistent indicator, and the Full Player screen's banner is where the honest
+    // detail lives. `open_player` (built below) is threaded in once it exists.
+    let last_toasted_error: Rc<RefCell<Option<abs_player::PlaybackErrorKind>>> = Rc::new(RefCell::new(None));
 
     // Phone-call interruption is best-effort in the same way: no system bus, or no ModemManager
     // on it, must never be fatal — it just means this feature is unavailable. There is
@@ -218,7 +228,15 @@ pub fn build(
 
     let stack = adw::ViewStack::new();
 
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let shell_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    // Wraps the shell so a playback-error toast (see `last_toasted_error` above) can show
+    // regardless of which tab is open — every screen already has its own per-screen
+    // `AdwToastOverlay` for its own toasts, but nothing wrapped the shell itself before this.
+    // `root` (this overlay) is still what gets swapped in/out as the window's content — every
+    // existing `swap_content`/`MainWindow.root` use below is unchanged, just backed by a
+    // different widget now.
+    let root = adw::ToastOverlay::new();
+    root.set_child(Some(&shell_box));
 
     // Opens the full player by swapping the window's content — there's no
     // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
@@ -252,6 +270,28 @@ pub fn build(
             });
             window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
             crate::widgets::swap_content(&window, &player_screen.root);
+        }
+    });
+
+    mini_bar.controller.add_listener({
+        let toast_overlay = root.clone();
+        let open_player = open_player.clone();
+        move |snapshot| {
+            let new_kind = snapshot.last_error.as_ref().map(|err| err.kind);
+            let mut last = last_toasted_error.borrow_mut();
+            if new_kind.is_some() && new_kind != *last {
+                if let Some(kind) = new_kind {
+                    let (title, _) = screens::player::friendly_message(kind);
+                    let toast = adw::Toast::new(title);
+                    toast.set_button_label(Some("Details"));
+                    toast.connect_button_clicked({
+                        let open_player = open_player.clone();
+                        move |_| open_player()
+                    });
+                    toast_overlay.add_toast(toast);
+                }
+            }
+            *last = new_kind;
         }
     });
 
@@ -483,9 +523,9 @@ pub fn build(
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
 
-    root.append(&stack);
-    root.append(&mini_bar.root);
-    root.append(&switcher_bar);
+    shell_box.append(&stack);
+    shell_box.append(&mini_bar.root);
+    shell_box.append(&switcher_bar);
 
     // Keyboard actions for the whole shell (ui-spec §6's global table; the accelerators
     // themselves are set app-wide in `application.rs`). Transport keys no-op when nothing is
@@ -554,6 +594,9 @@ pub fn build(
     });
     mini_bar.root.add_controller(mini_bar_gesture);
 
+    #[cfg(test)]
+    let toast_overlay_hook = root.clone();
+
     MainWindow {
         root: root.upcast(),
         _call_watcher: call_watcher,
@@ -572,6 +615,7 @@ pub fn build(
             open_library_search: open_library_search_action,
             library_search: library_screen.search_entry,
             pause_on_unplug_switch: settings_screen.hooks.pause_on_unplug_switch,
+            toast_overlay: toast_overlay_hook,
             resume_on_replug_switch: settings_screen.hooks.resume_on_replug_switch,
         },
     }
@@ -970,6 +1014,104 @@ pub(crate) mod tests {
             "the Player screen's collapse button should be present"
         );
         assert_eq!(hooks.mini_bar.title_label.label(), "Project Hail Mary", "the mini bar should reflect the item Play just started");
+    }
+
+    /// A real playback failure (the track file 404s) should toast once, shell-wide, regardless of
+    /// which tab is open — and the toast's "Details" action should open the Full Player screen,
+    /// the same as tapping the mini bar. Starts playback directly via the controller (rather than
+    /// through Home/Item Detail's UI, already covered above) since this test is about the toast,
+    /// not the tap-through path.
+    pub(crate) fn run_playback_error_toasts_once_with_a_details_action(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::item_json;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "media": { "audioFiles": [{ "ino": "1", "duration": 5.0 }] }
+                })))
+                .mount(&mock_server),
+        );
+        // The track file 404s — metadata resolves fine, but the actual audio fetch fails once
+        // GStreamer's `souphttpsrc` tries to read it, producing a real bus error.
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1/file/1"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        find_card_button(&home_root).expect("a synced item's card should render").emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("Item Detail should be showing");
+        let play_button = find_button_labeled(&content, "Play").expect("Item Detail's Play button");
+        play_button.emit_clicked();
+
+        pump_until(
+            || find_button_labeled(hooks.toast_overlay.upcast_ref(), "Details").is_some(),
+            std::time::Duration::from_secs(10),
+        );
+        let details_button =
+            find_button_labeled(hooks.toast_overlay.upcast_ref(), "Details").expect("a playback failure should toast with a Details action");
+        details_button.emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|c| c != window.root && find_button_with_icon(&c, "go-down-symbolic").is_some()),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            app_window.content().is_some_and(|c| c != window.root),
+            "the toast's Details action should open the Full Player screen, same as the mini bar's own tap"
+        );
     }
 
     /// End-to-end proof of Item Detail's series-button tap-through: tap a card with series
