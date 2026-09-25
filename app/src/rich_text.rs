@@ -218,10 +218,17 @@ fn close_pango_tag(out: &mut String, open_tags: &mut Vec<(&'static str, usize)>,
             out.push('>');
         }
     } else {
-        // Highest offset first, so the stored positions of the remaining tags stay valid.
-        while let Some((t, pos)) = open_tags.pop() {
-            out.replace_range(pos..pos + t.len() + 2, "");
+        // `open_tags` is already ascending by `pos` (each entry was pushed at the then-current
+        // `out.len()`), so the removed ranges can be skipped in one left-to-right pass instead
+        // of one `replace_range` per tag — O(n) instead of O(n²) for a long mismatched run.
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut last_end = 0;
+        for (t, pos) in open_tags.drain(..) {
+            rebuilt.push_str(&out[last_end..pos]);
+            last_end = pos + t.len() + 2;
         }
+        rebuilt.push_str(&out[last_end..]);
+        *out = rebuilt;
     }
 }
 
