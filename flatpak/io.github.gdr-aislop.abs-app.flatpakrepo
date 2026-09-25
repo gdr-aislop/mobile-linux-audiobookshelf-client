@@ -1,0 +1,9 @@
+[Flatpak Repo]
+Title=Audiobookshelf
+Url=__REPO_URL__
+Homepage=__HOMEPAGE_URL__
+Comment=Audiobookshelf GTK4 client — Flatpak repository
+Description=A GNOME-native Audiobookshelf client for mobile Linux, packaged as a Flatpak.
+Icon=__ICON_URL__
+DefaultBranch=master
+GPGKey=__GPG_KEY__

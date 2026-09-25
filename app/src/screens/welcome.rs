@@ -68,7 +68,6 @@ pub fn build(
         .margin_bottom(24)
         .margin_start(24)
         .margin_end(24)
-        .width_request(340)
         .spacing(0)
         .build();
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-pub use error::{PlayerError, Result};
+pub use error::{PlaybackError, PlaybackErrorKind, PlayerError, Result};
 
 /// Call once per process before constructing a [`GstBackend`]. Safe to call more than once
 /// (`gstreamer::init` is idempotent).
@@ -32,7 +32,41 @@ pub fn init() -> Result<()> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerEvent {
     EndOfStream,
-    Error(String),
+    Error(PlaybackError),
+}
+
+/// Classifies a GStreamer bus error into a [`PlaybackErrorKind`] a UI can pick a friendly message
+/// from — `glib::Error`'s own domain/code is checked against each of GStreamer's error enums in
+/// turn (a message only ever matches one domain, so order between them doesn't matter beyond
+/// putting the more specific "this file's format" cases ahead of the generic resource-failure
+/// catch-all). Falls back to [`PlaybackErrorKind::Other`] for anything not covered — this
+/// classification is deliberately a small, UI-relevant taxonomy, not an exhaustive mirror of
+/// GStreamer's own.
+fn classify_gst_error(err: &gst::glib::Error) -> PlaybackErrorKind {
+    if let Some(kind) = err.kind::<gst::CoreError>() {
+        if kind == gst::CoreError::MissingPlugin {
+            return PlaybackErrorKind::MissingCodec;
+        }
+    }
+    if let Some(kind) = err.kind::<gst::StreamError>() {
+        return match kind {
+            gst::StreamError::CodecNotFound => PlaybackErrorKind::MissingCodec,
+            gst::StreamError::Decode | gst::StreamError::WrongType | gst::StreamError::TypeNotFound | gst::StreamError::Demux | gst::StreamError::Mux => {
+                PlaybackErrorKind::UnsupportedOrCorrupt
+            }
+            _ => PlaybackErrorKind::Other,
+        };
+    }
+    if let Some(kind) = err.kind::<gst::ResourceError>() {
+        return match kind {
+            gst::ResourceError::NotFound | gst::ResourceError::OpenRead => PlaybackErrorKind::ResourceNotFound,
+            gst::ResourceError::NotAuthorized => PlaybackErrorKind::NotAuthorized,
+            gst::ResourceError::OpenWrite | gst::ResourceError::Busy => PlaybackErrorKind::AudioOutput,
+            gst::ResourceError::Read | gst::ResourceError::Sync | gst::ResourceError::Settings | gst::ResourceError::Failed => PlaybackErrorKind::Network,
+            _ => PlaybackErrorKind::Other,
+        };
+    }
+    PlaybackErrorKind::Other
 }
 
 /// Transport properties for HTTP(S) playback URIs — the playback-side mirror of the Connection
@@ -232,7 +266,11 @@ impl AudioBackend for GstBackend {
             let msg = bus.pop()?;
             match msg.view() {
                 gst::MessageView::Eos(_) => return Some(PlayerEvent::EndOfStream),
-                gst::MessageView::Error(e) => return Some(PlayerEvent::Error(e.error().to_string())),
+                gst::MessageView::Error(e) => {
+                    let error = e.error();
+                    let kind = classify_gst_error(&error);
+                    return Some(PlayerEvent::Error(PlaybackError { kind, message: error.to_string(), debug: e.debug().map(|d| d.to_string()) }));
+                }
                 _ => continue,
             }
         }
@@ -408,6 +446,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(saw_eos, "expected an EndOfStream event within 5s");
+    }
+
+    /// A real pipeline error, not a synthetic `glib::Error` — loading a file that doesn't exist
+    /// makes a real `GstBackend` post a genuine bus error, proving `poll_event` actually classifies
+    /// what GStreamer sends, not just what `classify_gst_error`'s unit tests construct by hand.
+    #[test]
+    fn a_missing_file_is_reported_as_a_classified_error() {
+        let mut player = backend();
+        player.load("file:///nonexistent/does-not-exist.wav").unwrap();
+        // A missing local file can fail synchronously right out of `set_state` (unlike a network
+        // 404, which only fails once the async pipeline actually tries to read) — either way, a
+        // bus `Error` message follows, which is what this test is actually about.
+        let _ = player.play();
+
+        let mut error = None;
+        for _ in 0..100 {
+            if let Some(PlayerEvent::Error(err)) = player.poll_event() {
+                error = Some(err);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let error = error.expect("expected an Error event within 5s");
+        assert_eq!(error.kind, PlaybackErrorKind::ResourceNotFound, "got: {error:?}");
+        assert!(!error.message.is_empty(), "the raw message must never be empty — this is the 'don't hide what happened' text");
+    }
+
+    /// `classify_gst_error` is a pure function of a `glib::Error`'s domain/code — these construct
+    /// one directly per GStreamer error kind rather than needing a real pipeline to fail in every
+    /// possible way, so every branch is covered deterministically.
+    #[test]
+    fn classifies_missing_plugin_as_missing_codec() {
+        let err = glib::Error::new(gst::CoreError::MissingPlugin, "no h264 decoder");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::MissingCodec);
+    }
+
+    #[test]
+    fn classifies_codec_not_found_as_missing_codec() {
+        let err = glib::Error::new(gst::StreamError::CodecNotFound, "no aac decoder");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::MissingCodec);
+    }
+
+    #[test]
+    fn classifies_decode_failure_as_unsupported_or_corrupt() {
+        let err = glib::Error::new(gst::StreamError::Decode, "malformed stream");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::UnsupportedOrCorrupt);
+    }
+
+    #[test]
+    fn classifies_resource_not_found_as_resource_not_found() {
+        let err = glib::Error::new(gst::ResourceError::NotFound, "404");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::ResourceNotFound);
+    }
+
+    #[test]
+    fn classifies_not_authorized_as_not_authorized() {
+        let err = glib::Error::new(gst::ResourceError::NotAuthorized, "401");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::NotAuthorized);
+    }
+
+    #[test]
+    fn classifies_open_write_as_audio_output() {
+        let err = glib::Error::new(gst::ResourceError::OpenWrite, "could not open audio device");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::AudioOutput);
+    }
+
+    #[test]
+    fn classifies_read_failure_as_network() {
+        let err = glib::Error::new(gst::ResourceError::Read, "connection reset");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::Network);
+    }
+
+    #[test]
+    fn classifies_unmatched_core_error_as_other() {
+        let err = glib::Error::new(gst::CoreError::Negotiation, "caps negotiation failed");
+        assert_eq!(classify_gst_error(&err), PlaybackErrorKind::Other);
+    }
+
+    #[test]
+    fn player_error_kinds_map_to_the_right_buckets() {
+        assert_eq!(PlayerError::NoSourceLoaded.kind(), PlaybackErrorKind::Unavailable);
+        assert_eq!(PlayerError::SeekFailed.kind(), PlaybackErrorKind::Other);
     }
 
     #[test]

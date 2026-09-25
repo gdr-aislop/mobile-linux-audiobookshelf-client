@@ -59,6 +59,7 @@ pub struct TestHooks {
     pub download_button: gtk4::MenuButton,
     pub download_popover: gtk4::Popover,
     pub download_popover_box: gtk4::Box,
+    pub error_banner: crate::widgets::banner::ErrorBanner,
 }
 
 #[cfg(test)]
@@ -88,6 +89,17 @@ pub fn build(
     });
     header.pack_start(&collapse_button);
     header.set_title_widget(Some(&adw::WindowTitle::new("Now Playing", "")));
+
+    // Surfaces `PlayerSnapshot::last_error` — see that field's doc comment for why this exists at
+    // all (previously a playback failure was completely invisible: logged, silently paused, done).
+    // Placed above `content` (below the header) so it's visible without disturbing the transport
+    // controls, the same "banner near the top of the main content" placement `home.rs`/`library.rs`
+    // already use for their own sync-failure banners.
+    let error_banner = crate::widgets::banner::ErrorBanner::new();
+    error_banner.action_button().connect_clicked({
+        let controller = controller.clone();
+        move |_| controller.play()
+    });
 
     // The spec's `⋯` menu is dropped down to "Add bookmark" plus two testing/recovery actions —
     // speed and sleep timer live as secondary-row buttons instead (see the scope decision in this
@@ -241,6 +253,7 @@ pub fn build(
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
+    root.append(error_banner.widget());
     root.append(&content);
 
     // Swipe-down-to-collapse — the counterpart to the mini bar's own swipe-up-to-open gesture
@@ -454,6 +467,7 @@ pub fn build(
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
         let cover = cover.clone();
+        let error_banner = error_banner.clone();
         move |snapshot: &PlayerSnapshot| {
             title_label.set_label(&snapshot.title);
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
@@ -482,6 +496,17 @@ pub fn build(
                 sleep_timer_button.add_css_class("accent");
             } else {
                 sleep_timer_button.remove_css_class("accent");
+            }
+
+            match &snapshot.last_error {
+                Some(err) => {
+                    let (title, action) = friendly_message(err.kind);
+                    error_banner.set_title(title);
+                    error_banner.set_action_label(action);
+                    error_banner.set_details(Some(err.debug.as_deref().unwrap_or(&err.message)));
+                    error_banner.set_revealed(true);
+                }
+                None => error_banner.set_revealed(false),
             }
         }
     };
@@ -527,6 +552,8 @@ pub fn build(
             download_popover: download_menu.popover,
             #[cfg(test)]
             download_popover_box: download_menu.popover_box,
+            #[cfg(test)]
+            error_banner,
         },
     }
 }
@@ -601,6 +628,25 @@ fn format_hms(total_seconds: f64) -> String {
     }
 }
 
+/// Picks a friendly headline and, where retrying is plausibly useful, a "Retry" action label for
+/// a [`abs_player::PlaybackErrorKind`]. The raw underlying text (`PlaybackError::message`/
+/// `debug`) is never derived from this — it always goes into the banner's "Show details" verbatim
+/// (see this screen's `update` closure), so a friendly headline here is never the *only* thing a
+/// self-hosting user debugging their server/codec setup can see.
+pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> (&'static str, Option<&'static str>) {
+    use abs_player::PlaybackErrorKind::*;
+    match kind {
+        MissingCodec => ("This app can't play this file — support for its audio format is missing on this device.", None),
+        UnsupportedOrCorrupt => ("This file's audio couldn't be decoded — it may be corrupted or in an unsupported format.", None),
+        ResourceNotFound => ("This title's audio couldn't be found on the server — it may have been moved or deleted.", None),
+        NotAuthorized => ("The server refused this request — try signing in again.", None),
+        AudioOutput => ("Couldn't reach this device's audio output.", Some("Retry")),
+        Network => ("Lost the connection while playing — check your connection and try again.", Some("Retry")),
+        Unavailable => ("Playback isn't available on this device — no audio engine could be started.", None),
+        Other => ("Playback stopped unexpectedly.", Some("Retry")),
+    }
+}
+
 /// Below this, a downward drag is ignored; at or above it, a predominantly-downward drag
 /// collapses the screen back to the mini bar. Unlike the mini bar's own swipe-up gesture (which
 /// also treats a tap as "open"), there is deliberately no tap component here — a plain tap on the
@@ -671,6 +717,55 @@ pub(crate) mod tests {
 
         hooks.collapse_button.emit_clicked();
         assert!(collapsed.get(), "the down-chevron should call on_collapse");
+        controller.stop();
+    }
+
+    /// End-to-end: a real `GstBackend` pipeline fetching from a real (wiremock) HTTP server that
+    /// 404s the track file — not a synthetic `PlaybackError` constructed by hand — so this proves
+    /// the whole chain (`GstBackend::poll_event`'s classification, `Inner::tick`'s error arm,
+    /// `PlayerSnapshot::last_error`, and this screen's banner wiring) actually works together, the
+    /// same "real pipeline, not backdoored" convention this file's other test above already uses.
+    pub(crate) fn run_playback_error_shows_the_banner(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "media": { "audioFiles": [{ "ino": "1", "duration": 5.0 }] }
+                })))
+                .mount(&mock_server)
+                .await;
+            // The file itself 404s — metadata resolves fine (so `now_playing` has a real
+            // title/duration to show), but the actual audio fetch fails once GStreamer's
+            // `souphttpsrc` tries to read it.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1/file/1"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
+        assert!(hooks.error_banner.widget().reveals_child(), "a real playback failure must reveal the error banner");
+        assert!(!hooks.error_banner.title().is_empty(), "the banner must show a friendly message");
+        assert!(hooks.error_banner.details_visible(), "the raw error must be shown behind 'Show details' — never hidden entirely");
+        assert!(!hooks.error_banner.details_text().is_empty());
+
         controller.stop();
     }
 

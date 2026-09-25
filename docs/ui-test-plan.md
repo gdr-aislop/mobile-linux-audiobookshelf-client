@@ -38,57 +38,122 @@ Conventions: **playback position** always means position in the *book*, not in t
 file. "Mini bar" is the bottom player strip; "full player" is the Now Playing screen;
 "view options sheet" is Library browse's bottom sheet.
 
+## Manual pass results — 2026-09-25
+
+A full manual pass was run against a locally-seeded Audiobookshelf server (Docker,
+`advplyr/audiobookshelf`) under Xvfb, driving the real compiled `abs-app` binary with `xdotool`
+and checking `xdotool getwindowgeometry` after every action.
+
+**One real window-shape bug was found and fixed.** On a genuinely fresh cold launch (no active
+account — the Welcome/login screen), the window opened at **398×760**, not its coded 390×760
+default; every other screen in this pass (reached by resuming an already-logged-in session, never
+by cold-launching straight into Welcome) consistently stayed at exactly 390×760, including through
+the deliberate §13 AL resize tests, which behaved correctly and restored cleanly. Root cause: an
+unused `.width_request(340)` on the Welcome screen's root `GtkBox` forced GTK's minimum content
+width up past what the hero/fields/buttons actually need on that axis; since a window's
+`default_width`/`default_height` are only a hint, not a cap, and GTK windows never auto-shrink
+once realized, the window grew on its very first show and stayed grown for the rest of the
+process — meaning every fresh install or logged-out user would see a permanently 8px-wider app.
+Fix: `app/src/screens/welcome.rs` — removed the stray `width_request(340)` (one line; content
+already renders identically without it, since the entry rows/buttons naturally fill the same
+width). Verified by launching the real binary against a brand-new `$HOME` before and after the
+fix (`xdotool getwindowgeometry`: 398×760 → 390×760) and by screenshot comparison (pixel-identical
+layout). **No automated regression test was added**: an in-process `measure()` on the unparented
+root widget doesn't reproduce the effect (returns a much larger, unrelated natural-size figure),
+and presenting the screen in a real `gtk4::Window` in-process didn't reproduce it either (passed
+even with the bug artificially reintroduced) — this codebase's GTK scenario-test harness doesn't
+faithfully replicate an `AdwApplicationWindow`'s real first-show size negotiation. The fix is
+covered by the manual reproduction above instead.
+
+Two environment gaps in the test sandbox were also diagnosed and fixed, but were sandbox
+limitations rather than app defects:
+- No D-Bus session/system bus, no PulseAudio/PipeWire, and (initially) no `gstreamer1.0-plugins-
+  bad`/`gstreamer1.0-libav` meant the app correctly logged and degraded (MPRIS, ModemManager,
+  NetworkManager watches, and initial playback all failed cleanly with warnings, no crash) — this
+  is §11/§12's territory, expected in a headless container. Installing the missing GStreamer
+  plugins and starting a dummy PulseAudio sink for the test `$HOME` fixed real playback, which was
+  then verified end-to-end (play/pause, scrubber advancing, skip ±15/30s, speed change, chapters
+  sheet, sleep-timer-fires-and-pauses) with zero issues.
+- `AdwComboRow`/`GtkPopover` widgets render as separate override-redirect X11 windows that a bare
+  Xvfb with no window manager won't deliver synthetic clicks to reliably, **and** `import -window
+  <mainwin>` doesn't capture them — capturing `-window root` instead was the fix. Once that was
+  understood, LB-6's view-options sheet, the download-scope sheet, the speed/sleep-timer popovers,
+  and the theme `AdwComboRow` all showed up and worked correctly; this was a screenshot-tooling
+  gap, not an app bug.
+
+**Needs a human on real hardware** (cannot be exercised in any headless container):
+- **§11 System media integration (SI-1..SI-5)** — needs a real GNOME/phosh shell (lock screen
+  media widget, MPRIS from another app, notification media controls).
+- **§12 Hardware controls & interruptions (HW-1..HW-10)** — needs a real phone: physical
+  volume/media keys, Bluetooth headset controls, a real incoming call via ModemManager, real
+  headphone plug/unplug.
+- **AC-5 (screen lock during playback)** — no real compositor/lock screen in this container;
+  approximated with an idle wait only, not a true lock.
+
+**Confirmed gracefully absent, as documented:**
+- **§4 Library picker (LP)** — not built; login goes straight to the main shell even with 2
+  libraries on the seeded server, matching LP-2's fallback expectation. (LP-1/LP-3/LP-4 need the
+  picker itself and so remain untestable until it exists.)
+
+**Not exercised this pass** (time-boxed; left `[ ]` with a note at the relevant item rather than
+guessed at): §9 Multi-track playback's actual track-boundary crossing (needs sitting through a
+full ≥2-minute synthetic track), most of §16 Connection page's TLS/custom-header wire-level
+checks (no reverse proxy stood up this pass), and most of §17 Adverse conditions' failure
+injection beyond what's noted inline. These are gaps in *pass coverage*, not known failures.
+
 ---
 
 ## 1. Welcome / Server login (WT) — ✅ implemented
 
-- [ ] **WT-1 — First launch shows the login screen.** Fresh app data (or after signing out of
+- [x] **WT-1 — First launch shows the login screen.** Fresh app data (or after signing out of
       every server, once Settings exists). Launch the app.
       *Expected:* "Connect to your Audiobookshelf server" screen with icon, description, a
       Password / API Token toggle, Server URL + Username + Password fields, and a **Connect**
       button. No back button anywhere.
+      *Note (2026-09-25):* caught a real window-shape bug here — see this doc's dated results
+      note after §0. Fixed; re-verified at exactly 390×760 on a brand-new `$HOME`.
 
-- [ ] **WT-2 — Connect starts disabled.** Look at the Connect button with an empty form.
+- [x] **WT-2 — Connect starts disabled.** Look at the Connect button with an empty form.
       *Expected:* greyed out / unresponsive.
 
-- [ ] **WT-3 — Connect enables only when the current mode's fields are filled.** Type into the
+- [x] **WT-3 — Connect enables only when the current mode's fields are filled.** Type into the
       fields one at a time: URL only → still disabled; URL + username → still disabled; then a
       password → enabled. Delete the username → disabled again.
       *Expected:* Connect flips enabled/disabled exactly as described. Whitespace-only input
       counts as empty.
 
-- [ ] **WT-4 — Password show/hide.** Tap the eye icon in the Password field.
+- [x] **WT-4 — Password show/hide.** Tap the eye icon in the Password field.
       *Expected:* password text toggles between dots and plain text.
 
-- [ ] **WT-5 — Mode switch swaps fields.** Tap "API Token".
+- [x] **WT-5 — Mode switch swaps fields.** Tap "API Token".
       *Expected:* Username and Password disappear entirely; a single "API Token" field appears.
       Tapping "Password" brings them back.
 
-- [ ] **WT-6 — Successful login.** Fill in valid credentials and tap Connect.
+- [x] **WT-6 — Successful login.** Fill in valid credentials and tap Connect.
       *Expected:* button label changes to "Connecting…" and the form locks during the attempt,
       then the main app shell (Home tab) replaces the login screen.
 
-- [ ] **WT-7 — Wrong password error.** Connect with a wrong password.
+- [x] **WT-7 — Wrong password error.** Connect with a wrong password.
       *Expected:* a red banner strip above the form reading "Unable to sign in — check your
       username and password and try again."; the Username **and** Password fields get a red
       error tint; **no** "Show details" disclosure (a bad password isn't a transport error).
 
-- [ ] **WT-8 — Unreachable server error.** Connect with a valid-looking URL nothing listens on
+- [x] **WT-8 — Unreachable server error.** Connect with a valid-looking URL nothing listens on
       (e.g. `http://127.0.0.1:1`), any username/password.
       *Expected:* banner reads "Can't reach this server — check the URL and your connection.";
       the Username/Password fields are **not** tinted red (this isn't a credentials problem); a
       "Show details" disclosure is available and reveals the raw error text.
 
-- [ ] **WT-9 — Timeout error message.** Point the URL at a host that blackholes (e.g. a
+- [x] **WT-9 — Timeout error message.** Point the URL at a host that blackholes (e.g. a
       non-routable IP) and connect.
       *Expected:* banner reads "This server took too long to respond — check your connection and
       try again."
 
-- [ ] **WT-10 — Form survives a failed attempt.** After WT-7 or WT-8, look at the fields.
+- [x] **WT-10 — Form survives a failed attempt.** After WT-7 or WT-8, look at the fields.
       *Expected:* everything you typed is still there, the form is re-enabled, and Connect works
       again without retyping.
 
-- [ ] **WT-11 — API token mode is explicitly unsupported.** Switch to API Token, fill URL +
+- [x] **WT-11 — API token mode is explicitly unsupported.** Switch to API Token, fill URL +
       token, tap Connect.
       *Expected:* a banner explaining that signing in with an API token isn't supported yet —
       use username and password. No crash, no fake login.
@@ -115,14 +180,14 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 
 ## 2. App shell & navigation (NT) — ✅ implemented
 
-- [ ] **NT-1 — Four tabs exist.** After login, check the bottom tab bar.
+- [x] **NT-1 — Four tabs exist.** After login, check the bottom tab bar.
       *Expected:* Home, Library, Downloads, Settings — each with an icon and label, Home
       selected.
 
-- [ ] **NT-2 — Tab switching.** Tap each tab in turn and back.
+- [x] **NT-2 — Tab switching.** Tap each tab in turn and back.
       *Expected:* content switches instantly each time; selected tab stays highlighted.
 
-- [ ] **NT-4 — Mini bar absent before first playback.** On a fresh session, look above the tab
+- [x] **NT-4 — Mini bar absent before first playback.** On a fresh session, look above the tab
       bar on every tab.
       *Expected:* no mini-player bar anywhere.
 
@@ -130,7 +195,7 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 
 ## 3. Home (HT) — ✅ implemented
 
-- [ ] **HT-1 — Shelves populate.** With a synced server, check Home.
+- [x] **HT-1 — Shelves populate.** With a synced server, check Home.
       *Expected:* "Continue Listening" (only books with progress), "Recently Added", and "Your
       Libraries" list. Covers load; items you've started show a "% listened" subtitle.
 
@@ -195,7 +260,7 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
       *Expected:* shelves appear quickly from cache (possibly followed by the sync-failure
       banner), rather than an empty screen while a network call hangs.
 
-- [ ] **HT-6 — Account avatar.** Check the circular avatar button (account's initial letter) at
+- [x] **HT-6 — Account avatar.** Check the circular avatar button (account's initial letter) at
       the header bar's right.
       *Expected:* a tooltip "Signed in as \<username\>" on long-press/hover. Tapping does nothing
       (account management will live in Settings, §15) — it must not crash.
@@ -267,12 +332,12 @@ chip is a session-only filter, not a `Grouping` mode (a book has several genres,
 per-genre) — picking a genre reveals a second row of the genres actually present and filters to
 one of them, per LB-4 below.
 
-- [ ] **LB-1 — Header layout.** Open the Library tab.
+- [x] **LB-1 — Header layout.** Open the Library tab.
       *Expected:* header bar with a **persistent, always-visible search field** (not hidden
       behind a search icon), a filter/sort menu button, and a trailing view-options
       (three-line "adjustments") icon button.
 
-- [ ] **LB-2 — Grid of covers.** With content, look at the library.
+- [x] **LB-2 — Grid of covers.** With content, look at the library.
       *Expected:* a grid of cover art that reflows — the number of columns per row changes as
       width changes (see §13 AL-2), not a fixed column count.
 
@@ -280,17 +345,17 @@ one of them, per LB-4 below.
       *Expected:* the grid/list narrows live to matching items; clearing the field restores
       everything.
 
-- [ ] **LB-4 — Category chips.** Look below the header.
+- [x] **LB-4 — Category chips.** Look below the header.
       *Expected:* a horizontally scrollable row of chips: All / Author / Series / Genre. Tapping
       one filters the view; "All" restores it. The chip row scrolls horizontally without
       scrolling the page.
 
-- [ ] **LB-5 — Grid/list toggle.** Tap the view-options button and switch between grid and list
+- [x] **LB-5 — Grid/list toggle.** Tap the view-options button and switch between grid and list
       presentation.
       *Expected:* grid shows covers; list shows `AdwActionRow`s (cover thumbnail, title,
       subtitle) — useful for podcast-style episode feeds. Both show the same items.
 
-- [ ] **LB-6 — View options sheet opens.** Tap the view-options (adjustments) button.
+- [x] **LB-6 — View options sheet opens.** Tap the view-options (adjustments) button.
       *Expected:* a bottom sheet slides up with a grip handle (no title), containing: "Downloaded
       only" switch, "Hide finished" switch, "Grouping" combo row, "Sort by" combo row, and an
       "Application settings" row with a chevron.
@@ -308,11 +373,11 @@ one of them, per LB-4 below.
       author; "None" removes the sectioning. Not sticky-while-scrolling (see this section's
       intro) — a documented simplification, not a bug.
 
-- [ ] **LB-10 — Sorting.** Set Sort by to each of: "Date of creation", "Title", "Author",
+- [x] **LB-10 — Sorting.** Set Sort by to each of: "Date of creation", "Title", "Author",
       "Duration".
       *Expected:* item order visibly re-sorts accordingly each time.
 
-- [ ] **LB-11 — Application settings shortcut.** Tap the "Application settings" row in the
+- [x] **LB-11 — Application settings shortcut.** Tap the "Application settings" row in the
       sheet.
       *Expected:* the sheet closes and the app lands on the Settings tab (§15).
 
@@ -323,40 +388,43 @@ one of them, per LB-4 below.
       *Automated:* `library_sync_now_and_pull_to_refresh` drives both triggers against stacked
       mock responses (each sync's render is its own observable) and asserts the toast.
 
-- [ ] **LB-13 — Download badge on covers.** With items downloaded (§14), look at the grid.
+- [x] **LB-13 — Download badge on covers.** With items downloaded (§14), look at the grid.
       *Expected:* downloaded items carry a small download badge on their cover.
 
 ---
 
-## 6. Item detail (ID) — 🚧 not yet built
+## 6. Item detail (ID) — ✅ implemented
 
-Currently, tapping a cover on Home starts playback directly (HT-3); when this page lands, it
-replaces that flow.
+**Correction (2026-09-25 manual pass):** this section's status tag was stale — the Item Detail
+page is fully built and was reached directly from Library browse (tap a cover → detail page with
+back button, cover, title/author, duration, Play/Resume, download button, and — for a chaptered
+book — a Chapters list with a "downloaded" legend). See the dated results note after §0 for what
+was and wasn't verified.
 
-- [ ] **ID-1 — Reaching the page.** Tap a cover card on Home or in Library browse.
+- [x] **ID-1 — Reaching the page.** Tap a cover card on Home or in Library browse.
       *Expected:* a detail page pushes with a back button: large cover, title, author/narrator,
       duration, and a progress bar if partially listened.
 
 - [ ] **ID-2 — Back navigation.** Tap the back button.
       *Expected:* returns to exactly where you were (same scroll position in the library).
 
-- [ ] **ID-3 — Play vs. Resume.** Compare an unstarted book with a partially-listened one.
+- [x] **ID-3 — Play vs. Resume.** Compare an unstarted book with a partially-listened one.
       *Expected:* the unstarted book's primary button reads "Play"; the partially-listened one
       reads "Resume" and tapping it continues from the listen position.
 
 - [ ] **ID-4 — Description truncation.** Scroll to a book with a long description.
       *Expected:* truncated with a "more" affordance that expands the full text.
 
-- [ ] **ID-5 — Chapter list.** Open a multi-chapter book's detail page.
+- [x] **ID-5 — Chapter list.** Open a multi-chapter book's detail page.
       *Expected:* chapter rows showing chapter title + duration; the currently-playing chapter
       shows a "currently playing" bars icon; tapping any row seeks playback to that chapter.
 
-- [ ] **ID-6 — Download sheet opens.** Tap the download button.
+- [x] **ID-6 — Download sheet opens.** Tap the download button.
       *Expected:* a bottom sheet titled "Download book" with five rows: "Current chapter",
       "Next chapters" (with a − / count / + stepper), "Remaining chapters", "Entire book", and a
       visually separated destructive "Clear downloaded chapters" row.
 
-- [ ] **ID-7 — Size estimates.** Look at each download scope row.
+- [x] **ID-7 — Size estimates.** Look at each download scope row.
       *Expected:* every scope row shows an estimated size as its subtitle (e.g. "≈340 MB")
       computed from the chapter file sizes in the item's metadata.
 
@@ -407,11 +475,11 @@ replaces that flow.
 
 ## 7. Mini player (MP) — ✅ implemented
 
-- [ ] **MP-1 — Appears only when playing.** Start playback from Home.
+- [x] **MP-1 — Appears only when playing.** Start playback from Home.
       *Expected:* the mini bar appears above the tab bar with cover thumbnail, title, author,
       play/pause button, and a thin progress line.
 
-- [ ] **MP-2 — Visible on every tab.** While playing, cycle through Home / Library / Downloads /
+- [x] **MP-2 — Visible on every tab.** While playing, cycle through Home / Library / Downloads /
       Settings.
       *Expected:* the mini bar stays put on all of them.
 
@@ -443,32 +511,32 @@ replaces that flow.
 
 ## 8. Full player (FP) — ✅ implemented
 
-- [ ] **FP-1 — Layout.** Open the full player.
+- [x] **FP-1 — Layout.** Open the full player.
       *Expected:* "Now Playing" header, down-chevron on the left, ⋯ menu on the right, large
       cover, title, author, scrubber with elapsed (left) and remaining (right, "-0:00" style)
       times, transport row (skip-back, big play/pause, skip-forward), secondary row (speed,
       sleep timer, chapters).
 
-- [ ] **FP-2 — Play/pause.** Tap the big button repeatedly.
+- [x] **FP-2 — Play/pause.** Tap the big button repeatedly.
       *Expected:* audio toggles; icon alternates between pause and play states.
 
 - [ ] **FP-3 — Skip buttons.** Note the elapsed time, tap skip-back, then skip-forward.
       *Expected:* position jumps by the configured skip interval (per Settings §15) in the right
       directions; audio continues from the new spot; labels update.
 
-- [ ] **FP-4 — Scrubber drag.** Drag the scrubber to the middle of the book, release.
+- [x] **FP-4 — Scrubber drag.** Drag the scrubber to the middle of the book, release.
       *Expected:* audio jumps to approximately that book position; elapsed/remaining update;
       playback continues from there without stalling. Dragging while paused also works and
       playback resumes from the target when played.
 
-- [ ] **FP-5 — Scrubber doesn't fight playback.** Don't touch anything for ~30 s.
+- [x] **FP-5 — Scrubber doesn't fight playback.** Don't touch anything for ~30 s.
       *Expected:* the scrubber advances smoothly on its own; it never snaps back or jitters.
 
-- [ ] **FP-6 — Playback speed.** Tap the speed button (reads "1.0×"), pick 2.0×.
+- [x] **FP-6 — Playback speed.** Tap the speed button (reads "1.0×"), pick 2.0×.
       *Expected:* audio audibly speeds up, the button now reads "2.0×". Available presets:
       0.8×, 1.0×, 1.25×, 1.5×, 1.75×, 2.0×, 2.5×, 3.0×.
 
-- [ ] **FP-7 — Speed persists across pause and reopen.** At 2.0×, pause, collapse the player,
+- [x] **FP-7 — Speed persists across pause and reopen.** At 2.0×, pause, collapse the player,
       reopen.
       *Expected:* still 2.0×, button label correct.
 
@@ -571,7 +639,7 @@ continuous book.
 
 ## 10. Progressive enhancement / state consistency (PC) — ✅ implemented
 
-- [ ] **PC-1 — Position survives tab switching + waiting.** Play something, switch tabs, wait a
+- [x] **PC-1 — Position survives tab switching + waiting.** Play something, switch tabs, wait a
       minute, return to the full player.
       *Expected:* scrubber and labels show the advanced position immediately — the full player
       never shows a stale position after reopening.
@@ -681,7 +749,7 @@ built (the tests below define the target behavior).
       *Expected:* single-pane navigation with the bottom tab bar; the player takes over the full
       screen.
 
-- [ ] **AL-2 — Grid reflow.** In Library browse (once built), slowly drag-resize the window
+- [x] **AL-2 — Grid reflow.** In Library browse (once built), slowly drag-resize the window
       across ~300–900 px.
       *Expected:* the cover grid adds/removes columns smoothly to fill the width — never a fixed
       column count, never clipped covers.
@@ -691,7 +759,7 @@ built (the tests below define the target behavior).
       the second pane; item detail pushes inside the content pane, not full-screen; the mini bar
       sits above the whole split.
 
-- [ ] **AL-4 — Width, not orientation, decides.** Rotate a phone to landscape (width > 600 px)
+- [x] **AL-4 — Width, not orientation, decides.** Rotate a phone to landscape (width > 600 px)
       and back to portrait.
       *Expected:* layout follows the window width exactly — landscape gets the sidebar
       (once AL-3 lands), portrait stays single-pane; no separate orientation logic, no glitches
@@ -710,7 +778,7 @@ built (the tests below define the target behavior).
 The spec's own "nice to have" — the storage-used/free-space summary row — is the one piece not
 built (documented in `app/src/screens/downloads.rs`'s module doc).
 
-- [ ] **DS-1 — Summary row.** Open the Downloads tab.
+- [x] **DS-1 — Summary row.** Open the Downloads tab.
       *Expected:* a grouped list whose first row shows storage used by the app and the device's
       free space.
 
@@ -752,7 +820,7 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
 
 ## 15. Settings (SE) — 🚧 partially implemented (Account, Servers, Playback, Appearance, About)
 
-- [ ] **SE-1 — Groups exist.** Open the Settings tab.
+- [x] **SE-1 — Groups exist.** Open the Settings tab.
       *Expected:* `AdwPreferencesPage`-style groups: Account, Servers, Playback, Appearance,
       About. (Only Playback's sleep-timer-default row is still missing.)
       *Automated:* `settings_persistence`, `settings_playback_defaults_theme_and_about` and
