@@ -57,6 +57,7 @@ impl PullIndicator {
         (revealer.clone(), Self { revealer, spinner })
     }
 
+    #[cfg(test)]
     pub(crate) fn spinner(&self) -> &gtk4::Spinner {
         &self.spinner
     }
