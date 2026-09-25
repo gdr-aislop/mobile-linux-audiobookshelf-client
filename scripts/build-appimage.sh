@@ -26,11 +26,20 @@
 #     (TLS, dconf), gdk-pixbuf loaders, GTK4 modules.
 #   - The generated apprun-hooks/abs-app.sh is sourced by linuxdeploy's
 #     default AppRun and points the runtime at all of the above.
+#
+# Update information: LDAI_UPDATE_INFORMATION (read by linuxdeploy's bundled
+# appimage output plugin, not a linuxdeploy CLI flag) is set to a
+# gh-releases-zsync string below, so the AppImage embeds enough to be
+# update-checked by AppImageUpdate/Gear Lever against this repo's GitHub
+# releases, and the plugin generates the matching .zsync file alongside the
+# .AppImage. Requires `zsyncmake` (the `zsync` package) on PATH.
 
 set -euo pipefail
 
 APP_NAME="abs-app"
 APP_ID="io.github.gdr-aislop.abs-app"
+GH_OWNER="gdr-aislop"
+GH_REPO="mobile-linux-audiobookshelf-client"
 LINUXDEPLOY_VERSION="1-alpha-20251107-1" # pinned for reproducible builds
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -92,7 +101,9 @@ fi
 VERSION="${VERSION//\//-}" # keep it filename-safe (branch names can contain /)
 
 # --- tool and source availability checks ---
-for tool in cargo pkg-config glib-compile-schemas curl; do
+# zsyncmake generates the .zsync file alongside the AppImage (see the update-information note
+# above) — the appimage output plugin shells out to it once LDAI_UPDATE_INFORMATION is set.
+for tool in cargo pkg-config glib-compile-schemas curl zsyncmake; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 
@@ -159,7 +170,7 @@ APPDIR="$OUTPUT_DIR/$APP_NAME.AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$OUTPUT_DIR"
 # Clear previous outputs so the post-build rename can't pick up stale files.
-rm -f "$OUTPUT_DIR"/*.AppImage
+rm -f "$OUTPUT_DIR"/*.AppImage "$OUTPUT_DIR"/*.zsync
 
 install -Dm755 "$BIN" "$APPDIR/usr/bin/$APP_NAME"
 if command -v strip >/dev/null 2>&1; then
@@ -281,6 +292,11 @@ else
 fi
 
 OUTPUT_PATH="$OUTPUT_DIR/$APP_NAME-$VERSION-$ARCH.AppImage"
+
+# The glob must match the *final* (post-rename, below) filename this script publishes, since
+# that's what actually lands on the GitHub release AppImageUpdate resolves this against.
+export LDAI_UPDATE_INFORMATION="gh-releases-zsync|$GH_OWNER|$GH_REPO|latest|$APP_NAME-*-$ARCH.AppImage.zsync"
+
 (
     cd "$OUTPUT_DIR"
     "$LINUXDEPLOY_BIN" \
@@ -305,6 +321,11 @@ for f in "$OUTPUT_DIR"/*.AppImage; do
 done
 [ -n "$produced" ] || die "no AppImage produced in $OUTPUT_DIR"
 
+# LDAI_UPDATE_INFORMATION above makes the appimage plugin shell out to zsyncmake and drop
+# "<produced AppImage name>.zsync" next to it — same rename need as the AppImage itself.
+produced_zsync="$produced.zsync"
+[ -f "$produced_zsync" ] || die "no .zsync produced alongside $produced (is zsyncmake on PATH?)"
+
 # linuxdeploy can silently ignore a --library input it doesn't like; the soup
 # plugin dlopens libsoup, so nothing else in the bundle references it and its
 # absence is invisible to every other check. Verify it landed.
@@ -313,8 +334,23 @@ done
 
 if [ "$produced" != "$OUTPUT_PATH" ]; then
     mv "$produced" "$OUTPUT_PATH"
+    mv "$produced_zsync" "$OUTPUT_PATH.zsync"
+
+    # zsyncmake wrote the .zsync file's Filename/URL header fields against the pre-rename name
+    # (e.g. Audiobookshelf-<ver>-<arch>.AppImage) — the name that's actually published is the one
+    # we just renamed to. Left alone, a zsync client would resolve updates against a filename that
+    # was never uploaded. Patch only the ASCII header (up to the first blank line); the checksum
+    # block data that follows is binary and must not be touched.
+    old_basename="$(basename "$produced")"
+    new_basename="$(basename "$OUTPUT_PATH")"
+    sed -i "0,/^\$/{s|^Filename: .*|Filename: $new_basename|; s|^URL: .*|URL: $new_basename|}" "$OUTPUT_PATH.zsync"
+    if ! grep -q "^Filename: $new_basename\$" "$OUTPUT_PATH.zsync"; then
+        die "failed to rewrite $OUTPUT_PATH.zsync's header from $old_basename to $new_basename"
+    fi
 fi
 
 echo
 echo "Built $OUTPUT_PATH ($(du -h "$OUTPUT_PATH" | cut -f1))"
 sha256sum "$OUTPUT_PATH"
+echo "Built $OUTPUT_PATH.zsync (for AppImageUpdate/Gear Lever)"
+sha256sum "$OUTPUT_PATH.zsync"

@@ -13,7 +13,8 @@ name: Release debs, AppImages, and Flatpaks
 # Three artifact types per architecture:
 #   - .deb (cargo deb)
 #   - .AppImage (scripts/build-appimage.sh; bundles GTK4/GStreamer itself, so
-#     it runs on systems without them installed)
+#     it runs on systems without them installed) + a matching .zsync file, so
+#     AppImageUpdate/Gear Lever can delta-update it against this repo's releases
 #   - .flatpak (flatpak/io.github.gdr-aislop.abs-app.json; built against the
 #     org.gnome.Platform runtime, with GStreamer's good/libav plugins and every
 #     crates.io dependency built from source inside the sandbox)
@@ -121,7 +122,7 @@ jobs:
           set -eux
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential pkg-config git curl ca-certificates file patchelf \
+            build-essential pkg-config git curl ca-certificates file patchelf zsync \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libssl-dev \
@@ -146,7 +147,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: appimage-${{ matrix.arch }}
-          path: build/appimage/*.AppImage
+          path: |
+            build/appimage/*.AppImage
+            build/appimage/*.zsync
           if-no-files-found: error
 
   build-flatpak:
@@ -220,7 +223,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum ./*.deb ./*.AppImage ./*.flatpak > SHA256SUMS
+          sha256sum ./*.deb ./*.AppImage ./*.zsync ./*.flatpak > SHA256SUMS
           rm -f SHA256SUMS-*.txt
           cat SHA256SUMS
 
@@ -229,5 +232,6 @@ jobs:
           files: |
             dist/*.deb
             dist/*.AppImage
+            dist/*.zsync
             dist/*.flatpak
             dist/SHA256SUMS
