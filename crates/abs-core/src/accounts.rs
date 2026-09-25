@@ -402,7 +402,7 @@ mod tests {
             }),
         )).mount(&server).await;
 
-        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused"), &previous, &format!("{}/", server.uri()), "jane", "hunter2")
+        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &format!("{}/", server.uri()), "jane", "hunter2")
             .await
             .unwrap();
 
@@ -440,7 +440,7 @@ mod tests {
             }),
         )).mount(&server).await;
 
-        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "bob", "hunter2")
+        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "bob", "hunter2")
             .await
             .unwrap();
 
@@ -477,7 +477,7 @@ mod tests {
         let added = add_server_and_login(&pool, &server_a.uri(), "jane", "hunter2").await.unwrap();
         seed_cache(&pool, &added.server_id, &added.account_id).await;
         let tmp = tempfile::tempdir().unwrap();
-        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
+        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
         let cover = paths.cover_cache_path(&added.server_id, "item-1", "jpg");
         tokio::fs::create_dir_all(cover.parent().unwrap()).await.unwrap();
         tokio::fs::write(&cover, b"bytes").await.unwrap();
@@ -519,7 +519,7 @@ mod tests {
         };
         Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
 
-        let result = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "jane", "wrong").await;
+        let result = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "jane", "wrong").await;
 
         assert!(matches!(result, Err(CoreError::Login(_))));
         assert!(accounts::get(&pool, &added.account_id).await.is_ok(), "the old account must survive a failed re-login");

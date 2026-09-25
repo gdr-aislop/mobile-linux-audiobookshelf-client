@@ -192,7 +192,7 @@ mod tests {
 
     fn test_paths() -> (tempfile::TempDir, AppPaths) {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"));
+        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
         (tmp, paths)
     }
 

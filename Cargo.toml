@@ -41,7 +41,13 @@ tracing = "0.1"
 # NFD decomposition + combining-mark stripping for diacritic-insensitive search
 # (`abs_core::search::normalize_for_search`).
 unicode-normalization = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Rolling log file for `app/src/crash_reporting.rs` — durable, local-only diagnostics for a
+# deployed app with no attached terminal (see that module's doc comment).
+tracing-appender = "0.2"
+# Local (never networked) native crash dumps — see `app/src/crash_reporting.rs`.
+crash-handler = "0.8"
+minidumper = "0.11"
 
 # Storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
