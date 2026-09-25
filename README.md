@@ -5,7 +5,7 @@ GNOME-native client for an Audiobookshelf media server, designed for mobile Linu
 
 ## Packaging
 
-Two artifact types are built for every `v*` tag by
+Three artifact types are built for every `v*` tag by
 [.github/workflows/release.yml](.github/workflows/release.yml), for both
 `x86_64` and `aarch64`:
 
@@ -13,9 +13,30 @@ Two artifact types are built for every `v*` tag by
   distro's GTK4/libadwaita/GStreamer packages.
 - **`.AppImage`** — bundles GTK4, libadwaita, GStreamer plugins and the Adwaita
   icon theme; runs on any glibc distro without installing dependencies.
+- **Flatpak** — built against `org.gnome.Platform`, published both as a
+  downloadable `.flatpak` bundle attached to the release and as a live,
+  signed remote hosted on GitHub Pages (see below).
 
-Both are built inside a Debian bookworm container so they link against the
-library baseline of the target distros.
+The `.deb` and `.AppImage` are built inside a Debian bookworm container so
+they link against the library baseline of the target distros.
+
+### Installing the Flatpak
+
+The recommended way — adds a remote once, then `flatpak update` picks up
+every new tagged release automatically:
+
+```sh
+flatpak remote-add --user --if-not-exists abs-app \
+  https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/io.github.gdr-aislop.abs-app.flatpakrepo
+flatpak install --user abs-app io.github.gdr-aislop.abs-app
+```
+
+Alternatively, download the `.flatpak` file from a
+[release](../../releases) and install it directly, with no remote added:
+
+```sh
+flatpak install --user ./abs-app-<version>-<arch>.flatpak
+```
 
 ### Building an AppImage manually
 

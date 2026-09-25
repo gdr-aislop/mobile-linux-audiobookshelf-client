@@ -17,6 +17,12 @@ name: Release debs, AppImages, and Flatpaks
 #   - .flatpak (flatpak/io.github.gdr-aislop.abs-app.json; built against the
 #     org.gnome.Platform runtime, with GStreamer's good/libav plugins and every
 #     crates.io dependency built from source inside the sandbox)
+#
+# The two arch-specific Flatpak repos are also signed, merged, and published as a live remote on
+# GitHub Pages (combine-flatpak-repo + deploy-pages) — see flatpak/io.github.gdr-aislop.abs-app.
+# flatpakrepo and README.md's "Installing the Flatpak" section. Requires two repo secrets
+# (FLATPAK_GPG_PRIVATE_KEY, FLATPAK_GPG_KEY_ID) and the repo's Settings → Pages source set to
+# "GitHub Actions" — both one-time manual setup, not something this workflow can do for itself.
 
 on:
   push:
@@ -179,15 +185,39 @@ jobs:
       - name: Generate vendored cargo sources
         run: ./scripts/gen-flatpak-cargo-sources.sh
 
+      # Signs the repo this job builds so it can be published as a live remote (see
+      # combine-flatpak-repo/deploy-pages below) — a passphrase-less, signing-only key dedicated to
+      # CI, so no pinentry/loopback dance is needed to unlock it non-interactively. Only present on
+      # a tag push (this job's whole scope); skipped entirely for a workflow_dispatch dry run,
+      # which then produces an unsigned local build only, same as before this was added.
+      - name: Import the Flatpak signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+
       - name: Build Flatpak
         run: |
           set -eux
-          flatpak-builder --user --force-clean --repo=build/flatpak-repo \
+          gpg_sign_args=()
+          if [ -n "${FLATPAK_GPG_KEY_ID:-}" ]; then
+            gpg_sign_args=(--gpg-sign="$FLATPAK_GPG_KEY_ID")
+          fi
+          flatpak-builder --user --force-clean --repo=build/flatpak-repo "${gpg_sign_args[@]}" \
             build/flatpak-build flatpak/io.github.gdr-aislop.abs-app.json
+          # flatpak-builder's own --gpg-sign signs the commits it makes as it builds — the repo's
+          # summary file (what a client actually checks first on remote-add/update) needs its own
+          # signed update, hence this separate build-update-repo call.
+          if [ -n "${FLATPAK_GPG_KEY_ID:-}" ]; then
+            flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" \
+              --generate-static-deltas --prune build/flatpak-repo
+          fi
           mkdir -p dist
           flatpak build-bundle build/flatpak-repo \
             "dist/abs-app-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.flatpak" \
             io.github.gdr-aislop.abs-app
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.FLATPAK_GPG_KEY_ID || '' }}
 
       - name: Collect artifacts
         run: |
@@ -200,6 +230,116 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # The raw signed OSTree repo — combine-flatpak-repo merges this arch's copy with the other
+      # arch's into one multi-arch repo, published as the live Flatpak remote (see that job and
+      # deploy-pages below). Only meaningful on a tag push; still uploaded on a workflow_dispatch
+      # dry run for consistency, just unsigned and never actually published (both downstream jobs
+      # are gated on the tag condition too).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-ostree-${{ matrix.arch }}
+          path: build/flatpak-repo
+          if-no-files-found: error
+
+  combine-flatpak-repo:
+    name: Combine the per-arch Flatpak repos into one
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-flatpak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GPG
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg
+
+      - name: Import the Flatpak signing key
+        run: echo "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flatpak-ostree-*
+          path: flatpak-repos
+
+      # OSTree/flatpak-builder have no first-class "merge two independently-built repos" command,
+      # so this does it by hand: x86_64's repo becomes the base (it already has the right
+      # config/refs layout for its own arch), then aarch64's objects and refs are copied in
+      # alongside it. build-update-repo below then regenerates the one summary file a client
+      # actually reads, covering both arches' refs.
+      - name: Merge the two arch repos
+        run: |
+          set -eux
+          mkdir -p flatpak-repo
+          cp -a flatpak-repos/flatpak-ostree-x86_64/. flatpak-repo/
+          mkdir -p flatpak-repo/objects flatpak-repo/refs/heads flatpak-repo/refs/remotes flatpak-repo/refs/tags flatpak-repo/refs/mirrors
+          cp -a flatpak-repos/flatpak-ostree-aarch64/objects/. flatpak-repo/objects/
+          cp -a flatpak-repos/flatpak-ostree-aarch64/refs/. flatpak-repo/refs/
+          flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" \
+            --generate-static-deltas --prune flatpak-repo
+          test -e flatpak-repo/refs/heads/app/io.github.gdr-aislop.abs-app/x86_64/master
+          test -e flatpak-repo/refs/heads/app/io.github.gdr-aislop.abs-app/aarch64/master
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+
+      # Stamps the committed template with this run's real URLs and the signing key's public half
+      # (base64'd, so `flatpak remote-add` against the resulting file verifies signatures with no
+      # separate keyserver step) — same shape as the repo's own Url ultimately pointing back at
+      # the very GitHub Pages site deploy-pages publishes below.
+      - name: Prepare the .flatpakrepo file
+        run: |
+          set -eux
+          repo_url="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          homepage_url="https://github.com/${{ github.repository }}"
+          icon_url="https://raw.githubusercontent.com/${{ github.repository }}/main/app/assets/abs-app.svg"
+          gpg_key_b64="$(gpg --export "$FLATPAK_GPG_KEY_ID" | base64 -w 0)"
+          sed \
+            -e "s|__REPO_URL__|$repo_url|g" \
+            -e "s|__HOMEPAGE_URL__|$homepage_url|g" \
+            -e "s|__ICON_URL__|$icon_url|g" \
+            -e "s|__GPG_KEY__|$gpg_key_b64|g" \
+            flatpak/io.github.gdr-aislop.abs-app.flatpakrepo \
+            > flatpak-repo/io.github.gdr-aislop.abs-app.flatpakrepo
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-pages
+          path: flatpak-repo
+          if-no-files-found: error
+
+  deploy-pages:
+    name: Publish the Flatpak repo to GitHub Pages
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: combine-flatpak-repo
+    runs-on: ubuntu-latest
+    # This is the one job that needs Pages-deploy access — everything upstream of it keeps the
+    # default read-only permissions. Requires the repo's Settings → Pages → "Build and deployment"
+    # source to be set to "GitHub Actions" (a one-time manual setting this workflow can't set for
+    # itself); without that, this job fails outright rather than silently no-op'ing.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: flatpak-pages
+          path: pages
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: pages
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
   release:
     name: Attach artifacts to the GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -211,9 +351,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Explicitly excludes flatpak-ostree-*/flatpak-pages (the raw OSTree repo artifacts
+      # combine-flatpak-repo/deploy-pages consume) — a bare "flatpak-*" would also match those and
+      # dump repo internals (config/objects/refs, with colliding filenames across arches) into dist.
       - uses: actions/download-artifact@v4
         with:
-          pattern: "{deb-*,appimage-*,flatpak-*}"
+          pattern: "{deb-*,appimage-*,flatpak-x86_64,flatpak-aarch64}"
           merge-multiple: true
           path: dist
 
