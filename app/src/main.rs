@@ -186,6 +186,7 @@ mod tests {
         (library_tapping_a_card_invokes_on_open, crate::screens::library::tests::run_tapping_a_card_invokes_on_open),
         (library_list_view_toggle_switches_visible_container, crate::screens::library::tests::run_list_view_toggle_switches_visible_container),
         (library_switching_view_mode_shows_a_spinner_immediately, crate::screens::library::tests::run_switching_view_mode_shows_a_spinner_immediately),
+        (library_category_chip_shows_a_spinner_while_regrouping, crate::screens::library::tests::run_category_chip_shows_a_spinner_while_regrouping),
         (library_list_view_rows_show_title_and_subtitle, crate::screens::library::tests::run_list_view_rows_show_title_and_subtitle),
         (library_tapping_a_list_row_invokes_on_open, crate::screens::library::tests::run_tapping_a_list_row_invokes_on_open),
         (library_search_and_sort_apply_in_list_mode_too, crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too),

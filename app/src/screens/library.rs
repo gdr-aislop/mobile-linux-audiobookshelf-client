@@ -100,7 +100,7 @@ impl LibraryScreen {
     pub(crate) fn apply_series_filter(&self, series_name: &str) {
         *self.widgets.category_filter.borrow_mut() = CategoryFilter::OneSeries(series_name.to_string());
         self.widgets.grouping.set(Grouping::None);
-        render_from_current_data(&self.widgets);
+        request_render(&self.widgets);
     }
 }
 
@@ -134,7 +134,7 @@ pub struct TestHooks {
     pub category_genre: gtk4::ToggleButton,
     pub genre_chip_box: gtk4::Box,
     pub genre_chip_revealer: gtk4::Revealer,
-    pub view_switch_spinner: gtk4::Spinner,
+    pub busy_spinner: gtk4::Spinner,
     pub pull_spinner: gtk4::Spinner,
 }
 
@@ -258,9 +258,9 @@ struct LibraryWidgets {
     genre_chip_box: gtk4::Box,
     /// This render's cards/rows and their (maybe not yet decoded) covers — see [`PendingCover`].
     pending_covers: Rc<std::cell::RefCell<Vec<PendingCover>>>,
-    /// Shown for the one main-loop tick between a view-mode toggle and the rebuild it triggers —
-    /// see [`apply_view_mode`]/[`set_view_switch_busy`].
-    view_switch_spinner: gtk4::Spinner,
+    /// Shown for the one main-loop tick between any filter/search/sort/view-mode change and the
+    /// rebuild it triggers — see [`request_render`]/[`set_busy`].
+    busy_spinner: gtk4::Spinner,
 }
 
 struct LibraryData {
@@ -461,14 +461,15 @@ pub fn build(
 
     let scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&scroll_content).build();
 
-    // Immediate feedback for the grid/list toggle (see `apply_view_mode`): the rebuild that
-    // happens on tap can take a couple of seconds on a large library, so this spinner is shown
-    // on the very next painted frame, before that rebuild ever runs, rather than leaving the
-    // screen looking unresponsive in the meantime. Overlaid rather than swapped in so the stale
-    // grid/list stays visible underneath instead of vanishing to blank.
-    let view_switch_spinner = gtk4::Spinner::builder().halign(gtk4::Align::Center).valign(gtk4::Align::Center).visible(false).build();
+    // Immediate feedback for any filter/search/sort/view-mode change (see `request_render`/
+    // `apply_view_mode`): the rebuild that follows can take a couple of seconds on a large
+    // library, so this spinner is shown on the very next painted frame, before that rebuild ever
+    // runs, rather than leaving the screen looking unresponsive in the meantime. Overlaid rather
+    // than swapped in so the stale grid/list stays visible underneath instead of vanishing to
+    // blank.
+    let busy_spinner = gtk4::Spinner::builder().halign(gtk4::Align::Center).valign(gtk4::Align::Center).visible(false).build();
     let content_overlay = gtk4::Overlay::builder().child(&scroller).build();
-    content_overlay.add_overlay(&view_switch_spinner);
+    content_overlay.add_overlay(&busy_spinner);
 
     let status_page = adw::StatusPage::builder()
         .icon_name("folder-music-symbolic")
@@ -524,7 +525,7 @@ pub fn build(
         progress_banner: progress_banner.clone(),
         genre_chip_box: genre_chip_box.clone(),
         pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
-        view_switch_spinner: view_switch_spinner.clone(),
+        busy_spinner: busy_spinner.clone(),
     };
 
     // The filter's two manual entry points that don't persist: the banner's "Show all", and (via
@@ -552,7 +553,7 @@ pub fn build(
         move |_| {
             let widgets = widgets.clone();
             search_debounce.schedule(std::time::Duration::from_millis(200), move || {
-                render_from_current_data(&widgets);
+                request_render(&widgets);
             });
         }
     });
@@ -823,7 +824,7 @@ pub fn build(
                 _ => SortBy::DateOfCreation,
             };
             widgets.sort.set(SortKey::from_sort_by(sort_by));
-            render_from_current_data(&widgets);
+            request_render(&widgets);
             spawn_persist_view_options(pool.clone(), toast_overlay.clone(), widgets.clone());
         }
     });
@@ -955,7 +956,7 @@ pub fn build(
             category_genre,
             genre_chip_box,
             genre_chip_revealer,
-            view_switch_spinner,
+            busy_spinner,
             pull_spinner: pull_indicator.spinner().clone(),
         },
     }
@@ -1106,7 +1107,7 @@ fn set_in_progress_only(widgets: &LibraryWidgets, active: bool) {
     if widgets.in_progress_only_switch.is_active() != active {
         widgets.in_progress_only_switch.set_active(active);
     }
-    render_from_current_data(widgets);
+    request_render(widgets);
 }
 
 /// The single writer behind the view-options popover's "Hide finished" switch — just the Cell,
@@ -1115,7 +1116,7 @@ fn set_in_progress_only(widgets: &LibraryWidgets, active: bool) {
 fn set_hide_finished(widgets: &LibraryWidgets, active: bool) {
     widgets.hide_finished.set(active);
     update_view_options_indicator(widgets);
-    render_from_current_data(widgets);
+    request_render(widgets);
 }
 
 /// The single writer behind both grouping surfaces — the popover's "Grouping" combo and the
@@ -1123,7 +1124,7 @@ fn set_hide_finished(widgets: &LibraryWidgets, active: bool) {
 /// funnels through here" shape. Genre selections never call this (see `CategoryFilter`'s doc).
 fn set_grouping(widgets: &LibraryWidgets, grouping: Grouping) {
     widgets.grouping.set(grouping);
-    render_from_current_data(widgets);
+    request_render(widgets);
 }
 
 /// Whether the view-options button should show its "a filter is active" hint (the funnel icon,
@@ -1189,7 +1190,7 @@ fn rebuild_genre_chips(widgets: &LibraryWidgets) {
             move |toggle| {
                 if toggle.is_active() {
                     *widgets.category_filter.borrow_mut() = CategoryFilter::Genre(genre.clone());
-                    render_from_current_data(&widgets);
+                    request_render(&widgets);
                 }
             }
         });
@@ -1222,11 +1223,26 @@ fn apply(data: LibraryData, widgets: &LibraryWidgets) {
     render_from_current_data(widgets);
 }
 
-/// Shows or hides the spinner overlaid on the library content — see `apply_view_mode`'s doc for
+/// Shows or hides the spinner overlaid on the library content — see `request_render`'s doc for
 /// why this exists.
-fn set_view_switch_busy(widgets: &LibraryWidgets, busy: bool) {
-    widgets.view_switch_spinner.set_visible(busy);
-    widgets.view_switch_spinner.set_spinning(busy);
+fn set_busy(widgets: &LibraryWidgets, busy: bool) {
+    widgets.busy_spinner.set_visible(busy);
+    widgets.busy_spinner.set_spinning(busy);
+}
+
+/// Shows the busy spinner immediately, then defers the actual rebuild by one main-loop idle
+/// tick — same idiom `apply_view_mode` already uses — so GTK gets a chance to paint the spinner
+/// before the (multi-second, on a large library) freeze `render_from_current_data` causes. Every
+/// filter/search/sort trigger that re-renders goes through this, not `render_from_current_data`
+/// directly, with one deliberate exception: the offline/downloaded-only toggle's render (see its
+/// own call sites' comments) must stay synchronous.
+fn request_render(widgets: &LibraryWidgets) {
+    set_busy(widgets, true);
+    let widgets = widgets.clone();
+    glib::idle_add_local_once(move || {
+        render_from_current_data(&widgets);
+        set_busy(&widgets, false);
+    });
 }
 
 /// Applies a view mode to every widget it affects — the toggle button's own icon/tooltip, which
@@ -1241,18 +1257,19 @@ fn set_view_switch_busy(widgets: &LibraryWidgets, busy: bool) {
 /// before GTK ever gets a chance to paint the icon flip or the busy spinner this function shows
 /// first. Deferring it one tick lets that feedback actually reach the screen before the freeze,
 /// same `glib::idle_add_local_once` idiom `render_from_current_data` already uses to defer cover
-/// decoding until after layout.
+/// decoding until after layout. Doesn't go through `request_render` because it also needs the
+/// container swap to happen inside that same deferred tick, before the render.
 fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk4::ToggleButton) {
     widgets.view_mode.set(mode);
     toggle.set_icon_name(if mode == LibraryViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
     toggle.set_tooltip_text(Some(if mode == LibraryViewMode::List { "Grid view" } else { "List view" }));
-    set_view_switch_busy(widgets, true);
+    set_busy(widgets, true);
     let widgets = widgets.clone();
     glib::idle_add_local_once(move || {
         widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
         widgets.list_box.set_visible(mode == LibraryViewMode::List);
         render_from_current_data(&widgets);
-        set_view_switch_busy(&widgets, false);
+        set_busy(&widgets, false);
     });
 }
 
@@ -2025,10 +2042,12 @@ pub(crate) mod tests {
         assert!(!hooks.progress_banner.reveals_child(), "the filter banner stays hidden while no filter is active");
         assert!(!hooks.in_progress_only_switch.is_active());
 
-        // Via the sheet's switch — the manual path.
+        // Via the sheet's switch — the manual path. The banner reveals synchronously (inside
+        // `set_in_progress_only`, before its now-deferred re-render), so pumping on it alone
+        // would return before the filtered rebuild actually lands — wait on the rebuild itself.
         hooks.in_progress_only_switch.set_active(true);
-        pump_until(|| hooks.progress_banner.reveals_child(), Duration::from_secs(5));
-        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Reading Now"], "only the unfinished item with progress survives the filter");
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Reading Now".to_string()], Duration::from_secs(5));
+        assert!(hooks.progress_banner.reveals_child());
         assert!(hooks.in_progress_only_switch.is_active());
         assert_eq!(hooks.view_options_button.icon_name().as_deref(), Some("funnel-symbolic"), "the view-options button signals the active filter, Nautilus-style");
 
@@ -2042,9 +2061,9 @@ pub(crate) mod tests {
         // Via navigation (`apply_view`) — the Continue Listening header's path. The externally-
         // set state must sync the switch back the other way: switch → state, state → switch.
         screen.apply_view(SortKey::LastListened, true);
-        pump_until(|| hooks.progress_banner.reveals_child(), Duration::from_secs(5));
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Reading Now".to_string()], Duration::from_secs(5));
         assert!(hooks.in_progress_only_switch.is_active(), "apply_view must sync the sheet's switch to the externally-set state");
-        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Reading Now"]);
+        assert!(hooks.progress_banner.reveals_child());
     }
 
     pub(crate) fn run_shows_a_banner_when_sync_fails(runtime: &tokio::runtime::Runtime) {
@@ -2263,18 +2282,75 @@ pub(crate) mod tests {
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
-        assert!(!hooks.view_switch_spinner.is_visible());
+        assert!(!hooks.busy_spinner.is_visible());
 
         hooks.view_toggle.set_active(false);
         // Before pumping the main loop at all: the spinner must already be showing and the
         // rebuild must not have happened yet — proving the feedback lands on the same frame as
         // the tap, ahead of the (deferred) rebuild, not after it.
-        assert!(hooks.view_switch_spinner.is_visible(), "the spinner should appear before the rebuild runs");
+        assert!(hooks.busy_spinner.is_visible(), "the spinner should appear before the rebuild runs");
         assert!(hooks.list_box.is_visible(), "the old mode's container should still be showing");
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(5));
-        assert!(!hooks.view_switch_spinner.is_visible(), "the spinner should hide once the rebuild is done");
+        assert!(!hooks.busy_spinner.is_visible(), "the spinner should hide once the rebuild is done");
         assert!(hooks.flow_box.is_visible());
+    }
+
+    /// Regression test: the busy spinner used to be wired only to the view-mode toggle above —
+    /// every other filter/search trigger (category chips, search, the sheet's switches/combos)
+    /// called the same expensive rebuild directly, with no feedback, which is exactly the freeze
+    /// the user reported. `request_render` fixes this for every trigger it covers; this test
+    /// proves it for a category chip — a synchronous trigger, so (like the view-mode test above)
+    /// the spinner's state can be asserted immediately after the tap, with no main-loop pump in
+    /// between. Search goes through the exact same `request_render` call (see its debounce
+    /// callback), but proving that specifically would need pumping the main loop to let the
+    /// debounce timer fire first — and once that happens, the freshly-scheduled deferred render
+    /// is dispatched in the very same GLib pass in this headless test harness (no real frame
+    /// clock pacing it apart the way a live compositor would), so the intermediate state isn't
+    /// reliably observable here even though the underlying code path is identical.
+    pub(crate) fn run_category_chip_shows_a_spinner_while_regrouping(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Book By Weir", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Book By Herbert", "Frank Herbert", 1_600_000_000_000, 3600.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        assert!(!hooks.busy_spinner.is_visible());
+
+        hooks.category_author.set_active(true);
+        // Before pumping the main loop at all: same proof as the view-mode test above, this time
+        // for a category chip — the spinner and the stale, ungrouped content must both still be
+        // exactly as they were, ahead of the deferred regroup-and-rebuild.
+        assert!(hooks.busy_spinner.is_visible(), "the spinner should appear before the regroup runs");
+        assert_eq!(flow_box_entries(&hooks.flow_box).len(), 2, "the stale, ungrouped entries should still be showing while the spinner is up");
+
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 4, Duration::from_secs(5));
+        assert!(!hooks.busy_spinner.is_visible(), "the spinner should hide once the regroup is done");
     }
 
     pub(crate) fn run_list_view_rows_show_title_and_subtitle(runtime: &tokio::runtime::Runtime) {
