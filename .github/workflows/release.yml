@@ -10,10 +10,13 @@ name: Release debs and AppImages
 # link against Crimson-era library versions, and so accidentally using a
 # newer-than-v4_8/v1_2 API fails the build instead of crashing on device.
 #
-# Two artifact types per architecture:
+# Three artifact types per architecture:
 #   - .deb (cargo deb)
 #   - .AppImage (scripts/build-appimage.sh; bundles GTK4/GStreamer itself, so
 #     it runs on systems without them installed)
+#   - .flatpak (flatpak/io.github.gdr-aislop.abs-app.json; built against the
+#     org.gnome.Platform runtime, with GStreamer's good/libav plugins and every
+#     crates.io dependency built from source inside the sandbox)
 
 on:
   push:
@@ -146,10 +149,61 @@ jobs:
           path: build/appimage/*.AppImage
           if-no-files-found: error
 
+  build-flatpak:
+    name: Build Flatpak (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    # Not the debian:bookworm container the other jobs use: flatpak-builder needs a normal
+    # Ubuntu userspace (systemd/dbus for the build sandbox), not a bare container image.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder python3-venv
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.gnome.Platform//47 org.gnome.Sdk//47 \
+            org.freedesktop.Sdk.Extension.rust-stable//47
+
+      - name: Generate vendored cargo sources
+        run: ./scripts/gen-flatpak-cargo-sources.sh
+
+      - name: Build Flatpak
+        run: |
+          set -eux
+          flatpak-builder --user --force-clean --repo=build/flatpak-repo \
+            build/flatpak-build flatpak/io.github.gdr-aislop.abs-app.json
+          mkdir -p dist
+          flatpak build-bundle build/flatpak-repo \
+            "dist/abs-app-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.flatpak" \
+            io.github.gdr-aislop.abs-app
+
+      - name: Collect artifacts
+        run: |
+          cd dist
+          sha256sum ./*.flatpak > "SHA256SUMS-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Attach artifacts to the GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-deb, build-appimage]
+    needs: [build-deb, build-appimage, build-flatpak]
     runs-on: ubuntu-latest
     # Only this job needs write access (to attach files to the release) — build-deb only
     # checks out, builds, and uploads a workflow artifact, so it keeps the default read-only
@@ -159,14 +213,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: "{deb-*,appimage-*}"
+          pattern: "{deb-*,appimage-*,flatpak-*}"
           merge-multiple: true
           path: dist
 
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum ./*.deb ./*.AppImage > SHA256SUMS
+          sha256sum ./*.deb ./*.AppImage ./*.flatpak > SHA256SUMS
           rm -f SHA256SUMS-*.txt
           cat SHA256SUMS
 
@@ -175,4 +229,5 @@ jobs:
           files: |
             dist/*.deb
             dist/*.AppImage
+            dist/*.flatpak
             dist/SHA256SUMS
