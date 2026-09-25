@@ -135,6 +135,7 @@ pub struct TestHooks {
     pub genre_chip_box: gtk4::Box,
     pub genre_chip_revealer: gtk4::Revealer,
     pub view_switch_spinner: gtk4::Spinner,
+    pub pull_spinner: gtk4::Spinner,
 }
 
 #[cfg(test)]
@@ -482,10 +483,12 @@ pub fn build(
     // cached (zero items renders the status page instead), and a banner trapped inside the
     // hidden scroller disappears without a trace. Above the status page too, so the failure
     // is visible in every state.
+    let (pull_indicator_widget, pull_indicator) = crate::widgets::pull_to_refresh::PullIndicator::build();
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
     body.append(&offline_banner);
     body.append(&progress_banner);
     body.append(banner.widget());
+    body.append(&pull_indicator_widget);
     body.append(&content_overlay);
     body.append(&status_page);
 
@@ -897,8 +900,9 @@ pub fn build(
     spawn_sync_cycle(ctx.clone(), widgets.clone(), None);
 
     // The two manual triggers — the ⋯ menu's "Sync now" and a pull past the scroller's top —
-    // share one `ManualSync` (toast + in-flight guard) between them, mirroring home.rs.
-    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay);
+    // share one `ManualSync` (indicator + toast + in-flight guard) between them, mirroring
+    // home.rs.
+    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay, &pull_indicator);
     {
         let ctx = ctx.clone();
         let widgets = widgets.clone();
@@ -952,6 +956,7 @@ pub fn build(
             genre_chip_box,
             genre_chip_revealer,
             view_switch_spinner,
+            pull_spinner: pull_indicator.spinner().clone(),
         },
     }
 }
@@ -3343,6 +3348,9 @@ pub(crate) mod tests {
         // Each trigger's round-trip lands a distinct response (1 → 2 → 3 items, via the stacked
         // `up_to_n_times` mocks above), so every stage's render is its own observable.
         hooks.sync_now_button.emit_clicked();
+        // `ManualSync::claim` reveals the pull indicator synchronously, in the same handler
+        // invocation as the click — no pump needed to observe it.
+        assert!(hooks.pull_spinner.is_spinning(), "the pull indicator should reveal the instant a manual sync starts");
         pump_until(|| list_box_titles(&hooks.list_box).len() == 2, Duration::from_secs(10));
         // The toast lands at the cycle's resolve step — after its cover-fetch stage — so wait
         // on it, don't assert it immediately.
@@ -3354,13 +3362,15 @@ pub(crate) mod tests {
             crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the manual sync's completion toast must appear"
         );
+        assert!(!hooks.pull_spinner.is_spinning(), "the pull indicator should retract once the cycle resolves");
 
         hooks.scroller.emit_by_name::<()>("edge-overshot", &[&gtk4::PositionType::Top]);
+        assert!(hooks.pull_spinner.is_spinning(), "the pull indicator should reveal for the gesture trigger too");
         pump_until(|| list_box_titles(&hooks.list_box).len() == 3, Duration::from_secs(10));
-        pump_until(
-            || crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
-            Duration::from_secs(10),
-        );
+        // Waiting on the toast text alone would race the first toast, which can still be showing
+        // (it hasn't timed out yet) — so it'd already read true before this cycle's own `finish`
+        // runs. The pull indicator has no such ambiguity: it's only ever unset by `finish`.
+        pump_until(|| !hooks.pull_spinner.is_spinning(), Duration::from_secs(10));
         assert!(
             crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the pull's completion toast must appear too"

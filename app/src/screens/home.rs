@@ -49,6 +49,7 @@ pub struct TestHooks {
     pub sync_now_button: gtk4::Button,
     pub toast_overlay: adw::ToastOverlay,
     pub scroller: gtk4::ScrolledWindow,
+    pub pull_spinner: gtk4::Spinner,
 }
 
 #[cfg(test)]
@@ -386,9 +387,11 @@ pub fn build(
     // The banner lives directly under the header bar, outside the scroller, so a sync failure is
     // visible in every state — when the shelves are empty the scroller is hidden, and a banner
     // trapped inside it was exactly how the first-sync failure used to disappear without a trace.
+    let (pull_indicator_widget, pull_indicator) = crate::widgets::pull_to_refresh::PullIndicator::build();
     let body = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).vexpand(true).build();
     body.append(&offline_banner);
     body.append(banner.widget());
+    body.append(&pull_indicator_widget);
     body.append(&scroller);
     body.append(&empty_state.root);
 
@@ -427,8 +430,9 @@ pub fn build(
     spawn_sync_cycle(ctx.clone(), widgets.clone(), None);
 
     // The two manual triggers — the ⋯ menu's "Sync now" and a pull past the scroller's top —
-    // share one `ManualSync` (toast + in-flight guard) between them; see `spawn_sync_cycle`.
-    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay);
+    // share one `ManualSync` (indicator + toast + in-flight guard) between them; see
+    // `spawn_sync_cycle`.
+    let manual_sync = crate::widgets::ManualSync::new(&toast_overlay, &pull_indicator);
 
     // Try again re-runs the whole cycle: back to the spinner first, then the same
     // sync → render → resolve pipeline the screen opened with. Unguarded and toast-less like
@@ -555,6 +559,7 @@ pub fn build(
             sync_now_button,
             toast_overlay,
             scroller,
+            pull_spinner: pull_indicator.spinner().clone(),
         },
     }
 }
@@ -1225,6 +1230,9 @@ pub(crate) mod tests {
         );
 
         trigger(hooks);
+        // `ManualSync::claim` reveals the pull indicator synchronously, in the same handler
+        // invocation as the trigger signal — no pump needed to observe it.
+        assert!(hooks.pull_spinner.is_spinning(), "the pull indicator should reveal the instant a manual sync starts");
 
         pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
         // The toast lands at the cycle's resolve step — after its (best-effort) cover-fetch
@@ -1238,6 +1246,7 @@ pub(crate) mod tests {
             crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the manual sync's completion toast must appear"
         );
+        assert!(!hooks.pull_spinner.is_spinning(), "the pull indicator should retract once the cycle resolves");
     }
 
     /// "Sync now" via the ⋯ menu (HT-10): forces an immediate resync and toasts the outcome.

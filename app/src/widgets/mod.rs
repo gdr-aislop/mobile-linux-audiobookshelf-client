@@ -77,38 +77,53 @@ pub(crate) fn entry_row_input_purpose(row: &adw::EntryRow, purpose: gtk4::InputP
 }
 
 /// What a *manual* sync trigger — a screen's ⋯ menu "Sync now" item, or the pull-to-refresh
-/// gesture — adds to that screen's sync cycle: a toast reporting the outcome (the banner/empty
-/// state stay the detailed failure surface), and the in-flight flag both of a screen's triggers
-/// share so syncs can't stack (an overshot can fire repeatedly during one rubber-band, and the
-/// menu is one tap away from the gesture). The automatic cycle and the empty state's "Try again"
-/// pass none — they already own their feedback, and re-running them is deliberately unguarded.
+/// gesture — adds to that screen's sync cycle: a pull indicator revealed for the sync's duration
+/// (otherwise the only feedback a pull gesture gets is invisible), a toast reporting the outcome
+/// (the banner/empty state stay the detailed failure surface), and the in-flight flag both of a
+/// screen's triggers share so syncs can't stack (an overshot can fire repeatedly during one
+/// rubber-band, and the menu is one tap away from the gesture). The automatic cycle and the empty
+/// state's "Try again" pass none — they already own their feedback, and re-running them is
+/// deliberately unguarded.
 ///
-/// Cheap to clone: both fields are reference-counted, and the clones share the one flag.
+/// Cheap to clone: every field is reference-counted, and the clones share the one flag.
 #[derive(Clone)]
 pub(crate) struct ManualSync {
     toast_overlay: adw::ToastOverlay,
+    indicator: crate::widgets::pull_to_refresh::PullIndicator,
     in_flight: Rc<Cell<bool>>,
 }
 
 impl ManualSync {
-    pub(crate) fn new(toast_overlay: &adw::ToastOverlay) -> Self {
-        Self { toast_overlay: toast_overlay.clone(), in_flight: Rc::new(Cell::new(false)) }
+    pub(crate) fn new(
+        toast_overlay: &adw::ToastOverlay,
+        indicator: &crate::widgets::pull_to_refresh::PullIndicator,
+    ) -> Self {
+        Self {
+            toast_overlay: toast_overlay.clone(),
+            indicator: indicator.clone(),
+            in_flight: Rc::new(Cell::new(false)),
+        }
     }
 
     /// Claims the manual-sync slot, or reports it taken. Called by the sync cycle when it's
-    /// spawned, so both trigger sites share the guard without knowing about each other.
+    /// spawned, so both trigger sites share the guard without knowing about each other. Reveals
+    /// the pull indicator the same frame the trigger is recognized — the only visual feedback a
+    /// pull gesture gets, since `edge-overshot` carries no drag-distance payload to animate.
     pub(crate) fn claim(&self) -> bool {
         if self.in_flight.get() {
             return false;
         }
         self.in_flight.set(true);
+        self.indicator.show();
         true
     }
 
-    /// Releases the slot and reports the outcome as a transient toast. Called at the sync
-    /// cycle's resolve step, so the toast lands only after the screen has rendered the result.
+    /// Releases the slot, retracts the pull indicator, and reports the outcome as a transient
+    /// toast. Called at the sync cycle's resolve step, so the toast lands only after the screen
+    /// has rendered the result.
     pub(crate) fn finish(&self, ok: bool) {
         self.in_flight.set(false);
+        self.indicator.hide();
         let message = if ok { "Sync complete" } else { "Sync failed" };
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
