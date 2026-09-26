@@ -99,6 +99,7 @@ struct Widgets {
     /// failed with no trace at all. Cleared the moment a new `Downloading`/`Complete`/`Stopped`
     /// state arrives for the same item (a retry, or the item leaving the list entirely).
     failed: Rc<RefCell<HashMap<String, String>>>,
+    on_open: Rc<dyn Fn(crate::player::PlayRequest)>,
 }
 
 pub fn build(
@@ -109,6 +110,11 @@ pub fn build(
     _session: abs_core::auth::Session,
     download_manager: DownloadManager,
     window: adw::ApplicationWindow,
+    // Tapping a row opens Item Detail for it — the same landing spot every other item surface
+    // (Home shelf cards, Library grid) already uses, and after A1/A2/A5 it's exactly where this
+    // item's own download progress and per-chapter glyphs live. `Rc<dyn Fn>`, not `impl Fn`, since
+    // it's cloned into every row `spawn_refresh` rebuilds.
+    on_open: Rc<dyn Fn(crate::player::PlayRequest)>,
 ) -> DownloadsScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Downloads", "")));
@@ -143,6 +149,7 @@ pub fn build(
         speeds: Rc::new(RefCell::new(HashMap::new())),
         live_rows: Rc::new(RefCell::new(HashMap::new())),
         failed: Rc::new(RefCell::new(HashMap::new())),
+        on_open,
     });
 
     // Confirmed via the same shared `GtkMessageDialog` helper Settings/Connection use for their
@@ -299,7 +306,7 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 if complete.is_empty() { None } else { Some(format!("{}, {}", chapters_label(complete.len()), format_bytes(size))) }
             };
 
-            let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle);
+            let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle, &widgets.on_open);
             if is_downloading {
                 widgets.live_rows.borrow_mut().insert(item_id.clone(), row.clone());
             }
@@ -317,16 +324,35 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
     });
 }
 
-fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download_manager: &DownloadManager, server_id: &str, subtitle: Option<String>) -> adw::ActionRow {
+#[allow(clippy::too_many_arguments)]
+fn download_row(
+    item: &abs_storage::models::Item,
+    is_downloading: bool,
+    download_manager: &DownloadManager,
+    server_id: &str,
+    subtitle: Option<String>,
+    on_open: &Rc<dyn Fn(crate::player::PlayRequest)>,
+) -> adw::ActionRow {
     const THUMBNAIL_SIZE: i32 = 48;
     let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
     cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
 
-    let row = adw::ActionRow::builder().title(&item.title).build();
+    let row = adw::ActionRow::builder().title(&item.title).activatable(true).build();
     if let Some(text) = subtitle {
         row.set_subtitle(&text);
     }
     row.add_prefix(cover.widget());
+    // Lands on Item Detail — the same surface every other item view (Home shelf cards, Library
+    // grid) opens on tap, and where this item's own download progress/chapter glyphs live (see
+    // widgets::download_progress, screens::item_detail's refresh_chapter_rows). The suffix's own
+    // Stop/Remove button below claims its own click, so it never bubbles into this activation.
+    row.connect_activated({
+        let on_open = on_open.clone();
+        let item_id = item.id.clone();
+        let title = item.title.clone();
+        let author = item.author.clone();
+        move |_| on_open(crate::player::PlayRequest { item_id: item_id.clone(), title: title.clone(), author: author.clone() })
+    });
 
     if is_downloading {
         let spinner = gtk4::Spinner::builder().spinning(true).valign(gtk4::Align::Center).build();
@@ -491,7 +517,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool, test_paths(), server, account, session, manager, app_window);
+        let screen = build(pool, test_paths(), server, account, session, manager, app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
@@ -510,7 +536,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -534,7 +560,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -579,7 +605,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         let events: Rc<RefCell<Vec<DownloadEvent>>> = Rc::new(RefCell::new(Vec::new()));
@@ -636,7 +662,7 @@ pub(crate) mod tests {
         );
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
 
@@ -644,6 +670,54 @@ pub(crate) mod tests {
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(10));
         assert!(hooks.status_page.is_visible(), "removing the only completed download should return to the empty state");
         assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty());
+    }
+
+    /// Regression test for "a Downloads row is otherwise dead — no way back to the book it's
+    /// for": tapping a row must report that item's `PlayRequest` via `on_open`, and the Remove
+    /// button (a `GtkButton` inside the row's suffix) must claim its own click rather than
+    /// bubbling into the row's own activation.
+    pub(crate) fn run_tapping_a_row_opens_it_and_remove_does_not(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        manager.start_download(session.clone(), "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+
+        let opened: Rc<RefCell<Vec<crate::player::PlayRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager, app_window, {
+            let opened = opened.clone();
+            Rc::new(move |request| opened.borrow_mut().push(request))
+        });
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let row = hooks.list_box.row_at_index(0).unwrap();
+        row.emit_by_name::<()>("activated", &[]);
+        assert_eq!(opened.borrow().len(), 1, "tapping the row should report this item's PlayRequest");
+        assert_eq!(opened.borrow()[0].item_id, "item-1");
+        assert_eq!(opened.borrow()[0].title, "Test Item");
+
+        // The Remove button (inside the row's suffix) must claim its own click, not bubble into
+        // the row's own activation.
+        let remove_button = crate::widgets::find_descendant::<gtk4::Button>(row.upcast_ref()).expect("the completed row's Remove button");
+        remove_button.emit_clicked();
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
+            "Remove should have actually run"
+        );
+        assert_eq!(opened.borrow().len(), 1, "clicking Remove must not also open the row");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Clear all downloads" button
@@ -657,7 +731,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
@@ -689,7 +763,7 @@ pub(crate) mod tests {
         );
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
 
@@ -730,7 +804,7 @@ pub(crate) mod tests {
         assert!(std::path::Path::new(&file_path).exists(), "the download should have actually written a file");
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
 

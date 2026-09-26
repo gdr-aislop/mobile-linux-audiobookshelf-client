@@ -552,7 +552,7 @@ pub fn build(
         "go-home-symbolic",
     );
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone());
+    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
 
     // A dot on the Downloads tab while anything is downloading, so "something is running in the
