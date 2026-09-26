@@ -57,6 +57,12 @@ pub fn build(
     current_chapter_index: impl Fn() -> usize + 'static,
     free_space: impl Fn() -> Option<u64> + 'static,
     toast_overlay: adw::ToastOverlay,
+    // Lets "Download started" carry a "View" action straight to the Downloads tab — the one
+    // place with any real progress/cancel affordance before the download finishes, and otherwise
+    // unreachable from here: both Item Detail and the Player are content-swapped over the shell,
+    // hiding the tab bar entirely. `Rc`, not a plain closure, since it's cloned into two toast
+    // sites below and into every popover reopen.
+    on_open_downloads: Rc<dyn Fn()>,
 ) -> DownloadScopeMenu {
     let popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     let popover = gtk4::Popover::builder().child(&popover_box).build();
@@ -72,6 +78,7 @@ pub fn build(
         let session = session.clone();
         let item_id = item_id.clone();
         let toast_overlay = toast_overlay.clone();
+        let on_open_downloads = on_open_downloads.clone();
         move |_| {
             // The stepper's count defaults to 10 (ui-spec) on every open and is shared by both
             // populate passes below, so the async availability rebuild can't reset it mid-open.
@@ -93,6 +100,7 @@ pub fn build(
                 free_space,
                 &next_count,
                 &toast_overlay,
+                &on_open_downloads,
             );
             glib::spawn_future_local({
                 let pool = pool.clone();
@@ -104,6 +112,7 @@ pub fn build(
                 let chapter_ranges = chapter_ranges.clone();
                 let next_count = next_count.clone();
                 let toast_overlay = toast_overlay.clone();
+                let on_open_downloads = on_open_downloads.clone();
                 async move {
                     let server_id = session.server_id().to_string();
                     let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
@@ -121,6 +130,7 @@ pub fn build(
                         free_space,
                         &next_count,
                         &toast_overlay,
+                        &on_open_downloads,
                     );
                 }
             });
@@ -208,6 +218,20 @@ fn blocked_label() -> gtk4::Label {
         .build()
 }
 
+/// The "Download started" toast, with a "View" action to the Downloads tab — otherwise
+/// unreachable from here (both Item Detail and the Player are content-swapped over the shell,
+/// hiding the tab bar), and the only screen with any progress/cancel affordance before this
+/// screen's own `widgets::download_progress::DownloadProgressStrip` reveals a moment later.
+fn started_download_toast(on_open_downloads: &Rc<dyn Fn()>) -> adw::Toast {
+    let toast = adw::Toast::new("Download started");
+    toast.set_button_label(Some("View"));
+    toast.connect_button_clicked({
+        let on_open_downloads = on_open_downloads.clone();
+        move |_| on_open_downloads()
+    });
+    toast
+}
+
 /// (Re)builds the download button's popover rows: the four scope options from ui-spec's Item
 /// Detail download sheet — "Current chapter", "Next chapters" with its inline − / count / +
 /// stepper (default 10, clamped to the chapters actually remaining after the current one; tapping
@@ -232,6 +256,7 @@ fn populate_download_popover_rows(
     free_space: Option<u64>,
     next_count: &Rc<Cell<u32>>,
     toast_overlay: &adw::ToastOverlay,
+    on_open_downloads: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = popover_box.first_child() {
         popover_box.remove(&child);
@@ -268,6 +293,7 @@ fn populate_download_popover_rows(
             let session = session.clone();
             let item_id = item_id.to_string();
             let toast_overlay = toast_overlay.clone();
+            let on_open_downloads = on_open_downloads.clone();
             move |_| {
                 if blocked {
                     toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
@@ -275,7 +301,7 @@ fn populate_download_popover_rows(
                 }
                 download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
                 popover.popdown();
-                toast_overlay.add_toast(adw::Toast::new("Download started"));
+                toast_overlay.add_toast(started_download_toast(&on_open_downloads));
             }
         });
         popover_box.append(&button);
@@ -392,6 +418,7 @@ fn populate_download_popover_rows(
         let toast_overlay = toast_overlay.clone();
         let next_count = next_count.clone();
         let next_blocked = next_blocked.clone();
+        let on_open_downloads = on_open_downloads.clone();
         move |_| {
             if next_blocked.get() {
                 toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
@@ -399,7 +426,7 @@ fn populate_download_popover_rows(
             }
             download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
             popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Download started"));
+            toast_overlay.add_toast(started_download_toast(&on_open_downloads));
         }
     });
 
@@ -487,7 +514,7 @@ pub(crate) mod tests {
         let chapter_ranges: Vec<(f64, f64)> = controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay);
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -530,7 +557,7 @@ pub(crate) mod tests {
         let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0)];
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay);
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -577,7 +604,7 @@ pub(crate) mod tests {
         let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)];
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay);
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -630,7 +657,7 @@ pub(crate) mod tests {
         let download_manager = DownloadManager::new(pool.clone(), paths, Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
         let free_space_manager = download_manager.clone();
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, move || free_space_manager.free_space_bytes(), toast_overlay);
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, move || free_space_manager.free_space_bytes(), toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -676,7 +703,7 @@ pub(crate) mod tests {
         let toast_overlay = adw::ToastOverlay::new();
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         toast_overlay.set_child(Some(&content));
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay.clone());
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay.clone(), Rc::new(|| {}));
         content.append(&menu.widget);
         let window = gtk4::Window::builder().child(&toast_overlay).build();
         window.present();

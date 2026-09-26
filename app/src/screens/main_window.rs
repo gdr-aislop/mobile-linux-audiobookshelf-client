@@ -270,15 +270,31 @@ pub fn build(
         let root = root.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let stack = stack.clone();
         move || {
-            let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
-                let window = window.clone();
-                let root = root.clone();
-                move || {
-                    crate::widgets::swap_content(&window, &root);
-                    window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
-                }
-            });
+            let player_screen = screens::player::build(
+                pool.clone(),
+                controller.clone(),
+                download_manager.clone(),
+                {
+                    let window = window.clone();
+                    let root = root.clone();
+                    move || {
+                        crate::widgets::swap_content(&window, &root);
+                        window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
+                    }
+                },
+                {
+                    let window = window.clone();
+                    let root = root.clone();
+                    let stack = stack.clone();
+                    move || {
+                        crate::widgets::swap_content(&window, &root);
+                        window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
+                        stack.set_visible_child_name("downloads");
+                    }
+                },
+            );
             window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
             crate::widgets::swap_content(&window, &player_screen.root);
         }
@@ -452,6 +468,19 @@ pub fn build(
                     }
                 }
             };
+            // "View" on a "Download started" toast (`widgets::download_scope_menu`'s own doc):
+            // closes whichever screen raised it and lands on the Downloads tab, the same
+            // "close this screen, land on a specific tab" shape `on_open_series`/`on_open_shelf`
+            // already use.
+            let on_open_downloads = {
+                let window = window.clone();
+                let root = root.clone();
+                let stack = stack.clone();
+                move || {
+                    crate::widgets::swap_content(&window, &root);
+                    stack.set_visible_child_name("downloads");
+                }
+            };
             let item_detail_screen = screens::item_detail::build(
                 pool.clone(),
                 server.clone(),
@@ -464,6 +493,7 @@ pub fn build(
                 on_back,
                 on_open_player,
                 on_open_series,
+                on_open_downloads,
             );
             crate::widgets::swap_content(&window, &item_detail_screen.root);
         }
@@ -1450,6 +1480,83 @@ pub(crate) mod tests {
         found
     }
 
+    /// Regression test for "no route to the Downloads tab from Item Detail/Player" — both are
+    /// content-swapped over the shell, hiding the tab bar, so the "Download started" toast's
+    /// "View" action (`widgets::download_scope_menu`'s `started_download_toast`) is the only way
+    /// back short of navigating there blind and hoping. Clicking it must close Item Detail and
+    /// land on the Downloads tab.
+    pub(crate) fn run_download_started_toast_view_action_opens_downloads(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::item_json;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(crate::downloads::tests::mock_two_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        find_card_button(&home_root).expect("a synced item's card should render").emit_clicked();
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("Item Detail should be showing");
+
+        let download_button = find_menu_button_with_icon(&content, "folder-download-symbolic").expect("Item Detail's download button");
+        download_button.popup();
+        pump_until(|| find_button_containing_label(&content, "Entire book").is_some(), std::time::Duration::from_secs(2));
+        find_button_containing_label(&content, "Entire book").expect("the Entire book scope row").emit_clicked();
+
+        pump_until(|| find_button_labeled(&content, "View").is_some(), std::time::Duration::from_secs(5));
+        find_button_labeled(&content, "View").expect("the toast's View action").emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|current| current == window.root),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(hooks.stack.visible_child_name().as_deref(), Some("downloads"), "the toast's View action should switch to the Downloads tab");
+    }
+
     /// Depth-first search for the first `GtkButton` constructed from exactly this icon name
     /// anywhere under `root` — used to prove the Player screen (not Item Detail or the shell) is
     /// showing, via its collapse button (`player.rs`'s `gtk4::Button::from_icon_name
@@ -1460,6 +1567,33 @@ pub(crate) mod tests {
                 return;
             }
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if button.icon_name().as_deref() == Some(icon_name) {
+                    *found = Some(button.clone());
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, icon_name, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, icon_name, &mut found);
+        found
+    }
+
+    /// Like [`find_button_with_icon`], but for a `GtkMenuButton` (Item Detail/Player's download
+    /// button, `folder-download-symbolic`) rather than a plain `GtkButton`.
+    fn find_menu_button_with_icon(root: &gtk4::Widget, icon_name: &str) -> Option<gtk4::MenuButton> {
+        fn walk(widget: &gtk4::Widget, icon_name: &str, found: &mut Option<gtk4::MenuButton>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::MenuButton>() {
                 if button.icon_name().as_deref() == Some(icon_name) {
                     *found = Some(button.clone());
                     return;

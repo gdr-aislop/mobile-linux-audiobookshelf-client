@@ -103,10 +103,12 @@ pub fn build(
     on_back: impl Fn() + 'static,
     on_open_player: impl Fn() + 'static,
     on_open_series: impl Fn(String) + 'static,
+    on_open_downloads: impl Fn() + 'static,
 ) -> ItemDetailScreen {
     let on_play: Rc<dyn Fn(String, Option<usize>)> = Rc::new(on_play);
     let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);
+    let on_open_downloads: Rc<dyn Fn()> = Rc::new(on_open_downloads);
 
     let header = adw::HeaderBar::new();
     let back_button = gtk4::Button::from_icon_name("go-previous-symbolic");
@@ -276,6 +278,7 @@ pub fn build(
             move || download_manager.free_space_bytes()
         },
         toast_overlay.clone(),
+        on_open_downloads.clone(),
     );
     // Same `pill` treatment as the primary button, so the row reads as one pair of matched
     // controls (the shared widget keeps its plain icon-button look in Player's row — this is a
@@ -849,7 +852,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), Some("Ray Porter"), Some("A lone astronaut."), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Project Hail Mary", Duration::from_secs(5));
@@ -873,7 +876,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Meditations", Some("Marcus Aurelius"), Some(""), None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Meditations", Duration::from_secs(5));
@@ -892,7 +895,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
@@ -914,7 +917,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), None, None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
@@ -946,7 +949,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(&long_description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.label() == long_description, Duration::from_secs(5));
@@ -971,7 +974,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.uses_markup(), Duration::from_secs(5));
@@ -1009,7 +1012,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.chapters_list.row_at_index(1).is_some(), Duration::from_secs(5));
@@ -1045,7 +1048,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Test Item", Duration::from_secs(5));
@@ -1069,7 +1072,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.back_button.emit_clicked();
@@ -1093,7 +1096,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
@@ -1129,7 +1132,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
@@ -1166,7 +1169,7 @@ pub(crate) mod tests {
         controller.start(session.clone(), crate::player::PlayRequest { item_id: "item-1".to_string(), title: "Test Item".to_string(), author: None }, 1.0);
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.mark_as_finished_button.emit_clicked();
@@ -1195,7 +1198,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 10.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.download_button.is_sensitive(), Duration::from_secs(5));
@@ -1231,7 +1234,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 15.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
@@ -1299,7 +1302,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, {
             let opened_player = opened_player.clone();
             move || opened_player.set(true)
-        }, |_| {});
+        }, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         // The mini bar is primed immediately from `controller.snapshot()` at build time — no need
@@ -1356,7 +1359,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, {
             let opened_series = opened_series.clone();
             move |name: String| opened_series.borrow_mut().push(name)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         // Pass 1 lands: title and the series button's plain name are set in the same
@@ -1396,7 +1399,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item_with_series(&pool, &server.id, "item-1", "Foundation", "Foundation", 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Foundation", Duration::from_secs(5));
@@ -1422,7 +1425,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "No Series Book", None, None, None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "No Series Book", Duration::from_secs(5));
