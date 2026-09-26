@@ -84,7 +84,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # appimagetool. mksquashfs comes from the tool-builder stage (bookworm's
 # squashfs-tools is too old for appimagetool's -offset option).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config git curl wget ca-certificates file patchelf \
+        build-essential pkg-config git curl wget ca-certificates file patchelf zsync \
         libgtk-4-dev libadwaita-1-dev \
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
         libssl-dev \
