@@ -66,6 +66,7 @@ pub struct TestHooks {
     pub mark_as_finished_button: gtk4::Button,
     pub reset_progress_button: gtk4::Button,
     pub mini_bar: crate::player::MiniPlayerHooks,
+    pub download_progress_revealer: gtk4::Revealer,
 }
 
 #[cfg(test)]
@@ -102,10 +103,12 @@ pub fn build(
     on_back: impl Fn() + 'static,
     on_open_player: impl Fn() + 'static,
     on_open_series: impl Fn(String) + 'static,
+    on_open_downloads: impl Fn() + 'static,
 ) -> ItemDetailScreen {
-    let on_play = Rc::new(on_play);
+    let on_play: Rc<dyn Fn(String, Option<usize>)> = Rc::new(on_play);
     let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);
+    let on_open_downloads: Rc<dyn Fn()> = Rc::new(on_open_downloads);
 
     let header = adw::HeaderBar::new();
     let back_button = gtk4::Button::from_icon_name("go-previous-symbolic");
@@ -251,6 +254,12 @@ pub fn build(
     // (which records progress at full duration) when this item isn't the one currently loaded
     // into `controller`, so there's no live playback duration to ask instead.
     let duration_seconds_cell: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+    // Chapters + the resume position, both filled in by Pass 2 below and kept around (this page's
+    // chapter list never changes shape after that, per `chapter_ranges_cell`'s own doc above) so
+    // `refresh_chapter_rows` can rebuild the "Downloaded" glyphs later without redoing Pass 2's
+    // network resolve — only re-querying which chapters are downloaded, which does change.
+    let chapters_cell: Rc<std::cell::RefCell<Vec<(String, f64, f64)>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let progress_seconds_cell: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
     let download_menu = download_scope_menu::build(
         pool.clone(),
         download_manager.clone(),
@@ -269,12 +278,66 @@ pub fn build(
             move || download_manager.free_space_bytes()
         },
         toast_overlay.clone(),
+        on_open_downloads.clone(),
     );
     // Same `pill` treatment as the primary button, so the row reads as one pair of matched
     // controls (the shared widget keeps its plain icon-button look in Player's row — this is a
     // per-call-site style, and the widget is built fresh here).
     download_menu.widget.add_css_class("pill");
     actions_row.append(&download_menu.widget);
+
+    // Visible progress for this item's own in-flight download (see
+    // `widgets::download_progress`'s doc for why the button's static spinner icon alone wasn't
+    // enough) — placed directly below the actions row, the same slot Home/Library use for their
+    // pull-to-refresh indicator.
+    // `insert_child_after`, not `append`: `content`'s children were already assembled above
+    // (`actions_row` included) before this widget exists, so appending now would land it after
+    // the chapters section instead of right below the actions row.
+    let (progress_strip_widget, _progress_strip) =
+        crate::widgets::download_progress::DownloadProgressStrip::build(download_manager.clone(), server.id.clone(), item_id.clone());
+    content.insert_child_after(&progress_strip_widget, Some(&actions_row));
+
+    // Keeps the chapter list's "Downloaded" glyphs live: Pass 2 above computes them once, but a
+    // download can complete (or start, or fail) while this screen is still open — without this,
+    // the glyphs stayed exactly as Pass 2 first found them until the screen was reopened. Refetch
+    // is cheap (one indexed query over this item's chapter ranges), so this re-derives markers on
+    // every event rather than trying to track "did a track just finish" precisely.
+    download_manager.add_listener({
+        let pool = pool.clone();
+        let server_id = server.id.clone();
+        let item_id = item_id.clone();
+        let chapters_list = chapters_list.clone();
+        let chapters_cell = chapters_cell.clone();
+        let chapter_ranges_cell = chapter_ranges_cell.clone();
+        let progress_seconds_cell = progress_seconds_cell.clone();
+        let on_play = on_play.clone();
+        move |event| {
+            let event_item_id = match event {
+                crate::downloads::DownloadEvent::ItemStateChanged { item_id, .. } => item_id,
+                crate::downloads::DownloadEvent::TrackProgress { item_id, .. } => item_id,
+            };
+            if *event_item_id != item_id {
+                return;
+            }
+            let chapters = chapters_cell.clone();
+            let chapter_ranges = chapter_ranges_cell.borrow().clone();
+            if chapter_ranges.is_empty() {
+                // Pass 2 hasn't landed yet (or this item has no chapters at all) — nothing to
+                // refresh against.
+                return;
+            }
+            let pool = pool.clone();
+            let server_id = server_id.clone();
+            let item_id = item_id.clone();
+            let chapters_list = chapters_list.clone();
+            let progress_seconds_cell = progress_seconds_cell.clone();
+            let on_play = on_play.clone();
+            glib::spawn_future_local(async move {
+                let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
+                refresh_chapter_rows(&chapters_list, &chapters.borrow(), progress_seconds_cell.get(), &markers, &on_play, &item_id);
+            });
+        }
+    });
 
     // "Mark as finished"/"Reset progress" — the same shared widget Player uses (see
     // `widgets::item_options_menu`'s doc), so both screens look and behave identically. Unlike
@@ -288,7 +351,6 @@ pub fn build(
     // "Play", no progress bar" state Pass 1 below already computes for an unstarted/finished
     // item, so there's no need to wait on the async write to know what to show.
     let options_menu = item_options_menu::build(
-        toast_overlay.clone(),
         None,
         {
             let controller = controller.clone();
@@ -300,11 +362,16 @@ pub fn build(
             let duration_seconds_cell = duration_seconds_cell.clone();
             let play_button = play_button.clone();
             let progress_bar = progress_bar.clone();
+            let toast_overlay = toast_overlay.clone();
             move || {
                 play_button.set_label("Play");
                 progress_bar.set_visible(false);
                 if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
+                    // Synchronous from the caller's point of view (the controller's own local
+                    // write is fire-and-forget, same posture as its periodic progress tick) —
+                    // safe to toast success right away, unlike the direct-write branch below.
                     controller.mark_as_finished();
+                    toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
                 } else {
                     let duration_seconds = duration_seconds_cell.get();
                     let pool = pool.clone();
@@ -312,32 +379,29 @@ pub fn build(
                     let account_id = account_id.clone();
                     let server_id = server_id.clone();
                     let item_id = item_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
+                        // The local write is this action's real outcome — the toast reports
+                        // exactly that, not whether the best-effort server push (below) also
+                        // landed, which was never something "Marked as finished" promised.
+                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await;
+                        if let Err(err) = &local_result {
+                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
+                        }
                         match session.connection_target().await {
                             Ok(connection) => {
                                 let access_token = session.access_token().await;
-                                if let Err(err) = abs_core::progress_sync::push_item_progress(
-                                    &pool,
-                                    &connection,
-                                    &access_token,
-                                    &account_id,
-                                    &server_id,
-                                    &item_id,
-                                    duration_seconds,
-                                    duration_seconds,
-                                    true,
-                                )
-                                .await
+                                if let Err(err) =
+                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, duration_seconds, duration_seconds, true).await
                                 {
                                     tracing::warn!(%err, item_id = %item_id, "couldn't push 'mark as finished' to the server; local write already landed");
                                 }
                             }
-                            Err(err) => {
-                                tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only");
-                                if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
-                                }
-                            }
+                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only"),
+                        }
+                        match local_result {
+                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Marked as finished")),
+                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Marking as finished", err),
                         }
                     });
                 }
@@ -353,11 +417,13 @@ pub fn build(
             let duration_seconds_cell = duration_seconds_cell.clone();
             let play_button = play_button.clone();
             let progress_bar = progress_bar.clone();
+            let toast_overlay = toast_overlay.clone();
             move || {
                 play_button.set_label("Play");
                 progress_bar.set_visible(false);
                 if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
                     controller.reset_progress();
+                    toast_overlay.add_toast(adw::Toast::new("Progress reset"));
                 } else {
                     let duration_seconds = duration_seconds_cell.get();
                     let pool = pool.clone();
@@ -365,32 +431,26 @@ pub fn build(
                     let account_id = account_id.clone();
                     let server_id = server_id.clone();
                     let item_id = item_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
+                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await;
+                        if let Err(err) = &local_result {
+                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
+                        }
                         match session.connection_target().await {
                             Ok(connection) => {
                                 let access_token = session.access_token().await;
-                                if let Err(err) = abs_core::progress_sync::push_item_progress(
-                                    &pool,
-                                    &connection,
-                                    &access_token,
-                                    &account_id,
-                                    &server_id,
-                                    &item_id,
-                                    0.0,
-                                    duration_seconds,
-                                    false,
-                                )
-                                .await
+                                if let Err(err) =
+                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, 0.0, duration_seconds, false).await
                                 {
                                     tracing::warn!(%err, item_id = %item_id, "couldn't push 'reset progress' to the server; local write already landed");
                                 }
                             }
-                            Err(err) => {
-                                tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only");
-                                if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
-                                }
-                            }
+                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only"),
+                        }
+                        match local_result {
+                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Progress reset")),
+                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Resetting progress", err),
                         }
                     });
                 }
@@ -420,6 +480,8 @@ pub fn build(
         let chapter_ranges_cell = chapter_ranges_cell.clone();
         let current_chapter_index_cell = current_chapter_index_cell.clone();
         let duration_seconds_cell = duration_seconds_cell.clone();
+        let chapters_cell = chapters_cell.clone();
+        let progress_seconds_cell = progress_seconds_cell.clone();
         async move {
             let server_id = server.id.clone();
             let account_id = account.id.clone();
@@ -473,6 +535,7 @@ pub fn build(
 
             let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
             let progress_seconds = progress.as_ref().filter(|p| !p.is_finished).map(|p| p.current_time_seconds).unwrap_or(0.0);
+            progress_seconds_cell.set(progress_seconds);
             let duration_seconds = item.as_ref().map(|i| i.duration_seconds).unwrap_or(0.0);
             duration_seconds_cell.set(duration_seconds);
             if progress_seconds > 0.0 {
@@ -557,30 +620,9 @@ pub fn build(
             let chapter_ranges: Vec<(f64, f64)> = chapters.iter().map(|(_, start, end)| (*start, *end)).collect();
             let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
 
-            while let Some(row) = chapters_list.row_at_index(0) {
-                chapters_list.remove(&row);
-            }
-            for (index, (title, start, end)) in chapters.iter().enumerate() {
-                let is_current = *start <= progress_seconds && progress_seconds < *end;
-                let is_downloaded = markers.get(index).copied().unwrap_or(false);
-                let row = adw::ActionRow::builder().title(title.as_str()).activatable(true).build();
-                row.set_subtitle(&format_duration((end - start).max(0.0)));
-                if is_current {
-                    row.add_css_class("heading");
-                }
-                if is_downloaded {
-                    row.add_suffix(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
-                }
-                row.connect_activated({
-                    let on_play = on_play.clone();
-                    let item_id = item_id.clone();
-                    move |_| {
-                        on_play(item_id.clone(), Some(index));
-                    }
-                });
-                chapters_list.append(&row);
-            }
             chapters_section.set_visible(!chapters.is_empty());
+            *chapters_cell.borrow_mut() = chapters.clone();
+            refresh_chapter_rows(&chapters_list, &chapters, progress_seconds, &markers, &on_play, &item_id);
 
             // Fills in the download menu's shared cells — the chapter the resume position falls
             // in, or 0 before it's known / for an unstarted book. Fixed once computed: unlike
@@ -599,7 +641,18 @@ pub fn build(
     play_button.connect_clicked({
         let on_play = on_play.clone();
         let item_id = item_id.clone();
+        let play_button = play_button.clone();
         move |_| {
+            // `on_play` (`main_window::start_playback`) resolves asynchronously (network + stream
+            // resolution, up to ~16s on a slow server) before it navigates away to the mini
+            // bar/Full Player — without this, a tap here looked like it silently did nothing for
+            // that whole window, and a second, impatient tap started a second concurrent resolve.
+            // No explicit revert: `start_playback` always ends by opening the Full Player now
+            // (`PlayerController::start` constructs `now_playing` — with `last_error` set — even
+            // on failure), so this screen is swapped out by the time there's anything to show
+            // again; a fresh `build()` next time this screen opens starts from "Play"/"Resume".
+            play_button.set_sensitive(false);
+            play_button.set_label("Starting…");
             on_play(item_id.clone(), None);
         }
     });
@@ -627,7 +680,47 @@ pub fn build(
             #[cfg(test)]
             reset_progress_button: options_menu.reset_progress_button,
             mini_bar: mini_bar.hooks,
+            download_progress_revealer: progress_strip_widget,
         },
+    }
+}
+
+/// Rebuilds `chapters_list`'s rows from scratch — the "currently playing" heading and the
+/// "Downloaded" glyph both depend on state that can change after Pass 2 first builds this list
+/// (a download completing while this screen is still open), so this is also called from a
+/// `download_manager` listener, not just Pass 2 itself. `markers` is index-aligned with
+/// `chapters`, same contract `abs_core::download_tracks::chapter_offline_markers_for_item`
+/// already returns.
+fn refresh_chapter_rows(
+    chapters_list: &gtk4::ListBox,
+    chapters: &[(String, f64, f64)],
+    progress_seconds: f64,
+    markers: &[bool],
+    on_play: &Rc<dyn Fn(String, Option<usize>)>,
+    item_id: &str,
+) {
+    while let Some(row) = chapters_list.row_at_index(0) {
+        chapters_list.remove(&row);
+    }
+    for (index, (title, start, end)) in chapters.iter().enumerate() {
+        let is_current = *start <= progress_seconds && progress_seconds < *end;
+        let is_downloaded = markers.get(index).copied().unwrap_or(false);
+        let row = adw::ActionRow::builder().title(title.as_str()).activatable(true).build();
+        row.set_subtitle(&format_duration((end - start).max(0.0)));
+        if is_current {
+            row.add_css_class("heading");
+        }
+        if is_downloaded {
+            row.add_suffix(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+        }
+        row.connect_activated({
+            let on_play = on_play.clone();
+            let item_id = item_id.to_string();
+            move |_| {
+                on_play(item_id.clone(), Some(index));
+            }
+        });
+        chapters_list.append(&row);
     }
 }
 
@@ -647,7 +740,7 @@ fn format_duration(total_seconds: f64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::test_support::pump_until;
+    use crate::test_support::{any_label_reads, pump_until};
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -756,7 +849,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), Some("Ray Porter"), Some("A lone astronaut."), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Project Hail Mary", Duration::from_secs(5));
@@ -780,7 +873,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Meditations", Some("Marcus Aurelius"), Some(""), None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Meditations", Duration::from_secs(5));
@@ -799,7 +892,7 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
@@ -821,7 +914,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), None, None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
@@ -853,7 +946,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(&long_description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.label() == long_description, Duration::from_secs(5));
@@ -878,7 +971,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, Some(description), 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.description_label.uses_markup(), Duration::from_secs(5));
@@ -916,7 +1009,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.chapters_list.row_at_index(1).is_some(), Duration::from_secs(5));
@@ -952,7 +1045,7 @@ pub(crate) mod tests {
         }, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Test Item", Duration::from_secs(5));
@@ -976,11 +1069,21 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, {
             let went_back = went_back.clone();
             move || went_back.set(true)
-        }, || {}, |_| {});
+        }, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.back_button.emit_clicked();
         assert!(went_back.get());
+    }
+
+    /// How many progress PATCHes `mock_server` has received so far.
+    fn progress_patches(runtime: &tokio::runtime::Runtime, mock_server: &MockServer) -> usize {
+        runtime
+            .block_on(mock_server.received_requests())
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH" && request.url.path().starts_with("/api/me/progress/"))
+            .count()
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. "Mark as finished" on an item that
@@ -1000,11 +1103,11 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
-        let requests_before = runtime.block_on(mock_server.received_requests()).unwrap().len();
+        let requests_before = progress_patches(runtime, &mock_server);
         hooks.mark_as_finished_button.emit_clicked();
 
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"), "the button should reflect the new state immediately, not wait on the async write");
@@ -1017,8 +1120,12 @@ pub(crate) mod tests {
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
         assert_eq!(progress.current_time_seconds, 3600.0, "should be recorded at the item's full duration");
 
-        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
-        assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+        // The local write (polled above) and the server push are two separate awaits in
+        // sequence, not one atomic step — the local write landing is not proof the push has too.
+        // Counts only the progress PATCH: the screen's own background item fetch can land in
+        // this window too, and counting every request made this flaky.
+        pump_until(|| progress_patches(runtime, &mock_server) - requests_before == 1, Duration::from_secs(5));
+        assert_eq!(progress_patches(runtime, &mock_server) - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Same shape as the mark-as-finished
@@ -1036,11 +1143,11 @@ pub(crate) mod tests {
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
-        let requests_before = runtime.block_on(mock_server.received_requests()).unwrap().len();
+        let requests_before = progress_patches(runtime, &mock_server);
         hooks.reset_progress_button.emit_clicked();
 
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"));
@@ -1053,8 +1160,48 @@ pub(crate) mod tests {
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
         assert!(!progress.is_finished);
 
-        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
-        assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+        // The local write (polled above) and the server push are two separate awaits in
+        // sequence, not one atomic step — the local write landing is not proof the push has too.
+        // Counts only the progress PATCH: the screen's own background item fetch can land in
+        // this window too, and counting every request made this flaky.
+        pump_until(|| progress_patches(runtime, &mock_server) - requests_before == 1, Duration::from_secs(5));
+        assert_eq!(progress_patches(runtime, &mock_server) - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+    }
+
+    /// Regression test for the "the toast said it worked, but the write never landed" gap:
+    /// before this, "Mark as finished" toasted unconditionally, synchronously, whether or not the
+    /// direct write actually succeeded. Forces a real failure (the item was never synced locally,
+    /// so `progress`'s `FOREIGN KEY (server_id, item_id) REFERENCES items` rejects the insert) and
+    /// asserts the failure toast, not "Marked as finished", is what actually shows.
+    pub(crate) fn run_options_menu_direct_write_failure_toasts_the_failure(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // Deliberately no `insert_synced_item` — "item-1" doesn't exist in the local `items`
+        // table, so `progress`'s FK constraint makes the direct write fail for real.
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.mark_as_finished_button.emit_clicked();
+
+        pump_until(|| any_label_reads(&screen.root, "Marking as finished failed — try again"), Duration::from_secs(5));
+        assert!(
+            any_label_reads(&screen.root, "Marking as finished failed — try again"),
+            "a real write failure must toast the failure, not claim success"
+        );
+        assert!(!any_label_reads(&screen.root, "Marked as finished"), "the success toast must not also appear");
+
+        window.destroy();
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. When this item *is* the one currently
@@ -1073,7 +1220,7 @@ pub(crate) mod tests {
         controller.start(session.clone(), crate::player::PlayRequest { item_id: "item-1".to_string(), title: "Test Item".to_string(), author: None }, 1.0);
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.mark_as_finished_button.emit_clicked();
@@ -1102,7 +1249,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 10.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.download_button.is_sensitive(), Duration::from_secs(5));
@@ -1121,6 +1268,64 @@ pub(crate) mod tests {
         );
         pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
         window.destroy();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for the "no visible
+    /// progress, and the chapter glyphs go stale" gaps: starting a whole-book download from this
+    /// screen must reveal the progress strip immediately, and once the batch completes, both the
+    /// strip must hide again *and* every chapter row must pick up its "Downloaded" glyph without
+    /// the screen being rebuilt — `download_manager::tests::mock_three_track_item` gives real
+    /// per-chapter tracks to download against.
+    pub(crate) fn run_download_progress_strip_reveals_and_chapter_glyphs_update_live(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 15.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        // Pass 2 (chapters over the network) must have landed before any row exists to assert on.
+        pump_until(|| hooks.chapters_list.row_at_index(0).is_some(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "nothing is downloading yet");
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        click_button_labeled(&hooks.download_popover_box, "Entire book");
+
+        pump_until(|| hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(hooks.download_progress_revealer.reveals_child(), "starting a download should reveal the progress strip immediately");
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::downloaded_item_ids(&pool, &server.id)).unwrap().iter().any(|id| id == "item-1"),
+            Duration::from_secs(10),
+        );
+        pump_until(|| !hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "the strip should retract once the batch completes");
+
+        let all_three_chapter_rows_marked = || {
+            (0..3).all(|i| hooks.chapters_list.row_at_index(i).is_some_and(|row| find_descendant_in_row::<gtk4::Image>(&row).is_some()))
+        };
+        pump_until(all_three_chapter_rows_marked, Duration::from_secs(5));
+        assert!(all_three_chapter_rows_marked(), "every chapter should show the Downloaded glyph without reopening the screen");
+        assert!(hooks.chapters_list.row_at_index(3).is_none(), "the item has exactly 3 chapters");
+
+        window.destroy();
+    }
+
+    /// Depth-first search for a widget of type `T` under a chapter row — same purpose as
+    /// `widgets::find_descendant`, duplicated here rather than made `pub(crate)` there since this
+    /// crosses from a `gtk4::ListBoxRow` (this screen's chapter rows) rather than the plain
+    /// `GtkWidget` root every other call site searches from.
+    fn find_descendant_in_row<T: glib::object::IsA<gtk4::Widget>>(row: &gtk4::ListBoxRow) -> Option<T> {
+        crate::widgets::find_descendant::<T>(row.upcast_ref())
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The direct regression test for the
@@ -1148,7 +1353,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, {
             let opened_player = opened_player.clone();
             move || opened_player.set(true)
-        }, |_| {});
+        }, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         // The mini bar is primed immediately from `controller.snapshot()` at build time — no need
@@ -1205,7 +1410,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, {
             let opened_series = opened_series.clone();
             move |name: String| opened_series.borrow_mut().push(name)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         // Pass 1 lands: title and the series button's plain name are set in the same
@@ -1245,7 +1450,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item_with_series(&pool, &server.id, "item-1", "Foundation", "Foundation", 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "Foundation", Duration::from_secs(5));
@@ -1271,7 +1476,7 @@ pub(crate) mod tests {
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "No Series Book", None, None, None, 3600.0));
 
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
-        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.title_label.label() == "No Series Book", Duration::from_secs(5));

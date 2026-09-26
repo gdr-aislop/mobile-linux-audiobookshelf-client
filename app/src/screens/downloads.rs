@@ -93,8 +93,18 @@ struct Widgets {
     /// text in place (throttled) instead of rebuilding the whole list per chunk. Rebuilt rows
     /// re-register here at refresh.
     live_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>>,
+    /// Item ids whose most recent batch ended in `ItemDownloadState::Failed`, with the reason —
+    /// otherwise a failed item with nothing completed simply isn't in `downloaded_item_ids` and
+    /// isn't `downloading` any more either, so it would vanish from the list the instant it
+    /// failed with no trace at all. Cleared the moment a new `Downloading`/`Complete`/`Stopped`
+    /// state arrives for the same item (a retry, or the item leaving the list entirely).
+    failed: Rc<RefCell<HashMap<String, String>>>,
+    on_open: Rc<dyn Fn(crate::player::PlayRequest)>,
+    /// Where a failed Remove or Clear-all reports.
+    toast_overlay: adw::ToastOverlay,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     _paths: abs_storage::AppPaths,
@@ -103,6 +113,11 @@ pub fn build(
     _session: abs_core::auth::Session,
     download_manager: DownloadManager,
     window: adw::ApplicationWindow,
+    // Tapping a row opens Item Detail for it — the same landing spot every other item surface
+    // (Home shelf cards, Library grid) already uses, and after A1/A2/A5 it's exactly where this
+    // item's own download progress and per-chapter glyphs live. `Rc<dyn Fn>`, not `impl Fn`, since
+    // it's cloned into every row `spawn_refresh` rebuilds.
+    on_open: Rc<dyn Fn(crate::player::PlayRequest)>,
 ) -> DownloadsScreen {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Downloads", "")));
@@ -119,10 +134,12 @@ pub fn build(
     let list_box = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).margin_start(12).margin_end(12).margin_top(12).build();
     let scroller = gtk4::ScrolledWindow::builder().child(&list_box).vexpand(true).build();
 
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    root.append(&header);
-    root.append(&status_page);
-    root.append(&scroller);
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.append(&header);
+    content.append(&status_page);
+    content.append(&scroller);
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content));
 
     let widgets = Rc::new(Widgets {
         pool,
@@ -136,6 +153,9 @@ pub fn build(
         track_bytes: Rc::new(RefCell::new(HashMap::new())),
         speeds: Rc::new(RefCell::new(HashMap::new())),
         live_rows: Rc::new(RefCell::new(HashMap::new())),
+        failed: Rc::new(RefCell::new(HashMap::new())),
+        on_open,
+        toast_overlay: toast_overlay.clone(),
     });
 
     // Confirmed via the same shared `GtkMessageDialog` helper Settings/Connection use for their
@@ -145,15 +165,24 @@ pub fn build(
         let window = window.clone();
         let download_manager = download_manager.clone();
         let server_id = widgets.server_id.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_| {
             let download_manager = download_manager.clone();
             let server_id = server_id.clone();
+            let toast_overlay = toast_overlay.clone();
             confirm(
                 &window,
                 "Clear all downloads?",
                 "Every downloaded chapter for every book on this device will be removed — nothing on the server is affected.",
                 "Clear Downloads",
-                Rc::new(move || download_manager.clear_all(&server_id)),
+                Rc::new(move || {
+                    let toast_overlay = toast_overlay.clone();
+                    download_manager.clear_all(&server_id, move |result| {
+                        if let Err(err) = result {
+                            crate::error_reporting::report_background_error(&toast_overlay, "Clearing downloads", err);
+                        }
+                    })
+                }),
             );
         }
     });
@@ -169,9 +198,18 @@ pub fn build(
                 match state {
                     ItemDownloadState::Downloading => {
                         widgets.downloading.borrow_mut().insert(item_id.clone());
+                        widgets.failed.borrow_mut().remove(item_id);
                     }
-                    ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Complete | ItemDownloadState::Failed => {
+                    ItemDownloadState::Failed(reason) => {
                         widgets.downloading.borrow_mut().remove(item_id);
+                        // Kept (not just logged) so `spawn_refresh` can still show this item —
+                        // and why it failed — instead of it silently vanishing the moment it's
+                        // no longer `downloading` and has nothing `Complete` to its name.
+                        widgets.failed.borrow_mut().insert(item_id.clone(), reason.clone());
+                    }
+                    ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Complete => {
+                        widgets.downloading.borrow_mut().remove(item_id);
+                        widgets.failed.borrow_mut().remove(item_id);
                     }
                 }
                 spawn_refresh(widgets.clone());
@@ -218,7 +256,7 @@ pub fn build(
     spawn_refresh(widgets);
 
     DownloadsScreen {
-        root: root.upcast(),
+        root: toast_overlay.upcast(),
         #[cfg(test)]
         hooks: TestHooks { status_page, list_box, scroller, clear_all_button },
     }
@@ -226,9 +264,21 @@ pub fn build(
 
 fn spawn_refresh(widgets: Rc<Widgets>) {
     adw::glib::spawn_future_local(async move {
-        let downloaded = abs_core::download_tracks::downloaded_item_ids(&widgets.pool, &widgets.server_id).await.unwrap_or_default();
+        // A failed read must not render as "No downloads yet": the files may well be on disk.
+        let (downloaded, read_failed) = match abs_core::download_tracks::downloaded_item_ids(&widgets.pool, &widgets.server_id).await {
+            Ok(downloaded) => (downloaded, false),
+            Err(err) => {
+                tracing::warn!(%err, "couldn't read the downloads list");
+                (Default::default(), true)
+            }
+        };
         let mut ids: Vec<String> = downloaded.into_iter().collect();
         for id in widgets.downloading.borrow().iter() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        for id in widgets.failed.borrow().keys() {
             if !ids.contains(id) {
                 ids.push(id.clone());
             }
@@ -256,7 +306,12 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 .borrow_mut()
                 .insert(item_id.clone(), tracks.iter().map(|track| (track.ino.clone(), track.bytes_downloaded.max(0) as u64)).collect());
 
-            let subtitle = if is_downloading {
+            let subtitle = if let Some(reason) = widgets.failed.borrow().get(&item_id) {
+                // Takes priority over the "N chapters, size" summary below: a failed batch may
+                // still have left some chapters `Complete` (see `finish_track`'s ordering), but
+                // *why the row is even still here* is the more useful thing to lead with.
+                Some(format!("Download failed — {reason}"))
+            } else if is_downloading {
                 let batch = widgets.download_manager.batch_progress(&widgets.server_id, &item_id);
                 let bytes: u64 = tracks.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
                 let speed = {
@@ -273,7 +328,7 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 if complete.is_empty() { None } else { Some(format!("{}, {}", chapters_label(complete.len()), format_bytes(size))) }
             };
 
-            let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle);
+            let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle, &widgets.on_open, &widgets.toast_overlay);
             if is_downloading {
                 widgets.live_rows.borrow_mut().insert(item_id.clone(), row.clone());
             }
@@ -285,22 +340,49 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
         widgets.track_bytes.borrow_mut().retain(|id, _| all_ids.contains(id));
         widgets.speeds.borrow_mut().retain(|id, _| all_ids.contains(id));
 
+        if read_failed {
+            widgets.status_page.set_title("Couldn't read downloads");
+            widgets.status_page.set_description(Some("The app's local data couldn't be read. Restarting the app may help."));
+        } else {
+            widgets.status_page.set_title("No downloads yet");
+            widgets.status_page.set_description(None);
+        }
         widgets.status_page.set_visible(!any_row);
         widgets.scroller.set_visible(any_row);
         widgets.clear_all_button.set_sensitive(any_row);
     });
 }
 
-fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download_manager: &DownloadManager, server_id: &str, subtitle: Option<String>) -> adw::ActionRow {
+#[allow(clippy::too_many_arguments)]
+fn download_row(
+    item: &abs_storage::models::Item,
+    is_downloading: bool,
+    download_manager: &DownloadManager,
+    server_id: &str,
+    subtitle: Option<String>,
+    on_open: &Rc<dyn Fn(crate::player::PlayRequest)>,
+    toast_overlay: &adw::ToastOverlay,
+) -> adw::ActionRow {
     const THUMBNAIL_SIZE: i32 = 48;
     let cover = crate::widgets::cover_image::CoverImage::new(THUMBNAIL_SIZE);
     cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
 
-    let row = adw::ActionRow::builder().title(&item.title).build();
+    let row = adw::ActionRow::builder().title(&item.title).activatable(true).build();
     if let Some(text) = subtitle {
         row.set_subtitle(&text);
     }
     row.add_prefix(cover.widget());
+    // Lands on Item Detail — the same surface every other item view (Home shelf cards, Library
+    // grid) opens on tap, and where this item's own download progress/chapter glyphs live (see
+    // widgets::download_progress, screens::item_detail's refresh_chapter_rows). The suffix's own
+    // Stop/Remove button below claims its own click, so it never bubbles into this activation.
+    row.connect_activated({
+        let on_open = on_open.clone();
+        let item_id = item.id.clone();
+        let title = item.title.clone();
+        let author = item.author.clone();
+        move |_| on_open(crate::player::PlayRequest { item_id: item_id.clone(), title: title.clone(), author: author.clone() })
+    });
 
     if is_downloading {
         let spinner = gtk4::Spinner::builder().spinning(true).valign(gtk4::Align::Center).build();
@@ -323,7 +405,15 @@ fn download_row(item: &abs_storage::models::Item, is_downloading: bool, download
             let download_manager = download_manager.clone();
             let server_id = server_id.to_string();
             let item_id = item.id.clone();
-            move |_| download_manager.clear_item(&server_id, &item_id)
+            let toast_overlay = toast_overlay.clone();
+            move |_| {
+                let toast_overlay = toast_overlay.clone();
+                download_manager.clear_item(&server_id, &item_id, move |result| {
+                    if let Err(err) = result {
+                        crate::error_reporting::report_background_error(&toast_overlay, "Removing the download", err);
+                    }
+                })
+            }
         });
         row.add_suffix(&remove_button);
     }
@@ -350,8 +440,11 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 }
 
 /// The in-flight subtitle: chapter progress from the manager's batch ("3/10 chapters"), total
-/// bytes so far, and — while samples are flowing — the smoothed speed.
-fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
+/// bytes so far, and — while samples are flowing — the smoothed speed. `pub(crate)` so
+/// `widgets::download_progress::DownloadProgressStrip` (Item Detail/Player's own in-flight
+/// indicator) reads the same numbers in the same words as this screen's own live row, rather
+/// than inventing a second wording for the same data.
+pub(crate) fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
     let mut parts = Vec::new();
     if let Some((finished, total)) = batch {
         parts.push(format!("{finished}/{total} chapters"));
@@ -462,7 +555,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool, test_paths(), server, account, session, manager, app_window);
+        let screen = build(pool, test_paths(), server, account, session, manager, app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
@@ -481,7 +574,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -505,7 +598,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         manager.start_download(session, "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
@@ -550,7 +643,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         let events: Rc<RefCell<Vec<DownloadEvent>>> = Rc::new(RefCell::new(Vec::new()));
@@ -590,6 +683,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A failed Remove must say so rather
+    /// than leave a row that silently ignores the tap, and a failed read of the downloads list
+    /// must not claim there are no downloads. Closing the pool makes both fail for real.
+    pub(crate) fn run_database_failures_are_reported(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        manager.start_download(session.clone(), "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+
+        // `AdwToastOverlay` defers toasts while unmapped.
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account.clone(), session.clone(), manager.clone(), app_window.clone(), Rc::new(|_| {}));
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        runtime.block_on(pool.close());
+
+        let row = hooks.list_box.row_at_index(0).unwrap();
+        crate::widgets::find_descendant::<gtk4::Button>(row.upcast_ref()).expect("the row's Remove button").emit_clicked();
+        pump_until(|| crate::test_support::any_label_reads(&screen.root, "Removing the download failed — try again"), Duration::from_secs(5));
+        assert!(
+            crate::test_support::any_label_reads(&screen.root, "Removing the download failed — try again"),
+            "a failed Remove must be reported"
+        );
+        app_window.destroy();
+
+        // A fresh screen over the same (closed) pool: its first read fails.
+        let screen = build(pool.clone(), test_paths(), server, account, session, manager, adw::ApplicationWindow::builder().build(), Rc::new(|_| {}));
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
+        assert_eq!(hooks.status_page.title(), "Couldn't read downloads", "a failed read must not claim there are no downloads");
+    }
+
     /// A completed download shows a row with a remove button; removing it deletes the row and the
     /// underlying rows/files (verified indirectly via `downloaded_item_ids` going back to empty).
     pub(crate) fn run_completed_download_can_be_removed(runtime: &tokio::runtime::Runtime) {
@@ -607,14 +744,62 @@ pub(crate) mod tests {
         );
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
 
-        manager.clear_item(&server.id, "item-1");
+        manager.clear_item(&server.id, "item-1", |result| result.unwrap());
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(10));
         assert!(hooks.status_page.is_visible(), "removing the only completed download should return to the empty state");
         assert!(runtime.block_on(abs_storage::repo::download_tracks::list_for_item(&pool, &server.id, "item-1")).unwrap().is_empty());
+    }
+
+    /// Regression test for "a Downloads row is otherwise dead — no way back to the book it's
+    /// for": tapping a row must report that item's `PlayRequest` via `on_open`, and the Remove
+    /// button (a `GtkButton` inside the row's suffix) must claim its own click rather than
+    /// bubbling into the row's own activation.
+    pub(crate) fn run_tapping_a_row_opens_it_and_remove_does_not(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_single_track_item(&mock_server, "item-1", Duration::ZERO));
+        let (session, server, account) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let manager = test_download_manager(pool.clone());
+        manager.start_download(session.clone(), "item-1".to_string(), abs_core::downloads::DownloadScope::EntireBook, 0);
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+
+        let opened: Rc<RefCell<Vec<crate::player::PlayRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let app_window = adw::ApplicationWindow::builder().build();
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager, app_window, {
+            let opened = opened.clone();
+            Rc::new(move |request| opened.borrow_mut().push(request))
+        });
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(5));
+
+        let row = hooks.list_box.row_at_index(0).unwrap();
+        row.emit_by_name::<()>("activated", &[]);
+        assert_eq!(opened.borrow().len(), 1, "tapping the row should report this item's PlayRequest");
+        assert_eq!(opened.borrow()[0].item_id, "item-1");
+        assert_eq!(opened.borrow()[0].title, "Test Item");
+
+        // The Remove button (inside the row's suffix) must claim its own click, not bubble into
+        // the row's own activation.
+        let remove_button = crate::widgets::find_descendant::<gtk4::Button>(row.upcast_ref()).expect("the completed row's Remove button");
+        remove_button.emit_clicked();
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
+            "Remove should have actually run"
+        );
+        assert_eq!(opened.borrow().len(), 1, "clicking Remove must not also open the row");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Clear all downloads" button
@@ -628,7 +813,7 @@ pub(crate) mod tests {
 
         let manager = test_download_manager(pool.clone());
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session.clone(), manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
 
         pump_until(|| hooks.status_page.is_visible(), Duration::from_secs(5));
@@ -660,7 +845,7 @@ pub(crate) mod tests {
         );
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
 
@@ -701,7 +886,7 @@ pub(crate) mod tests {
         assert!(std::path::Path::new(&file_path).exists(), "the download should have actually written a file");
 
         let app_window = adw::ApplicationWindow::builder().build();
-        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window);
+        let screen = build(pool.clone(), test_paths(), server.clone(), account, session, manager.clone(), app_window, Rc::new(|_| {}));
         let hooks = screen.test_hooks();
         pump_until(|| hooks.clear_all_button.is_sensitive(), Duration::from_secs(5));
 

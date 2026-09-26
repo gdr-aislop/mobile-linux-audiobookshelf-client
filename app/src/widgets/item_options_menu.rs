@@ -36,10 +36,14 @@ pub struct ItemOptionsMenu {
 
 /// `leading_widget`, if given, is inserted above the separator, ahead of "Mark as finished" —
 /// Player uses this for its "Add bookmark" button; Item Detail passes `None`. `on_mark_as_finished`
-/// and `on_reset_progress` do the actual work; this widget only wires the click, closes the
-/// popover, and shows the same toast text either call site already used.
+/// and `on_reset_progress` do the actual work; this widget only wires the click and closes the
+/// popover. Deliberately no toast here any more (see this crate's git history for the "Marked as
+/// finished"/"Progress reset" toasts this widget used to fire unconditionally, the instant the
+/// button was clicked, before either callback's write had actually landed): both callbacks can
+/// resolve asynchronously (item_detail's own not-currently-playing branch pushes to the server),
+/// so only the caller — which awaits that — knows whether to report success or a real failure via
+/// `error_reporting::report_background_error`.
 pub fn build(
-    toast_overlay: adw::ToastOverlay,
     leading_widget: Option<gtk4::Widget>,
     on_mark_as_finished: impl Fn() + 'static,
     on_reset_progress: impl Fn() + 'static,
@@ -60,11 +64,9 @@ pub fn build(
 
     mark_as_finished_button.connect_clicked({
         let popover = popover.clone();
-        let toast_overlay = toast_overlay.clone();
         move |_| {
             on_mark_as_finished();
             popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
         }
     });
     reset_progress_button.connect_clicked({
@@ -72,7 +74,6 @@ pub fn build(
         move |_| {
             on_reset_progress();
             popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Progress reset"));
         }
     });
 
@@ -95,17 +96,13 @@ pub(crate) mod tests {
     use std::rc::Rc;
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Clicking either button invokes the
-    /// matching closure and closes the popover; the toast overlay still hosts its own child
-    /// (proof the popup didn't tear anything down besides itself).
+    /// matching closure and closes the popover.
     pub(crate) fn run_buttons_invoke_their_callback_and_popdown(_runtime: &tokio::runtime::Runtime) {
-        let toast_overlay = adw::ToastOverlay::new();
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        toast_overlay.set_child(Some(&content));
 
         let marked_finished = Rc::new(Cell::new(false));
         let reset = Rc::new(Cell::new(false));
         let menu = build(
-            toast_overlay.clone(),
             None,
             {
                 let marked_finished = marked_finished.clone();
@@ -121,7 +118,7 @@ pub(crate) mod tests {
         // A popover needs a real, mapped toplevel to `popup()`/`popdown()` against — same
         // requirement `screens::item_detail`'s own download-menu popover test already works
         // around the same way.
-        let window = gtk4::Window::builder().child(&toast_overlay).build();
+        let window = gtk4::Window::builder().child(&content).build();
         window.present();
         crate::test_support::pump_until(|| window.is_mapped(), std::time::Duration::from_secs(5));
 
@@ -135,21 +132,17 @@ pub(crate) mod tests {
         assert!(reset.get(), "clicking 'Reset progress' should invoke the given callback");
         assert!(!menu.popover.is_visible(), "the popover should close after the action");
 
-        assert!(toast_overlay.child().is_some(), "the toast overlay should still be hosting its content");
         window.destroy();
     }
 
     /// A `leading_widget` shows up in the popover above the separator; omitting it leaves just
     /// the two rows this widget always builds.
     pub(crate) fn run_leading_widget_is_inserted_when_given(_runtime: &tokio::runtime::Runtime) {
-        let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&gtk4::Box::new(gtk4::Orientation::Vertical, 0)));
-
-        let with_leading = build(toast_overlay.clone(), Some(gtk4::Button::with_label("Add bookmark").upcast()), || {}, || {});
+        let with_leading = build(Some(gtk4::Button::with_label("Add bookmark").upcast()), || {}, || {});
         let first_child = with_leading.popover_box.first_child().unwrap();
         assert!(first_child.downcast_ref::<gtk4::Button>().is_some(), "the leading widget should be the first child when given");
 
-        let without_leading = build(toast_overlay, None, || {}, || {});
+        let without_leading = build(None, || {}, || {});
         let first_child = without_leading.popover_box.first_child().unwrap();
         assert!(first_child.downcast_ref::<gtk4::Separator>().is_some(), "with no leading widget, the separator should be first");
     }

@@ -43,6 +43,7 @@ pub struct SettingsHooks {
     pub skip_back_row: adw::ComboRow,
     pub skip_forward_row: adw::ComboRow,
     pub wifi_only_switch: gtk4::Switch,
+    pub wifi_only_row: adw::ActionRow,
     pub burst_buffering_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
@@ -81,6 +82,11 @@ pub fn build(
     // Save serialization state — see `persist` for why two saves must never run concurrently.
     let pending_save: Rc<RefCell<Option<PlaybackSettings>>> = Rc::new(RefCell::new(None));
     let writer_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Declared here (not at the end, alongside `content`) so every row/action below can capture
+    // it — background-write failures (switch account, sign out, remove server, theme, playback
+    // settings) need somewhere to report to, and this screen previously had no toast surface at
+    // all.
+    let toast_overlay = adw::ToastOverlay::new();
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
@@ -206,14 +212,16 @@ pub fn build(
                 let paths = paths.clone();
                 let window = window.clone();
                 let account_id = account.id.clone();
+                let toast_overlay = toast_overlay.clone();
                 move |_| {
                     let pool = pool.clone();
                     let paths = paths.clone();
                     let window = window.clone();
                     let account_id = account_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
                         if let Err(err) = abs_core::accounts::switch_active_account(&pool, &account_id).await {
-                            tracing::warn!(%err, "couldn't switch the active account");
+                            crate::error_reporting::report_background_error(&toast_overlay, "Switching accounts", err);
                             return;
                         }
                         crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -230,12 +238,14 @@ pub fn build(
                 let window = window.clone();
                 let account_id = account.id.clone();
                 let username = account.username.clone();
+                let toast_overlay = toast_overlay.clone();
                 move |_| {
                     let dialog_window = window.clone();
                     let pool = pool.clone();
                     let paths = paths.clone();
                     let window = window.clone();
                     let account_id = account_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     confirm(
                         &dialog_window,
                         &format!("Sign out of {username}?"),
@@ -249,9 +259,10 @@ pub fn build(
                             let paths = paths.clone();
                             let window = window.clone();
                             let account_id = account_id.clone();
+                            let toast_overlay = toast_overlay.clone();
                             glib::spawn_future_local(async move {
                                 if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                                    tracing::warn!(%err, "couldn't sign out");
+                                    crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
                                     return;
                                 }
                                 crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -271,12 +282,14 @@ pub fn build(
             let window = window.clone();
             let server_id = server.id.clone();
             let server_host = host_of(&server.url).to_string();
+            let toast_overlay = toast_overlay.clone();
             move |_| {
                 let dialog_window = window.clone();
                 let pool = pool.clone();
                 let paths = paths.clone();
                 let window = window.clone();
                 let server_id = server_id.clone();
+                let toast_overlay = toast_overlay.clone();
                 confirm(
                     &dialog_window,
                     &format!("Remove {server_host}?"),
@@ -288,9 +301,10 @@ pub fn build(
                         let paths = paths.clone();
                         let window = window.clone();
                         let server_id = server_id.clone();
+                        let toast_overlay = toast_overlay.clone();
                         glib::spawn_future_local(async move {
                             if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
-                                tracing::warn!(%err, "couldn't remove the server");
+                                crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
                                 return;
                             }
                             if let Err(err) = paths.purge_server_data(&server_id).await {
@@ -367,9 +381,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_, state| {
             settings.borrow_mut().pause_on_headphone_unplug = state;
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
             resume_on_replug_switch.set_sensitive(state);
             glib::signal::Propagation::Proceed
         }
@@ -381,9 +396,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_, state| {
             settings.borrow_mut().resume_on_headphone_replug = state;
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
             glib::signal::Propagation::Proceed
         }
     });
@@ -408,7 +424,7 @@ pub fn build(
     wifi_only_switch.set_active(playback_settings.wifi_only_downloads);
     let wifi_only_row = adw::ActionRow::builder()
         .title("Wi-Fi only downloads")
-        .subtitle("Don't start downloads on metered connections")
+        .subtitle(wifi_only_subtitle(download_manager.can_detect_metered()))
         .build();
     wifi_only_row.add_suffix(&wifi_only_switch);
     wifi_only_row.set_activatable_widget(Some(&wifi_only_switch));
@@ -433,9 +449,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |row| {
             settings.borrow_mut().default_speed = SPEED_PRESETS[row.selected() as usize];
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
         }
     });
     skip_back_row.connect_selected_notify({
@@ -445,9 +462,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |row| {
             settings.borrow_mut().skip_back_seconds = SKIP_CHOICES[row.selected() as usize];
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
         }
     });
     skip_forward_row.connect_selected_notify({
@@ -457,9 +475,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |row| {
             settings.borrow_mut().skip_forward_seconds = SKIP_CHOICES[row.selected() as usize];
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
         }
     });
     wifi_only_switch.connect_state_set({
@@ -469,9 +488,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_, state| {
             settings.borrow_mut().wifi_only_downloads = state;
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
             glib::signal::Propagation::Proceed
         }
     });
@@ -482,9 +502,10 @@ pub fn build(
         let controller = controller.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_, state| {
             settings.borrow_mut().burst_buffering = state;
-            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
             glib::signal::Propagation::Proceed
         }
     });
@@ -498,13 +519,15 @@ pub fn build(
     appearance_group.add(&theme_row);
     theme_row.connect_selected_notify({
         let pool = pool.clone();
+        let toast_overlay = toast_overlay.clone();
         move |row| {
             let theme = theme_from_index(row.selected());
             crate::application::apply_theme(theme);
             let pool = pool.clone();
+            let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_core::settings::save_theme(&pool, theme).await {
-                    tracing::warn!(%err, "couldn't save theme setting");
+                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the theme", err);
                 }
             });
         }
@@ -538,12 +561,13 @@ pub fn build(
     about_group.add(&about_row);
     page.add(&about_group);
 
-    let root = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    root.append(&header);
-    root.append(&page);
+    let content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    content.append(&header);
+    content.append(&page);
+    toast_overlay.set_child(Some(&content));
 
     SettingsScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: SettingsHooks {
             pause_on_unplug_switch,
@@ -552,6 +576,7 @@ pub fn build(
             skip_back_row,
             skip_forward_row,
             wifi_only_switch,
+            wifi_only_row,
             burst_buffering_switch,
             theme_row,
             about_row,
@@ -664,11 +689,21 @@ fn theme_from_index(index: u32) -> Theme {
     }
 }
 
+/// The Wi-Fi-only row's subtitle. Without a way to detect the connection type the setting
+/// never blocks anything, so the row says that instead of promising something it can't do.
+fn wifi_only_subtitle(can_detect_metered: bool) -> &'static str {
+    if can_detect_metered {
+        "Don't start downloads on metered connections"
+    } else {
+        "Can't detect the connection type on this device, so downloads aren't restricted"
+    }
+}
+
 /// Fire-and-forget persistence on the shared Tokio runtime — same shape as every other GTK
 /// signal handler that touches the database (`PlayerController`'s progress writes, Welcome's
-/// Connect button): capture everything up front, spawn, log on failure. Also applies the new
-/// values to the live controller and download manager immediately, so a change takes effect
-/// without an app restart.
+/// Connect button): capture everything up front, spawn, report on failure through the toast
+/// overlay. Also applies the new values to the live controller and download manager
+/// immediately, so a change takes effect without an app restart.
 ///
 /// Saves are serialized through `pending_save`/`writer_running` — one snapshot slot plus at most
 /// one in-flight writer task. Two concurrent `save_playback_settings` calls would interleave
@@ -684,6 +719,7 @@ fn persist(
     settings: &RefCell<PlaybackSettings>,
     controller: &PlayerController,
     download_manager: &DownloadManager,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     let snapshot = *settings.borrow();
     controller.set_headphone_behavior(snapshot.pause_on_headphone_unplug, snapshot.resume_on_headphone_replug);
@@ -702,11 +738,14 @@ fn persist(
     let pool = pool.clone();
     let pending_save = pending_save.clone();
     let writer_running = writer_running.clone();
+    let toast_overlay = toast_overlay.clone();
     glib::spawn_future_local(async move {
         loop {
             let Some(snapshot) = pending_save.borrow_mut().take() else { break };
+            // The live controller already has the new values, so the change *looks* saved;
+            // without a toast the user only learns otherwise on next launch.
             if let Err(err) = abs_core::settings::save_playback_settings(&pool, &snapshot).await {
-                tracing::warn!(%err, "couldn't save playback settings");
+                crate::error_reporting::report_background_error(&toast_overlay, "Saving playback settings", err);
             }
         }
         writer_running.set(false);
@@ -843,6 +882,11 @@ pub(crate) mod tests {
         assert_eq!(screen.hooks.skip_back_row.selected(), 2, "15 seconds is the third skip choice");
         assert_eq!(screen.hooks.skip_forward_row.selected(), 4, "30 seconds is the fifth skip choice");
         assert!(screen.hooks.wifi_only_switch.state(), "Wi-Fi-only downloads defaults to on");
+        assert_eq!(
+            screen.hooks.wifi_only_row.subtitle().as_deref(),
+            Some("Can't detect the connection type on this device, so downloads aren't restricted"),
+            "with no way to detect a metered connection, the row must not promise to restrict downloads"
+        );
         assert!(screen.hooks.burst_buffering_switch.state(), "burst buffering defaults to on");
         assert_eq!(screen.hooks.theme_row.selected(), 0, "theme defaults to System");
 
@@ -890,6 +934,56 @@ pub(crate) mod tests {
             || gtk4::Window::list_toplevels().iter().any(|w| w.is::<adw::AboutWindow>()),
             Duration::from_secs(2),
         );
+    }
+
+    /// A theme or playback-setting change that applies live but fails to persist must say so,
+    /// instead of silently being lost on the next launch. Closing the pool makes every write
+    /// fail for real.
+    pub(crate) fn run_failed_setting_saves_toast(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let download_manager = test_download_manager(pool.clone());
+        let window = adw::ApplicationWindow::builder().build();
+        let screen = build(
+            pool.clone(),
+            controller.clone(),
+            download_manager,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            window.clone(),
+        );
+        // `AdwToastOverlay` defers toasts while unmapped.
+        window.set_content(Some(&screen.root));
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        runtime.block_on(pool.close());
+
+        screen.hooks.theme_row.set_selected(2); // Dark
+        pump_until(|| crate::test_support::any_label_reads(&screen.root, "Saving the theme failed — try again"), Duration::from_secs(5));
+        assert!(
+            crate::test_support::any_label_reads(&screen.root, "Saving the theme failed — try again"),
+            "a theme that applied but didn't persist must be reported"
+        );
+
+        screen.hooks.default_speed_row.set_selected(3); // 1.5×
+        assert_eq!(controller.default_speed(), 1.5, "the live change still applies");
+        // 10 s, not 5: the overlay shows one toast at a time, so this one queues behind the
+        // theme toast above.
+        pump_until(
+            || crate::test_support::any_label_reads(&screen.root, "Saving playback settings failed — try again"),
+            Duration::from_secs(10),
+        );
+        assert!(
+            crate::test_support::any_label_reads(&screen.root, "Saving playback settings failed — try again"),
+            "a playback setting that applied but didn't persist must be reported"
+        );
+
+        crate::application::apply_theme(abs_core::settings::Theme::System);
+        window.destroy();
     }
 
     /// The Account and Servers groups mirror the database: the active account's row (username,

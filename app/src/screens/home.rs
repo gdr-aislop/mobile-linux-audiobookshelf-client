@@ -196,6 +196,23 @@ impl EmptyState {
         self.root.set_visible(true);
     }
 
+    /// The sync went fine but this device's own database couldn't be read back. Showing
+    /// "No library synced yet" here would claim the server has nothing.
+    fn show_local_read_error(&self, error: &str) {
+        self.spinner.set_visible(false);
+        self.spinner.stop();
+        self.icon.set_visible(true);
+        self.icon.set_icon_name(Some("dialog-warning-symbolic"));
+        self.title.set_label("Couldn't read local data");
+        self.description.set_label("The library synced, but the app couldn't read it back. Try again, or restart the app.");
+        self.details.set_label(error);
+        self.details.set_visible(!error.is_empty());
+        self.buttons.set_visible(true);
+        self.retry.set_visible(true);
+        self.login_again.set_visible(false);
+        self.root.set_visible(true);
+    }
+
     fn show_empty(&self) {
         self.spinner.set_visible(false);
         self.spinner.stop();
@@ -657,13 +674,18 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
                 }
 
-                let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
+                let data_after_sync = Some(load(&pool, &server_id, &account_id).await);
                 (sync_result, data_after_sync)
             }
         });
         let (sync_result, data_after_sync) = spawned_sync
             .await
             .expect("the Home sync task must not panic");
+        let local_read_error = data_after_sync.as_ref().and_then(|data| data.as_ref().err()).map(|err| {
+            tracing::warn!(%err, "couldn't read the synced library back from local storage");
+            err.to_string()
+        });
+        let data_after_sync = data_after_sync.and_then(Result::ok);
         if let Some(data) = &data_after_sync {
             if !data.libraries.is_empty() {
                 apply(data, &widgets);
@@ -738,7 +760,10 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         } else {
             widgets.banner.set_revealed(false);
             match sync_result {
-                Ok(()) => widgets.empty_state.show_empty(),
+                Ok(()) => match &local_read_error {
+                    Some(error) => widgets.empty_state.show_local_read_error(error),
+                    None => widgets.empty_state.show_empty(),
+                },
                 Err(err) => {
                     if matches!(err, CoreError::Auth) {
                         widgets.empty_state.show_auth_error(&err.to_string());

@@ -11,7 +11,7 @@
 //! wide-screen sidebar layout (`AdwNavigationSplitView`/`AdwBreakpoint`, both v1.4+) — phone-width
 //! single-pane only, left as a documented follow-up.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
@@ -309,6 +309,12 @@ pub fn build(
     // different widget now.
     let root = adw::ToastOverlay::new();
     root.set_child(Some(&shell_box));
+    // Reported here rather than on Home's or Library's own overlay: this overlay is on screen
+    // whichever of the two tabs the toggle was flipped from.
+    offline_mode.set_on_persist_error({
+        let root = root.clone();
+        move |err| crate::error_reporting::report_background_error(&root, "Saving offline mode", err)
+    });
 
     // Opens the full player by swapping the window's content — there's no
     // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),
@@ -331,15 +337,31 @@ pub fn build(
         let root = root.clone();
         let pool = pool.clone();
         let download_manager = download_manager.clone();
+        let stack = stack.clone();
         move || {
-            let player_screen = screens::player::build(pool.clone(), controller.clone(), download_manager.clone(), {
-                let window = window.clone();
-                let root = root.clone();
-                move || {
-                    crate::widgets::swap_content(&window, &root);
-                    window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
-                }
-            });
+            let player_screen = screens::player::build(
+                pool.clone(),
+                controller.clone(),
+                download_manager.clone(),
+                {
+                    let window = window.clone();
+                    let root = root.clone();
+                    move || {
+                        crate::widgets::swap_content(&window, &root);
+                        window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
+                    }
+                },
+                {
+                    let window = window.clone();
+                    let root = root.clone();
+                    let stack = stack.clone();
+                    move || {
+                        crate::widgets::swap_content(&window, &root);
+                        window.insert_action_group("player", None::<&gtk4::gio::ActionGroup>);
+                        stack.set_visible_child_name("downloads");
+                    }
+                },
+            );
             window.insert_action_group("player", Some(player_screen.actions.upcast_ref::<gtk4::gio::ActionGroup>()));
             crate::widgets::swap_content(&window, &player_screen.root);
         }
@@ -364,6 +386,20 @@ pub fn build(
                 }
             }
             *last = new_kind;
+        }
+    });
+
+    // One toast per progress-sync failure *episode*, same rate-limiting idea as the playback
+    // error toast above: a sync is attempted every few minutes while playing, and a dead server
+    // must not toast on every attempt. A successful sync ends the episode; a failure of a
+    // different kind (session expired after a network outage) is news, so it toasts too.
+    mini_bar.controller.set_on_progress_sync({
+        let toast_overlay = root.clone();
+        let last_failure: Rc<Cell<Option<player::ProgressSyncOutcome>>> = Rc::new(Cell::new(None));
+        move |outcome| {
+            if let Some(title) = progress_sync_toast(&last_failure, outcome) {
+                toast_overlay.add_toast(adw::Toast::new(title));
+            }
         }
     });
 
@@ -400,13 +436,17 @@ pub fn build(
             }
             // `controller.start()` above resolves asynchronously (network + stream resolution),
             // so there's nothing playing yet the instant this call returns — `open_player` (via
-            // `screens::player::build`) requires that there already is. Poll for readiness the
-            // same bounded way (50 * 100ms) the chapter seek above already does, rather than
-            // opening the shelf and waiting for the mini bar to catch up a moment later.
+            // `screens::player::build`) requires that there already is (which `start()` now also
+            // guarantees on a *failed* resolve, so this poll and the Player screen surfacing the
+            // error are the same path, not a special case). Bounded to 16s, not the chapter seek's
+            // 5s above: `start()`'s network resolve alone has a 15s timeout
+            // (`abs_api::Client::with_bearer_token`'s default), so a 5s poll would give up and
+            // leave the mini bar as the only sign anything happened, on a merely slow server that
+            // was always going to succeed (or fail) a few seconds later.
             let controller = controller.clone();
             let open_player = open_player.clone();
             glib::spawn_future_local(async move {
-                for _ in 0..50 {
+                for _ in 0..160 {
                     if controller.current_download_context().is_some() {
                         open_player();
                         return;
@@ -509,6 +549,19 @@ pub fn build(
                     }
                 }
             };
+            // "View" on a "Download started" toast (`widgets::download_scope_menu`'s own doc):
+            // closes whichever screen raised it and lands on the Downloads tab, the same
+            // "close this screen, land on a specific tab" shape `on_open_series`/`on_open_shelf`
+            // already use.
+            let on_open_downloads = {
+                let window = window.clone();
+                let root = root.clone();
+                let stack = stack.clone();
+                move || {
+                    crate::widgets::swap_content(&window, &root);
+                    stack.set_visible_child_name("downloads");
+                }
+            };
             let item_detail_screen = screens::item_detail::build(
                 pool.clone(),
                 server.clone(),
@@ -521,6 +574,7 @@ pub fn build(
                 on_back,
                 on_open_player,
                 on_open_series,
+                on_open_downloads,
             );
             crate::widgets::swap_content(&window, &item_detail_screen.root);
         }
@@ -579,8 +633,40 @@ pub fn build(
         "go-home-symbolic",
     );
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
-    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone());
+    let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
+
+    // A dot on the Downloads tab while anything is downloading, so "something is running in the
+    // background" stays visible from Home/Library too, once the user has navigated away from
+    // wherever they started it (the toast's own "View" action, above, covers the moment right
+    // after starting it). Cleared the moment the tab is actually opened.
+    {
+        let stack = stack.clone();
+        let downloads_root = downloads_screen.root.clone();
+        let download_manager = download_manager.clone();
+        download_manager.add_listener({
+            let stack = stack.clone();
+            let downloads_root = downloads_root.clone();
+            let download_manager = download_manager.clone();
+            move |_event| {
+                // Deferred: `download_manager.any_in_flight()` borrows the same `RefCell` several
+                // publish() call sites are still holding mutably borrowed at the point they
+                // publish (see `widgets::download_progress`'s identical fix for the same reason).
+                let stack = stack.clone();
+                let downloads_root = downloads_root.clone();
+                let download_manager = download_manager.clone();
+                glib::idle_add_local_once(move || {
+                    let showing_downloads = stack.visible_child_name().as_deref() == Some("downloads");
+                    stack.page(&downloads_root).set_needs_attention(download_manager.any_in_flight() && !showing_downloads);
+                });
+            }
+        });
+        stack.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some("downloads") {
+                stack.page(&downloads_root).set_needs_attention(false);
+            }
+        });
+    }
     let settings_screen = screens::settings::build(
         pool.clone(),
         mini_bar.controller.clone(),
@@ -614,7 +700,19 @@ pub fn build(
     let bookmark_action = gtk4::gio::SimpleAction::new("bookmark", None);
     bookmark_action.connect_activate({
         let controller = mini_bar.controller.clone();
-        move |_, _| controller.add_bookmark()
+        // `root`, not a per-screen overlay: this keyboard shortcut works from any tab, exactly
+        // like the playback-error toast above already does.
+        let toast_overlay = root.clone();
+        move |_, _| {
+            let Some(write) = controller.add_bookmark() else { return };
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                match write.await {
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                }
+            });
+        }
     });
     window.add_action(&bookmark_action);
 
@@ -690,6 +788,55 @@ pub fn build(
             toast_overlay: toast_overlay_hook,
             resume_on_replug_switch: settings_screen.hooks.resume_on_replug_switch,
         },
+    }
+}
+
+/// What to toast, if anything, for one progress-sync outcome. `last_failure` carries the
+/// current failure episode between calls: a success ends it, a repeat of the same failure stays
+/// quiet, and a different kind of failure toasts again.
+pub(crate) fn progress_sync_toast(last_failure: &Cell<Option<player::ProgressSyncOutcome>>, outcome: player::ProgressSyncOutcome) -> Option<&'static str> {
+    use player::ProgressSyncOutcome;
+    if outcome == ProgressSyncOutcome::Synced {
+        last_failure.set(None);
+        return None;
+    }
+    if last_failure.replace(Some(outcome)) == Some(outcome) {
+        return None;
+    }
+    Some(match outcome {
+        ProgressSyncOutcome::SessionExpired => "Session expired — progress isn't syncing. Log in again",
+        _ => "Failed to sync progress — will retry",
+    })
+}
+
+#[cfg(test)]
+mod progress_sync_toast_tests {
+    use std::cell::Cell;
+
+    use super::progress_sync_toast;
+    use crate::player::ProgressSyncOutcome::{Failed, SessionExpired, Synced};
+
+    #[test]
+    fn toasts_once_per_failure_episode() {
+        let last = Cell::new(None);
+        assert_eq!(progress_sync_toast(&last, Synced), None);
+        assert_eq!(progress_sync_toast(&last, Failed), Some("Failed to sync progress — will retry"));
+        assert_eq!(progress_sync_toast(&last, Failed), None, "a repeat of the same failure stays quiet");
+        assert_eq!(progress_sync_toast(&last, Failed), None);
+        assert_eq!(progress_sync_toast(&last, Synced), None, "a success ends the episode quietly");
+        assert_eq!(progress_sync_toast(&last, Failed), Some("Failed to sync progress — will retry"), "a new episode toasts again");
+    }
+
+    #[test]
+    fn a_different_kind_of_failure_toasts_again() {
+        let last = Cell::new(None);
+        assert!(progress_sync_toast(&last, Failed).is_some());
+        assert_eq!(
+            progress_sync_toast(&last, SessionExpired),
+            Some("Session expired — progress isn't syncing. Log in again"),
+            "an expired session is news even mid-outage"
+        );
+        assert_eq!(progress_sync_toast(&last, SessionExpired), None);
     }
 }
 
@@ -1507,6 +1654,92 @@ pub(crate) mod tests {
         found
     }
 
+    /// Regression test for "no route to the Downloads tab from Item Detail/Player" — both are
+    /// content-swapped over the shell, hiding the tab bar, so the "Download started" toast's
+    /// "View" action (`widgets::download_scope_menu`'s `started_download_toast`) is the only way
+    /// back short of navigating there blind and hoping. Clicking it must close Item Detail and
+    /// land on the Downloads tab. Also covers the Downloads tab's attention dot: it must appear
+    /// while a batch is in flight and the tab isn't visible, and clear once it becomes visible.
+    pub(crate) fn run_download_started_toast_view_action_opens_downloads(runtime: &tokio::runtime::Runtime) {
+        use crate::screens::home::tests::item_json;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary")]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(crate::downloads::tests::mock_two_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool,
+            crate::test_support::test_paths(),
+            server,
+            account,
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+        find_card_button(&home_root).expect("a synced item's card should render").emit_clicked();
+        pump_until(
+            || app_window.content().is_some_and(|content| find_label_text(&content, "Project Hail Mary")),
+            std::time::Duration::from_secs(5),
+        );
+        let content = app_window.content().expect("Item Detail should be showing");
+
+        let download_button = find_menu_button_with_icon(&content, "folder-download-symbolic").expect("Item Detail's download button");
+        download_button.popup();
+        pump_until(|| find_button_containing_label(&content, "Entire book").is_some(), std::time::Duration::from_secs(2));
+        find_button_containing_label(&content, "Entire book").expect("the Entire book scope row").emit_clicked();
+
+        // Also covers the Downloads tab's attention dot (A4): while a batch is in flight and the
+        // user is looking at Item Detail, not the Downloads tab, the tab should carry it.
+        let downloads_root = hooks.stack.child_by_name("downloads").expect("downloads tab exists");
+        pump_until(|| hooks.stack.page(&downloads_root).needs_attention(), std::time::Duration::from_secs(5));
+        assert!(hooks.stack.page(&downloads_root).needs_attention(), "the Downloads tab should show a dot while something is downloading");
+
+        pump_until(|| find_button_labeled(&content, "View").is_some(), std::time::Duration::from_secs(5));
+        find_button_labeled(&content, "View").expect("the toast's View action").emit_clicked();
+
+        pump_until(
+            || app_window.content().is_some_and(|current| current == window.root),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(hooks.stack.visible_child_name().as_deref(), Some("downloads"), "the toast's View action should switch to the Downloads tab");
+        pump_until(|| !hooks.stack.page(&downloads_root).needs_attention(), std::time::Duration::from_secs(5));
+        assert!(!hooks.stack.page(&downloads_root).needs_attention(), "opening the Downloads tab should clear its own attention dot");
+    }
+
     /// Depth-first search for the first `GtkButton` constructed from exactly this icon name
     /// anywhere under `root` — used to prove the Player screen (not Item Detail or the shell) is
     /// showing, via its collapse button (`player.rs`'s `gtk4::Button::from_icon_name
@@ -1517,6 +1750,33 @@ pub(crate) mod tests {
                 return;
             }
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                if button.icon_name().as_deref() == Some(icon_name) {
+                    *found = Some(button.clone());
+                    return;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                walk(&w, icon_name, found);
+                if found.is_some() {
+                    return;
+                }
+                child = w.next_sibling();
+            }
+        }
+        let mut found = None;
+        walk(root, icon_name, &mut found);
+        found
+    }
+
+    /// Like [`find_button_with_icon`], but for a `GtkMenuButton` (Item Detail/Player's download
+    /// button, `folder-download-symbolic`) rather than a plain `GtkButton`.
+    fn find_menu_button_with_icon(root: &gtk4::Widget, icon_name: &str) -> Option<gtk4::MenuButton> {
+        fn walk(widget: &gtk4::Widget, icon_name: &str, found: &mut Option<gtk4::MenuButton>) {
+            if found.is_some() {
+                return;
+            }
+            if let Some(button) = widget.downcast_ref::<gtk4::MenuButton>() {
                 if button.icon_name().as_deref() == Some(icon_name) {
                     *found = Some(button.clone());
                     return;

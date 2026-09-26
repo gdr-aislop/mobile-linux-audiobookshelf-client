@@ -726,6 +726,20 @@ Needs a real GNOME/phosh session.
       headphones off / walk out of range.
       *Expected:* playback pauses.
 
+- [ ] **HW-6b — Wired unplug while Bluetooth keeps streaming does not pause.** With Bluetooth
+      headphones connected and playing, plug in and then unplug wired headphones.
+      *Expected:* playback carries on through the Bluetooth headphones — an output the listener
+      still hears going away is what pauses, not any jack event. Also: changing the volume
+      while both are connected must never pause playback.
+
+- [ ] **HW-6c — Audio-server restart is survived.** While the app runs, restart the audio
+      server (`systemctl --user restart pulseaudio` on PureOS, `… pipewire pipewire-pulse`
+      elsewhere), then repeat HW-5.
+      *Expected:* the unplug still pauses. To see what the watcher sees, run the app with
+      `RUST_LOG=debug` and watch for `route_watch` lines: one "watching the audio server" per
+      connection, one "scanned sinks" per audio-server event listing every sink's headphone
+      port availability, and one "headphone route changed" per plug/unplug.
+
 - [ ] **HW-7 — Replug stays paused by default.** With Settings → Playback → "Resume when
       headphones reconnect" off (the default), replug the headphones after HW-5.
       *Expected:* playback stays paused; resuming is manual.

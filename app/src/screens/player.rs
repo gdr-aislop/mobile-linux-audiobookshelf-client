@@ -60,6 +60,7 @@ pub struct TestHooks {
     pub download_popover: gtk4::Popover,
     pub download_popover_box: gtk4::Box,
     pub error_banner: crate::widgets::banner::ErrorBanner,
+    pub download_progress_revealer: gtk4::Revealer,
 }
 
 #[cfg(test)]
@@ -74,9 +75,11 @@ pub fn build(
     controller: PlayerController,
     download_manager: DownloadManager,
     on_collapse: impl Fn() + 'static,
+    on_open_downloads: impl Fn() + 'static,
 ) -> PlayerScreen {
     // Shared by the down-chevron header button and the Escape action below.
     let on_collapse = Rc::new(on_collapse);
+    let on_open_downloads: Rc<dyn Fn()> = Rc::new(on_open_downloads);
     let header = adw::HeaderBar::new();
     let collapse_button = gtk4::Button::from_icon_name("go-down-symbolic");
     collapse_button.connect_clicked({
@@ -292,8 +295,13 @@ pub fn build(
     // playing by the time this runs — unlike `chapter_ranges`/`current_chapter_index`/free space
     // below, which the widget itself re-asks on every popover open since those genuinely change
     // over a session's lifetime.
-    let (download_session, _download_server_id, download_item_id) =
+    let (download_session, download_server_id, download_item_id) =
         controller.current_download_context().expect("a player screen is only ever built once something is playing");
+    // Visible progress for this item's own in-flight download (see `widgets::download_progress`'s
+    // doc) — built before `download_menu` moves `download_item_id`, appended to `content` below
+    // (its last child is `secondary_row`, so a plain `append` here lands right after it).
+    let (progress_strip_widget, _progress_strip) =
+        crate::widgets::download_progress::DownloadProgressStrip::build(download_manager.clone(), download_server_id.clone(), download_item_id.clone());
     let download_menu = crate::widgets::download_scope_menu::build(
         pool.clone(),
         download_manager.clone(),
@@ -312,19 +320,28 @@ pub fn build(
             move || download_manager.free_space_bytes()
         },
         toast_overlay.clone(),
+        on_open_downloads.clone(),
     );
     secondary_row.append(&download_menu.widget);
+    content.append(&progress_strip_widget);
 
     let options_menu = crate::widgets::item_options_menu::build(
-        toast_overlay.clone(),
         Some(add_bookmark_button.clone().upcast()),
         {
             let controller = controller.clone();
-            move || controller.mark_as_finished()
+            let toast_overlay = toast_overlay.clone();
+            move || {
+                controller.mark_as_finished();
+                toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
+            }
         },
         {
             let controller = controller.clone();
-            move || controller.reset_progress()
+            let toast_overlay = toast_overlay.clone();
+            move || {
+                controller.reset_progress();
+                toast_overlay.add_toast(adw::Toast::new("Progress reset"));
+            }
         },
     );
     header.pack_end(&options_menu.widget);
@@ -334,9 +351,15 @@ pub fn build(
         let options_popover = options_menu.popover.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
-            controller.add_bookmark();
             options_popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Bookmark added"));
+            let Some(write) = controller.add_bookmark() else { return };
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                match write.await {
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                }
+            });
         }
     });
     // The skip intervals are read at click time from the controller (Settings → Playback's live
@@ -560,6 +583,8 @@ pub fn build(
             download_popover_box: download_menu.popover_box,
             #[cfg(test)]
             error_banner,
+            #[cfg(test)]
+            download_progress_revealer: progress_strip_widget,
         },
     }
 }
@@ -705,7 +730,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
-        });
+        }, || {});
         let hooks = screen.test_hooks();
 
         // The screen paints from `controller.snapshot()` immediately on build, before any tick.
@@ -763,7 +788,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
 
         pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
@@ -804,7 +829,7 @@ pub(crate) mod tests {
         // readiness signal `PlayerController::start` itself waits on for the resume-seek).
         pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.chapters_button.popover().as_ref(), Some(&hooks.chapters_popover), "the chapters button should open the chapters popover");
 
@@ -855,7 +880,7 @@ pub(crate) mod tests {
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
 
         let download_manager = test_download_manager(pool.clone());
-        let screen = build(pool.clone(), controller.clone(), download_manager, || {});
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {}, || {});
         let hooks = screen.test_hooks();
 
         let window = gtk4::Window::builder().child(&screen.root).build();
@@ -872,6 +897,53 @@ pub(crate) mod tests {
         );
         pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
         assert_eq!(hooks.download_button.icon_name().as_deref(), Some("emblem-ok-symbolic"), "the button should reflect Complete once the download finishes");
+
+        window.destroy();
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The Full Player's own progress strip
+    /// (same widget Item Detail uses — see `widgets::download_progress`) must reveal for its own
+    /// in-flight download and retract once it completes, exactly like the download button's icon
+    /// does, since both are driven off the same `DownloadManager` events.
+    pub(crate) fn run_download_progress_strip_reveals_while_downloading(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-1", 10, &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+
+        let download_manager = test_download_manager(pool.clone());
+        let screen = build(pool.clone(), controller.clone(), download_manager, || {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "nothing is downloading yet");
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        click_button_labeled(&hooks.download_popover_box, "Current chapter");
+
+        pump_until(|| hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(hooks.download_progress_revealer.reveals_child(), "starting a download should reveal the progress strip immediately");
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
+            Duration::from_secs(10),
+        );
+        pump_until(|| !hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "the strip should retract once the download completes");
 
         window.destroy();
         controller.stop();
@@ -896,7 +968,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
         assert_eq!(hooks.speed_label.label(), "1.0×", "should start at the default speed");
         assert!(hooks.speed_button.popover().is_some(), "the speed button should open a popover");
@@ -934,7 +1006,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
             let collapsed = collapsed.clone();
             move || collapsed.set(true)
-        });
+        }, || {});
         let actions = &screen.actions;
 
         assert_eq!(controller.snapshot().unwrap().speed, 1.0);
@@ -1002,7 +1074,7 @@ pub(crate) mod tests {
         );
         pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
         assert!(!hooks.sleep_timer_button.has_css_class("accent"), "no sleep timer armed yet");
         assert_eq!(hooks.sleep_timer_button.popover().as_ref(), Some(&hooks.sleep_timer_popover));
@@ -1040,7 +1112,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
         assert!(hooks.menu_button.popover().is_some(), "the ... menu button should open a popover");
 
@@ -1073,7 +1145,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.mark_as_finished_button.emit_clicked();
@@ -1108,7 +1180,7 @@ pub(crate) mod tests {
         controller.skip(2.0);
         pump_until(|| controller.snapshot().unwrap().position_seconds > 1.0, Duration::from_secs(5));
 
-        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {});
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
 
         hooks.reset_progress_button.emit_clicked();

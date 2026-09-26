@@ -716,8 +716,12 @@ pub fn build(
                     // only its own (fixing a related bug: this used to never fire from a
                     // Home-driven toggle at all). A single targeted write, not the full
                     // load-mutate-save round trip over all four view-option fields.
+                    //
+                    // Logged, not toasted: `OfflineModeState` already reports its own write of
+                    // this same toggle to the shell, and both writes hit the same settings table,
+                    // so one failure would otherwise toast twice.
                     if let Err(err) = abs_core::settings::set_downloaded_only(&pool, active).await {
-                        crate::error_reporting::report_background_error(&toast_overlay, "Saving offline mode", err);
+                        tracing::warn!(%err, "couldn't mirror offline mode into the Library view options");
                     }
                 }
             });
@@ -1072,14 +1076,29 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
         let manual_ok = sync_result.is_ok();
 
-        let data_after_sync = load(&pool, &server_id, &account_id).await.ok();
+        let data_after_sync = load(&pool, &server_id, &account_id).await;
+        let local_read_error = data_after_sync.as_ref().err().map(|err| {
+            tracing::warn!(%err, "couldn't read the synced library back from local storage");
+            err.to_string()
+        });
+        let data_after_sync = data_after_sync.ok();
         let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.items.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
         if let Some(data) = data_after_sync {
             apply(data, &widgets);
         }
 
         match &sync_result {
-            Ok(()) => widgets.banner.set_revealed(false),
+            // The sync worked but the result couldn't be read back: without this the grid
+            // silently keeps showing stale (or no) items, which reads as "nothing here".
+            Ok(()) => match &local_read_error {
+                Some(error) => {
+                    widgets.banner.set_title("Couldn't read local data — the list may be out of date.");
+                    widgets.banner.set_action_label(None);
+                    widgets.banner.set_details(Some(error));
+                    widgets.banner.set_revealed(true);
+                }
+                None => widgets.banner.set_revealed(false),
+            },
             Err(err) => {
                 // An authorization failure is not fixable by re-syncing — the session itself
                 // is what died — so the banner swaps its copy and grows a "Log in again"

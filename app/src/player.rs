@@ -198,6 +198,20 @@ enum SeekPlan {
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
 
+/// How one background push of playback progress to the server ended — see
+/// `PlayerController::set_on_progress_sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressSyncOutcome {
+    Synced,
+    /// The server said the session is no longer valid; retrying won't help until the user logs
+    /// in again.
+    SessionExpired,
+    /// Anything else (unreachable server, server error). The next periodic sync retries.
+    Failed,
+}
+
+type ProgressSyncListener = Rc<dyn Fn(ProgressSyncOutcome)>;
+
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
     pool: SqlitePool,
@@ -238,6 +252,9 @@ struct Inner {
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
     /// same shape as `pause_on_unplug`/`resume_on_replug` above.
     burst_buffering: bool,
+    /// Told how every server progress push ended. Without it a sync failure only reached the
+    /// log, and a user could listen for hours with nothing synced and no idea.
+    on_progress_sync: Option<ProgressSyncListener>,
 }
 
 impl Inner {
@@ -351,6 +368,7 @@ impl Inner {
         let item_id = now_playing.item_id.clone();
         let session = now_playing.session.clone();
         let duration_seconds = now_playing.duration_seconds;
+        let on_progress_sync = self.on_progress_sync.clone();
         self.last_progress_write = Instant::now();
 
         let sync_now = force_server_sync || self.last_server_sync.elapsed() >= SERVER_PROGRESS_SYNC_INTERVAL;
@@ -374,17 +392,29 @@ impl Inner {
             // holds open — as long as neither has actually changed, which for this call site (the
             // most frequent server-facing one in the app, while playing) is what keeps a periodic
             // background sync from costing a fresh TLS handshake every time.
+            let report = |outcome| {
+                if let Some(on_progress_sync) = &on_progress_sync {
+                    on_progress_sync(outcome);
+                }
+            };
+            let outcome_of = |err: &abs_core::CoreError| match err {
+                abs_core::CoreError::Auth => ProgressSyncOutcome::SessionExpired,
+                _ => ProgressSyncOutcome::Failed,
+            };
             let api = match session.api_client().await {
                 Ok(api) => api,
                 Err(err) => {
                     tracing::warn!(%err, "couldn't build an API client for this server; progress stays local");
+                    report(outcome_of(&err));
                     return;
                 }
             };
-            if let Err(err) =
-                abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await
-            {
-                tracing::warn!(%err, "couldn't sync playback progress to the server");
+            match abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await {
+                Ok(()) => report(ProgressSyncOutcome::Synced),
+                Err(err) => {
+                    tracing::warn!(%err, "couldn't sync playback progress to the server");
+                    report(outcome_of(&err));
+                }
             }
         });
     }
@@ -592,6 +622,7 @@ impl PlayerController {
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
+                on_progress_sync: None,
             })),
             tick_source: Rc::new(RefCell::new(None)),
         }
@@ -695,10 +726,13 @@ impl PlayerController {
 
     /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
     /// same precedent as `write_progress`'s local half: a plain repo write, no server sync, since
-    /// none is specified for bookmarks. A no-op if nothing is playing.
-    pub fn add_bookmark(&self) {
+    /// none is specified for bookmarks. `None` if nothing is playing; otherwise the write itself,
+    /// handed back rather than spawned in here, so the caller (whose own toast is the only honest
+    /// place to report "Bookmark added" — this was a bare, unconditional toast before, showing
+    /// success whether or not the write actually landed) can await the real outcome instead.
+    pub fn add_bookmark(&self) -> Option<impl std::future::Future<Output = Result<(), abs_storage::StorageError>> + 'static> {
         let inner = self.inner.borrow();
-        let Some(now_playing) = &inner.now_playing else { return };
+        let now_playing = inner.now_playing.as_ref()?;
         let pool = inner.pool.clone();
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
@@ -706,11 +740,7 @@ impl PlayerController {
         let position = inner.book_position();
         drop(inner);
 
-        glib::spawn_future_local(async move {
-            if let Err(err) = abs_storage::repo::bookmarks::add(&pool, &account_id, &server_id, &item_id, position).await {
-                tracing::warn!(%err, "couldn't save bookmark");
-            }
-        });
+        Some(async move { abs_storage::repo::bookmarks::add(&pool, &account_id, &server_id, &item_id, position).await.map(|_id| ()) })
     }
 
     /// Pauses (if playing) and marks the current item finished at its full duration — the same
@@ -773,18 +803,6 @@ impl PlayerController {
                 (inner.pool.clone(), inner.paths.clone())
             };
 
-            // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
-            // connection (settings + resolved base URL) is asked the same way: a settings
-            // change is honored by the very next playback without any rebuild.
-            let access_token = session.access_token().await;
-            let connection = match session.connection_target().await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
-                    return;
-                }
-            };
-
             // The cover the player shows is, first of all, whatever is already cached locally —
             // the same `cover_cache_path` Home/Library render from. Seeding `now_playing` with it
             // below (rather than starting from `None` and waiting on a fetch) is what makes the
@@ -793,13 +811,80 @@ impl PlayerController {
             // so on a first play a fast cache hit was discarded (the cover stayed blank), and on
             // a re-play it landed in the *previous* session's struct only to be wiped by this
             // function's tail (the cover appeared, then vanished). A local DB read never delays
-            // anything, so this runs inline; the network fetch itself stays detached, spawned
-            // once `now_playing` exists (below) so its result can always land.
+            // anything, so this runs inline, and — moved ahead of the connection lookup below —
+            // is available even on the earliest failure path, so a failed start still shows the
+            // right cover next to its error rather than a blank one.
             let cached_cover = abs_core::covers::cached_cover_path(&pool, session.server_id(), &item.item_id).await;
             // Captured up front — `item` and `session` move into `NowPlaying` below, and the
             // detached cover task needs these after that.
             let item_id = item.item_id.clone();
             let server_id = session.server_id().to_string();
+
+            // Builds the "nothing could start" `now_playing` shared by every early-failure branch
+            // below: same reasoning as the load-failure path further down (`now_playing` is always
+            // constructed, even on failure, so the mini bar/Full Player have something to show
+            // instead of quietly never appearing) — just for failures that happen before a
+            // `StreamTarget` even exists, so there are no tracks/chapters/duration to report.
+            // Owns its own clones (rather than borrowing `item`/`session`/`cached_cover`) so it
+            // doesn't hold a borrow across the rest of this future, which later moves each of
+            // those into the success-path `NowPlaying`.
+            let failed_now_playing = {
+                let item_id = item_id.clone();
+                let server_id = server_id.clone();
+                let session = session.clone();
+                let title = item.title.clone();
+                let author = item.author.clone();
+                let cached_cover = cached_cover.clone();
+                move |kind: abs_player::PlaybackErrorKind, message: String| NowPlaying {
+                    item_id: item_id.clone(),
+                    server_id: server_id.clone(),
+                    account_id: session.account_id().to_string(),
+                    session: session.clone(),
+                    title: title.clone(),
+                    author: author.clone(),
+                    duration_seconds: 0.0,
+                    tracks: Vec::new(),
+                    current_track: 0,
+                    current_source_is_local: false,
+                    is_playing: false,
+                    chapters: Vec::new(),
+                    speed: 1.0,
+                    sleep_timer: SleepTimerState::Off,
+                    cover_path: cached_cover.clone(),
+                    last_error: Some(abs_player::PlaybackError { kind, message, debug: None }),
+                    last_known_within_track: 0.0,
+                    seek_target_pending: false,
+                    // `false`, not `true`: with an empty `tracks`, `play()`'s reload path
+                    // (`spawn_load_track` on `current_track: 0`) would just silently no-op on
+                    // the missing-track guard, swallowing a Retry tap with no feedback at all.
+                    // `false` keeps this failure's existing contract instead: Retry calls
+                    // `backend.play()`, which fails the same way every time (nothing was ever
+                    // loaded) and re-populates the same `last_error` — a real "why did nothing
+                    // happen" fix for resolve-time failures like this one is a separate, later
+                    // improvement (it would need `play()`/Retry to re-run the whole resolve, not
+                    // just reload a track), not something this fix's scope covers.
+                    needs_reload: false,
+                }
+            };
+
+            // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
+            // connection (settings + resolved base URL) is asked the same way: a settings
+            // change is honored by the very next playback without any rebuild.
+            let access_token = session.access_token().await;
+            let connection = match session.connection_target().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    // Previously a bare `return`: `now_playing` stayed `None` forever, so
+                    // `main_window::start_playback`'s readiness poll just expired and Play looked
+                    // like it silently did nothing — see this fix's sibling below for the same
+                    // reasoning against the resolve failure.
+                    tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
+                    let mut inner = inner_rc.borrow_mut();
+                    inner.now_playing = Some(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
+                    inner.publish();
+                    return;
+                }
+            };
 
             // Resolving the stream URL is required to proceed — unless the item can be played
             // from locally cached state instead (below). Reconciling progress is a nice-to-have
@@ -826,7 +911,20 @@ impl PlayerController {
                             offline
                         }
                         Err(offline_err) => {
+                            // Previously a bare `return` here too — same silent-Play-button
+                            // symptom as the connection failure above, and the most common trigger
+                            // in practice: an expired session (`resolve_stream_target` now
+                            // distinguishes a 401/403 as `CoreError::Auth`), which nothing else
+                            // catches until Home/Library's next sync.
                             tracing::warn!(%err, offline = %offline_err, item_id = %item.item_id, "couldn't resolve a playable URL");
+                            let kind = if matches!(err, abs_core::CoreError::Auth) {
+                                abs_player::PlaybackErrorKind::NotAuthorized
+                            } else {
+                                abs_player::PlaybackErrorKind::Network
+                            };
+                            let mut inner = inner_rc.borrow_mut();
+                            inner.now_playing = Some(failed_now_playing(kind, err.to_string()));
+                            inner.publish();
                             return;
                         }
                     }
@@ -1163,6 +1261,12 @@ impl PlayerController {
     /// `set_headphone_behavior`). Takes effect on the *next* track load — an already-loaded
     /// pipeline's fetch strategy doesn't change retroactively (see `AudioBackend::
     /// set_burst_buffering`'s doc comment).
+    /// Registers the one listener told how each background progress push to the server ended.
+    /// The shell uses it to toast a sync failure once per failure episode.
+    pub fn set_on_progress_sync(&self, listener: impl Fn(ProgressSyncOutcome) + 'static) {
+        self.inner.borrow_mut().on_progress_sync = Some(Rc::new(listener));
+    }
+
     pub fn set_burst_buffering(&self, enabled: bool) {
         let mut inner = self.inner.borrow_mut();
         inner.burst_buffering = enabled;
@@ -2131,6 +2235,58 @@ pub(crate) mod tests {
         controller.stop();
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Every server progress push reports
+    /// how it ended, so the shell can tell the user when progress stops syncing. A 401 is told
+    /// apart from other failures, since only logging in again fixes it.
+    pub(crate) fn run_progress_sync_reports_each_outcome(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 30));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let outcomes: Rc<RefCell<Vec<ProgressSyncOutcome>>> = Rc::new(RefCell::new(Vec::new()));
+        controller.set_on_progress_sync({
+            let outcomes = outcomes.clone();
+            move |outcome| outcomes.borrow_mut().push(outcome)
+        });
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        outcomes.borrow_mut().clear();
+
+        // Each one-shot, higher-priority response overrides the item's default 200 for exactly
+        // one PATCH; `pause()` always forces a server push.
+        let pause_with = |status: Option<u16>| {
+            if let Some(status) = status {
+                runtime.block_on(
+                    Mock::given(method("PATCH"))
+                        .and(path("/api/me/progress/item-1"))
+                        .respond_with(ResponseTemplate::new(status))
+                        .up_to_n_times(1)
+                        .with_priority(1)
+                        .mount(&mock_server),
+                );
+            }
+            let seen = outcomes.borrow().len();
+            controller.play();
+            controller.pause();
+            pump_until(|| outcomes.borrow().len() > seen, Duration::from_secs(5));
+            outcomes.borrow().last().copied()
+        };
+
+        assert_eq!(pause_with(Some(500)), Some(ProgressSyncOutcome::Failed), "a server error is a retryable failure");
+        assert_eq!(pause_with(Some(401)), Some(ProgressSyncOutcome::SessionExpired), "a 401 means the session is gone");
+        assert_eq!(pause_with(None), Some(ProgressSyncOutcome::Synced), "a working server reports success");
+        controller.stop();
+    }
+
     /// Regression test for the "Play button silently does nothing" gap: when the audio engine
     /// itself is unavailable (no GStreamer plugins at all — `real_backend`'s `NullBackend`
     /// fallback, reproduced here as `FailingBackend` since `load()` always fails), `start()` used
@@ -2165,6 +2321,44 @@ pub(crate) mod tests {
         assert!(!snapshot.is_playing);
         let err = snapshot.last_error.expect("a failed load must populate last_error");
         assert_eq!(err.kind, abs_player::PlaybackErrorKind::Unavailable);
+
+        controller.stop();
+    }
+
+    /// Regression test for the "Play button silently does nothing" gap's more common trigger: the
+    /// item was never played or downloaded on this device (no cached track metadata to fall back
+    /// on) and the server rejects the resolve with a 401 — an expired session, in practice.
+    /// `start()` used to `return` before `now_playing` existed at all in this case too; it now
+    /// records the failure with `PlaybackErrorKind::NotAuthorized` (via `resolve_stream_target`
+    /// mapping a 401 to `CoreError::Auth`), same as any other failed load.
+    pub(crate) fn run_start_with_an_expired_session_and_nothing_cached_shows_a_login_error(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET")).and(path("/api/items/item-1")).respond_with(ResponseTemplate::new(401)).mount(&mock_server).await;
+            Mock::given(method("GET")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(|| controller.current_download_context().is_some(), Duration::from_secs(10));
+        assert!(
+            controller.current_download_context().is_some(),
+            "now_playing must exist even when the resolve fails entirely — otherwise the shell's \
+             readiness poll expires and the Full Player screen never opens at all"
+        );
+        let snapshot = controller.snapshot().expect("now_playing should exist");
+        assert_eq!(snapshot.title, "Test Book");
+        assert!(!snapshot.is_playing);
+        let err = snapshot.last_error.expect("a failed resolve must populate last_error");
+        assert_eq!(err.kind, abs_player::PlaybackErrorKind::NotAuthorized, "a 401 should read as a login failure, not a generic network one");
 
         controller.stop();
     }
@@ -2343,7 +2537,12 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        controller.add_bookmark();
+        // `add_bookmark` hands back the write rather than spawning it itself (see its own doc
+        // comment) — the caller (here, and every real call site) is what actually runs it.
+        let write = controller.add_bookmark().expect("something is playing, so a bookmark can be added");
+        glib::spawn_future_local(async move {
+            write.await.expect("the bookmark write should succeed");
+        });
         pump_until(|| false, Duration::from_millis(300));
 
         let count: i64 =
