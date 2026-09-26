@@ -93,6 +93,12 @@ struct Widgets {
     /// text in place (throttled) instead of rebuilding the whole list per chunk. Rebuilt rows
     /// re-register here at refresh.
     live_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>>,
+    /// Item ids whose most recent batch ended in `ItemDownloadState::Failed`, with the reason —
+    /// otherwise a failed item with nothing completed simply isn't in `downloaded_item_ids` and
+    /// isn't `downloading` any more either, so it would vanish from the list the instant it
+    /// failed with no trace at all. Cleared the moment a new `Downloading`/`Complete`/`Stopped`
+    /// state arrives for the same item (a retry, or the item leaving the list entirely).
+    failed: Rc<RefCell<HashMap<String, String>>>,
 }
 
 pub fn build(
@@ -136,6 +142,7 @@ pub fn build(
         track_bytes: Rc::new(RefCell::new(HashMap::new())),
         speeds: Rc::new(RefCell::new(HashMap::new())),
         live_rows: Rc::new(RefCell::new(HashMap::new())),
+        failed: Rc::new(RefCell::new(HashMap::new())),
     });
 
     // Confirmed via the same shared `GtkMessageDialog` helper Settings/Connection use for their
@@ -169,9 +176,18 @@ pub fn build(
                 match state {
                     ItemDownloadState::Downloading => {
                         widgets.downloading.borrow_mut().insert(item_id.clone());
+                        widgets.failed.borrow_mut().remove(item_id);
                     }
-                    ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Complete | ItemDownloadState::Failed => {
+                    ItemDownloadState::Failed(reason) => {
                         widgets.downloading.borrow_mut().remove(item_id);
+                        // Kept (not just logged) so `spawn_refresh` can still show this item —
+                        // and why it failed — instead of it silently vanishing the moment it's
+                        // no longer `downloading` and has nothing `Complete` to its name.
+                        widgets.failed.borrow_mut().insert(item_id.clone(), reason.clone());
+                    }
+                    ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Complete => {
+                        widgets.downloading.borrow_mut().remove(item_id);
+                        widgets.failed.borrow_mut().remove(item_id);
                     }
                 }
                 spawn_refresh(widgets.clone());
@@ -233,6 +249,11 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 ids.push(id.clone());
             }
         }
+        for id in widgets.failed.borrow().keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
         let all_ids = ids.clone();
 
         // Rows are rebuilt from scratch every refresh; the in-flight rows re-register below.
@@ -256,7 +277,12 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 .borrow_mut()
                 .insert(item_id.clone(), tracks.iter().map(|track| (track.ino.clone(), track.bytes_downloaded.max(0) as u64)).collect());
 
-            let subtitle = if is_downloading {
+            let subtitle = if let Some(reason) = widgets.failed.borrow().get(&item_id) {
+                // Takes priority over the "N chapters, size" summary below: a failed batch may
+                // still have left some chapters `Complete` (see `finish_track`'s ordering), but
+                // *why the row is even still here* is the more useful thing to lead with.
+                Some(format!("Download failed — {reason}"))
+            } else if is_downloading {
                 let batch = widgets.download_manager.batch_progress(&widgets.server_id, &item_id);
                 let bytes: u64 = tracks.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
                 let speed = {

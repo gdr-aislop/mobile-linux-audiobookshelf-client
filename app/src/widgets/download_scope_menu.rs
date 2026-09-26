@@ -139,6 +139,7 @@ pub fn build(
     download_manager.add_listener({
         let widget = widget.clone();
         let item_id = item_id.clone();
+        let toast_overlay = toast_overlay.clone();
         move |event| {
             let DownloadEvent::ItemStateChanged { item_id: event_item_id, state } = event else { return };
             if *event_item_id != item_id {
@@ -149,8 +150,15 @@ pub fn build(
                 ItemDownloadState::Complete => "emblem-ok-symbolic",
                 // A stopped download kept its completed chapters — the button returns to its
                 // "can start/continue a download" state, same as idle.
-                ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Failed => "folder-download-symbolic",
+                ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Failed(_) => "folder-download-symbolic",
             });
+            // Before this, a failure only ever showed as the icon quietly reverting from its
+            // in-progress spinner to idle a moment after "Download started" — indistinguishable
+            // from Stop, and with the actual reason (metered connection, dead session, a 404)
+            // sitting unread in the log.
+            if let ItemDownloadState::Failed(reason) = state {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Download failed — {reason}")));
+            }
         }
     });
 
@@ -437,7 +445,7 @@ fn populate_download_popover_rows(
 pub(crate) mod tests {
     use super::*;
     use crate::player::PlayRequest;
-    use crate::test_support::pump_until;
+    use crate::test_support::{any_label_reads, pump_until};
     use std::time::Duration;
 
     fn test_download_manager(pool: sqlx::SqlitePool) -> DownloadManager {
@@ -638,11 +646,78 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// Regression test for the "a download fails and the only sign is the icon quietly reverting"
+    /// gap: a metered connection with "Wi-Fi-only downloads" on fails every track immediately
+    /// (`FakeNetworkMonitor` reports metered; `wifi_only: true`), and the failure must now surface
+    /// as a toast naming the actual reason, not just "Download started" and then silence.
+    pub(crate) fn run_a_failed_download_toasts_the_reason(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(crate::player::tests::account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(crate::player::tests::insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)];
+        let paths = crate::test_support::test_paths();
+        runtime.block_on(paths.ensure_dirs()).unwrap();
+        struct MeteredNetworkMonitor;
+        impl abs_player::network_watch::NetworkMonitor for MeteredNetworkMonitor {
+            fn is_metered(&self) -> Option<bool> {
+                Some(true)
+            }
+        }
+        let download_manager = DownloadManager::new(pool.clone(), paths, Box::new(MeteredNetworkMonitor), true);
+
+        // A window whose *content* is the toast overlay (not just a sibling of it) — an
+        // unmapped `AdwToastOverlay` defers its toasts, same requirement
+        // `error_reporting::tests` documents for its own scenario.
+        let toast_overlay = adw::ToastOverlay::new();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        toast_overlay.set_child(Some(&content));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay.clone());
+        content.append(&menu.widget);
+        let window = gtk4::Window::builder().child(&toast_overlay).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        menu.popover.popup();
+        // Row population runs in two passes (a synchronous one from the given chapter ranges,
+        // then an async one once cached tracks/offline-availability resolve) — waiting on
+        // `is_visible()` alone can race ahead of both, the same reason
+        // `run_rows_block_when_free_space_is_insufficient` waits on the rows' own content instead.
+        pump_until(|| button_labeled(&menu.popover_box, "Current chapter").is_some(), Duration::from_secs(2));
+        click_button_labeled(&menu.popover_box, "Current chapter");
+
+        // `AdwToastOverlay` shows one toast at a time and queues the rest — "Download failed" is
+        // queued behind the "Download started" toast the click itself raised, so this can't land
+        // until that first toast's own display duration lapses. Comfortably past a toast's
+        // default lifetime, not tuned to race it.
+        pump_until(
+            || any_label_reads(toast_overlay.upcast_ref(), "Download failed — waiting for a non-metered connection"),
+            Duration::from_secs(10),
+        );
+        assert!(
+            any_label_reads(toast_overlay.upcast_ref(), "Download failed — waiting for a non-metered connection"),
+            "a failed download must toast the actual reason, not just leave the icon to quietly revert"
+        );
+
+        window.destroy();
+    }
+
     /// Finds and clicks the button with the given label anywhere inside a container, so tests can
     /// drive widgets the same way a user tapping them would. The text may sit on the button
     /// itself (the flat scope rows used to) or on a label inside it (scope rows are title +
     /// subtitle stacks now; "Next chapters" carries its title in its child box).
     fn click_button_labeled(container: &gtk4::Box, label: &str) {
+        button_labeled(container, label).unwrap_or_else(|| panic!("no button labeled {label:?} found")).emit_clicked();
+    }
+
+    /// The button with the given label anywhere inside a container, if it currently exists —
+    /// the read half of `click_button_labeled`, also used to poll for a popover's async row
+    /// population having landed before clicking (see its own call sites).
+    fn button_labeled(container: &gtk4::Box, label: &str) -> Option<gtk4::Button> {
         let mut found = None;
         for_each_descendant(container.upcast_ref(), &mut |widget| {
             if found.is_some() {
@@ -654,7 +729,7 @@ pub(crate) mod tests {
                 }
             }
         });
-        found.unwrap_or_else(|| panic!("no button labeled {label:?} found")).emit_clicked();
+        found
     }
 
     /// A button's effective text: its own label, else the first label inside its child box.

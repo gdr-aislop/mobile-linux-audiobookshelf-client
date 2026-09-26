@@ -278,6 +278,7 @@ mod tests {
         (download_scope_menu_rows_show_size_estimates_that_track_the_stepper, crate::widgets::download_scope_menu::tests::run_rows_show_size_estimates_that_track_the_stepper),
 
         (download_scope_menu_rows_block_when_free_space_is_insufficient, crate::widgets::download_scope_menu::tests::run_rows_block_when_free_space_is_insufficient),
+        (download_scope_menu_a_failed_download_toasts_the_reason, crate::widgets::download_scope_menu::tests::run_a_failed_download_toasts_the_reason),
 
         (item_options_menu_buttons_invoke_their_callback_and_popdown, crate::widgets::item_options_menu::tests::run_buttons_invoke_their_callback_and_popdown),
         (item_options_menu_leading_widget_is_inserted_when_given, crate::widgets::item_options_menu::tests::run_leading_widget_is_inserted_when_given),

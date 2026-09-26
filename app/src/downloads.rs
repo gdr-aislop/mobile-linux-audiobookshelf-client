@@ -40,7 +40,7 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 /// that comment cross-reference stays meaningful; nothing outside this module needs to read it.
 pub(crate) const PROGRESS_EVENT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemDownloadState {
     /// Nothing in flight for this item — either it was never started, finished being cleared, or
     /// every in-flight track was canceled before the whole batch finished.
@@ -51,7 +51,15 @@ pub enum ItemDownloadState {
     /// chapters that had already completed stay downloaded (their files and rows are untouched) —
     /// a user-driven end, deliberately distinct from `Failed` (where a track itself errored).
     Stopped,
-    Failed,
+    /// Carries a human-readable reason (the first failing track's `TrackDownloadOutcome::Failed`
+    /// message, or whatever stopped the batch before any track was even attempted — a dead
+    /// connection, a resolve failure, "waiting for a non-metered connection") so a listener can
+    /// show *why*, not just that it failed. Before this, the reason existed
+    /// (`TrackDownloadOutcome::Failed(String)`, persisted via `mark_failed`) but nothing surfaced
+    /// it: a scope-row tap toasted "Download started" and the download button's icon quietly
+    /// reverted to idle a moment later, with no way to tell "waiting for Wi-Fi" apart from a real
+    /// error.
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +92,10 @@ struct ItemBatch {
     failed: usize,
     canceled: usize,
     cancel_flags: Vec<Rc<Cell<bool>>>,
+    /// The first failing track's reason — kept, not the latest, so a batch where one track fails
+    /// early and others keep going still reports the failure that actually explains why the item
+    /// ended up `Failed` rather than whichever happened to finish last.
+    first_failure_reason: Option<String>,
 }
 
 impl ItemBatch {
@@ -199,7 +211,8 @@ impl DownloadManager {
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::warn!(%err, item_id, "couldn't load the server's connection settings");
-                        inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed });
+                        let reason = format!("couldn't load the server's connection settings: {err}");
+                        inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(reason) });
                         return;
                     }
                 };
@@ -216,14 +229,15 @@ impl DownloadManager {
                     }
                     Err(err) => {
                         tracing::warn!(%err, item_id, "couldn't resolve tracks for download");
-                        inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed });
+                        inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(err.to_string()) });
                         return;
                     }
                 }
             }
 
             if tracks.is_empty() {
-                inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed });
+                let reason = "the server reported no audio files for this item".to_string();
+                inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(reason) });
                 return;
             }
 
@@ -255,7 +269,7 @@ impl DownloadManager {
                 let mut inner = inner_rc.borrow_mut();
                 inner.batches.insert(
                     (server_id.clone(), item_id.clone()),
-                    ItemBatch { total: pending_inos.len(), completed: 0, failed: 0, canceled: 0, cancel_flags: cancel_flags.clone() },
+                    ItemBatch { total: pending_inos.len(), completed: 0, failed: 0, canceled: 0, cancel_flags: cancel_flags.clone(), first_failure_reason: None },
                 );
                 inner.publish(DownloadEvent::ItemStateChanged { item_id: item_id.clone(), state: ItemDownloadState::Downloading });
             }
@@ -360,7 +374,10 @@ impl DownloadManager {
 
         match outcome {
             TrackDownloadOutcome::Completed => batch.completed += 1,
-            TrackDownloadOutcome::Failed(_) => batch.failed += 1,
+            TrackDownloadOutcome::Failed(reason) => {
+                batch.failed += 1;
+                batch.first_failure_reason.get_or_insert(reason);
+            }
             TrackDownloadOutcome::Canceled => batch.canceled += 1,
         }
 
@@ -369,10 +386,14 @@ impl DownloadManager {
         }
 
         let (failed, canceled) = (batch.failed, batch.canceled);
+        let first_failure_reason = batch.first_failure_reason.clone();
         inner.batches.remove(&key);
 
         let state = if failed > 0 {
-            ItemDownloadState::Failed
+            // `first_failure_reason` is only ever `None` here if every failing track somehow hit
+            // `finish_track` without going through the `Failed(reason)` arm above — shouldn't
+            // happen, but a generic message beats a blank one if it ever did.
+            ItemDownloadState::Failed(first_failure_reason.unwrap_or_else(|| "the download failed".to_string()))
         } else if canceled > 0 {
             // The user stopped the job — whatever completed chapters exist are kept (their files
             // and rows were never touched by cancellation), and a stop with nothing completed
@@ -699,11 +720,11 @@ pub(crate) mod tests {
         manager.start_download(session, "item-1".to_string(), DownloadScope::CurrentChapter, 0);
 
         pump_until(
-            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Failed, .. })),
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Failed(_), .. })),
             Duration::from_secs(5),
         );
         assert!(
-            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Failed, .. })),
+            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Failed(_), .. })),
             "a metered connection with wifi_only set should fail the download rather than fetch it"
         );
 
@@ -789,7 +810,7 @@ pub(crate) mod tests {
         manager.start_download(session.clone(), "item-1".to_string(), DownloadScope::CurrentChapter, 0);
         pump_until(
             || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Complete, .. } if item_id == "item-1"))
-                || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-1")),
+                || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(_), .. } if item_id == "item-1")),
             Duration::from_secs(10),
         );
         assert!(
@@ -802,11 +823,11 @@ pub(crate) mod tests {
         // Started after the toggle, still on a metered connection — this one must be blocked.
         manager.start_download(session, "item-2".to_string(), DownloadScope::CurrentChapter, 0);
         pump_until(
-            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-2")),
+            || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(_), .. } if item_id == "item-2")),
             Duration::from_secs(5),
         );
         assert!(
-            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed, .. } if item_id == "item-2")),
+            events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(_), .. } if item_id == "item-2")),
             "a download started after wifi_only was set true, on a metered connection, must be blocked"
         );
     }
