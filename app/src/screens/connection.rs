@@ -191,10 +191,12 @@ pub fn build(
                         let server_id = server_id.clone();
                         let row = row.clone();
                         let dialog = dialog.clone();
+                        let error_label = error_label.clone();
                         glib::spawn_future_local(async move {
                             let address = (!address.is_empty()).then_some(address.as_str());
                             if let Err(err) = abs_storage::repo::servers::set_local_network_address(&pool, &server_id, address).await {
                                 tracing::warn!(%err, server_id, "couldn't persist the local network address");
+                                show_error(&error_label, &err.to_string());
                                 return;
                             }
                             row.set_subtitle(&text_subtitle(address));
@@ -418,6 +420,10 @@ fn save_cancel_dialog(
     dialog.connect_response(move |dialog, response| {
         if response == gtk4::ResponseType::Ok {
             on_save(dialog, &response_label);
+        } else {
+            // A GtkDialog doesn't close itself on a response, so without this Cancel was a
+            // dead button and the editor could only be dismissed with Escape.
+            dialog.close();
         }
     });
     (dialog, error_label)
@@ -482,9 +488,11 @@ fn show_headers_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, serve
             let server_id = server_id.clone();
             let row = row.clone();
             let dialog = dialog.clone();
+            let error_label = error_label.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_storage::repo::servers::set_custom_headers_json(&pool, &server_id, &json).await {
                     tracing::warn!(%err, server_id, "couldn't persist the custom headers");
+                    show_error(&error_label, &err.to_string());
                     return;
                 }
                 row.set_subtitle(&headers_subtitle(&json));
@@ -506,7 +514,7 @@ fn show_headers_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, serve
 fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_id: &str, row: &adw::ActionRow, current_path: Option<&str>) {
     let chosen: Rc<std::cell::RefCell<Option<std::path::PathBuf>>> = Rc::new(std::cell::RefCell::new(current_path.map(std::path::PathBuf::from)));
 
-    let (dialog, _error_label) = save_cancel_dialog(window, "Client Certificate", {
+    let (dialog, save_error_label) = save_cancel_dialog(window, "Client Certificate", {
         let pool = pool.clone();
         let server_id = server_id.to_string();
         let row = row.clone();
@@ -525,14 +533,17 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
             let server_id = server_id.clone();
             let row = row.clone();
             let dialog = dialog.clone();
+            let error_label = error_label.clone();
             let filename = cert_subtitle(Some(&path.to_string_lossy()));
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_storage::repo::servers::set_client_cert_path(&pool, &server_id, Some(&path.to_string_lossy())).await {
                     tracing::warn!(%err, server_id, "couldn't persist the client certificate");
+                    show_error(&error_label, &err.to_string());
                     return;
                 }
                 if let Err(err) = abs_storage::repo::servers::set_client_cert_password(&pool, &server_id, password.as_deref()).await {
                     tracing::warn!(%err, server_id, "couldn't persist the client certificate's password");
+                    show_error(&error_label, &err.to_string());
                     return;
                 }
                 row.set_subtitle(&filename);
@@ -578,9 +589,10 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
     content.append(&file_label);
     content.append(&choose_button);
     content.append(&gtk4::PasswordEntry::builder().show_peek_icon(true).placeholder_text("Export password").build());
-    // `max_width_chars(1)` caps this label's natural width regardless of `wrap` (see the
-    // `error_label` above in `save_cancel_dialog` for the same reasoning).
-    content.append(&gtk4::Label::builder().css_classes(["error"]).wrap(true).max_width_chars(1).visible(false).halign(gtk4::Align::Start).build());
+    // Reuses `save_cancel_dialog`'s own error label rather than appending a second, disconnected
+    // one here (there used to be two — this dialog's on-save failures reached the first, and
+    // nothing ever reached the second) — Remove's own failures below now show here too.
+    content.append(&save_error_label);
 
     if current_path.is_some() {
         let remove_button = gtk4::Button::builder().label("Remove Certificate").css_classes(["destructive-action"]).halign(gtk4::Align::Start).build();
@@ -589,18 +601,22 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
             let server_id = server_id.to_string();
             let row = row.clone();
             let dialog = dialog.clone();
+            let error_label = save_error_label.clone();
             move |_| {
                 let pool = pool.clone();
                 let server_id = server_id.clone();
                 let row = row.clone();
                 let dialog = dialog.clone();
+                let error_label = error_label.clone();
                 glib::spawn_future_local(async move {
                     if let Err(err) = abs_storage::repo::servers::set_client_cert_path(&pool, &server_id, None).await {
                         tracing::warn!(%err, server_id, "couldn't clear the client certificate");
+                        show_error(&error_label, &err.to_string());
                         return;
                     }
                     if let Err(err) = abs_storage::repo::servers::set_client_cert_password(&pool, &server_id, None).await {
                         tracing::warn!(%err, server_id, "couldn't clear the client certificate's password");
+                        show_error(&error_label, &err.to_string());
                         return;
                     }
                     row.set_subtitle("None");
@@ -857,6 +873,7 @@ pub(crate) mod tests {
         );
         dialog.response(gtk4::ResponseType::Cancel);
         pump_until(|| find_dialog().is_none(), Duration::from_secs(5));
+        assert!(find_dialog().is_none(), "Cancel must close the editor");
 
         // The User Agent editor: a value persists (trimmed); clearing it falls back to the
         // default — both reflected in the subtitle.
@@ -901,5 +918,80 @@ pub(crate) mod tests {
         );
         pump_until(|| find_dialog().is_none(), Duration::from_secs(5));
         assert_eq!(screen.hooks.user_agent_row.subtitle().as_deref(), Some("Default"));
+    }
+
+    /// The text of the dialog's visible inline error label, if one is showing.
+    fn visible_error_text(dialog: &gtk4::Dialog) -> Option<String> {
+        fn walk(widget: &gtk4::Widget) -> Option<String> {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                if label.has_css_class("error") && label.is_visible() && !label.text().is_empty() {
+                    return Some(label.text().to_string());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(text) = walk(&current) {
+                    return Some(text);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        walk(dialog.content_area().upcast_ref())
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`, same as the scenarios above.
+    ///
+    /// A persist that fails after validation passed must say so inside the still-open dialog,
+    /// not leave a Save button that silently does nothing. The server row is deleted under the
+    /// open page, which makes every per-server setter fail for real.
+    pub(crate) fn run_editor_persist_failures_show_inline(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, "https://library.example/abs")).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().build();
+        let shell_root: gtk4::Widget = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast();
+        app_window.set_content(Some(&shell_root));
+
+        let screen = build(pool.clone(), server, None, &app_window, &shell_root, Rc::new(|| {}));
+        app_window.set_content(Some(&screen.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), Duration::from_secs(5));
+
+        runtime.block_on(abs_storage::repo::servers::remove(&pool, &server_id)).unwrap();
+
+        // Local Network Server Address: valid input, failed write.
+        adw::prelude::ActionRowExt::activate(&screen.hooks.local_address_row);
+        pump_until_dialog_mapped();
+        let dialog = find_dialog().unwrap();
+        find_descendant::<gtk4::Entry>(dialog.content_area().upcast_ref())
+            .unwrap()
+            .set_text("http://192.168.1.50:13378");
+        dialog.response(gtk4::ResponseType::Ok);
+        pump_until(|| visible_error_text(&dialog).is_some(), Duration::from_secs(5));
+        assert!(visible_error_text(&dialog).is_some(), "a failed address save must show an inline error");
+        assert!(find_dialog().is_some(), "the dialog stays open so the user can retry or cancel");
+        assert_eq!(screen.hooks.local_address_row.subtitle().as_deref(), Some("None"));
+        dialog.response(gtk4::ResponseType::Cancel);
+        pump_until(|| find_dialog().is_none(), Duration::from_secs(5));
+        assert!(find_dialog().is_none(), "Cancel must close the editor");
+
+        // Custom Headers: valid input, failed write.
+        adw::prelude::ActionRowExt::activate(&screen.hooks.headers_row);
+        pump_until_dialog_mapped();
+        let dialog = find_dialog().unwrap();
+        find_descendant::<gtk4::TextView>(dialog.content_area().upcast_ref())
+            .unwrap()
+            .buffer()
+            .set_text("X-Auth: secret");
+        dialog.response(gtk4::ResponseType::Ok);
+        pump_until(|| visible_error_text(&dialog).is_some(), Duration::from_secs(5));
+        assert!(visible_error_text(&dialog).is_some(), "a failed headers save must show an inline error");
+        assert!(find_dialog().is_some(), "the dialog stays open so the user can retry or cancel");
+        assert_eq!(screen.hooks.headers_row.subtitle().as_deref(), Some("None"));
+        dialog.response(gtk4::ResponseType::Cancel);
+        pump_until(|| find_dialog().is_none(), Duration::from_secs(5));
+        assert!(find_dialog().is_none(), "Cancel must close the editor");
     }
 }

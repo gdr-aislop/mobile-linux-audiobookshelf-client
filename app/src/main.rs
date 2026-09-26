@@ -244,6 +244,7 @@ mod tests {
         (settings_add_server_row_opens_welcome_and_cancels_back, crate::screens::settings::tests::run_add_server_row_opens_welcome_and_cancels_back),
         (connection_page_url_info_disconnect_and_back, crate::screens::connection::tests::run_url_info_disconnect_and_back),
         (connection_advanced_rows_persist_and_edit, crate::screens::connection::tests::run_advanced_rows_persist_and_edit),
+        (connection_editor_persist_failures_show_inline, crate::screens::connection::tests::run_editor_persist_failures_show_inline),
         (playback_start_and_pause_persists_progress, crate::player::tests::run_start_and_pause_persists_progress),
         (playback_start_with_no_working_audio_engine_still_opens_with_an_error, crate::player::tests::run_start_with_no_working_audio_engine_still_opens_with_an_error),
         (playback_start_with_an_expired_session_and_nothing_cached_shows_a_login_error, crate::player::tests::run_start_with_an_expired_session_and_nothing_cached_shows_a_login_error),
