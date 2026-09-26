@@ -104,6 +104,7 @@ struct Widgets {
     toast_overlay: adw::ToastOverlay,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
     _paths: abs_storage::AppPaths,
