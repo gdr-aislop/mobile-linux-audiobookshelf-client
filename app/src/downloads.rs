@@ -441,7 +441,10 @@ impl DownloadManager {
     /// resurrect a row via its own next progress checkpoint. Accepted as a known race for this
     /// pass (clearing while actively downloading is an edge case, not the common path); a future
     /// pass could close it by having `clear_item` await the canceled tracks' own completion first.
-    pub fn clear_item(&self, server_id: &str, item_id: &str) {
+    ///
+    /// `on_done` gets the outcome, so the caller can confirm success or report a failure instead
+    /// of toasting before the delete has actually happened.
+    pub fn clear_item(&self, server_id: &str, item_id: &str, on_done: impl FnOnce(abs_core::Result<()>) + 'static) {
         self.cancel_item(server_id, item_id);
         let inner_rc = self.inner.clone();
         let server_id = server_id.to_string();
@@ -449,17 +452,18 @@ impl DownloadManager {
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
             if let Err(err) = abs_core::download_tracks::clear_item_downloads(&pool, &server_id, &item_id).await {
-                tracing::warn!(%err, item_id, "couldn't clear downloaded tracks");
+                on_done(Err(err));
                 return;
             }
             inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Idle });
+            on_done(Ok(()));
         });
     }
 
     /// Cancels anything in flight for this server, then deletes every downloaded track file and
     /// row across every item — the server-scoped mirror of `clear_item`, with the same known
-    /// cooperative-cancel race documented there.
-    pub fn clear_all(&self, server_id: &str) {
+    /// cooperative-cancel race documented there. `on_done` gets the outcome, same as `clear_item`.
+    pub fn clear_all(&self, server_id: &str, on_done: impl FnOnce(abs_core::Result<()>) + 'static) {
         {
             let inner = self.inner.borrow();
             for (key, batch) in inner.batches.iter() {
@@ -476,12 +480,15 @@ impl DownloadManager {
             let pool = inner_rc.borrow().pool.clone();
             match abs_core::download_tracks::clear_all_downloads(&pool, &server_id).await {
                 Ok(item_ids) => {
-                    let inner = inner_rc.borrow();
-                    for item_id in item_ids {
-                        inner.publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Idle });
+                    {
+                        let inner = inner_rc.borrow();
+                        for item_id in item_ids {
+                            inner.publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Idle });
+                        }
                     }
+                    on_done(Ok(()));
                 }
-                Err(err) => tracing::warn!(%err, server_id, "couldn't clear all downloaded tracks"),
+                Err(err) => on_done(Err(err)),
             }
         });
     }
@@ -767,7 +774,7 @@ pub(crate) mod tests {
             move |event| events.borrow_mut().push(event.clone())
         });
 
-        manager.clear_item(&server.id, "item-1");
+        manager.clear_item(&server.id, "item-1", |result| result.unwrap());
 
         pump_until(
             || events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { state: ItemDownloadState::Idle, .. })),

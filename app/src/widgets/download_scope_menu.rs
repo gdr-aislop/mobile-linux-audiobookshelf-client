@@ -459,9 +459,12 @@ fn populate_download_popover_rows(
             let item_id = item_id.to_string();
             let toast_overlay = toast_overlay.clone();
             move |_| {
-                download_manager.clear_item(session.server_id(), &item_id);
                 popover.popdown();
-                toast_overlay.add_toast(adw::Toast::new("Downloaded chapters cleared"));
+                let toast_overlay = toast_overlay.clone();
+                download_manager.clear_item(session.server_id(), &item_id, move |result| match result {
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Downloaded chapters cleared")),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Clearing downloaded chapters", err),
+                });
             }
         });
         popover_box.append(&clear_button);
