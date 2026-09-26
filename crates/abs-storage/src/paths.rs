@@ -15,7 +15,13 @@ use directories::BaseDirs;
 /// and `organization` entirely and just lowercases `application` — confirmed by actually running
 /// it, not assumed — which would have put this app's data under `~/.local/share/audiobookshelf/`
 /// instead of the reverse-DNS-named directory GNOME apps (and Flatpak) actually use.
-pub const APP_ID: &str = "io.github.gdr_aislop.Audiobookshelf";
+///
+/// Matches the Flatpak manifest's `app-id` (`flatpak/io.github.gdr-aislop.abs-app.json`) exactly —
+/// a hyphen mid-element is valid in a `GApplication` id (`g_application_id_is_valid` only forbids
+/// a leading hyphen per element, confirmed against GLib's own docs), so there's no reason for this
+/// to diverge from the id every other part of the app's identity (AppStream metainfo, the Flatpak
+/// manifest itself) already uses.
+pub const APP_ID: &str = "io.github.gdr-aislop.abs-app";
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {

@@ -461,10 +461,35 @@ jobs:
           rm -f SHA256SUMS-*.txt
           cat SHA256SUMS
 
+      # A detached signature per .deb/.AppImage — same key as the Flatpak/APT repos, for anyone
+      # who downloads one of these standalone rather than through either repo. Not the .flatpak
+      # bundle: its OSTree commit is already signed via flatpak-builder --gpg-sign, so a second,
+      # unrelated signature on the bundle file itself would be redundant. Not embedded into the
+      # .deb via debsigs either — tried it, and it's broken for zstd-compressed .debs (the default
+      # since Debian bookworm/Ubuntu 22.04, what cargo deb produces here): debsigs' member-matching
+      # regex predates zstd support and silently signs the wrong data, which debsig-verify then
+      # (correctly) rejects. Confirmed by actually building, signing, and verifying a real .deb.
+      - name: Import the signing key
+        run: echo "$SIGNING_GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          SIGNING_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+
+      - name: Sign the .deb and .AppImage files
+        run: |
+          set -eux
+          cd dist
+          for f in *.deb *.AppImage; do
+            gpg --batch --default-key "$SIGNING_GPG_KEY_ID" --detach-sign --armor -o "$f.asc" "$f"
+          done
+          gpg --armor --export "$SIGNING_GPG_KEY_ID" > abs-app.asc
+        env:
+          SIGNING_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.deb
             dist/*.AppImage
             dist/*.flatpak
+            dist/*.asc
             dist/SHA256SUMS

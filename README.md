@@ -60,6 +60,20 @@ version history) — older `.deb`s stay available from
 [past releases](../../releases) directly, via `sudo apt install
 ./abs-app_<version>_<arch>.deb`.
 
+### Verifying a standalone `.deb` or `.AppImage`
+
+Every `.deb` and `.AppImage` attached to a [release](../../releases) also
+gets a detached signature (`<file>.asc`), from the same key that signs the
+Flatpak and APT repos — useful if you downloaded one directly rather than
+through either repo (an `apt install` from the hosted repo above is already
+verified via its own signed `Release`/`InRelease`, with nothing extra to do):
+
+```sh
+gpg --import abs-app.asc   # once, also attached to every release
+gpg --verify abs-app_<version>_<arch>.deb.asc abs-app_<version>_<arch>.deb
+gpg --verify abs-app-<version>-<arch>.AppImage.asc abs-app-<version>-<arch>.AppImage
+```
+
 ### Building an AppImage manually
 
 ```sh
@@ -83,7 +97,7 @@ mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfi
 
 The app never phones home; everything below stays on the user's device. If
 someone reports a crash, ask for whatever exists under
-`~/.local/state/io.github.gdr_aislop.Audiobookshelf/`:
+`~/.local/state/io.github.gdr-aislop.abs-app/`:
 
 - `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without

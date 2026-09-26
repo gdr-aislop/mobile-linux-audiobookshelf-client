@@ -131,8 +131,15 @@ pub fn build(
     // must never be fatal to playback, so a failure here is just a warning. On success, the
     // bridge becomes a permanent snapshot listener (via the foundation refactor's `add_listener`)
     // so the lock-screen/Shell media card stays current for the app's whole lifetime.
+    //
+    // "abs-app" (not "Audiobookshelf") — `mpris::register` builds the bus name as
+    // `org.mpris.MediaPlayer2.{app_name}`, and the Flatpak manifest's `finish-args` only grants
+    // `--own-name=org.mpris.MediaPlayer2.abs-app`. Under Flatpak, `--own-name` is an exact-match
+    // allowlist, so this previously asked to own a name the sandbox never actually permitted —
+    // silently non-fatal (MPRIS failures are always treated as best-effort, per the comment
+    // above), but MPRIS would never actually have worked inside the Flatpak build.
     let mpris_bridge: Rc<dyn abs_player::mpris::MprisCommands> = Rc::new(player::MprisBridge::new(mini_bar.controller.clone()));
-    match abs_player::mpris::register("Audiobookshelf", mpris_bridge) {
+    match abs_player::mpris::register("abs-app", mpris_bridge) {
         Ok(mpris_handle) => {
             mini_bar.controller.add_listener(move |snapshot| mpris_handle.update(player::mpris_state_from_snapshot(snapshot)));
         }
