@@ -55,6 +55,11 @@ pub fn build(
 ) -> ConnectionScreen {
     ensure_mono_css();
 
+    // Declared here so every action below can capture it — this screen previously had no toast
+    // surface at all, so a background failure (disconnect, or any of the Advanced editors) had
+    // nowhere to report to besides the log.
+    let toast_overlay = adw::ToastOverlay::new();
+
     let back_button = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
         .css_classes(["flat"])
@@ -125,17 +130,18 @@ pub fn build(
     ssl_switch.connect_state_set({
         let pool = pool.clone();
         let server_id = server_id.clone();
+        let toast_overlay = toast_overlay.clone();
         // `state` is what a user toggle drives; `active` is what the next toggle flips from —
         // both initialized (same discipline as the Settings screen's switches).
         move |_, disable| {
-            // Optimistic persist: the only failure is a storage-level one (the row itself is
-            // gone), which the next shell rebuild handles; there is no useful inline message
-            // for it here.
+            // Optimistic: the switch already reflects the new state. A toast beats leaving a
+            // switch that visually flipped but silently didn't persist.
             let pool = pool.clone();
             let server_id = server_id.clone();
+            let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_storage::repo::servers::set_disable_ssl_verify(&pool, &server_id, disable).await {
-                    tracing::warn!(%err, server_id, "couldn't persist the SSL verification setting");
+                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the SSL verification setting", err);
                 }
             });
             glib::signal::Propagation::Proceed
@@ -272,11 +278,13 @@ pub fn build(
         let window = window.clone();
         let account = account.clone();
         let on_session_changed = on_session_changed.clone();
+        let toast_overlay = toast_overlay.clone();
         move |_| {
             let Some(account) = account.clone() else { return };
             let window = window.clone();
             let on_session_changed = on_session_changed.clone();
             let pool = pool.clone();
+            let toast_overlay = toast_overlay.clone();
             confirm(
                 &window,
                 &format!("Disconnect from {}?", host_of(&server.url)),
@@ -290,9 +298,10 @@ pub fn build(
                     let pool = pool.clone();
                     let account_id = account.id.clone();
                     let on_session_changed = on_session_changed.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
                         if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                            tracing::warn!(%err, "couldn't sign out");
+                            crate::error_reporting::report_background_error(&toast_overlay, "Disconnecting", err);
                             return;
                         }
                         on_session_changed();
@@ -302,13 +311,14 @@ pub fn build(
         }
     });
 
-    let root = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    root.append(&header);
-    root.append(&page);
-    root.append(&disconnect_button);
+    let content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    content.append(&header);
+    content.append(&page);
+    content.append(&disconnect_button);
+    toast_overlay.set_child(Some(&content));
 
     ConnectionScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: ConnectionHooks {
             url_row,

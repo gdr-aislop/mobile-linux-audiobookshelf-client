@@ -81,6 +81,11 @@ pub fn build(
     // Save serialization state — see `persist` for why two saves must never run concurrently.
     let pending_save: Rc<RefCell<Option<PlaybackSettings>>> = Rc::new(RefCell::new(None));
     let writer_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Declared here (not at the end, alongside `content`) so every row/action below can capture
+    // it — background-write failures (switch account, sign out, remove server, theme, playback
+    // settings) need somewhere to report to, and this screen previously had no toast surface at
+    // all.
+    let toast_overlay = adw::ToastOverlay::new();
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
@@ -206,14 +211,16 @@ pub fn build(
                 let paths = paths.clone();
                 let window = window.clone();
                 let account_id = account.id.clone();
+                let toast_overlay = toast_overlay.clone();
                 move |_| {
                     let pool = pool.clone();
                     let paths = paths.clone();
                     let window = window.clone();
                     let account_id = account_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
                         if let Err(err) = abs_core::accounts::switch_active_account(&pool, &account_id).await {
-                            tracing::warn!(%err, "couldn't switch the active account");
+                            crate::error_reporting::report_background_error(&toast_overlay, "Switching accounts", err);
                             return;
                         }
                         crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -230,12 +237,14 @@ pub fn build(
                 let window = window.clone();
                 let account_id = account.id.clone();
                 let username = account.username.clone();
+                let toast_overlay = toast_overlay.clone();
                 move |_| {
                     let dialog_window = window.clone();
                     let pool = pool.clone();
                     let paths = paths.clone();
                     let window = window.clone();
                     let account_id = account_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     confirm(
                         &dialog_window,
                         &format!("Sign out of {username}?"),
@@ -249,9 +258,10 @@ pub fn build(
                             let paths = paths.clone();
                             let window = window.clone();
                             let account_id = account_id.clone();
+                            let toast_overlay = toast_overlay.clone();
                             glib::spawn_future_local(async move {
                                 if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                                    tracing::warn!(%err, "couldn't sign out");
+                                    crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
                                     return;
                                 }
                                 crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -271,12 +281,14 @@ pub fn build(
             let window = window.clone();
             let server_id = server.id.clone();
             let server_host = host_of(&server.url).to_string();
+            let toast_overlay = toast_overlay.clone();
             move |_| {
                 let dialog_window = window.clone();
                 let pool = pool.clone();
                 let paths = paths.clone();
                 let window = window.clone();
                 let server_id = server_id.clone();
+                let toast_overlay = toast_overlay.clone();
                 confirm(
                     &dialog_window,
                     &format!("Remove {server_host}?"),
@@ -288,9 +300,10 @@ pub fn build(
                         let paths = paths.clone();
                         let window = window.clone();
                         let server_id = server_id.clone();
+                        let toast_overlay = toast_overlay.clone();
                         glib::spawn_future_local(async move {
                             if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
-                                tracing::warn!(%err, "couldn't remove the server");
+                                crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
                                 return;
                             }
                             if let Err(err) = paths.purge_server_data(&server_id).await {
@@ -538,12 +551,13 @@ pub fn build(
     about_group.add(&about_row);
     page.add(&about_group);
 
-    let root = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    root.append(&header);
-    root.append(&page);
+    let content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    content.append(&header);
+    content.append(&page);
+    toast_overlay.set_child(Some(&content));
 
     SettingsScreen {
-        root: root.upcast(),
+        root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: SettingsHooks {
             pause_on_unplug_switch,
