@@ -716,8 +716,12 @@ pub fn build(
                     // only its own (fixing a related bug: this used to never fire from a
                     // Home-driven toggle at all). A single targeted write, not the full
                     // load-mutate-save round trip over all four view-option fields.
+                    //
+                    // Logged, not toasted: `OfflineModeState` already reports its own write of
+                    // this same toggle to the shell, and both writes hit the same settings table,
+                    // so one failure would otherwise toast twice.
                     if let Err(err) = abs_core::settings::set_downloaded_only(&pool, active).await {
-                        crate::error_reporting::report_background_error(&toast_overlay, "Saving offline mode", err);
+                        tracing::warn!(%err, "couldn't mirror offline mode into the Library view options");
                     }
                 }
             });

@@ -242,6 +242,8 @@ mod tests {
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
         (settings_servers_menu_actions_rebuild_the_shell, crate::screens::settings::tests::run_servers_menu_actions_rebuild_the_shell),
         (settings_add_server_row_opens_welcome_and_cancels_back, crate::screens::settings::tests::run_add_server_row_opens_welcome_and_cancels_back),
+        (settings_failed_setting_saves_toast, crate::screens::settings::tests::run_failed_setting_saves_toast),
+        (offline_mode_failed_persist_is_reported, crate::offline_mode::tests::run_failed_persist_is_reported),
         (connection_page_url_info_disconnect_and_back, crate::screens::connection::tests::run_url_info_disconnect_and_back),
         (connection_advanced_rows_persist_and_edit, crate::screens::connection::tests::run_advanced_rows_persist_and_edit),
         (connection_editor_persist_failures_show_inline, crate::screens::connection::tests::run_editor_persist_failures_show_inline),

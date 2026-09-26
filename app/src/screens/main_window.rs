@@ -248,6 +248,12 @@ pub fn build(
     // different widget now.
     let root = adw::ToastOverlay::new();
     root.set_child(Some(&shell_box));
+    // Reported here rather than on Home's or Library's own overlay: this overlay is on screen
+    // whichever of the two tabs the toggle was flipped from.
+    offline_mode.set_on_persist_error({
+        let root = root.clone();
+        move |err| crate::error_reporting::report_background_error(&root, "Saving offline mode", err)
+    });
 
     // Opens the full player by swapping the window's content — there's no
     // `AdwNavigationView`/`AdwDialog` available at this crate's libadwaita ceiling (both v1.4+),

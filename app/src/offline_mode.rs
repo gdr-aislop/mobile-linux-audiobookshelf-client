@@ -20,11 +20,15 @@ use adw::glib;
 use sqlx::SqlitePool;
 
 type Listener = Box<dyn Fn(bool)>;
+type PersistErrorHandler = Rc<dyn Fn(abs_storage::StorageError)>;
 
 struct Inner {
     pool: SqlitePool,
     value: bool,
     listeners: Vec<Listener>,
+    /// Told when persisting a change fails. The toggle has already taken effect in memory, so
+    /// without this the user only finds out on next launch that it wasn't remembered.
+    on_persist_error: Option<PersistErrorHandler>,
 }
 
 impl Inner {
@@ -48,7 +52,7 @@ impl OfflineModeState {
     /// synchronous setup finishes, so listeners registered during `build()` are always in place in
     /// time, the same ordering `DownloadManager`/`PlayerController` listeners already rely on.
     pub fn new(pool: SqlitePool) -> Self {
-        let state = Self { inner: Rc::new(RefCell::new(Inner { pool: pool.clone(), value: false, listeners: Vec::new() })) };
+        let state = Self { inner: Rc::new(RefCell::new(Inner { pool: pool.clone(), value: false, listeners: Vec::new(), on_persist_error: None })) };
         let inner_rc = state.inner.clone();
         glib::spawn_future_local(async move {
             if let Ok(value) = abs_core::settings::load_offline_mode(&pool).await {
@@ -71,13 +75,13 @@ impl OfflineModeState {
     /// widget-sync guard each screen's listener applies, is what keeps a listener-driven
     /// `toggle.set_active(...)` from re-triggering `connect_toggled` into an infinite loop.
     pub fn set(&self, value: bool) {
-        let pool = {
+        let (pool, on_persist_error) = {
             let mut inner = self.inner.borrow_mut();
             if inner.value == value {
                 return;
             }
             inner.value = value;
-            inner.pool.clone()
+            (inner.pool.clone(), inner.on_persist_error.clone())
         };
         // `publish()` must run with no active borrow — listener callbacks call `.get()` (and
         // `apply()`/`render_from_current_data()` do too, transitively), which needs its own
@@ -86,9 +90,18 @@ impl OfflineModeState {
         self.inner.borrow().publish();
         glib::spawn_future_local(async move {
             if let Err(err) = abs_core::settings::save_offline_mode(&pool, value).await {
-                tracing::warn!(%err, "couldn't persist offline mode; it won't be remembered next launch");
+                match on_persist_error {
+                    Some(on_persist_error) => on_persist_error(err),
+                    None => tracing::warn!(%err, "couldn't persist offline mode; it won't be remembered next launch"),
+                }
             }
         });
+    }
+
+    /// Sets where a failed persist is reported. The shell points this at its own toast overlay,
+    /// which is on screen whichever tab the toggle was flipped from.
+    pub fn set_on_persist_error(&self, handler: impl Fn(abs_storage::StorageError) + 'static) {
+        self.inner.borrow_mut().on_persist_error = Some(Rc::new(handler));
     }
 
     /// Permanent registration, no unregister — same shape as `PlayerController::add_listener`/
@@ -96,5 +109,37 @@ impl OfflineModeState {
     /// registered; screens live for the app's whole lifetime).
     pub fn add_listener(&self, listener: impl Fn(bool) + 'static) {
         self.inner.borrow_mut().listeners.push(Box::new(listener));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::test_support::pump_until;
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A toggle whose write fails still
+    /// takes effect in memory, and the failure reaches the persist-error hook instead of only
+    /// the log. Closing the pool makes the write fail for real.
+    pub(crate) fn run_failed_persist_is_reported(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let state = super::OfflineModeState::new(pool.clone());
+        // Let the initial load land first, so it can't race the closed pool below.
+        pump_until(|| false, Duration::from_millis(300));
+
+        let reported: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        state.set_on_persist_error({
+            let reported = reported.clone();
+            move |err| reported.borrow_mut().push(err.to_string())
+        });
+
+        runtime.block_on(pool.close());
+        state.set(true);
+        assert!(state.get(), "the toggle takes effect in memory even though the write fails");
+
+        pump_until(|| !reported.borrow().is_empty(), Duration::from_secs(5));
+        assert_eq!(reported.borrow().len(), 1, "exactly one failed write, reported once");
     }
 }
