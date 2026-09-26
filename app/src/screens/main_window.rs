@@ -28,6 +28,60 @@ use abs_storage::AppPaths;
 use crate::player::{self, PlayRequest};
 use crate::screens;
 
+/// Holds a GTK application-level suspend inhibitor for exactly as long as something is playing —
+/// see `docs/design/ui-spec.md`'s "Hardware controls & interruptions" and this plan's Librem 5
+/// field report (playback stopped mid-book because the phone suspended). `Application::inhibit`
+/// asks the session manager (`org.gnome.SessionManager` under GNOME/Phosh) to keep the SoC out
+/// of suspend; inside Flatpak, GTK routes this through the `org.freedesktop.portal.Inhibit`
+/// portal automatically, so no extra manifest permission is needed. Deliberately `SUSPEND` only,
+/// never `IDLE`: the screen should still blank and lock during playback, only the device must
+/// stay awake to keep decoding and streaming audio.
+///
+/// `cookie: 0` is GTK's own sentinel for "no inhibitor held" (returned by a real `inhibit()`
+/// call, and never a valid cookie itself) — reused here as the initial/cleared state rather than
+/// wrapping it in an `Option`, so a session manager that's unreachable at inhibit time is
+/// silently treated the same as "not currently playing" instead of a special case.
+struct SuspendInhibitGuard {
+    app: Option<gtk4::Application>,
+    window: adw::ApplicationWindow,
+    cookie: std::cell::Cell<u32>,
+}
+
+impl SuspendInhibitGuard {
+    /// Called on every published snapshot (so up to 4×/s while playing) — cheap by construction:
+    /// `inhibit`/`uninhibit` are only actually asked for on the specific tick `is_playing` flips,
+    /// never on every unchanged snapshot in between.
+    fn update(&self, is_playing: bool) {
+        let Some(app) = &self.app else { return };
+        match (is_playing, self.cookie.get()) {
+            (true, 0) => {
+                let cookie = app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::SUSPEND, Some("Playing an audiobook"));
+                self.cookie.set(cookie);
+            }
+            (false, cookie) if cookie != 0 => {
+                app.uninhibit(cookie);
+                self.cookie.set(0);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for SuspendInhibitGuard {
+    /// Releases a still-held inhibitor when this guard itself goes away (signing out, switching
+    /// accounts, or the app quitting mid-playback all drop the controller — and with it every
+    /// listener, this one included) — otherwise a suspend block could outlive the very playback
+    /// it was justified by.
+    fn drop(&mut self) {
+        let cookie = self.cookie.get();
+        if cookie != 0 {
+            if let Some(app) = &self.app {
+                app.uninhibit(cookie);
+            }
+        }
+    }
+}
+
 pub struct MainWindow {
     pub root: gtk4::Widget,
     /// Kept alive for the app's whole lifetime — dropping it unsubscribes from ModemManager's
@@ -145,6 +199,13 @@ pub fn build(
         }
         Err(err) => tracing::warn!(%err, "couldn't register MPRIS media player; system media integration will be unavailable"),
     }
+
+    // Keeps the device out of suspend for exactly as long as something is playing — see
+    // `SuspendInhibitGuard`'s own doc comment. `window.application()` is `None` only in a test
+    // that builds a bare `adw::ApplicationWindow` with no `adw::Application` behind it, in which
+    // case this listener is a permanent, harmless no-op.
+    let suspend_inhibit = SuspendInhibitGuard { app: window.application(), window: window.clone(), cookie: std::cell::Cell::new(0) };
+    mini_bar.controller.add_listener(move |snapshot| suspend_inhibit.update(snapshot.is_playing));
 
     // One toast per *new* playback failure (never a repeat of the same ongoing one — every
     // snapshot while the error persists would otherwise re-fire this on every 250ms tick) — the

@@ -524,6 +524,15 @@ was and wasn't verified.
       *Expected:* position jumps by the configured skip interval (per Settings §15) in the right
       directions; audio continues from the new spot; labels update.
 
+- [ ] **FP-3b — Skip during a network stall.** With a *streamed* (not downloaded) book, enable
+      airplane mode or throttle Wi-Fi/mobile data, then tap Forward.
+      *Expected:* the time label moves to `position + skip interval` and stays there — it must
+      never read as, or jump to, the start of the current file/track. If the network is genuinely
+      gone, a "Lost the connection" banner appears rather than the app silently sitting on a dead
+      pipeline; Retry (or Play) resumes from that position once the network is back, without
+      needing to restart the app. Regression test for a Librem 5 field report where a second skip
+      during a network stall both jumped backwards and left playback unrecoverable.
+
 - [x] **FP-4 — Scrubber drag.** Drag the scrubber to the middle of the book, release.
       *Expected:* audio jumps to approximately that book position; elapsed/remaining update;
       playback continues from there without stalling. Dragging while paused also works and
@@ -737,6 +746,25 @@ Needs a real GNOME/phosh session.
       reachable via the PulseAudio socket (e.g. a bare sandbox).
       *Expected:* playback works normally; the app logs a warning at most — the missing watcher
       never blocks or crashes anything.
+
+- [ ] **HW-11 — Playback survives screen-off suspend.** Play a *streamed* book, lock the phone
+      (screen off), wait 15+ minutes.
+      *Expected:* audio keeps playing the whole time — the phone must not suspend while
+      something is playing. Verify the app is holding a suspend inhibitor with
+      `gdbus call --session --dest org.gnome.SessionManager --object-path /org/gnome/SessionManager --method org.gnome.SessionManager.GetInhibitors`
+      while playing (one inhibitor naming this app) and again after pausing (none). Regression
+      test for a Librem 5 field report where playback stopped ~10–15 minutes in, coinciding with
+      the screen going to sleep.
+
+- [ ] **HW-12 — Wired-headset play/pause button.** Play through wired headphones, press the
+      inline play/pause button on the cable.
+      *Expected:* playback toggles. If it doesn't, bisect in two steps before filing it as an app
+      bug: (1) `busctl --user call org.mpris.MediaPlayer2.abs-app /org/mpris/MediaPlayer2
+      org.mpris.MediaPlayer2.Player PlayPause` — if this toggles playback, the app's MPRIS side
+      works and the gap is in how the shell routes the hardware button to it; (2) `sudo evtest`
+      (or `sudo libinput debug-events`) while pressing the button — if no `KEY_PLAYPAUSE`/
+      `KEY_MEDIA` event appears at all, the codec driver/firmware isn't reporting the button,
+      which is a kernel/firmware issue outside this app.
 
 ---
 

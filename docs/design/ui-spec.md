@@ -305,6 +305,12 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
     this). It **only** lifts a pause caused by the disconnect itself: a manual pause, a phone
     call, a sleep timer or end-of-book are never overridden by a reconnection, and the switch
     is insensitive while pause-on-disconnect is off (a replug has nothing to act on then).
+- **Screen-off suspend**: the phone must not suspend mid-book just because the screen locked —
+  the app holds a GTK application-level suspend inhibitor (`org.gnome.SessionManager` under
+  GNOME/Phosh; the `org.freedesktop.portal.Inhibit` portal under Flatpak, no extra manifest
+  permission needed) for exactly as long as something is playing, released the instant it pauses
+  or stops. Deliberately `SUSPEND` only, never `IDLE` — the screen still blanks and locks as
+  normal, only the SoC is kept awake to keep decoding and streaming audio.
 
 ### Player — full
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for

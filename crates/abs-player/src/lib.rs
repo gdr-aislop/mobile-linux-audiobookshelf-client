@@ -116,6 +116,14 @@ pub trait AudioBackend {
     /// for why this can't be changed on an already-loaded pipeline. Local files are unaffected
     /// either way.
     fn set_burst_buffering(&mut self, enabled: bool);
+    /// Releases whatever the pipeline currently holds — the audio device/stream and any open
+    /// network connection — without expecting to resume from where it left off. A `set_state`
+    /// call on a pipeline that has posted a bus `Error` never recovers it (GStreamer requires
+    /// going through `Null` and reloading), so every caller that reaches an error, a failed
+    /// `load()`, or a failed state change calls this rather than leaving a broken pipeline
+    /// sitting on the audio server across every later Play/Retry — see this plan's Librem 5
+    /// field report. The next real progress is always a fresh `load()`.
+    fn reset(&mut self);
 }
 
 /// A `playbin`-based [`AudioBackend`]. Uses an explicit `fakesink` audio sink when constructed
@@ -297,6 +305,16 @@ impl AudioBackend for GstBackend {
         // already loaded/playing wouldn't retroactively change how it's fetching — `load()` is
         // the only point this can take effect, same contract as `apply_connection`.
     }
+
+    fn reset(&mut self) {
+        // Same effect as `Drop`'s own teardown, just without dropping the pipeline itself — this
+        // is what releases the `pulsesink` stream and any open HTTP connection after an error,
+        // so the device is never left held by a pipeline nothing will ever resume without a
+        // fresh `load()`. `Null` is always a synchronous, unconditionally successful transition
+        // for `playbin` (unlike `Playing`/`Paused`, which can go `Async`), so this needs no
+        // result check.
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 impl Drop for GstBackend {
@@ -344,10 +362,15 @@ fn apply_burst_buffering(pipeline: &gst::Element, enabled: bool) {
 /// Tags this app's audio stream with PulseAudio's `media.role=music` once `playbin`'s internal
 /// `autoaudiosink` actually resolves to a real sink — confirmed via `gst-inspect-1.0 pulsesink`
 /// that `stream-properties` is the right property name (a `GstStructure`, not a plain string map).
-/// `pipewiresink` wasn't installed in the environment this was implemented in to cross-check
-/// against, so this only reaches PipeWire installs that route through `pulsesink`'s PulseAudio
-/// compatibility layer (the common case); a native `pipewiresink` deployment is unverified and
-/// should be checked with `gst-inspect-1.0 pipewiresink` on real target hardware.
+/// Also sets `client-name`, a separate `pulsesink` property (the *client's* PulseAudio identity,
+/// distinct from the per-stream `stream-properties`) — this is what makes this app's audio
+/// stream identifiable in `pactl list clients`/`pw-top` rather than showing up as an anonymous
+/// GStreamer client, which is what actually makes a future "why is the audio stack stuck" report
+/// diagnosable (see this plan's Librem 5 field report). `pipewiresink` wasn't installed in the
+/// environment this was implemented in to cross-check against, so this only reaches PipeWire
+/// installs that route through `pulsesink`'s PulseAudio compatibility layer (the common case); a
+/// native `pipewiresink` deployment is unverified and should be checked with
+/// `gst-inspect-1.0 pipewiresink` on real target hardware.
 fn apply_stream_role_when_sink_is_ready(pipeline: &gst::Element) {
     use glib::prelude::ObjectExt;
     // `element-setup` fires from whichever internal GStreamer thread creates the element (caught
@@ -359,6 +382,9 @@ fn apply_stream_role_when_sink_is_ready(pipeline: &gst::Element) {
         if element.factory().map(|f| f.name() == "pulsesink").unwrap_or(false) {
             let props = gst::Structure::builder("props").field("media.role", "music").build();
             element.set_property("stream-properties", &props);
+            if element.has_property("client-name", Some(glib::Type::STRING)) {
+                element.set_property("client-name", "Audiobookshelf");
+            }
         }
         None
     });
