@@ -1076,6 +1076,16 @@ pub(crate) mod tests {
         assert!(went_back.get());
     }
 
+    /// How many progress PATCHes `mock_server` has received so far.
+    fn progress_patches(runtime: &tokio::runtime::Runtime, mock_server: &MockServer) -> usize {
+        runtime
+            .block_on(mock_server.received_requests())
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH" && request.url.path().starts_with("/api/me/progress/"))
+            .count()
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. "Mark as finished" on an item that
     /// isn't currently loaded into `controller` must still take effect: a direct local write plus
     /// a best-effort push to the server, and the screen's own Play button/progress bar reflecting
@@ -1097,7 +1107,7 @@ pub(crate) mod tests {
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
-        let requests_before = runtime.block_on(mock_server.received_requests()).unwrap().len();
+        let requests_before = progress_patches(runtime, &mock_server);
         hooks.mark_as_finished_button.emit_clicked();
 
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"), "the button should reflect the new state immediately, not wait on the async write");
@@ -1112,9 +1122,10 @@ pub(crate) mod tests {
 
         // The local write (polled above) and the server push are two separate awaits in
         // sequence, not one atomic step — the local write landing is not proof the push has too.
-        pump_until(|| runtime.block_on(mock_server.received_requests()).unwrap().len() - requests_before == 1, Duration::from_secs(5));
-        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
-        assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+        // Counts only the progress PATCH: the screen's own background item fetch can land in
+        // this window too, and counting every request made this flaky.
+        pump_until(|| progress_patches(runtime, &mock_server) - requests_before == 1, Duration::from_secs(5));
+        assert_eq!(progress_patches(runtime, &mock_server) - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Same shape as the mark-as-finished
@@ -1136,7 +1147,7 @@ pub(crate) mod tests {
         let hooks = screen.test_hooks();
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
 
-        let requests_before = runtime.block_on(mock_server.received_requests()).unwrap().len();
+        let requests_before = progress_patches(runtime, &mock_server);
         hooks.reset_progress_button.emit_clicked();
 
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"));
@@ -1151,9 +1162,10 @@ pub(crate) mod tests {
 
         // The local write (polled above) and the server push are two separate awaits in
         // sequence, not one atomic step — the local write landing is not proof the push has too.
-        pump_until(|| runtime.block_on(mock_server.received_requests()).unwrap().len() - requests_before == 1, Duration::from_secs(5));
-        let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
-        assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+        // Counts only the progress PATCH: the screen's own background item fetch can land in
+        // this window too, and counting every request made this flaky.
+        pump_until(|| progress_patches(runtime, &mock_server) - requests_before == 1, Duration::from_secs(5));
+        assert_eq!(progress_patches(runtime, &mock_server) - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
     }
 
     /// Regression test for the "the toast said it worked, but the write never landed" gap:
