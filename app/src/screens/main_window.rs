@@ -619,7 +619,19 @@ pub fn build(
     let bookmark_action = gtk4::gio::SimpleAction::new("bookmark", None);
     bookmark_action.connect_activate({
         let controller = mini_bar.controller.clone();
-        move |_, _| controller.add_bookmark()
+        // `root`, not a per-screen overlay: this keyboard shortcut works from any tab, exactly
+        // like the playback-error toast above already does.
+        let toast_overlay = root.clone();
+        move |_, _| {
+            let Some(write) = controller.add_bookmark() else { return };
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                match write.await {
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                }
+            });
+        }
     });
     window.add_action(&bookmark_action);
 

@@ -326,15 +326,22 @@ pub fn build(
     content.append(&progress_strip_widget);
 
     let options_menu = crate::widgets::item_options_menu::build(
-        toast_overlay.clone(),
         Some(add_bookmark_button.clone().upcast()),
         {
             let controller = controller.clone();
-            move || controller.mark_as_finished()
+            let toast_overlay = toast_overlay.clone();
+            move || {
+                controller.mark_as_finished();
+                toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
+            }
         },
         {
             let controller = controller.clone();
-            move || controller.reset_progress()
+            let toast_overlay = toast_overlay.clone();
+            move || {
+                controller.reset_progress();
+                toast_overlay.add_toast(adw::Toast::new("Progress reset"));
+            }
         },
     );
     header.pack_end(&options_menu.widget);
@@ -344,9 +351,15 @@ pub fn build(
         let options_popover = options_menu.popover.clone();
         let toast_overlay = toast_overlay.clone();
         move |_| {
-            controller.add_bookmark();
             options_popover.popdown();
-            toast_overlay.add_toast(adw::Toast::new("Bookmark added"));
+            let Some(write) = controller.add_bookmark() else { return };
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                match write.await {
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                }
+            });
         }
     });
     // The skip intervals are read at click time from the controller (Settings → Playback's live

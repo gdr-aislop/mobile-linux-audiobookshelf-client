@@ -351,7 +351,6 @@ pub fn build(
     // "Play", no progress bar" state Pass 1 below already computes for an unstarted/finished
     // item, so there's no need to wait on the async write to know what to show.
     let options_menu = item_options_menu::build(
-        toast_overlay.clone(),
         None,
         {
             let controller = controller.clone();
@@ -363,11 +362,16 @@ pub fn build(
             let duration_seconds_cell = duration_seconds_cell.clone();
             let play_button = play_button.clone();
             let progress_bar = progress_bar.clone();
+            let toast_overlay = toast_overlay.clone();
             move || {
                 play_button.set_label("Play");
                 progress_bar.set_visible(false);
                 if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
+                    // Synchronous from the caller's point of view (the controller's own local
+                    // write is fire-and-forget, same posture as its periodic progress tick) —
+                    // safe to toast success right away, unlike the direct-write branch below.
                     controller.mark_as_finished();
+                    toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
                 } else {
                     let duration_seconds = duration_seconds_cell.get();
                     let pool = pool.clone();
@@ -375,32 +379,29 @@ pub fn build(
                     let account_id = account_id.clone();
                     let server_id = server_id.clone();
                     let item_id = item_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
+                        // The local write is this action's real outcome — the toast reports
+                        // exactly that, not whether the best-effort server push (below) also
+                        // landed, which was never something "Marked as finished" promised.
+                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await;
+                        if let Err(err) = &local_result {
+                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
+                        }
                         match session.connection_target().await {
                             Ok(connection) => {
                                 let access_token = session.access_token().await;
-                                if let Err(err) = abs_core::progress_sync::push_item_progress(
-                                    &pool,
-                                    &connection,
-                                    &access_token,
-                                    &account_id,
-                                    &server_id,
-                                    &item_id,
-                                    duration_seconds,
-                                    duration_seconds,
-                                    true,
-                                )
-                                .await
+                                if let Err(err) =
+                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, duration_seconds, duration_seconds, true).await
                                 {
                                     tracing::warn!(%err, item_id = %item_id, "couldn't push 'mark as finished' to the server; local write already landed");
                                 }
                             }
-                            Err(err) => {
-                                tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only");
-                                if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
-                                }
-                            }
+                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only"),
+                        }
+                        match local_result {
+                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Marked as finished")),
+                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Marking as finished", err),
                         }
                     });
                 }
@@ -416,11 +417,13 @@ pub fn build(
             let duration_seconds_cell = duration_seconds_cell.clone();
             let play_button = play_button.clone();
             let progress_bar = progress_bar.clone();
+            let toast_overlay = toast_overlay.clone();
             move || {
                 play_button.set_label("Play");
                 progress_bar.set_visible(false);
                 if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
                     controller.reset_progress();
+                    toast_overlay.add_toast(adw::Toast::new("Progress reset"));
                 } else {
                     let duration_seconds = duration_seconds_cell.get();
                     let pool = pool.clone();
@@ -428,32 +431,26 @@ pub fn build(
                     let account_id = account_id.clone();
                     let server_id = server_id.clone();
                     let item_id = item_id.clone();
+                    let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
+                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await;
+                        if let Err(err) = &local_result {
+                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
+                        }
                         match session.connection_target().await {
                             Ok(connection) => {
                                 let access_token = session.access_token().await;
-                                if let Err(err) = abs_core::progress_sync::push_item_progress(
-                                    &pool,
-                                    &connection,
-                                    &access_token,
-                                    &account_id,
-                                    &server_id,
-                                    &item_id,
-                                    0.0,
-                                    duration_seconds,
-                                    false,
-                                )
-                                .await
+                                if let Err(err) =
+                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, 0.0, duration_seconds, false).await
                                 {
                                     tracing::warn!(%err, item_id = %item_id, "couldn't push 'reset progress' to the server; local write already landed");
                                 }
                             }
-                            Err(err) => {
-                                tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only");
-                                if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
-                                }
-                            }
+                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only"),
+                        }
+                        match local_result {
+                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Progress reset")),
+                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Resetting progress", err),
                         }
                     });
                 }
@@ -743,7 +740,7 @@ fn format_duration(total_seconds: f64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::test_support::pump_until;
+    use crate::test_support::{any_label_reads, pump_until};
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1113,6 +1110,9 @@ pub(crate) mod tests {
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
         assert_eq!(progress.current_time_seconds, 3600.0, "should be recorded at the item's full duration");
 
+        // The local write (polled above) and the server push are two separate awaits in
+        // sequence, not one atomic step — the local write landing is not proof the push has too.
+        pump_until(|| runtime.block_on(mock_server.received_requests()).unwrap().len() - requests_before == 1, Duration::from_secs(5));
         let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
         assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
     }
@@ -1149,8 +1149,47 @@ pub(crate) mod tests {
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
         assert!(!progress.is_finished);
 
+        // The local write (polled above) and the server push are two separate awaits in
+        // sequence, not one atomic step — the local write landing is not proof the push has too.
+        pump_until(|| runtime.block_on(mock_server.received_requests()).unwrap().len() - requests_before == 1, Duration::from_secs(5));
         let requests_after = runtime.block_on(mock_server.received_requests()).unwrap();
         assert_eq!(requests_after.len() - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+    }
+
+    /// Regression test for the "the toast said it worked, but the write never landed" gap:
+    /// before this, "Mark as finished" toasted unconditionally, synchronously, whether or not the
+    /// direct write actually succeeded. Forces a real failure (the item was never synced locally,
+    /// so `progress`'s `FOREIGN KEY (server_id, item_id) REFERENCES items` rejects the insert) and
+    /// asserts the failure toast, not "Marked as finished", is what actually shows.
+    pub(crate) fn run_options_menu_direct_write_failure_toasts_the_failure(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // Deliberately no `insert_synced_item` — "item-1" doesn't exist in the local `items`
+        // table, so `progress`'s FK constraint makes the direct write fail for real.
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.mark_as_finished_button.emit_clicked();
+
+        pump_until(|| any_label_reads(&screen.root, "Marking as finished failed — try again"), Duration::from_secs(5));
+        assert!(
+            any_label_reads(&screen.root, "Marking as finished failed — try again"),
+            "a real write failure must toast the failure, not claim success"
+        );
+        assert!(!any_label_reads(&screen.root, "Marked as finished"), "the success toast must not also appear");
+
+        window.destroy();
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. When this item *is* the one currently

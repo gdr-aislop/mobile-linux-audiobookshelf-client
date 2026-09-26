@@ -221,6 +221,7 @@ mod tests {
         (item_detail_series_button_stays_hidden_when_the_item_has_no_series, crate::screens::item_detail::tests::run_series_button_stays_hidden_when_the_item_has_no_series),
         (item_detail_action_buttons_render_equal_heights, crate::screens::item_detail::tests::run_action_buttons_render_equal_heights),
         (item_detail_options_menu_marks_finished_via_direct_write_when_not_currently_playing, crate::screens::item_detail::tests::run_options_menu_marks_finished_via_direct_write_when_not_currently_playing),
+        (item_detail_options_menu_direct_write_failure_toasts_the_failure, crate::screens::item_detail::tests::run_options_menu_direct_write_failure_toasts_the_failure),
         (item_detail_options_menu_resets_progress_via_direct_write_when_not_currently_playing, crate::screens::item_detail::tests::run_options_menu_resets_progress_via_direct_write_when_not_currently_playing),
         (item_detail_options_menu_delegates_to_the_live_controller_when_this_item_is_playing, crate::screens::item_detail::tests::run_options_menu_delegates_to_the_live_controller_when_this_item_is_playing),
         (item_card_renders, |_rt| crate::widgets::item_card::tests::run()),

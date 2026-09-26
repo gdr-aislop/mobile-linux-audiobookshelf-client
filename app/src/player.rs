@@ -589,10 +589,13 @@ impl PlayerController {
 
     /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
     /// same precedent as `write_progress`'s local half: a plain repo write, no server sync, since
-    /// none is specified for bookmarks. A no-op if nothing is playing.
-    pub fn add_bookmark(&self) {
+    /// none is specified for bookmarks. `None` if nothing is playing; otherwise the write itself,
+    /// handed back rather than spawned in here, so the caller (whose own toast is the only honest
+    /// place to report "Bookmark added" — this was a bare, unconditional toast before, showing
+    /// success whether or not the write actually landed) can await the real outcome instead.
+    pub fn add_bookmark(&self) -> Option<impl std::future::Future<Output = Result<(), abs_storage::StorageError>> + 'static> {
         let inner = self.inner.borrow();
-        let Some(now_playing) = &inner.now_playing else { return };
+        let now_playing = inner.now_playing.as_ref()?;
         let pool = inner.pool.clone();
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
@@ -600,11 +603,7 @@ impl PlayerController {
         let position = inner.book_position();
         drop(inner);
 
-        glib::spawn_future_local(async move {
-            if let Err(err) = abs_storage::repo::bookmarks::add(&pool, &account_id, &server_id, &item_id, position).await {
-                tracing::warn!(%err, "couldn't save bookmark");
-            }
-        });
+        Some(async move { abs_storage::repo::bookmarks::add(&pool, &account_id, &server_id, &item_id, position).await.map(|_id| ()) })
     }
 
     /// Pauses (if playing) and marks the current item finished at its full duration — the same
@@ -2110,7 +2109,12 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
 
-        controller.add_bookmark();
+        // `add_bookmark` hands back the write rather than spawning it itself (see its own doc
+        // comment) — the caller (here, and every real call site) is what actually runs it.
+        let write = controller.add_bookmark().expect("something is playing, so a bookmark can be added");
+        glib::spawn_future_local(async move {
+            write.await.expect("the bookmark write should succeed");
+        });
         pump_until(|| false, Duration::from_millis(300));
 
         let count: i64 =
