@@ -11,7 +11,7 @@
 //! wide-screen sidebar layout (`AdwNavigationSplitView`/`AdwBreakpoint`, both v1.4+) — phone-width
 //! single-pane only, left as a documented follow-up.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use abs_player::call_watch::CallWatcher;
@@ -325,6 +325,20 @@ pub fn build(
                 }
             }
             *last = new_kind;
+        }
+    });
+
+    // One toast per progress-sync failure *episode*, same rate-limiting idea as the playback
+    // error toast above: a sync is attempted every few minutes while playing, and a dead server
+    // must not toast on every attempt. A successful sync ends the episode; a failure of a
+    // different kind (session expired after a network outage) is news, so it toasts too.
+    mini_bar.controller.set_on_progress_sync({
+        let toast_overlay = root.clone();
+        let last_failure: Rc<Cell<Option<player::ProgressSyncOutcome>>> = Rc::new(Cell::new(None));
+        move |outcome| {
+            if let Some(title) = progress_sync_toast(&last_failure, outcome) {
+                toast_overlay.add_toast(adw::Toast::new(title));
+            }
         }
     });
 
@@ -713,6 +727,55 @@ pub fn build(
             toast_overlay: toast_overlay_hook,
             resume_on_replug_switch: settings_screen.hooks.resume_on_replug_switch,
         },
+    }
+}
+
+/// What to toast, if anything, for one progress-sync outcome. `last_failure` carries the
+/// current failure episode between calls: a success ends it, a repeat of the same failure stays
+/// quiet, and a different kind of failure toasts again.
+pub(crate) fn progress_sync_toast(last_failure: &Cell<Option<player::ProgressSyncOutcome>>, outcome: player::ProgressSyncOutcome) -> Option<&'static str> {
+    use player::ProgressSyncOutcome;
+    if outcome == ProgressSyncOutcome::Synced {
+        last_failure.set(None);
+        return None;
+    }
+    if last_failure.replace(Some(outcome)) == Some(outcome) {
+        return None;
+    }
+    Some(match outcome {
+        ProgressSyncOutcome::SessionExpired => "Session expired — progress isn't syncing. Log in again",
+        _ => "Failed to sync progress — will retry",
+    })
+}
+
+#[cfg(test)]
+mod progress_sync_toast_tests {
+    use std::cell::Cell;
+
+    use super::progress_sync_toast;
+    use crate::player::ProgressSyncOutcome::{Failed, SessionExpired, Synced};
+
+    #[test]
+    fn toasts_once_per_failure_episode() {
+        let last = Cell::new(None);
+        assert_eq!(progress_sync_toast(&last, Synced), None);
+        assert_eq!(progress_sync_toast(&last, Failed), Some("Failed to sync progress — will retry"));
+        assert_eq!(progress_sync_toast(&last, Failed), None, "a repeat of the same failure stays quiet");
+        assert_eq!(progress_sync_toast(&last, Failed), None);
+        assert_eq!(progress_sync_toast(&last, Synced), None, "a success ends the episode quietly");
+        assert_eq!(progress_sync_toast(&last, Failed), Some("Failed to sync progress — will retry"), "a new episode toasts again");
+    }
+
+    #[test]
+    fn a_different_kind_of_failure_toasts_again() {
+        let last = Cell::new(None);
+        assert!(progress_sync_toast(&last, Failed).is_some());
+        assert_eq!(
+            progress_sync_toast(&last, SessionExpired),
+            Some("Session expired — progress isn't syncing. Log in again"),
+            "an expired session is news even mid-outage"
+        );
+        assert_eq!(progress_sync_toast(&last, SessionExpired), None);
     }
 }
 

@@ -248,6 +248,7 @@ mod tests {
         (connection_advanced_rows_persist_and_edit, crate::screens::connection::tests::run_advanced_rows_persist_and_edit),
         (connection_editor_persist_failures_show_inline, crate::screens::connection::tests::run_editor_persist_failures_show_inline),
         (playback_start_and_pause_persists_progress, crate::player::tests::run_start_and_pause_persists_progress),
+        (playback_progress_sync_reports_each_outcome, crate::player::tests::run_progress_sync_reports_each_outcome),
         (playback_start_with_no_working_audio_engine_still_opens_with_an_error, crate::player::tests::run_start_with_no_working_audio_engine_still_opens_with_an_error),
         (playback_start_with_an_expired_session_and_nothing_cached_shows_a_login_error, crate::player::tests::run_start_with_an_expired_session_and_nothing_cached_shows_a_login_error),
         (playback_downloaded_track_is_preferred_over_streaming, crate::player::tests::run_downloaded_track_is_preferred_over_streaming),

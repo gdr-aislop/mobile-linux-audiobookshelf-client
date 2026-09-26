@@ -156,6 +156,20 @@ struct NowPlaying {
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
 
+/// How one background push of playback progress to the server ended — see
+/// `PlayerController::set_on_progress_sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressSyncOutcome {
+    Synced,
+    /// The server said the session is no longer valid; retrying won't help until the user logs
+    /// in again.
+    SessionExpired,
+    /// Anything else (unreachable server, server error). The next periodic sync retries.
+    Failed,
+}
+
+type ProgressSyncListener = Rc<dyn Fn(ProgressSyncOutcome)>;
+
 struct Inner {
     backend: Box<dyn abs_player::AudioBackend>,
     pool: SqlitePool,
@@ -196,6 +210,9 @@ struct Inner {
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
     /// same shape as `pause_on_unplug`/`resume_on_replug` above.
     burst_buffering: bool,
+    /// Told how every server progress push ended. Without it a sync failure only reached the
+    /// log, and a user could listen for hours with nothing synced and no idea.
+    on_progress_sync: Option<ProgressSyncListener>,
 }
 
 impl Inner {
@@ -266,6 +283,7 @@ impl Inner {
         let item_id = now_playing.item_id.clone();
         let session = now_playing.session.clone();
         let duration_seconds = now_playing.duration_seconds;
+        let on_progress_sync = self.on_progress_sync.clone();
         self.last_progress_write = Instant::now();
 
         let sync_now = force_server_sync || self.last_server_sync.elapsed() >= SERVER_PROGRESS_SYNC_INTERVAL;
@@ -289,17 +307,29 @@ impl Inner {
             // holds open — as long as neither has actually changed, which for this call site (the
             // most frequent server-facing one in the app, while playing) is what keeps a periodic
             // background sync from costing a fresh TLS handshake every time.
+            let report = |outcome| {
+                if let Some(on_progress_sync) = &on_progress_sync {
+                    on_progress_sync(outcome);
+                }
+            };
+            let outcome_of = |err: &abs_core::CoreError| match err {
+                abs_core::CoreError::Auth => ProgressSyncOutcome::SessionExpired,
+                _ => ProgressSyncOutcome::Failed,
+            };
             let api = match session.api_client().await {
                 Ok(api) => api,
                 Err(err) => {
                     tracing::warn!(%err, "couldn't build an API client for this server; progress stays local");
+                    report(outcome_of(&err));
                     return;
                 }
             };
-            if let Err(err) =
-                abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await
-            {
-                tracing::warn!(%err, "couldn't sync playback progress to the server");
+            match abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await {
+                Ok(()) => report(ProgressSyncOutcome::Synced),
+                Err(err) => {
+                    tracing::warn!(%err, "couldn't sync playback progress to the server");
+                    report(outcome_of(&err));
+                }
             }
         });
     }
@@ -486,6 +516,7 @@ impl PlayerController {
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
+                on_progress_sync: None,
             })),
             tick_source: Rc::new(RefCell::new(None)),
         }
@@ -1065,6 +1096,12 @@ impl PlayerController {
     /// `set_headphone_behavior`). Takes effect on the *next* track load — an already-loaded
     /// pipeline's fetch strategy doesn't change retroactively (see `AudioBackend::
     /// set_burst_buffering`'s doc comment).
+    /// Registers the one listener told how each background progress push to the server ended.
+    /// The shell uses it to toast a sync failure once per failure episode.
+    pub fn set_on_progress_sync(&self, listener: impl Fn(ProgressSyncOutcome) + 'static) {
+        self.inner.borrow_mut().on_progress_sync = Some(Rc::new(listener));
+    }
+
     pub fn set_burst_buffering(&self, enabled: bool) {
         let mut inner = self.inner.borrow_mut();
         inner.burst_buffering = enabled;
@@ -1856,6 +1893,58 @@ pub(crate) mod tests {
             .expect("pausing should also sync progress to the server");
         let body: serde_json::Value = progress_sync.body_json().unwrap();
         assert_eq!(body["isFinished"], false);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Every server progress push reports
+    /// how it ended, so the shell can tell the user when progress stops syncing. A 401 is told
+    /// apart from other failures, since only logging in again fixes it.
+    pub(crate) fn run_progress_sync_reports_each_outcome(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 30));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let outcomes: Rc<RefCell<Vec<ProgressSyncOutcome>>> = Rc::new(RefCell::new(Vec::new()));
+        controller.set_on_progress_sync({
+            let outcomes = outcomes.clone();
+            move |outcome| outcomes.borrow_mut().push(outcome)
+        });
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        outcomes.borrow_mut().clear();
+
+        // Each one-shot, higher-priority response overrides the item's default 200 for exactly
+        // one PATCH; `pause()` always forces a server push.
+        let pause_with = |status: Option<u16>| {
+            if let Some(status) = status {
+                runtime.block_on(
+                    Mock::given(method("PATCH"))
+                        .and(path("/api/me/progress/item-1"))
+                        .respond_with(ResponseTemplate::new(status))
+                        .up_to_n_times(1)
+                        .with_priority(1)
+                        .mount(&mock_server),
+                );
+            }
+            let seen = outcomes.borrow().len();
+            controller.play();
+            controller.pause();
+            pump_until(|| outcomes.borrow().len() > seen, Duration::from_secs(5));
+            outcomes.borrow().last().copied()
+        };
+
+        assert_eq!(pause_with(Some(500)), Some(ProgressSyncOutcome::Failed), "a server error is a retryable failure");
+        assert_eq!(pause_with(Some(401)), Some(ProgressSyncOutcome::SessionExpired), "a 401 means the session is gone");
+        assert_eq!(pause_with(None), Some(ProgressSyncOutcome::Synced), "a working server reports success");
         controller.stop();
     }
 
