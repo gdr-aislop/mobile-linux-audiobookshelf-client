@@ -6,6 +6,7 @@ mod offline_mode;
 mod player;
 mod rich_text;
 mod screens;
+mod sync_coordinator;
 #[cfg(test)]
 mod test_support;
 mod widgets;

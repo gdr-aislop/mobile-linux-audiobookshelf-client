@@ -30,6 +30,13 @@ pub struct PlaybackSettings {
     /// AntennaPod's "unpause on reconnection"): auto-resuming at an arbitrary later moment is
     /// more surprising than useful.
     pub resume_on_headphone_replug: bool,
+    /// Whether network playback downloads ahead at full speed (`playbin`'s download-buffering
+    /// mode) instead of trickling in at roughly the audio bitrate. On by default: a radio that
+    /// only wakes for a burst every so often, then idles, uses noticeably less battery than one
+    /// kept in a low-power-but-active state continuously for the length of a stream. Off is for a
+    /// slow or capped connection, where downloading ahead of what's actually being listened to
+    /// wastes data the user may not want spent.
+    pub burst_buffering: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -42,6 +49,7 @@ impl Default for PlaybackSettings {
             wifi_only_downloads: true,
             pause_on_headphone_unplug: true,
             resume_on_headphone_replug: false,
+            burst_buffering: true,
         }
     }
 }
@@ -54,6 +62,7 @@ mod keys {
     pub const WIFI_ONLY_DOWNLOADS: &str = "playback.wifi_only_downloads";
     pub const PAUSE_ON_HEADPHONE_UNPLUG: &str = "playback.pause_on_headphone_unplug";
     pub const RESUME_ON_HEADPHONE_REPLUG: &str = "playback.resume_on_headphone_replug";
+    pub const BURST_BUFFERING: &str = "playback.burst_buffering";
     pub const THEME: &str = "appearance.theme";
     pub const DOWNLOADED_ONLY: &str = "library.downloaded_only";
     pub const HIDE_FINISHED: &str = "library.hide_finished";
@@ -101,6 +110,7 @@ pub async fn load_playback_settings(pool: &SqlitePool) -> Result<PlaybackSetting
             defaults.resume_on_headphone_replug,
         )
         .await?,
+        burst_buffering: parse_or_default(pool, keys::BURST_BUFFERING, defaults.burst_buffering).await?,
     })
 }
 
@@ -117,6 +127,7 @@ pub async fn save_playback_settings(pool: &SqlitePool, settings: &PlaybackSettin
     kv::set(pool, keys::WIFI_ONLY_DOWNLOADS, &settings.wifi_only_downloads.to_string()).await?;
     kv::set(pool, keys::PAUSE_ON_HEADPHONE_UNPLUG, &settings.pause_on_headphone_unplug.to_string()).await?;
     kv::set(pool, keys::RESUME_ON_HEADPHONE_REPLUG, &settings.resume_on_headphone_replug.to_string()).await?;
+    kv::set(pool, keys::BURST_BUFFERING, &settings.burst_buffering.to_string()).await?;
     Ok(())
 }
 
@@ -346,6 +357,7 @@ mod tests {
             wifi_only_downloads: false,
             pause_on_headphone_unplug: false,
             resume_on_headphone_replug: true,
+            burst_buffering: false,
         };
         save_playback_settings(&pool, &settings).await.unwrap();
         assert_eq!(load_playback_settings(&pool).await.unwrap(), settings);

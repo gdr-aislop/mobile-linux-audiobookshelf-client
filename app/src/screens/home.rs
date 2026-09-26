@@ -594,16 +594,35 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
             return;
         }
     }
+
+    // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Library
+    // does the exact same thing for the same account, since both screens are built eagerly. Only
+    // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
+    // trigger is user-initiated and always runs for real regardless — nothing else races it.
+    let is_automatic = manual.is_none();
+    if is_automatic {
+        let server_id = ctx.server.id.clone();
+        let account_id = ctx.account.id.clone();
+        if !crate::sync_coordinator::claim_startup_sync(&server_id, &account_id) {
+            let pool = ctx.pool.clone();
+            glib::spawn_future_local(render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()));
+            // Separate bindings for the borrow `on_completed` takes vs. what the closure below
+            // moves — borrowing `server_id`/`account_id` themselves here would conflict with the
+            // `move` closure's own capture of them, evaluated as part of the same call.
+            let (claim_server_id, claim_account_id) = (server_id.clone(), account_id.clone());
+            crate::sync_coordinator::on_completed(&claim_server_id, &claim_account_id, move || {
+                glib::spawn_future_local(render_from_cache(pool, server_id, account_id, widgets));
+            });
+            return;
+        }
+    }
+
     glib::spawn_future_local(async move {
         let SyncCtx { pool, paths, server, account, session } = ctx;
         let server_id = server.id.clone();
         let account_id = account.id.clone();
 
-        if let Ok(data) = load(&pool, &server_id, &account_id).await {
-            if !data.libraries.is_empty() {
-                apply(&data, &widgets);
-            }
-        }
+        render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()).await;
 
         let spawned_sync = tokio::spawn({
             let pool = pool.clone();
@@ -737,7 +756,27 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         if let Some(manual) = manual {
             manual.finish(manual_ok);
         }
+
+        // Only the cycle that actually claimed the automatic sync (see above) reports back —
+        // Library, if it lost the claim, is waiting on exactly this to re-render from what just
+        // landed.
+        if is_automatic {
+            crate::sync_coordinator::mark_completed(&server_id, &account_id);
+        }
     });
+}
+
+/// Reads whatever's currently cached locally and renders it — never talks to the network. Used
+/// both as the ordinary "show cached data immediately, before syncing" step of a real cycle, and
+/// as the *entire* response for a screen that lost the automatic-sync claim (see
+/// `sync_coordinator`): called once right away and once more when the winning screen's own cycle
+/// completes.
+async fn render_from_cache(pool: SqlitePool, server_id: String, account_id: String, widgets: HomeWidgets) {
+    if let Ok(data) = load(&pool, &server_id, &account_id).await {
+        if !data.libraries.is_empty() {
+            apply(&data, &widgets);
+        }
+    }
 }
 
 /// Reads whatever's currently cached locally — never talks to the network. Called once before

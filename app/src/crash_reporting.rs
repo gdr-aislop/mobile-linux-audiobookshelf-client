@@ -19,6 +19,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[derive(Clone)]
 struct BufferedLogWriter {
     inner: Arc<Mutex<std::io::BufWriter<RollingFileAppender>>>,
+    /// Set on every `write`, cleared by `flush` — lets the periodic flush thread skip the
+    /// syscall (and the mutex lock) entirely on a tick where nothing was logged, rather than
+    /// waking every minute to flush zero bytes for as long as the app sits idle.
+    dirty: Arc<AtomicBool>,
 }
 
 /// Ordinary logging traffic over a minute of normal use shouldn't approach this before the
@@ -49,19 +54,33 @@ const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 impl BufferedLogWriter {
     fn new(appender: RollingFileAppender) -> Self {
-        Self { inner: Arc::new(Mutex::new(std::io::BufWriter::with_capacity(LOG_BUFFER_CAPACITY, appender))) }
+        Self {
+            inner: Arc::new(Mutex::new(std::io::BufWriter::with_capacity(LOG_BUFFER_CAPACITY, appender))),
+            dirty: Arc::new(AtomicBool::new(false)),
+        }
     }
 
+    /// Flushes only if something was written since the last flush — used both by the periodic
+    /// timer (so an app sitting idle doesn't lock the mutex and hit the OS every minute for zero
+    /// bytes) and by [`install_panic_hook`]'s hook: a panic always logs its own backtrace
+    /// immediately beforehand, which is what actually needs flushing, so `dirty` is already true
+    /// by the time that call lands here — this never skips a flush a panic depends on.
     fn flush(&self) {
-        if let Ok(mut writer) = self.inner.lock() {
-            let _ = writer.flush();
+        if self.dirty.swap(false, Ordering::Relaxed) {
+            if let Ok(mut writer) = self.inner.lock() {
+                let _ = writer.flush();
+            }
         }
     }
 }
 
 impl Write for BufferedLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.lock().expect("log writer mutex").write(buf)
+        let written = self.inner.lock().expect("log writer mutex").write(buf)?;
+        if written > 0 {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

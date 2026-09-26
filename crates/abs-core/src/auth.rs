@@ -65,6 +65,9 @@ struct SessionInner {
     /// connection it was made for, and so tests sharing a process can't leak verdicts to each
     /// other through a global cache.
     probe_cache: tokio::sync::Mutex<Option<CachedProbe>>,
+    /// The last `abs_api::Client` minted for this session, plus the exact `(ConnectionTarget,
+    /// access token)` it was minted for — see [`Session::api_client`].
+    client_cache: tokio::sync::Mutex<Option<CachedClient>>,
 }
 
 #[derive(Clone)]
@@ -77,6 +80,15 @@ struct CachedProbe {
     address: String,
     reachable: bool,
     at: std::time::Instant,
+}
+
+/// A minted `abs_api::Client`, tagged with exactly what it was minted for — comparing these two
+/// fields is how [`Session::api_client`] knows whether the cached client is still good, without
+/// having to inspect the client itself (which owns an opaque `reqwest::Client`).
+struct CachedClient {
+    target: crate::connection::ConnectionTarget,
+    access_token: String,
+    client: abs_api::Client,
 }
 
 impl Session {
@@ -97,6 +109,7 @@ impl Session {
                     refresh_token: account.refresh_token.clone(),
                 }),
                 probe_cache: tokio::sync::Mutex::new(None),
+                client_cache: tokio::sync::Mutex::new(None),
             }),
         }
     }
@@ -217,6 +230,38 @@ impl Session {
         }
 
         tokens.access_token.clone()
+    }
+
+    /// A ready-to-use authenticated `abs_api::Client` for this session's server, reused across
+    /// calls as long as the resolved connection and the current access token haven't changed
+    /// since the last mint. Minting a client from scratch does a full CA-store parse and TLS
+    /// config build (and the first request on it a fresh TCP+TLS handshake, since a brand-new
+    /// client starts with an empty connection pool) — real, measurable CPU, and on a phone a
+    /// radio wakeup too. That cost is fine once per user action, but callers that mint on a
+    /// timer (the playback-progress sync, most notably) used to pay it every single tick; this is
+    /// the shared cache that stops that. `access_token()` and `connection_target()` are still
+    /// asked fresh on every call — this only skips *minting a new client* when both come back
+    /// unchanged, so a token refresh or a settings edit is still picked up immediately.
+    ///
+    /// Callers that need a specific timeout (covers, downloads — deliberately short so a bad
+    /// connection isn't felt as a hang) keep minting directly via `ConnectionTarget::api_client`/
+    /// `api_client_with_timeout`, uncached; this is for the standard-timeout, called-often case.
+    pub async fn api_client(&self) -> crate::error::Result<abs_api::Client> {
+        let target = self.connection_target().await?;
+        let access_token = self.access_token().await;
+
+        let mut cache = self.inner.client_cache.lock().await;
+        if let Some(cached) = cache.as_ref() {
+            if cached.target == target && cached.access_token == access_token {
+                return Ok(cached.client.clone());
+            }
+        }
+
+        let client = target
+            .api_client(&access_token)
+            .map_err(|err| crate::error::CoreError::UnexpectedResponse(err.to_string()))?;
+        *cache = Some(CachedClient { target, access_token, client: client.clone() });
+        Ok(client)
     }
 }
 

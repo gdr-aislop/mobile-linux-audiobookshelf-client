@@ -132,6 +132,22 @@ pub async fn sync_progress_to_server(
     let api = connection
         .api_client(access_token)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+    sync_progress_to_server_with_client(&api, item_id, current_time_seconds, duration_seconds, is_finished).await
+}
+
+/// Same as [`sync_progress_to_server`], but against an already-minted client instead of building
+/// one from a connection + token — for callers that maintain their own client cache
+/// (`abs_core::auth::Session::api_client`) rather than minting fresh on every call. The player's
+/// periodic progress sync is the motivating (and, as of this writing, only) caller: it runs often
+/// enough while playing that minting a fresh `reqwest::Client` — a full TLS config build, then a
+/// fresh handshake on first use — every single time was real, avoidable overhead.
+pub async fn sync_progress_to_server_with_client(
+    api: &abs_api::Client,
+    item_id: &str,
+    current_time_seconds: f64,
+    duration_seconds: f64,
+    is_finished: bool,
+) -> Result<()> {
     api.update_media_progress(item_id, current_time_seconds, duration_seconds, is_finished)
         .await
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))

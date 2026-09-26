@@ -109,6 +109,13 @@ pub trait AudioBackend {
     fn duration(&self) -> Option<Duration>;
     /// Non-blocking: returns the next pending bus event, if any, without waiting.
     fn poll_event(&self) -> Option<PlayerEvent>;
+    /// Whether the **next** `load()` of a network-streamed URI should download ahead at full
+    /// speed (bursting, then idling — better for battery) rather than trickling in at roughly the
+    /// audio bitrate (the default; better for a slow or capped connection). Mirrors
+    /// `apply_connection`'s "takes effect on the next load" contract — see `GstBackend`'s impl
+    /// for why this can't be changed on an already-loaded pipeline. Local files are unaffected
+    /// either way.
+    fn set_burst_buffering(&mut self, enabled: bool);
 }
 
 /// A `playbin`-based [`AudioBackend`]. Uses an explicit `fakesink` audio sink when constructed
@@ -121,6 +128,12 @@ pub struct GstBackend {
     /// GStreamer creates (and hands over) a fresh HTTP source per `load()`, so the properties
     /// can't be set on an element once — they have to be re-read at each source setup.
     connection_properties: std::sync::Arc<std::sync::Mutex<ConnectionProperties>>,
+    /// Applied to `playbin`'s own `flags`/`ring-buffer-max-size` properties at the start of every
+    /// `load()` (see `set_burst_buffering`'s doc comment for why it can't just be set once).
+    /// Defaults to `true` — matches `PlaybackSettings::default()` — production always overrides
+    /// this explicitly right after construction, same as `PlayerController`'s other
+    /// settings-derived fields.
+    burst_buffering: bool,
 }
 
 impl GstBackend {
@@ -159,7 +172,7 @@ impl GstBackend {
             // creates internally), not up front.
             None => apply_stream_role_when_sink_is_ready(&pipeline),
         }
-        Ok(Self { pipeline, current_speed: 1.0, connection_properties })
+        Ok(Self { pipeline, current_speed: 1.0, connection_properties, burst_buffering: true })
     }
 
     fn bus(&self) -> gst::Bus {
@@ -200,6 +213,7 @@ fn connect_source_setup(pipeline: &gst::Element, properties: std::sync::Arc<std:
 impl AudioBackend for GstBackend {
     fn load(&mut self, uri: &str) -> Result<()> {
         self.pipeline.set_state(gst::State::Null)?;
+        apply_burst_buffering(&self.pipeline, self.burst_buffering);
         self.pipeline.set_property("uri", uri);
         self.current_speed = 1.0;
         Ok(())
@@ -275,11 +289,55 @@ impl AudioBackend for GstBackend {
             }
         }
     }
+
+    fn set_burst_buffering(&mut self, enabled: bool) {
+        self.burst_buffering = enabled;
+        // Deliberately not applied to `self.pipeline` here: `playbin`'s buffering strategy is
+        // read once as the pipeline transitions out of `NULL`, so changing it while a stream is
+        // already loaded/playing wouldn't retroactively change how it's fetching — `load()` is
+        // the only point this can take effect, same contract as `apply_connection`.
+    }
 }
 
 impl Drop for GstBackend {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// The `GST_PLAY_FLAG_DOWNLOAD` bit of `playbin`'s `flags` property (a plugin-defined
+/// `GstPlayFlags`, not part of core GStreamer, so gstreamer-rs has no static binding for it —
+/// see `apply_burst_buffering`). Value from `playbin`'s own flag ordering: VIDEO, AUDIO, TEXT,
+/// VIS, SOFT_VOLUME, NATIVE_AUDIO, NATIVE_VIDEO, DOWNLOAD is the 8th (bit 7).
+const GST_PLAY_FLAG_DOWNLOAD: u32 = 1 << 7;
+
+/// 64 MiB — generous for an audiobook chapter (typically a few MB to a few tens of MB at
+/// spoken-word bitrates), so download mode can fetch a whole file ahead and let the radio idle,
+/// without holding an unbounded amount of a very long chapter in memory/temp storage at once.
+const BURST_RING_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Applies (or clears) `playbin`'s download-buffering mode: with it on, the HTTP source fetches
+/// ahead at full speed into a ring buffer instead of trickling in at roughly the audio bitrate —
+/// better for battery (the radio gets to idle between bursts) at the cost of downloading data
+/// that might go unlistened if playback stops early. `flags` is a `GstPlayFlags`, a type the
+/// `playbin` element itself registers at runtime — gstreamer-rs has no static Rust binding for it
+/// (unlike `gst::State` et al.), so this goes through `glib::FlagsClass` generically, the same way
+/// the upstream gstreamer-rs `playbin` examples do. Silently leaves the setting unapplied (logged)
+/// if `flags` isn't actually a flags-typed property — would mean a `playbin` factory that changed
+/// shape in a way this code doesn't understand, not something a user action can trigger.
+fn apply_burst_buffering(pipeline: &gst::Element, enabled: bool) {
+    let flags_value = pipeline.property_value("flags");
+    let Some(flags_class) = glib::FlagsClass::with_type(flags_value.type_()) else {
+        tracing::warn!("playbin's \"flags\" property isn't a flags type; couldn't apply the burst-buffering setting");
+        return;
+    };
+    let updated = if enabled { flags_class.set(flags_value, GST_PLAY_FLAG_DOWNLOAD) } else { flags_class.unset(flags_value, GST_PLAY_FLAG_DOWNLOAD) };
+    match updated {
+        Ok(value) => {
+            pipeline.set_property_from_value("flags", &value);
+            pipeline.set_property("ring-buffer-max-size", if enabled { BURST_RING_BUFFER_BYTES } else { 0 });
+        }
+        Err(_) => tracing::warn!("couldn't set playbin's download-buffering flag"),
     }
 }
 

@@ -141,11 +141,17 @@ pub fn build(
         .css_classes(["circular"])
         .child(&gtk4::Image::from_icon_name("media-seek-backward-symbolic"))
         .build();
+    // A persistent icon, updated in place via `set_icon_name` (see `update` below) rather than a
+    // fresh `gtk4::Image::from_icon_name` per snapshot — this screen's `update` closure runs once
+    // per player tick (4 times a second while playing), and allocating and swapping in a whole
+    // new child widget that often, whether or not the playing state actually changed, forced a
+    // needless relayout on every firing. The mini bar's own play icon already gets this right.
+    let play_icon = gtk4::Image::from_icon_name("media-playback-pause-symbolic");
     let play_button = gtk4::Button::builder()
         .css_classes(["circular", "suggested-action"])
         .width_request(72)
         .height_request(72)
-        .child(&gtk4::Image::from_icon_name("media-playback-pause-symbolic"))
+        .child(&play_icon)
         .build();
     let skip_forward = gtk4::Button::builder()
         .css_classes(["circular"])
@@ -460,7 +466,7 @@ pub fn build(
     let update = {
         let title_label = title_label.clone();
         let author_label = author_label.clone();
-        let play_button = play_button.clone();
+        let play_icon = play_icon.clone();
         let scrubber = scrubber.clone();
         let elapsed_label = elapsed_label.clone();
         let remaining_label = remaining_label.clone();
@@ -473,11 +479,11 @@ pub fn build(
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
             author_label.set_visible(snapshot.author.is_some());
             cover.set_path(snapshot.cover_path.as_deref());
-            play_button.set_child(Some(&gtk4::Image::from_icon_name(if snapshot.is_playing {
+            play_icon.set_icon_name(Some(if snapshot.is_playing {
                 "media-playback-pause-symbolic"
             } else {
                 "media-playback-start-symbolic"
-            })));
+            }));
 
             let fraction = if snapshot.duration_seconds > 0.0 {
                 (snapshot.position_seconds / snapshot.duration_seconds).clamp(0.0, 1.0)

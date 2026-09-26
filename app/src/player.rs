@@ -60,7 +60,18 @@ fn playback_properties(connection: &abs_core::connection::ConnectionTarget) -> a
 }
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
-const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the *local* progress row is refreshed while playing, from the periodic tick — cheap
+/// (a WAL-mode SQLite upsert, no network) and worth keeping frequent so "Continue Listening"
+/// never looks far behind.
+const LOCAL_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often that same periodic tick additionally pushes progress to the *server* while playing.
+/// Deliberately much coarser than the local write: syncing costs a real HTTP round trip (a radio
+/// wakeup on a phone, even with `Session::api_client`'s client cache removing the handshake), and
+/// every meaningful state change (pause, end-of-book, a sleep timer firing, switching items) has
+/// its own explicit `write_progress` call that syncs immediately regardless of this interval — see
+/// `write_progress_at`'s `force_server_sync`. 15s matches the interval Audiobookshelf's official
+/// clients use for the same "still playing" push.
+const SERVER_PROGRESS_SYNC_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct PlayRequest {
@@ -156,7 +167,14 @@ struct Inner {
     /// optional slot toggled as the full player screen opens/closes.
     listeners: Vec<SnapshotListener>,
     full_update: Option<SnapshotListener>,
+    /// When the local progress row was last refreshed — the periodic tick's own throttle (see
+    /// `LOCAL_PROGRESS_WRITE_INTERVAL`).
     last_progress_write: Instant,
+    /// When progress was last actually pushed to the server — the periodic tick's separate,
+    /// coarser throttle (see `SERVER_PROGRESS_SYNC_INTERVAL`). Every explicit `write_progress`
+    /// call (pause, end-of-book, a sleep timer firing, ...) still syncs immediately and updates
+    /// this too, so the tick never re-syncs something an explicit action just pushed a moment ago.
+    last_server_sync: Instant,
     /// Headphone unplug behavior, from `PlaybackSettings` (Settings → Playback) — see
     /// `handle_route_event`.
     pause_on_unplug: bool,
@@ -173,6 +191,11 @@ struct Inner {
     /// to a manual pause, a phone call, a sleep timer or end-of-book). Only a pause this specific
     /// may ever be lifted by a replug. Cleared by every other pause path.
     paused_by_unplug: bool,
+    /// Mirrors whatever was last forwarded to `backend.set_burst_buffering` — the backend itself
+    /// has no getter (it's a `Box<dyn AudioBackend>`), so this is what `PlayerController`'s own
+    /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
+    /// same shape as `pause_on_unplug`/`resume_on_replug` above.
+    burst_buffering: bool,
 }
 
 impl Inner {
@@ -212,22 +235,30 @@ impl Inner {
         }
     }
 
-    /// Fire-and-forget: spawns the actual DB write (and, best-effort, the server sync) rather
-    /// than awaiting them, since every call site is a synchronous GTK signal handler or the tick
-    /// timer, neither of which can await. Captures the position/ids up front rather than
-    /// re-reading `self` from inside the spawned future. Reads the current position from the
-    /// backend — for a write at an explicit position instead (marking finished, resetting),
-    /// see `write_progress_at`.
+    /// Fire-and-forget: spawns the actual DB write (and, best-effort, the server sync — always,
+    /// regardless of `SERVER_PROGRESS_SYNC_INTERVAL`) rather than awaiting them, since every call
+    /// site is a synchronous GTK signal handler or the tick timer, neither of which can await.
+    /// Captures the position/ids up front rather than re-reading `self` from inside the spawned
+    /// future. Reads the current position from the backend — for a write at an explicit position
+    /// instead (marking finished, resetting), see `write_progress_at`.
     fn write_progress(&mut self, is_finished: bool) {
         let position = self.book_position();
-        self.write_progress_at(position, is_finished);
+        self.write_progress_at(position, is_finished, true);
     }
 
-    /// The shared implementation behind `write_progress` (backend's current position),
-    /// `PlayerController::mark_as_finished` (`duration_seconds`), and
-    /// `PlayerController::reset_progress` (`0.0`) — same fire-and-forget local-write-then-sync
-    /// shape in every case, differing only in which position gets written.
-    fn write_progress_at(&mut self, position: f64, is_finished: bool) {
+    /// The shared implementation behind `write_progress` (backend's current position, always
+    /// forcing a server sync), `PlayerController::mark_as_finished` (`duration_seconds`),
+    /// `PlayerController::reset_progress` (`0.0`), and the periodic tick's own local-only refresh
+    /// (`force_server_sync: false`, throttled separately by `SERVER_PROGRESS_SYNC_INTERVAL`) —
+    /// same fire-and-forget local-write-then-maybe-sync shape in every case, differing in which
+    /// position gets written and whether the server push happens unconditionally.
+    ///
+    /// `force_server_sync: false` does not mean "never sync" — it still syncs once
+    /// `last_server_sync` is stale enough, so a long stretch of uninterrupted playback keeps
+    /// drifting its server-side progress forward at that coarser cadence, even though every
+    /// explicit action (pause, a sleep timer firing, ...) already resets that clock by calling
+    /// `write_progress` with `true`.
+    fn write_progress_at(&mut self, position: f64, is_finished: bool, force_server_sync: bool) {
         let Some(now_playing) = &self.now_playing else { return };
         let pool = self.pool.clone();
         let account_id = now_playing.account_id.clone();
@@ -237,27 +268,36 @@ impl Inner {
         let duration_seconds = now_playing.duration_seconds;
         self.last_progress_write = Instant::now();
 
+        let sync_now = force_server_sync || self.last_server_sync.elapsed() >= SERVER_PROGRESS_SYNC_INTERVAL;
+        if sync_now {
+            self.last_server_sync = Instant::now();
+        }
+
         glib::spawn_future_local(async move {
             if let Err(err) = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, position, is_finished).await
             {
                 tracing::warn!(%err, "couldn't persist playback progress");
             }
+            if !sync_now {
+                return;
+            }
             // Best-effort: the local write above is this client's own source of truth (Home's
             // "Continue Listening" reads it), so a network hiccup syncing it up to the server
-            // must not be treated as a playback error. The token — and the connection — are
-            // asked at write time; these writes happen for as long as the app is open, well
-            // past any single token's life or any settings change.
-            let access_token = session.access_token().await;
-            let connection = match session.connection_target().await {
-                Ok(connection) => connection,
+            // must not be treated as a playback error. `Session::api_client` asks for a fresh
+            // token/connection on every call (so a settings change or a token refresh is always
+            // honored) but reuses the already-minted `abs_api::Client` — and the TLS connection it
+            // holds open — as long as neither has actually changed, which for this call site (the
+            // most frequent server-facing one in the app, while playing) is what keeps a periodic
+            // background sync from costing a fresh TLS handshake every time.
+            let api = match session.api_client().await {
+                Ok(api) => api,
                 Err(err) => {
-                    tracing::warn!(%err, "couldn't load the server's connection settings; progress stays local");
+                    tracing::warn!(%err, "couldn't build an API client for this server; progress stays local");
                     return;
                 }
             };
             if let Err(err) =
-                abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, position, duration_seconds, is_finished)
-                    .await
+                abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await
             {
                 tracing::warn!(%err, "couldn't sync playback progress to the server");
             }
@@ -403,11 +443,14 @@ impl Inner {
 #[derive(Clone)]
 pub struct PlayerController {
     inner: Rc<RefCell<Inner>>,
-    /// The tick timer runs for as long as the controller exists — fine in production (one
-    /// controller for the whole app's lifetime), but tests build a fresh controller per scenario
-    /// and, without an explicit way to stop it, every one of those timers keeps firing forever on
-    /// the shared GLib main context, interleaving with (and slowing down) whatever scenario runs
-    /// next. `stop()` removes it; call it at the end of any test that builds a controller.
+    /// `Some` exactly while the tick timer is installed. Unlike most of this workspace's other
+    /// permanent GLib sources, this one is **not** left running for the controller's whole
+    /// lifetime: a paused (or nothing-loaded) player has nothing that changes on its own between
+    /// user actions, so ticking it 4 times a second would just be a battery-draining no-op. See
+    /// `ensure_ticking`/`tick` for the install/stop halves of this. Tests that build a controller
+    /// and start something playing should call `stop()` once done, so its timer doesn't keep
+    /// firing forever on the shared GLib main context, interleaving with whatever scenario runs
+    /// next.
     tick_source: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
@@ -418,44 +461,65 @@ impl PlayerController {
         backend: Box<dyn abs_player::AudioBackend>,
         mini_update: impl Fn(&PlayerSnapshot) + 'static,
     ) -> Self {
-            let controller = Self {
-                inner: Rc::new(RefCell::new(Inner {
-                    backend,
-                    pool,
-                    paths,
-                    now_playing: None,
-                    listeners: vec![Box::new(mini_update)],
-                    full_update: None,
-                    last_progress_write: Instant::now(),
-                    // Overridden right after construction via `set_headphone_behavior` and
-                    // `set_playback_config` (the settings aren't known to `new()`'s signature)
-                    // — false/false is the safe "do nothing automatically" middle, and the
-                    // playback defaults below are `PlaybackSettings`' own defaults.
-                    pause_on_unplug: false,
-                    resume_on_replug: false,
-                    default_speed: abs_core::playback::DEFAULT_SPEED,
-                    skip_back_seconds: 15.0,
-                    skip_forward_seconds: 30.0,
-                    paused_by_unplug: false,
-                })),
-                tick_source: Rc::new(RefCell::new(None)),
-            };
-
-        let source_id = glib::timeout_add_local(TICK_INTERVAL, {
-            let controller = controller.clone();
-            move || {
-                controller.tick();
-                glib::ControlFlow::Continue
-            }
-        });
-        *controller.tick_source.borrow_mut() = Some(source_id);
-
-        controller
+        // No tick timer installed yet — nothing is loaded, so there's nothing to tick. See
+        // `ensure_ticking`, called from every path that starts (or resumes) playback.
+        Self {
+            inner: Rc::new(RefCell::new(Inner {
+                backend,
+                pool,
+                paths,
+                now_playing: None,
+                listeners: vec![Box::new(mini_update)],
+                full_update: None,
+                last_progress_write: Instant::now(),
+                last_server_sync: Instant::now(),
+                // Overridden right after construction via `set_headphone_behavior` and
+                // `set_playback_config` (the settings aren't known to `new()`'s signature)
+                // — false/false is the safe "do nothing automatically" middle, and the
+                // playback defaults below are `PlaybackSettings`' own defaults.
+                pause_on_unplug: false,
+                resume_on_replug: false,
+                default_speed: abs_core::playback::DEFAULT_SPEED,
+                skip_back_seconds: 15.0,
+                skip_forward_seconds: 30.0,
+                paused_by_unplug: false,
+                // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
+                // construction the same way as the fields above, via `set_burst_buffering`.
+                burst_buffering: true,
+            })),
+            tick_source: Rc::new(RefCell::new(None)),
+        }
     }
 
-    /// Stops the tick timer permanently. See the `tick_source` field doc — production never needs
-    /// this (one controller for the app's lifetime); tests should call it once done with a
-    /// controller so its timer doesn't keep running into later scenarios.
+    /// Installs the tick timer if it isn't already running — idempotent, so every call site that
+    /// starts or resumes playback (and `set_sleep_timer_minutes`, for a wall-clock deadline that
+    /// must keep counting down even while paused) can just call this unconditionally. `tick`
+    /// itself is what removes the source again once neither condition holds — see its doc
+    /// comment — so this is the only place that ever re-installs it.
+    fn ensure_ticking(&self) {
+        if self.tick_source.borrow().is_some() {
+            return;
+        }
+        let controller = self.clone();
+        let source_id = glib::timeout_add_local(TICK_INTERVAL, move || {
+            if controller.tick() {
+                glib::ControlFlow::Continue
+            } else {
+                // The source is about to self-destroy (returning `Break` below) — clear our own
+                // handle to it *before* that happens, so nothing later mistakes it for still
+                // being alive and calls `.remove()` on an id GLib is about to invalidate. Same
+                // footgun `Debouncer::schedule`'s doc comment explains in detail.
+                controller.tick_source.borrow_mut().take();
+                glib::ControlFlow::Break
+            }
+        });
+        *self.tick_source.borrow_mut() = Some(source_id);
+    }
+
+    /// Stops the tick timer, if one is running. Production code never needs this explicitly —
+    /// `tick` already stops it on its own once nothing justifies it — but tests that build a
+    /// controller and start something playing should call it once done, so its timer doesn't
+    /// keep running into later scenarios.
     #[cfg(test)]
     pub fn stop(&self) {
         if let Some(id) = self.tick_source.borrow_mut().take() {
@@ -557,7 +621,7 @@ impl PlayerController {
             }
         }
         inner.publish();
-        inner.write_progress_at(duration_seconds, true);
+        inner.write_progress_at(duration_seconds, true, true);
     }
 
     /// Resets the current item's progress back to the start — local and server — and seeks
@@ -575,7 +639,7 @@ impl PlayerController {
         self.seek_to_seconds(0.0);
         let mut inner = self.inner.borrow_mut();
         inner.publish();
-        inner.write_progress_at(0.0, false);
+        inner.write_progress_at(0.0, false, true);
     }
 
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
@@ -584,7 +648,7 @@ impl PlayerController {
     /// change it afterwards via `set_speed`).
     pub fn start(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64) {
         // Flush whatever was loaded before it's replaced below — otherwise switching to a new
-        // item while another is still actively playing loses up to `PROGRESS_WRITE_INTERVAL`'s
+        // item while another is still actively playing loses up to `LOCAL_PROGRESS_WRITE_INTERVAL`'s
         // worth of the outgoing item's progress (the only other writes are the periodic tick and
         // an explicit `pause()`, neither of which fires on a session switch). Harmless if the
         // outgoing item was already paused/up to date — same blind-push shape `pause()` already
@@ -596,6 +660,7 @@ impl PlayerController {
             }
         }
         let inner_rc = self.inner.clone();
+        let controller = self.clone();
         glib::spawn_future_local(async move {
             let (pool, paths) = {
                 let inner = inner_rc.borrow();
@@ -789,6 +854,9 @@ impl PlayerController {
             inner.last_progress_write = Instant::now();
             inner.publish();
             drop(inner);
+            if is_playing {
+                controller.ensure_ticking();
+            }
 
             // The cover fetch, spawned only now that it can't race `now_playing` into existence.
             // Still detached from anything time-critical (its own timeout only bounds a slow
@@ -832,12 +900,13 @@ impl PlayerController {
 
     pub fn play(&self) {
         let mut inner = self.inner.borrow_mut();
-        match inner.backend.play() {
+        let started = match inner.backend.play() {
             Ok(()) => {
                 if let Some(now_playing) = &mut inner.now_playing {
                     now_playing.is_playing = true;
                     now_playing.last_error = None;
                 }
+                true
             }
             // A synchronous failure here means the pipeline itself is broken (e.g. a prior load
             // failed and left `now_playing` in the error state `start()`/`spawn_load_track` build
@@ -849,9 +918,14 @@ impl PlayerController {
                 if let Some(now_playing) = &mut inner.now_playing {
                     now_playing.last_error = Some((&err).into());
                 }
+                false
             }
-        }
+        };
         inner.publish();
+        drop(inner);
+        if started {
+            self.ensure_ticking();
+        }
     }
 
     pub fn pause(&self) {
@@ -930,6 +1004,24 @@ impl PlayerController {
     pub fn headphone_behavior(&self) -> (bool, bool) {
         let inner = self.inner.borrow();
         (inner.pause_on_unplug, inner.resume_on_replug)
+    }
+
+    /// Applies Settings → Playback's "Buffer streams in bursts" switch (persisted; the live
+    /// controller must follow immediately, not on the next app start, same as
+    /// `set_headphone_behavior`). Takes effect on the *next* track load — an already-loaded
+    /// pipeline's fetch strategy doesn't change retroactively (see `AudioBackend::
+    /// set_burst_buffering`'s doc comment).
+    pub fn set_burst_buffering(&self, enabled: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.burst_buffering = enabled;
+        inner.backend.set_burst_buffering(enabled);
+    }
+
+    /// What `set_burst_buffering` last applied — for asserting that the Settings screen's switch
+    /// actually reaches the controller.
+    #[cfg(test)]
+    pub fn burst_buffering(&self) -> bool {
+        self.inner.borrow().burst_buffering
     }
 
     /// Applies Settings → Playback's start-of-session speed and skip intervals (persisted; the
@@ -1057,12 +1149,22 @@ impl PlayerController {
     /// Arms a wall-clock sleep timer: playback pauses once `minutes` have passed, checked once
     /// per tick rather than via a second timer source (see `SleepTimerDeadline`).
     pub fn set_sleep_timer_minutes(&self, minutes: u32) {
-        let mut inner = self.inner.borrow_mut();
-        let deadline = SleepTimerDeadline::WallClock(Instant::now() + Duration::from_secs(u64::from(minutes) * 60));
-        if let Some(now_playing) = &mut inner.now_playing {
-            now_playing.sleep_timer = SleepTimerState::Armed(deadline);
+        let armed = {
+            let mut inner = self.inner.borrow_mut();
+            let deadline = SleepTimerDeadline::WallClock(Instant::now() + Duration::from_secs(u64::from(minutes) * 60));
+            let armed = inner.now_playing.is_some();
+            if let Some(now_playing) = &mut inner.now_playing {
+                now_playing.sleep_timer = SleepTimerState::Armed(deadline);
+            }
+            inner.publish();
+            armed
+        };
+        // A wall-clock deadline must keep counting down even if the player is currently paused
+        // (or gets paused a moment later) — `tick` is the only thing that checks it, so the timer
+        // has to be running for as long as this stays armed, independent of `is_playing`.
+        if armed {
+            self.ensure_ticking();
         }
-        inner.publish();
     }
 
     /// Arms a sleep timer that fires at the end of whatever chapter is currently playing, falling
@@ -1090,10 +1192,20 @@ impl PlayerController {
         inner.publish();
     }
 
-    fn tick(&self) {
+    /// Runs one tick's worth of work (bus events, sleep-timer deadline, snapshot publish, the
+    /// periodic progress write) and reports whether the tick timer should keep firing.
+    /// `ensure_ticking`'s closure turns this straight into a `glib::ControlFlow` — see its doc
+    /// comment for the install half of this. Ticking is only worth doing while something is
+    /// actually playing (there's nothing to report otherwise) or a wall-clock sleep-timer
+    /// deadline is still counting down (the one thing that must keep advancing even while
+    /// paused); once neither holds, this returns `false` and the caller lets the source
+    /// self-destroy rather than leaving a 250ms timer running against a player with nothing to
+    /// do — see `tick_source`'s doc comment for why that used to be the case and cost real
+    /// battery.
+    fn tick(&self) -> bool {
         let mut inner = self.inner.borrow_mut();
         if inner.now_playing.is_none() {
-            return;
+            return false;
         }
 
         if let Some(event) = inner.backend.poll_event() {
@@ -1112,8 +1224,9 @@ impl PlayerController {
                         // publishes its own correct one (`backend_pos: None` right after `load()`)
                         // moments later. Caught via a real timing-dependent test failure once an
                         // async DB check (`resolve_playable_url`) widened this race's window
-                        // enough to make it land inside a test's polling loop.
-                        return;
+                        // enough to make it land inside a test's polling loop. Still playing (the
+                        // next file is about to load) — keep the timer running.
+                        return true;
                     } else {
                         let _ = inner.backend.pause();
                         if let Some(now_playing) = &mut inner.now_playing {
@@ -1155,9 +1268,24 @@ impl PlayerController {
         inner.publish();
 
         let is_playing = inner.now_playing.as_ref().is_some_and(|n| n.is_playing);
-        if is_playing && inner.last_progress_write.elapsed() >= PROGRESS_WRITE_INTERVAL {
-            inner.write_progress(false);
+        if is_playing && inner.last_progress_write.elapsed() >= LOCAL_PROGRESS_WRITE_INTERVAL {
+            // Not `write_progress`: this is the routine "still playing" heartbeat, not a
+            // meaningful state change, so it must not force a server round trip on every firing —
+            // `write_progress_at`'s own `force_server_sync: false` still syncs once
+            // `SERVER_PROGRESS_SYNC_INTERVAL` has actually elapsed.
+            let position = inner.book_position();
+            inner.write_progress_at(position, false, false);
         }
+
+        // Computed *after* the sleep-timer check above (which may have just turned an armed
+        // wall-clock deadline back off) — otherwise a tick that reaches the deadline would keep
+        // itself alive for one extra, pointless round based on the now-stale "was armed" state.
+        let wall_clock_deadline_armed = matches!(
+            inner.now_playing.as_ref().map(|n| n.sleep_timer),
+            Some(SleepTimerState::Armed(SleepTimerDeadline::WallClock(_)))
+        );
+
+        is_playing || wall_clock_deadline_armed
     }
 }
 
@@ -1403,6 +1531,9 @@ impl abs_player::AudioBackend for NullBackend {
     fn poll_event(&self) -> Option<abs_player::PlayerEvent> {
         None
     }
+    fn set_burst_buffering(&mut self, _enabled: bool) {
+        // Nothing to configure: there is no transport behind this backend at all.
+    }
 }
 
 /// The real, production audio backend — `GstBackend::new()` (the system default
@@ -1492,6 +1623,7 @@ pub(crate) mod tests {
         fn poll_event(&self) -> Option<abs_player::PlayerEvent> {
             None
         }
+        fn set_burst_buffering(&mut self, _enabled: bool) {}
     }
 
     /// Responds to a `Range: bytes=START-[END]` request with `206 Partial Content` and the
@@ -1713,8 +1845,9 @@ pub(crate) mod tests {
 
     /// Regression test for the "no flush on teardown" gap: switching to a new item while another
     /// is still actively playing used to lose whatever progress had accrued since the last
-    /// periodic 5s write (the only other write paths are the tick and an explicit `pause()`,
-    /// neither of which fires on a session switch). `start()` now flushes the outgoing item first.
+    /// periodic local write (the only other write paths are the tick and an explicit `pause()`,
+    /// neither of which fires on a session switch). `start()` now flushes the outgoing item first,
+    /// and always forces a server sync regardless of `SERVER_PROGRESS_SYNC_INTERVAL`.
     pub(crate) fn run_starting_a_new_item_flushes_the_previous_items_progress(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
@@ -1732,8 +1865,8 @@ pub(crate) mod tests {
             1.0,
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
-        // Let some real playback time accrue, but nowhere near `PROGRESS_WRITE_INTERVAL` (5s) —
-        // if the periodic tick were what persisted this, the test would be proving nothing.
+        // Let some real playback time accrue, but nowhere near `LOCAL_PROGRESS_WRITE_INTERVAL`
+        // (5s) — if the periodic tick were what persisted this, the test would be proving nothing.
         pump_until(|| false, Duration::from_millis(1200));
 
         controller.start(

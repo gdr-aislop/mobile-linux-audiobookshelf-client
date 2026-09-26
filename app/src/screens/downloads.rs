@@ -28,8 +28,11 @@ use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
 use crate::screens::settings::confirm;
 use abs_storage::models::DownloadStatus;
 
-/// Minimum gap between live subtitle writes for one item — `TrackProgress` fires per chunk
-/// written, which can be many times a second; the subtitle only needs ~5 updates a second.
+/// Minimum gap between live subtitle writes for one item. `DownloadManager` already throttles
+/// `TrackProgress` itself to the same cadence (`downloads::PROGRESS_EVENT_MIN_INTERVAL`) — this
+/// screen's own throttle stays regardless, since it costs nothing and keeps this file correct
+/// even if that upstream cadence ever changes; the subtitle only needs ~5 updates a second either
+/// way.
 const LABEL_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A speed sample older than this means nothing has arrived in a while — hide the speed part

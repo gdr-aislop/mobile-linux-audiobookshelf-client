@@ -188,6 +188,10 @@ pub fn build(
         playback_settings.skip_back_seconds as f64,
         playback_settings.skip_forward_seconds as f64,
     );
+    // Same story again for burst buffering — applied before any track can load, so the very
+    // first playback of this session already honors Settings → Playback's switch rather than
+    // needing a Settings edit (which re-applies it) to take effect.
+    mini_bar.controller.set_burst_buffering(playback_settings.burst_buffering);
     let route_watcher = match abs_player::route_watch::PulseRouteWatcher::new() {
         Ok(mut watcher) => {
             let controller = mini_bar.controller.clone();

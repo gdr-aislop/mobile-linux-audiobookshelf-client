@@ -34,6 +34,12 @@ use abs_storage::AppPaths;
 /// connection. Not user-configurable (yet); a fixed, conservative default.
 const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 
+/// The minimum gap between two `DownloadEvent::TrackProgress` publishes for one track — see
+/// `spawn_track_download`'s `on_progress`. Matches `screens::downloads::LABEL_UPDATE_INTERVAL`
+/// (no point publishing faster than the fastest listener actually repaints). `pub(crate)` only so
+/// that comment cross-reference stays meaningful; nothing outside this module needs to read it.
+pub(crate) const PROGRESS_EVENT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDownloadState {
     /// Nothing in flight for this item — either it was never started, finished being cleared, or
@@ -294,7 +300,22 @@ impl DownloadManager {
             let progress_item_id = item_id.clone();
             let progress_ino = ino.clone();
             let progress_inner = inner_rc.clone();
+            // `download_track` calls this once per network chunk (typically 8-16 KB), which can
+            // be many times a second — every listener (the Downloads screen, Item Detail's
+            // download button, the scope menu) would otherwise redo its own bookkeeping that
+            // often for no visible benefit. Throttled here at the source, once, rather than in
+            // each listener: the Downloads screen already throttles its own label repaint
+            // (`LABEL_UPDATE_INTERVAL`) downstream of this, but that only saved the repaint, not
+            // the dispatch or every listener's per-event work. Always let the *last* chunk of a
+            // track through regardless of timing, so a fast/small track's completion is never
+            // dropped by the throttle window.
+            let mut last_published = std::time::Instant::now() - PROGRESS_EVENT_MIN_INTERVAL;
             let on_progress = move |downloaded: u64, total: Option<u64>| {
+                let is_last_chunk = total.is_some_and(|total| downloaded >= total);
+                if !is_last_chunk && last_published.elapsed() < PROGRESS_EVENT_MIN_INTERVAL {
+                    return;
+                }
+                last_published = std::time::Instant::now();
                 progress_inner.borrow().publish(DownloadEvent::TrackProgress {
                     item_id: progress_item_id.clone(),
                     ino: progress_ino.clone(),

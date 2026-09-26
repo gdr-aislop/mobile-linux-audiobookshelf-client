@@ -995,12 +995,25 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
             return;
         }
     }
+
+    // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Home
+    // does the exact same thing for the same account, since both screens are built eagerly. Only
+    // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
+    // trigger is user-initiated and always runs for real regardless — nothing else races it.
+    let is_automatic = manual.is_none();
+    if is_automatic && !crate::sync_coordinator::claim_startup_sync(&ctx.server_id, &ctx.account_id) {
+        let (pool, server_id, account_id) = (ctx.pool.clone(), ctx.server_id.clone(), ctx.account_id.clone());
+        glib::spawn_future_local(render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()));
+        crate::sync_coordinator::on_completed(&ctx.server_id, &ctx.account_id, move || {
+            glib::spawn_future_local(render_from_cache(pool, server_id, account_id, widgets));
+        });
+        return;
+    }
+
     glib::spawn_future_local(async move {
         let SyncCtx { pool, paths, session, server_id, account_id } = ctx;
 
-        if let Ok(data) = load(&pool, &server_id, &account_id).await {
-            apply(data, &widgets);
-        }
+        render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()).await;
 
         let spawned_sync = tokio::spawn({
             let pool = pool.clone();
@@ -1089,7 +1102,25 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         if let Some(manual) = manual {
             manual.finish(manual_ok);
         }
+
+        // Only the cycle that actually claimed the automatic sync (see above) reports back —
+        // Home, if it lost the claim, is waiting on exactly this to re-render from what just
+        // landed.
+        if is_automatic {
+            crate::sync_coordinator::mark_completed(&server_id, &account_id);
+        }
     });
+}
+
+/// Reads whatever's currently cached locally and renders it — never talks to the network. Used
+/// both as the ordinary "show cached data immediately, before syncing" step of a real cycle, and
+/// as the *entire* response for a screen that lost the automatic-sync claim (see
+/// `sync_coordinator`): called once right away and once more when the winning screen's own cycle
+/// completes.
+async fn render_from_cache(pool: SqlitePool, server_id: String, account_id: String, widgets: LibraryWidgets) {
+    if let Ok(data) = load(&pool, &server_id, &account_id).await {
+        apply(data, &widgets);
+    }
 }
 
 /// The single writer behind every "in progress only" surface — the sheet's switch, the view-

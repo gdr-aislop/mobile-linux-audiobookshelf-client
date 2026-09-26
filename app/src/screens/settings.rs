@@ -43,6 +43,7 @@ pub struct SettingsHooks {
     pub skip_back_row: adw::ComboRow,
     pub skip_forward_row: adw::ComboRow,
     pub wifi_only_switch: gtk4::Switch,
+    pub burst_buffering_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
     pub account_row: adw::ActionRow,
@@ -413,6 +414,18 @@ pub fn build(
     wifi_only_row.set_activatable_widget(Some(&wifi_only_switch));
     playback_group.add(&wifi_only_row);
 
+    let burst_buffering_switch = gtk4::Switch::new();
+    burst_buffering_switch.set_valign(gtk4::Align::Center);
+    burst_buffering_switch.set_state(playback_settings.burst_buffering);
+    burst_buffering_switch.set_active(playback_settings.burst_buffering);
+    let burst_buffering_row = adw::ActionRow::builder()
+        .title("Buffer streams in bursts")
+        .subtitle("Downloads ahead at full speed so the radio can idle. Turn off on a slow or capped connection.")
+        .build();
+    burst_buffering_row.add_suffix(&burst_buffering_switch);
+    burst_buffering_row.set_activatable_widget(Some(&burst_buffering_switch));
+    playback_group.add(&burst_buffering_row);
+
     default_speed_row.connect_selected_notify({
         let settings = settings.clone();
         let pending_save = pending_save.clone();
@@ -458,6 +471,19 @@ pub fn build(
         let download_manager = download_manager.clone();
         move |_, state| {
             settings.borrow_mut().wifi_only_downloads = state;
+            persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
+            glib::signal::Propagation::Proceed
+        }
+    });
+    burst_buffering_switch.connect_state_set({
+        let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        let writer_running = writer_running.clone();
+        let controller = controller.clone();
+        let pool = pool.clone();
+        let download_manager = download_manager.clone();
+        move |_, state| {
+            settings.borrow_mut().burst_buffering = state;
             persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager);
             glib::signal::Propagation::Proceed
         }
@@ -526,6 +552,7 @@ pub fn build(
             skip_back_row,
             skip_forward_row,
             wifi_only_switch,
+            burst_buffering_switch,
             theme_row,
             about_row,
             account_row,
@@ -665,6 +692,7 @@ fn persist(
         snapshot.skip_back_seconds as f64,
         snapshot.skip_forward_seconds as f64,
     );
+    controller.set_burst_buffering(snapshot.burst_buffering);
     download_manager.set_wifi_only(snapshot.wifi_only_downloads);
     *pending_save.borrow_mut() = Some(snapshot);
     if writer_running.get() {
@@ -776,7 +804,11 @@ pub(crate) mod tests {
         assert!(!screen.hooks.pause_on_unplug_switch.state());
         assert!(screen.hooks.resume_on_replug_switch.state());
         assert!(!screen.hooks.resume_on_replug_switch.is_sensitive(), "with pause-on-unplug off, resume has nothing to act on");
-        pump_until(|| false, Duration::from_millis(300));
+        // 1s, not the 300ms this used to get away with: `persist` always saves the whole
+        // `PlaybackSettings` struct regardless of which single field changed, and it has grown a
+        // field since (`burst_buffering`) — one more sequential `kv::set` was enough to push a
+        // real save past 300ms in this sandbox.
+        pump_until(|| false, Duration::from_millis(1000));
         assert_eq!(controller.headphone_behavior(), (false, true), "switch activation must reach the live controller");
 
         let (pause_saved, resume_saved) = runtime.block_on(async {
@@ -787,9 +819,10 @@ pub(crate) mod tests {
         assert!(resume_saved, "toggling resume-on-replug must persist");
     }
 
-    /// The rows added with the Playback/Appearance/About groups: the combos and Wi-Fi switch
-    /// start from the settings the shell was built with, reach the live controller/manager on
-    /// change, persist (including the theme's own key), and the About row opens an about window.
+    /// The rows added with the Playback/Appearance/About groups: the combos and the Wi-Fi/burst-
+    /// buffering switches start from the settings the shell was built with, reach the live
+    /// controller/manager on change, persist (including the theme's own key), and the About row
+    /// opens an about window.
     pub(crate) fn run_playback_defaults_theme_and_about(runtime: &tokio::runtime::Runtime) {
         let pool = runtime.block_on(crate::test_support::pool());
         let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
@@ -810,6 +843,7 @@ pub(crate) mod tests {
         assert_eq!(screen.hooks.skip_back_row.selected(), 2, "15 seconds is the third skip choice");
         assert_eq!(screen.hooks.skip_forward_row.selected(), 4, "30 seconds is the fifth skip choice");
         assert!(screen.hooks.wifi_only_switch.state(), "Wi-Fi-only downloads defaults to on");
+        assert!(screen.hooks.burst_buffering_switch.state(), "burst buffering defaults to on");
         assert_eq!(screen.hooks.theme_row.selected(), 0, "theme defaults to System");
 
         // `set_selected` is the property change the combo handlers listen to (a real user choice
@@ -819,11 +853,13 @@ pub(crate) mod tests {
         screen.hooks.skip_back_row.set_selected(0); // 5 sec
         screen.hooks.skip_forward_row.set_selected(6); // 60 sec
         let _: bool = screen.hooks.wifi_only_switch.emit_by_name("state-set", &[&false]);
+        let _: bool = screen.hooks.burst_buffering_switch.emit_by_name("state-set", &[&false]);
         screen.hooks.theme_row.set_selected(2); // Dark
 
         assert_eq!(controller.default_speed(), 1.5, "combo activation must reach the live controller");
         assert_eq!(controller.skip_intervals(), (5.0, 60.0), "skip choices must reach the live controller");
         assert!(!download_manager.wifi_only(), "the Wi-Fi switch must reach the download manager");
+        assert!(!controller.burst_buffering(), "the burst-buffering switch must reach the live controller");
         assert_eq!(
             adw::StyleManager::default().color_scheme(),
             adw::ColorScheme::ForceDark,
@@ -831,8 +867,8 @@ pub(crate) mod tests {
         );
 
         // The saves are spawned futures on the GLib main context — pump until they land, same as
-        // the headphone-switch scenario above.
-        pump_until(|| false, Duration::from_millis(300));
+        // the headphone-switch scenario above (see its own comment on why 1s, not 300ms).
+        pump_until(|| false, Duration::from_millis(1000));
 
         let (saved, saved_theme) = runtime.block_on(async {
             let settings = abs_core::settings::load_playback_settings(&pool).await.unwrap();
@@ -843,6 +879,7 @@ pub(crate) mod tests {
         assert_eq!(saved.skip_back_seconds, 5, "skip back must persist");
         assert_eq!(saved.skip_forward_seconds, 60, "skip forward must persist");
         assert!(!saved.wifi_only_downloads, "the Wi-Fi switch must persist");
+        assert!(!saved.burst_buffering, "the burst-buffering switch must persist");
         assert_eq!(saved_theme, abs_core::settings::Theme::Dark, "the theme must persist");
 
         // About: activating the row opens the app's one about window, transient to the shell's
