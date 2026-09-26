@@ -135,6 +135,7 @@ pub struct TestHooks {
     pub genre_chip_box: gtk4::Box,
     pub genre_chip_revealer: gtk4::Revealer,
     pub busy_spinner: gtk4::Spinner,
+    pub busy_scrim: gtk4::Box,
     pub pull_spinner: gtk4::Spinner,
 }
 
@@ -261,6 +262,10 @@ struct LibraryWidgets {
     /// Shown for the one main-loop tick between any filter/search/sort/view-mode change and the
     /// rebuild it triggers — see [`request_render`]/[`set_busy`].
     busy_spinner: gtk4::Spinner,
+    /// The dimming layer behind `busy_spinner`, sized to cover the *entire* content area (not
+    /// just the spinner's own small box) — see `busy_spinner`'s construction comment in `build()`
+    /// for why a bare spinner over arbitrary list/grid content needs this at all.
+    busy_scrim: gtk4::Box,
 }
 
 struct LibraryData {
@@ -467,8 +472,28 @@ pub fn build(
     // runs, rather than leaving the screen looking unresponsive in the meantime. Overlaid rather
     // than swapped in so the stale grid/list stays visible underneath instead of vanishing to
     // blank.
-    let busy_spinner = gtk4::Spinner::builder().halign(gtk4::Align::Center).valign(gtk4::Align::Center).visible(false).build();
+    //
+    // A bare `GtkSpinner` renders as a handful of thin, foreground-colored dashes with no
+    // background of its own, sized to its own small natural size — over this screen's own
+    // (typically light) content, in the middle of an otherwise untouched list, that's easy to
+    // miss entirely: exactly the "I wouldn't notice it if I didn't know where to look" report
+    // this exists to fix. `busy_scrim` is a full-bleed dark dimming layer, sized to the *whole*
+    // content area (it has no `halign`/`valign`, so `GtkOverlay` sizes it to match the main
+    // child, unlike the spinner centered on top of it) — the same "dim what's behind, show a
+    // spinner on top" shape a modal loading state uses elsewhere, rather than a small backdrop
+    // sized to the spinner alone, which would still be easy to miss against a large list.
+    ensure_busy_overlay_css();
+    let busy_scrim = gtk4::Box::builder().hexpand(true).vexpand(true).css_classes(["library-busy-scrim"]).visible(false).build();
+    let busy_spinner = gtk4::Spinner::builder()
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .width_request(56)
+        .height_request(56)
+        .css_classes(["library-busy-spinner"])
+        .visible(false)
+        .build();
     let content_overlay = gtk4::Overlay::builder().child(&scroller).build();
+    content_overlay.add_overlay(&busy_scrim);
     content_overlay.add_overlay(&busy_spinner);
 
     let status_page = adw::StatusPage::builder()
@@ -526,6 +551,7 @@ pub fn build(
         genre_chip_box: genre_chip_box.clone(),
         pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
         busy_spinner: busy_spinner.clone(),
+        busy_scrim: busy_scrim.clone(),
     };
 
     // The filter's two manual entry points that don't persist: the banner's "Show all", and (via
@@ -957,6 +983,7 @@ pub fn build(
             genre_chip_box,
             genre_chip_revealer,
             busy_spinner,
+            busy_scrim,
             pull_spinner: pull_indicator.spinner().clone(),
         },
     }
@@ -1254,11 +1281,35 @@ fn apply(data: LibraryData, widgets: &LibraryWidgets) {
     render_from_current_data(widgets);
 }
 
-/// Shows or hides the spinner overlaid on the library content — see `request_render`'s doc for
-/// why this exists.
+/// Shows or hides the busy overlay (dimming scrim + spinner) over the library content — see
+/// `request_render`'s doc for why this exists. Both widgets are shown/hidden together; the scrim
+/// has no animation of its own to start/stop.
 fn set_busy(widgets: &LibraryWidgets, busy: bool) {
+    widgets.busy_scrim.set_visible(busy);
     widgets.busy_spinner.set_visible(busy);
     widgets.busy_spinner.set_spinning(busy);
+}
+
+/// Loads the `library-busy-scrim`/`library-busy-spinner` CSS classes once per process — same
+/// `Once`-guarded `CssProvider` idiom `screens::connection::ensure_mono_css` already uses. The
+/// scrim is a plain dark semi-opaque fill (`GtkOverlay` already sizes it to match the main child,
+/// per `build()`'s comment, so no width/height rule is needed here); the spinner gets a white
+/// foreground on top of it so the spinning dashes read clearly regardless of what's behind the
+/// overlay.
+fn ensure_busy_overlay_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(
+            "box.library-busy-scrim { background-color: rgba(0, 0, 0, 0.45); } \
+             spinner.library-busy-spinner { color: white; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("a display for the app's css"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 /// Shows the busy spinner immediately, then defers the actual rebuild by one main-loop idle
@@ -2314,16 +2365,19 @@ pub(crate) mod tests {
 
         pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
         assert!(!hooks.busy_spinner.is_visible());
+        assert!(!hooks.busy_scrim.is_visible(), "the dimming scrim behind the spinner must hide with it");
 
         hooks.view_toggle.set_active(false);
         // Before pumping the main loop at all: the spinner must already be showing and the
         // rebuild must not have happened yet — proving the feedback lands on the same frame as
         // the tap, ahead of the (deferred) rebuild, not after it.
         assert!(hooks.busy_spinner.is_visible(), "the spinner should appear before the rebuild runs");
+        assert!(hooks.busy_scrim.is_visible(), "the dimming scrim should appear together with the spinner");
         assert!(hooks.list_box.is_visible(), "the old mode's container should still be showing");
 
         pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(5));
         assert!(!hooks.busy_spinner.is_visible(), "the spinner should hide once the rebuild is done");
+        assert!(!hooks.busy_scrim.is_visible(), "the scrim should hide with it");
         assert!(hooks.flow_box.is_visible());
     }
 
@@ -2372,16 +2426,29 @@ pub(crate) mod tests {
         hooks.view_toggle.set_active(false);
         pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
         assert!(!hooks.busy_spinner.is_visible());
+        assert!(!hooks.busy_scrim.is_visible(), "the dimming scrim behind the spinner must hide with it");
 
         hooks.category_author.set_active(true);
         // Before pumping the main loop at all: same proof as the view-mode test above, this time
         // for a category chip — the spinner and the stale, ungrouped content must both still be
         // exactly as they were, ahead of the deferred regroup-and-rebuild.
         assert!(hooks.busy_spinner.is_visible(), "the spinner should appear before the regroup runs");
+        assert!(hooks.busy_scrim.is_visible(), "the dimming scrim should appear together with the spinner");
         assert_eq!(flow_box_entries(&hooks.flow_box).len(), 2, "the stale, ungrouped entries should still be showing while the spinner is up");
 
         pump_until(|| flow_box_entries(&hooks.flow_box).len() == 4, Duration::from_secs(5));
         assert!(!hooks.busy_spinner.is_visible(), "the spinner should hide once the regroup is done");
+        assert!(!hooks.busy_scrim.is_visible(), "the scrim should hide with it");
+
+        // Switching back to "All" is the same code path (`category_all`'s own `connect_toggled`
+        // → `set_grouping` → `request_render`) — regression coverage for the reported gap where
+        // only the forward direction (All → a grouped category) was ever exercised.
+        hooks.category_all.set_active(true);
+        assert!(hooks.busy_spinner.is_visible(), "the spinner should appear switching back to All too");
+        assert!(hooks.busy_scrim.is_visible(), "and the scrim with it");
+        pump_until(|| flow_box_entries(&hooks.flow_box).len() == 2, Duration::from_secs(5));
+        assert!(!hooks.busy_spinner.is_visible(), "the spinner should hide once back on All");
+        assert!(!hooks.busy_scrim.is_visible(), "the scrim should hide with it");
     }
 
     pub(crate) fn run_list_view_rows_show_title_and_subtitle(runtime: &tokio::runtime::Runtime) {
