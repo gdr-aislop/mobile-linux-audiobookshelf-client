@@ -66,6 +66,7 @@ pub struct TestHooks {
     pub mark_as_finished_button: gtk4::Button,
     pub reset_progress_button: gtk4::Button,
     pub mini_bar: crate::player::MiniPlayerHooks,
+    pub download_progress_revealer: gtk4::Revealer,
 }
 
 #[cfg(test)]
@@ -103,7 +104,7 @@ pub fn build(
     on_open_player: impl Fn() + 'static,
     on_open_series: impl Fn(String) + 'static,
 ) -> ItemDetailScreen {
-    let on_play = Rc::new(on_play);
+    let on_play: Rc<dyn Fn(String, Option<usize>)> = Rc::new(on_play);
     let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);
 
@@ -251,6 +252,12 @@ pub fn build(
     // (which records progress at full duration) when this item isn't the one currently loaded
     // into `controller`, so there's no live playback duration to ask instead.
     let duration_seconds_cell: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+    // Chapters + the resume position, both filled in by Pass 2 below and kept around (this page's
+    // chapter list never changes shape after that, per `chapter_ranges_cell`'s own doc above) so
+    // `refresh_chapter_rows` can rebuild the "Downloaded" glyphs later without redoing Pass 2's
+    // network resolve — only re-querying which chapters are downloaded, which does change.
+    let chapters_cell: Rc<std::cell::RefCell<Vec<(String, f64, f64)>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let progress_seconds_cell: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
     let download_menu = download_scope_menu::build(
         pool.clone(),
         download_manager.clone(),
@@ -275,6 +282,59 @@ pub fn build(
     // per-call-site style, and the widget is built fresh here).
     download_menu.widget.add_css_class("pill");
     actions_row.append(&download_menu.widget);
+
+    // Visible progress for this item's own in-flight download (see
+    // `widgets::download_progress`'s doc for why the button's static spinner icon alone wasn't
+    // enough) — placed directly below the actions row, the same slot Home/Library use for their
+    // pull-to-refresh indicator.
+    // `insert_child_after`, not `append`: `content`'s children were already assembled above
+    // (`actions_row` included) before this widget exists, so appending now would land it after
+    // the chapters section instead of right below the actions row.
+    let (progress_strip_widget, _progress_strip) =
+        crate::widgets::download_progress::DownloadProgressStrip::build(download_manager.clone(), server.id.clone(), item_id.clone());
+    content.insert_child_after(&progress_strip_widget, Some(&actions_row));
+
+    // Keeps the chapter list's "Downloaded" glyphs live: Pass 2 above computes them once, but a
+    // download can complete (or start, or fail) while this screen is still open — without this,
+    // the glyphs stayed exactly as Pass 2 first found them until the screen was reopened. Refetch
+    // is cheap (one indexed query over this item's chapter ranges), so this re-derives markers on
+    // every event rather than trying to track "did a track just finish" precisely.
+    download_manager.add_listener({
+        let pool = pool.clone();
+        let server_id = server.id.clone();
+        let item_id = item_id.clone();
+        let chapters_list = chapters_list.clone();
+        let chapters_cell = chapters_cell.clone();
+        let chapter_ranges_cell = chapter_ranges_cell.clone();
+        let progress_seconds_cell = progress_seconds_cell.clone();
+        let on_play = on_play.clone();
+        move |event| {
+            let event_item_id = match event {
+                crate::downloads::DownloadEvent::ItemStateChanged { item_id, .. } => item_id,
+                crate::downloads::DownloadEvent::TrackProgress { item_id, .. } => item_id,
+            };
+            if *event_item_id != item_id {
+                return;
+            }
+            let chapters = chapters_cell.clone();
+            let chapter_ranges = chapter_ranges_cell.borrow().clone();
+            if chapter_ranges.is_empty() {
+                // Pass 2 hasn't landed yet (or this item has no chapters at all) — nothing to
+                // refresh against.
+                return;
+            }
+            let pool = pool.clone();
+            let server_id = server_id.clone();
+            let item_id = item_id.clone();
+            let chapters_list = chapters_list.clone();
+            let progress_seconds_cell = progress_seconds_cell.clone();
+            let on_play = on_play.clone();
+            glib::spawn_future_local(async move {
+                let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
+                refresh_chapter_rows(&chapters_list, &chapters.borrow(), progress_seconds_cell.get(), &markers, &on_play, &item_id);
+            });
+        }
+    });
 
     // "Mark as finished"/"Reset progress" — the same shared widget Player uses (see
     // `widgets::item_options_menu`'s doc), so both screens look and behave identically. Unlike
@@ -420,6 +480,8 @@ pub fn build(
         let chapter_ranges_cell = chapter_ranges_cell.clone();
         let current_chapter_index_cell = current_chapter_index_cell.clone();
         let duration_seconds_cell = duration_seconds_cell.clone();
+        let chapters_cell = chapters_cell.clone();
+        let progress_seconds_cell = progress_seconds_cell.clone();
         async move {
             let server_id = server.id.clone();
             let account_id = account.id.clone();
@@ -473,6 +535,7 @@ pub fn build(
 
             let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
             let progress_seconds = progress.as_ref().filter(|p| !p.is_finished).map(|p| p.current_time_seconds).unwrap_or(0.0);
+            progress_seconds_cell.set(progress_seconds);
             let duration_seconds = item.as_ref().map(|i| i.duration_seconds).unwrap_or(0.0);
             duration_seconds_cell.set(duration_seconds);
             if progress_seconds > 0.0 {
@@ -557,30 +620,9 @@ pub fn build(
             let chapter_ranges: Vec<(f64, f64)> = chapters.iter().map(|(_, start, end)| (*start, *end)).collect();
             let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
 
-            while let Some(row) = chapters_list.row_at_index(0) {
-                chapters_list.remove(&row);
-            }
-            for (index, (title, start, end)) in chapters.iter().enumerate() {
-                let is_current = *start <= progress_seconds && progress_seconds < *end;
-                let is_downloaded = markers.get(index).copied().unwrap_or(false);
-                let row = adw::ActionRow::builder().title(title.as_str()).activatable(true).build();
-                row.set_subtitle(&format_duration((end - start).max(0.0)));
-                if is_current {
-                    row.add_css_class("heading");
-                }
-                if is_downloaded {
-                    row.add_suffix(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
-                }
-                row.connect_activated({
-                    let on_play = on_play.clone();
-                    let item_id = item_id.clone();
-                    move |_| {
-                        on_play(item_id.clone(), Some(index));
-                    }
-                });
-                chapters_list.append(&row);
-            }
             chapters_section.set_visible(!chapters.is_empty());
+            *chapters_cell.borrow_mut() = chapters.clone();
+            refresh_chapter_rows(&chapters_list, &chapters, progress_seconds, &markers, &on_play, &item_id);
 
             // Fills in the download menu's shared cells — the chapter the resume position falls
             // in, or 0 before it's known / for an unstarted book. Fixed once computed: unlike
@@ -638,7 +680,47 @@ pub fn build(
             #[cfg(test)]
             reset_progress_button: options_menu.reset_progress_button,
             mini_bar: mini_bar.hooks,
+            download_progress_revealer: progress_strip_widget,
         },
+    }
+}
+
+/// Rebuilds `chapters_list`'s rows from scratch — the "currently playing" heading and the
+/// "Downloaded" glyph both depend on state that can change after Pass 2 first builds this list
+/// (a download completing while this screen is still open), so this is also called from a
+/// `download_manager` listener, not just Pass 2 itself. `markers` is index-aligned with
+/// `chapters`, same contract `abs_core::download_tracks::chapter_offline_markers_for_item`
+/// already returns.
+fn refresh_chapter_rows(
+    chapters_list: &gtk4::ListBox,
+    chapters: &[(String, f64, f64)],
+    progress_seconds: f64,
+    markers: &[bool],
+    on_play: &Rc<dyn Fn(String, Option<usize>)>,
+    item_id: &str,
+) {
+    while let Some(row) = chapters_list.row_at_index(0) {
+        chapters_list.remove(&row);
+    }
+    for (index, (title, start, end)) in chapters.iter().enumerate() {
+        let is_current = *start <= progress_seconds && progress_seconds < *end;
+        let is_downloaded = markers.get(index).copied().unwrap_or(false);
+        let row = adw::ActionRow::builder().title(title.as_str()).activatable(true).build();
+        row.set_subtitle(&format_duration((end - start).max(0.0)));
+        if is_current {
+            row.add_css_class("heading");
+        }
+        if is_downloaded {
+            row.add_suffix(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+        }
+        row.connect_activated({
+            let on_play = on_play.clone();
+            let item_id = item_id.to_string();
+            move |_| {
+                on_play(item_id.clone(), Some(index));
+            }
+        });
+        chapters_list.append(&row);
     }
 }
 
@@ -1132,6 +1214,64 @@ pub(crate) mod tests {
         );
         pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
         window.destroy();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for the "no visible
+    /// progress, and the chapter glyphs go stale" gaps: starting a whole-book download from this
+    /// screen must reveal the progress strip immediately, and once the batch completes, both the
+    /// strip must hide again *and* every chapter row must pick up its "Downloaded" glyph without
+    /// the screen being rebuilt — `download_manager::tests::mock_three_track_item` gives real
+    /// per-chapter tracks to download against.
+    pub(crate) fn run_download_progress_strip_reveals_and_chapter_glyphs_update_live(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 15.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server.clone(), account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        // Pass 2 (chapters over the network) must have landed before any row exists to assert on.
+        pump_until(|| hooks.chapters_list.row_at_index(0).is_some(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "nothing is downloading yet");
+
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        click_button_labeled(&hooks.download_popover_box, "Entire book");
+
+        pump_until(|| hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(hooks.download_progress_revealer.reveals_child(), "starting a download should reveal the progress strip immediately");
+
+        pump_until(
+            || runtime.block_on(abs_storage::repo::download_tracks::downloaded_item_ids(&pool, &server.id)).unwrap().iter().any(|id| id == "item-1"),
+            Duration::from_secs(10),
+        );
+        pump_until(|| !hooks.download_progress_revealer.reveals_child(), Duration::from_secs(5));
+        assert!(!hooks.download_progress_revealer.reveals_child(), "the strip should retract once the batch completes");
+
+        let all_three_chapter_rows_marked = || {
+            (0..3).all(|i| hooks.chapters_list.row_at_index(i).is_some_and(|row| find_descendant_in_row::<gtk4::Image>(&row).is_some()))
+        };
+        pump_until(all_three_chapter_rows_marked, Duration::from_secs(5));
+        assert!(all_three_chapter_rows_marked(), "every chapter should show the Downloaded glyph without reopening the screen");
+        assert!(hooks.chapters_list.row_at_index(3).is_none(), "the item has exactly 3 chapters");
+
+        window.destroy();
+    }
+
+    /// Depth-first search for a widget of type `T` under a chapter row — same purpose as
+    /// `widgets::find_descendant`, duplicated here rather than made `pub(crate)` there since this
+    /// crosses from a `gtk4::ListBoxRow` (this screen's chapter rows) rather than the plain
+    /// `GtkWidget` root every other call site searches from.
+    fn find_descendant_in_row<T: glib::object::IsA<gtk4::Widget>>(row: &gtk4::ListBoxRow) -> Option<T> {
+        crate::widgets::find_descendant::<T>(row.upcast_ref())
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The direct regression test for the

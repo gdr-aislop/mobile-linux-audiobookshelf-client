@@ -214,6 +214,7 @@ mod tests {
         (item_detail_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller, crate::screens::item_detail::tests::run_tapping_play_invokes_on_play_and_leaves_navigation_to_the_caller),
         (item_detail_back_button_invokes_on_back, crate::screens::item_detail::tests::run_back_button_invokes_on_back),
         (item_detail_download_menu_starts_a_real_download, crate::screens::item_detail::tests::run_download_menu_starts_a_real_download),
+        (item_detail_download_progress_strip_reveals_and_chapter_glyphs_update_live, crate::screens::item_detail::tests::run_download_progress_strip_reveals_and_chapter_glyphs_update_live),
         (item_detail_shows_the_mini_bar_for_whatever_is_currently_playing, crate::screens::item_detail::tests::run_shows_the_mini_bar_for_whatever_is_currently_playing),
         (item_detail_series_button_shows_the_plain_name_then_fills_in_the_real_numbers, crate::screens::item_detail::tests::run_series_button_shows_the_plain_name_then_fills_in_the_real_numbers),
         (item_detail_series_button_keeps_the_plain_name_when_the_network_call_fails, crate::screens::item_detail::tests::run_series_button_keeps_the_plain_name_when_the_network_call_fails),
@@ -270,6 +271,7 @@ mod tests {
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),
         (player_screen_chapters_sheet_lists_and_seeks, crate::screens::player::tests::run_chapters_sheet_lists_and_seeks),
         (player_screen_download_button_starts_a_download_and_reflects_state, crate::screens::player::tests::run_download_button_starts_a_download_and_reflects_state),
+        (player_screen_download_progress_strip_reveals_while_downloading, crate::screens::player::tests::run_download_progress_strip_reveals_while_downloading),
 
         (download_scope_menu_stepper_defaults_clamps_and_steps, crate::widgets::download_scope_menu::tests::run_stepper_defaults_clamps_and_steps),
 

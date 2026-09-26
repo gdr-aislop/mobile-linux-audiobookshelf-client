@@ -376,8 +376,11 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 }
 
 /// The in-flight subtitle: chapter progress from the manager's batch ("3/10 chapters"), total
-/// bytes so far, and — while samples are flowing — the smoothed speed.
-fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
+/// bytes so far, and — while samples are flowing — the smoothed speed. `pub(crate)` so
+/// `widgets::download_progress::DownloadProgressStrip` (Item Detail/Player's own in-flight
+/// indicator) reads the same numbers in the same words as this screen's own live row, rather
+/// than inventing a second wording for the same data.
+pub(crate) fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
     let mut parts = Vec::new();
     if let Some((finished, total)) = batch {
         parts.push(format!("{finished}/{total} chapters"));
