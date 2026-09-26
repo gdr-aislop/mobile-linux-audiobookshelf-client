@@ -42,10 +42,13 @@ pub async fn resolve_stream_target(connection: &crate::connection::ConnectionTar
     let api = connection
         .api_client(access_token)
         .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
-    let info = api
-        .get_item_playback_info(item_id)
-        .await
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))?;
+    let info = api.get_item_playback_info(item_id).await.map_err(|e| match e {
+        // Distinguished so callers (e.g. `app::player::PlayerController::start`) can show
+        // "session expired — log in again" rather than a generic network failure — the same
+        // 401/403-means-Auth convention `sync.rs`'s `auth_or_unexpected` already draws.
+        abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
+        other => CoreError::UnexpectedResponse(other.details()),
+    })?;
 
     if info.audio_files.is_empty() {
         return Err(CoreError::UnexpectedResponse(format!("item {item_id} has no audio files")));
@@ -150,7 +153,10 @@ pub async fn sync_progress_to_server_with_client(
 ) -> Result<()> {
     api.update_media_progress(item_id, current_time_seconds, duration_seconds, is_finished)
         .await
-        .map_err(|e| CoreError::UnexpectedResponse(e.to_string()))
+        .map_err(|e| match e {
+            abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
+            other => CoreError::UnexpectedResponse(other.details()),
+        })
 }
 
 #[cfg(test)]
@@ -232,6 +238,19 @@ mod tests {
         assert_eq!(target.tracks[0].offset_seconds, 0.0);
         assert_eq!(target.tracks[1].offset_seconds, 1800.0, "the second track starts where the first ends");
         assert_eq!(target.duration_seconds, 3600.0, "book-level duration spans every track");
+    }
+
+    /// A 401 must come back as `CoreError::Auth`, not a generic `UnexpectedResponse` — this is
+    /// what lets `app::player::PlayerController::start` show "log in again" instead of a plain
+    /// network-failure message for the most common real trigger (an expired session).
+    #[tokio::test]
+    async fn resolve_stream_target_maps_401_to_auth() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1")).respond_with(ResponseTemplate::new(401)).mount(&mock_server).await;
+
+        let result = resolve_stream_target(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1").await;
+
+        assert!(matches!(result, Err(CoreError::Auth)), "a 401 must map to CoreError::Auth");
     }
 
     #[tokio::test]
@@ -416,5 +435,15 @@ mod tests {
 
         let result = sync_progress_to_server(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1", 42.5, 100.0, false).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_progress_to_server_maps_401_to_auth() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(401)).mount(&mock_server).await;
+
+        let result = sync_progress_to_server(&ConnectionTarget::direct(&mock_server.uri()), "test-token", "item-1", 42.5, 100.0, false).await;
+
+        assert!(matches!(result, Err(CoreError::Auth)), "got: {result:?}");
     }
 }

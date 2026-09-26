@@ -599,7 +599,18 @@ pub fn build(
     play_button.connect_clicked({
         let on_play = on_play.clone();
         let item_id = item_id.clone();
+        let play_button = play_button.clone();
         move |_| {
+            // `on_play` (`main_window::start_playback`) resolves asynchronously (network + stream
+            // resolution, up to ~16s on a slow server) before it navigates away to the mini
+            // bar/Full Player — without this, a tap here looked like it silently did nothing for
+            // that whole window, and a second, impatient tap started a second concurrent resolve.
+            // No explicit revert: `start_playback` always ends by opening the Full Player now
+            // (`PlayerController::start` constructs `now_playing` — with `last_error` set — even
+            // on failure), so this screen is swapped out by the time there's anything to show
+            // again; a fresh `build()` next time this screen opens starts from "Play"/"Resume".
+            play_button.set_sensitive(false);
+            play_button.set_label("Starting…");
             on_play(item_id.clone(), None);
         }
     });

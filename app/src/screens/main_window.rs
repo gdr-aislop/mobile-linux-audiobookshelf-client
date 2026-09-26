@@ -339,13 +339,17 @@ pub fn build(
             }
             // `controller.start()` above resolves asynchronously (network + stream resolution),
             // so there's nothing playing yet the instant this call returns — `open_player` (via
-            // `screens::player::build`) requires that there already is. Poll for readiness the
-            // same bounded way (50 * 100ms) the chapter seek above already does, rather than
-            // opening the shelf and waiting for the mini bar to catch up a moment later.
+            // `screens::player::build`) requires that there already is (which `start()` now also
+            // guarantees on a *failed* resolve, so this poll and the Player screen surfacing the
+            // error are the same path, not a special case). Bounded to 16s, not the chapter seek's
+            // 5s above: `start()`'s network resolve alone has a 15s timeout
+            // (`abs_api::Client::with_bearer_token`'s default), so a 5s poll would give up and
+            // leave the mini bar as the only sign anything happened, on a merely slow server that
+            // was always going to succeed (or fail) a few seconds later.
             let controller = controller.clone();
             let open_player = open_player.clone();
             glib::spawn_future_local(async move {
-                for _ in 0..50 {
+                for _ in 0..160 {
                     if controller.current_download_context().is_some() {
                         open_player();
                         return;

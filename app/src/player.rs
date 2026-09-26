@@ -667,18 +667,6 @@ impl PlayerController {
                 (inner.pool.clone(), inner.paths.clone())
             };
 
-            // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
-            // connection (settings + resolved base URL) is asked the same way: a settings
-            // change is honored by the very next playback without any rebuild.
-            let access_token = session.access_token().await;
-            let connection = match session.connection_target().await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
-                    return;
-                }
-            };
-
             // The cover the player shows is, first of all, whatever is already cached locally —
             // the same `cover_cache_path` Home/Library render from. Seeding `now_playing` with it
             // below (rather than starting from `None` and waiting on a fetch) is what makes the
@@ -687,13 +675,67 @@ impl PlayerController {
             // so on a first play a fast cache hit was discarded (the cover stayed blank), and on
             // a re-play it landed in the *previous* session's struct only to be wiped by this
             // function's tail (the cover appeared, then vanished). A local DB read never delays
-            // anything, so this runs inline; the network fetch itself stays detached, spawned
-            // once `now_playing` exists (below) so its result can always land.
+            // anything, so this runs inline, and — moved ahead of the connection lookup below —
+            // is available even on the earliest failure path, so a failed start still shows the
+            // right cover next to its error rather than a blank one.
             let cached_cover = abs_core::covers::cached_cover_path(&pool, session.server_id(), &item.item_id).await;
             // Captured up front — `item` and `session` move into `NowPlaying` below, and the
             // detached cover task needs these after that.
             let item_id = item.item_id.clone();
             let server_id = session.server_id().to_string();
+
+            // Builds the "nothing could start" `now_playing` shared by every early-failure branch
+            // below: same reasoning as the load-failure path further down (`now_playing` is always
+            // constructed, even on failure, so the mini bar/Full Player have something to show
+            // instead of quietly never appearing) — just for failures that happen before a
+            // `StreamTarget` even exists, so there are no tracks/chapters/duration to report.
+            // Owns its own clones (rather than borrowing `item`/`session`/`cached_cover`) so it
+            // doesn't hold a borrow across the rest of this future, which later moves each of
+            // those into the success-path `NowPlaying`.
+            let failed_now_playing = {
+                let item_id = item_id.clone();
+                let server_id = server_id.clone();
+                let session = session.clone();
+                let title = item.title.clone();
+                let author = item.author.clone();
+                let cached_cover = cached_cover.clone();
+                move |kind: abs_player::PlaybackErrorKind, message: String| NowPlaying {
+                    item_id: item_id.clone(),
+                    server_id: server_id.clone(),
+                    account_id: session.account_id().to_string(),
+                    session: session.clone(),
+                    title: title.clone(),
+                    author: author.clone(),
+                    duration_seconds: 0.0,
+                    tracks: Vec::new(),
+                    current_track: 0,
+                    is_playing: false,
+                    chapters: Vec::new(),
+                    speed: 1.0,
+                    sleep_timer: SleepTimerState::Off,
+                    cover_path: cached_cover.clone(),
+                    last_error: Some(abs_player::PlaybackError { kind, message, debug: None }),
+                }
+            };
+
+            // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
+            // connection (settings + resolved base URL) is asked the same way: a settings
+            // change is honored by the very next playback without any rebuild.
+            let access_token = session.access_token().await;
+            let connection = match session.connection_target().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    // Previously a bare `return`: `now_playing` stayed `None` forever, so
+                    // `main_window::start_playback`'s readiness poll just expired and Play looked
+                    // like it silently did nothing — see this fix's sibling below for the same
+                    // reasoning against the resolve failure.
+                    tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
+                    let mut inner = inner_rc.borrow_mut();
+                    inner.now_playing = Some(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
+                    inner.publish();
+                    return;
+                }
+            };
 
             // Resolving the stream URL is required to proceed — unless the item can be played
             // from locally cached state instead (below). Reconciling progress is a nice-to-have
@@ -720,7 +762,20 @@ impl PlayerController {
                             offline
                         }
                         Err(offline_err) => {
+                            // Previously a bare `return` here too — same silent-Play-button
+                            // symptom as the connection failure above, and the most common trigger
+                            // in practice: an expired session (`resolve_stream_target` now
+                            // distinguishes a 401/403 as `CoreError::Auth`), which nothing else
+                            // catches until Home/Library's next sync.
                             tracing::warn!(%err, offline = %offline_err, item_id = %item.item_id, "couldn't resolve a playable URL");
+                            let kind = if matches!(err, abs_core::CoreError::Auth) {
+                                abs_player::PlaybackErrorKind::NotAuthorized
+                            } else {
+                                abs_player::PlaybackErrorKind::Network
+                            };
+                            let mut inner = inner_rc.borrow_mut();
+                            inner.now_playing = Some(failed_now_playing(kind, err.to_string()));
+                            inner.publish();
                             return;
                         }
                     }
@@ -1839,6 +1894,44 @@ pub(crate) mod tests {
         assert!(!snapshot.is_playing);
         let err = snapshot.last_error.expect("a failed load must populate last_error");
         assert_eq!(err.kind, abs_player::PlaybackErrorKind::Unavailable);
+
+        controller.stop();
+    }
+
+    /// Regression test for the "Play button silently does nothing" gap's more common trigger: the
+    /// item was never played or downloaded on this device (no cached track metadata to fall back
+    /// on) and the server rejects the resolve with a 401 — an expired session, in practice.
+    /// `start()` used to `return` before `now_playing` existed at all in this case too; it now
+    /// records the failure with `PlaybackErrorKind::NotAuthorized` (via `resolve_stream_target`
+    /// mapping a 401 to `CoreError::Auth`), same as any other failed load.
+    pub(crate) fn run_start_with_an_expired_session_and_nothing_cached_shows_a_login_error(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET")).and(path("/api/items/item-1")).respond_with(ResponseTemplate::new(401)).mount(&mock_server).await;
+            Mock::given(method("GET")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+
+        let controller = PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+
+        pump_until(|| controller.current_download_context().is_some(), Duration::from_secs(10));
+        assert!(
+            controller.current_download_context().is_some(),
+            "now_playing must exist even when the resolve fails entirely — otherwise the shell's \
+             readiness poll expires and the Full Player screen never opens at all"
+        );
+        let snapshot = controller.snapshot().expect("now_playing should exist");
+        assert_eq!(snapshot.title, "Test Book");
+        assert!(!snapshot.is_playing);
+        let err = snapshot.last_error.expect("a failed resolve must populate last_error");
+        assert_eq!(err.kind, abs_player::PlaybackErrorKind::NotAuthorized, "a 401 should read as a login failure, not a generic network one");
 
         controller.stop();
     }
