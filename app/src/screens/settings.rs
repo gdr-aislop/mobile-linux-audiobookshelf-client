@@ -43,6 +43,7 @@ pub struct SettingsHooks {
     pub skip_back_row: adw::ComboRow,
     pub skip_forward_row: adw::ComboRow,
     pub wifi_only_switch: gtk4::Switch,
+    pub wifi_only_row: adw::ActionRow,
     pub burst_buffering_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
@@ -423,7 +424,7 @@ pub fn build(
     wifi_only_switch.set_active(playback_settings.wifi_only_downloads);
     let wifi_only_row = adw::ActionRow::builder()
         .title("Wi-Fi only downloads")
-        .subtitle("Don't start downloads on metered connections")
+        .subtitle(wifi_only_subtitle(download_manager.can_detect_metered()))
         .build();
     wifi_only_row.add_suffix(&wifi_only_switch);
     wifi_only_row.set_activatable_widget(Some(&wifi_only_switch));
@@ -575,6 +576,7 @@ pub fn build(
             skip_back_row,
             skip_forward_row,
             wifi_only_switch,
+            wifi_only_row,
             burst_buffering_switch,
             theme_row,
             about_row,
@@ -687,11 +689,21 @@ fn theme_from_index(index: u32) -> Theme {
     }
 }
 
+/// The Wi-Fi-only row's subtitle. Without a way to detect the connection type the setting
+/// never blocks anything, so the row says that instead of promising something it can't do.
+fn wifi_only_subtitle(can_detect_metered: bool) -> &'static str {
+    if can_detect_metered {
+        "Don't start downloads on metered connections"
+    } else {
+        "Can't detect the connection type on this device, so downloads aren't restricted"
+    }
+}
+
 /// Fire-and-forget persistence on the shared Tokio runtime — same shape as every other GTK
 /// signal handler that touches the database (`PlayerController`'s progress writes, Welcome's
-/// Connect button): capture everything up front, spawn, log on failure. Also applies the new
-/// values to the live controller and download manager immediately, so a change takes effect
-/// without an app restart.
+/// Connect button): capture everything up front, spawn, report on failure through the toast
+/// overlay. Also applies the new values to the live controller and download manager
+/// immediately, so a change takes effect without an app restart.
 ///
 /// Saves are serialized through `pending_save`/`writer_running` — one snapshot slot plus at most
 /// one in-flight writer task. Two concurrent `save_playback_settings` calls would interleave
@@ -870,6 +882,11 @@ pub(crate) mod tests {
         assert_eq!(screen.hooks.skip_back_row.selected(), 2, "15 seconds is the third skip choice");
         assert_eq!(screen.hooks.skip_forward_row.selected(), 4, "30 seconds is the fifth skip choice");
         assert!(screen.hooks.wifi_only_switch.state(), "Wi-Fi-only downloads defaults to on");
+        assert_eq!(
+            screen.hooks.wifi_only_row.subtitle().as_deref(),
+            Some("Can't detect the connection type on this device, so downloads aren't restricted"),
+            "with no way to detect a metered connection, the row must not promise to restrict downloads"
+        );
         assert!(screen.hooks.burst_buffering_switch.state(), "burst buffering defaults to on");
         assert_eq!(screen.hooks.theme_row.selected(), 0, "theme defaults to System");
 

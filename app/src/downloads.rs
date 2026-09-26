@@ -176,6 +176,13 @@ impl DownloadManager {
         !self.inner.borrow().batches.is_empty()
     }
 
+    /// Whether this device can currently tell a metered connection from an unmetered one. When
+    /// it can't (no NetworkManager, or it doesn't know), Wi-Fi-only never blocks anything, and
+    /// Settings says so rather than offering a switch that silently does nothing.
+    pub fn can_detect_metered(&self) -> bool {
+        self.inner.borrow().network_monitor.is_metered().is_some()
+    }
+
     /// Bytes free on the filesystem holding the downloads directory — the number the download
     /// sheet's size estimates are compared against. The downloads dir may not exist yet (it's
     /// created lazily at first download), so its parent is probed first; either missing means
