@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # leaving no libsoup-3 for GStreamer's soup plugin to dlopen at runtime, which
 # kills all https:// playback in the produced AppImage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config git curl ca-certificates file patchelf \
+        build-essential pkg-config git curl ca-certificates file patchelf zsync \
         libgtk-4-dev libadwaita-1-dev \
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
         libssl-dev \
