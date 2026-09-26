@@ -554,6 +554,38 @@ pub fn build(
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone());
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
+
+    // A dot on the Downloads tab while anything is downloading, so "something is running in the
+    // background" stays visible from Home/Library too, once the user has navigated away from
+    // wherever they started it (the toast's own "View" action, above, covers the moment right
+    // after starting it). Cleared the moment the tab is actually opened.
+    {
+        let stack = stack.clone();
+        let downloads_root = downloads_screen.root.clone();
+        let download_manager = download_manager.clone();
+        download_manager.add_listener({
+            let stack = stack.clone();
+            let downloads_root = downloads_root.clone();
+            let download_manager = download_manager.clone();
+            move |_event| {
+                // Deferred: `download_manager.any_in_flight()` borrows the same `RefCell` several
+                // publish() call sites are still holding mutably borrowed at the point they
+                // publish (see `widgets::download_progress`'s identical fix for the same reason).
+                let stack = stack.clone();
+                let downloads_root = downloads_root.clone();
+                let download_manager = download_manager.clone();
+                glib::idle_add_local_once(move || {
+                    let showing_downloads = stack.visible_child_name().as_deref() == Some("downloads");
+                    stack.page(&downloads_root).set_needs_attention(download_manager.any_in_flight() && !showing_downloads);
+                });
+            }
+        });
+        stack.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some("downloads") {
+                stack.page(&downloads_root).set_needs_attention(false);
+            }
+        });
+    }
     let settings_screen = screens::settings::build(
         pool.clone(),
         mini_bar.controller.clone(),
@@ -1484,7 +1516,8 @@ pub(crate) mod tests {
     /// content-swapped over the shell, hiding the tab bar, so the "Download started" toast's
     /// "View" action (`widgets::download_scope_menu`'s `started_download_toast`) is the only way
     /// back short of navigating there blind and hoping. Clicking it must close Item Detail and
-    /// land on the Downloads tab.
+    /// land on the Downloads tab. Also covers the Downloads tab's attention dot: it must appear
+    /// while a batch is in flight and the tab isn't visible, and clear once it becomes visible.
     pub(crate) fn run_download_started_toast_view_action_opens_downloads(runtime: &tokio::runtime::Runtime) {
         use crate::screens::home::tests::item_json;
 
@@ -1547,6 +1580,12 @@ pub(crate) mod tests {
         pump_until(|| find_button_containing_label(&content, "Entire book").is_some(), std::time::Duration::from_secs(2));
         find_button_containing_label(&content, "Entire book").expect("the Entire book scope row").emit_clicked();
 
+        // Also covers the Downloads tab's attention dot (A4): while a batch is in flight and the
+        // user is looking at Item Detail, not the Downloads tab, the tab should carry it.
+        let downloads_root = hooks.stack.child_by_name("downloads").expect("downloads tab exists");
+        pump_until(|| hooks.stack.page(&downloads_root).needs_attention(), std::time::Duration::from_secs(5));
+        assert!(hooks.stack.page(&downloads_root).needs_attention(), "the Downloads tab should show a dot while something is downloading");
+
         pump_until(|| find_button_labeled(&content, "View").is_some(), std::time::Duration::from_secs(5));
         find_button_labeled(&content, "View").expect("the toast's View action").emit_clicked();
 
@@ -1555,6 +1594,8 @@ pub(crate) mod tests {
             std::time::Duration::from_secs(5),
         );
         assert_eq!(hooks.stack.visible_child_name().as_deref(), Some("downloads"), "the toast's View action should switch to the Downloads tab");
+        pump_until(|| !hooks.stack.page(&downloads_root).needs_attention(), std::time::Duration::from_secs(5));
+        assert!(!hooks.stack.page(&downloads_root).needs_attention(), "opening the Downloads tab should clear its own attention dot");
     }
 
     /// Depth-first search for the first `GtkButton` constructed from exactly this icon name

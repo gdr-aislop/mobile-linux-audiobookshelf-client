@@ -169,6 +169,13 @@ impl DownloadManager {
         self.inner.borrow().batches.contains_key(&(server_id.to_string(), item_id.to_string()))
     }
 
+    /// Whether *anything* is downloading right now, across every item — the Downloads tab's own
+    /// attention-dot uses this so "something is running in the background" stays visible from
+    /// Home/Library too, not just from whichever screen happened to start it.
+    pub fn any_in_flight(&self) -> bool {
+        !self.inner.borrow().batches.is_empty()
+    }
+
     /// Bytes free on the filesystem holding the downloads directory — the number the download
     /// sheet's size estimates are compared against. The downloads dir may not exist yet (it's
     /// created lazily at first download), so its parent is probed first; either missing means
