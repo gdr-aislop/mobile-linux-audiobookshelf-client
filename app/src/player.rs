@@ -99,6 +99,8 @@ const ADOPT_SERVER_POSITION_MIN_DELTA_SECONDS: f64 = 5.0;
 /// A seek while paused is saved once the listener has stopped moving the position for this long
 /// — scrubbing emits many seeks, and each doesn't need its own write and push.
 const PAUSED_SEEK_WRITE_DELAY: Duration = Duration::from_secs(2);
+/// See `Inner::premature_end_of_stream`.
+const PREMATURE_EOS_MIN_GAP_SECONDS: f64 = 60.0;
 /// How long quitting may wait for the final progress push.
 const SHUTDOWN_PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -223,6 +225,9 @@ struct NowPlaying {
     /// before any track could be resolved (`tracks` is empty). Retry then re-runs the whole start
     /// instead of resuming whatever the backend still held from the previous book.
     retry_request: Option<(PlayRequest, f64)>,
+    /// Where the last end-of-stream that looked premature happened, as `(track, within)` — see
+    /// `Inner::premature_end_of_stream`.
+    premature_eos_at: Option<(usize, f64)>,
 }
 
 /// What `seek_to_seconds` decided to do once its synchronous, borrow-scoped decision-making is
@@ -665,6 +670,33 @@ impl Inner {
             push,
             on_progress_sync: self.on_progress_sync.clone(),
         });
+    }
+
+    /// Whether an end-of-stream came well before the end of the track: a stream cut off mid-file
+    /// can end like a finished one, and treating it as finished would advance to the next file
+    /// (or mark the whole book finished) from the middle of this one. Only a large gap counts
+    /// (at least a minute and 10% of the track), since durations of some files are estimates. And
+    /// a second one at the same spot is accepted as the real end, so a wrong estimate can't trap
+    /// playback in a retry loop.
+    fn premature_end_of_stream(&mut self) -> bool {
+        let within = self.backend.position().map(|d| d.as_secs_f64());
+        let backend_duration = self.backend.duration().map(|d| d.as_secs_f64()).filter(|d| *d > 0.0);
+        let Some(now_playing) = &mut self.now_playing else { return false };
+        let within = within.unwrap_or(now_playing.last_known_within_track);
+        let server_duration = now_playing.tracks.get(now_playing.current_track).map(|t| t.duration_seconds).filter(|d| *d > 0.0);
+        let Some(duration) = server_duration.or(backend_duration) else { return false };
+        let short_by = duration - within;
+        if short_by < PREMATURE_EOS_MIN_GAP_SECONDS.max(duration * 0.1) {
+            return false;
+        }
+        let here = (now_playing.current_track, within);
+        if now_playing.premature_eos_at.is_some_and(|(track, at)| track == here.0 && (at - within).abs() < 5.0) {
+            tracing::warn!(within, duration, "the stream ended early at the same spot again; taking it as the real end");
+            now_playing.premature_eos_at = None;
+            return false;
+        }
+        now_playing.premature_eos_at = Some(here);
+        true
     }
 
     /// At end-of-stream: if another track follows the current one, refines the track map against
@@ -1136,6 +1168,7 @@ impl PlayerController {
                     seek_issued_at: None,
                     seek_retries: 0,
                     retry_request: Some(retry_request.clone()),
+                    premature_eos_at: None,
                 }
             };
             // A failed start must not leave the previous book loaded: Retry would otherwise
@@ -1348,6 +1381,7 @@ impl PlayerController {
                 seek_issued_at: (is_playing && start_within > 0.0).then(Instant::now),
                 seek_retries: 0,
                 retry_request: None,
+                premature_eos_at: None,
                 // `is_playing`/`last_error` above already reflect a load failure; `needs_reload`
                 // mirrors that a load failure did (see the `Err` arm just above), so the very
                 // first Retry goes through the reload path rather than a plain `set_state`.
@@ -1972,6 +2006,17 @@ impl PlayerController {
         inner.observe_position();
 
         if let Some(event) = inner.backend.poll_event() {
+            let event = match event {
+                abs_player::PlayerEvent::EndOfStream if inner.premature_end_of_stream() => {
+                    tracing::warn!("the stream ended well before the end of the track; treating it as a lost connection");
+                    abs_player::PlayerEvent::Error(abs_player::PlaybackError {
+                        kind: abs_player::PlaybackErrorKind::Network,
+                        message: "The audio stream ended before the end of the file.".to_string(),
+                        debug: None,
+                    })
+                }
+                event => event,
+            };
             match event {
                 abs_player::PlayerEvent::EndOfStream => {
                     if let Some((item_id, next_track)) = inner.next_track_after_end_of_stream() {
@@ -3966,6 +4011,60 @@ pub(crate) mod tests {
         let saved = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
         assert!((saved.current_time_seconds - 4.0).abs() < 0.5, "shutdown must save the final position, got {}", saved.current_time_seconds);
         assert!(!saved.needs_push, "and push it, when the server is reachable");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A stream cut off mid-file can end
+    /// like a finished one. Taken at face value, that marks the book finished from the middle;
+    /// it must instead read as a lost connection, keeping the position, with Retry picking up
+    /// there. A second early end at the same spot is taken as the real end, so a wrong duration
+    /// estimate can't trap playback in a loop.
+    pub(crate) fn run_a_stream_that_ends_early_is_not_the_end_of_the_book(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "media": { "audioFiles": [{ "ino": "1", "duration": 600.0 }] }
+                })))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+        });
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(100));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 99.5), Duration::from_secs(5));
+
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(5));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_some(), "an end 500 s short of the track must read as a lost connection");
+        assert!(!snapshot.is_playing);
+        assert!((snapshot.position_seconds - 100.0).abs() < 0.5, "the position must be kept, got {}", snapshot.position_seconds);
+        pump_until(|| false, Duration::from_millis(300));
+        let saved = || runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert!(!saved().is_finished, "the book must not be marked finished");
+        assert!((saved().current_time_seconds - 100.0).abs() < 0.5);
+
+        // Retry picks up at 100 s; ending early at the same spot again is taken as the real end.
+        controller.play();
+        pump_until(|| state.borrow().seek_calls.last() == Some(&Duration::from_secs(100)), Duration::from_secs(5));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing && s.last_error.is_none()), Duration::from_secs(5));
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        pump_until(|| saved().is_finished, Duration::from_secs(5));
+        assert!(saved().is_finished, "a second early end at the same spot is accepted as the end");
+        controller.stop();
     }
 
     #[test]

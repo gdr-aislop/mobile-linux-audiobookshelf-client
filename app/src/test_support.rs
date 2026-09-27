@@ -61,3 +61,21 @@ pub fn any_label_reads(root: &gtk4::Widget, text: &str) -> bool {
     }
     false
 }
+
+/// Depth-first search for a button whose label reads `label` — how scenarios press a toast's
+/// action button, which lives inside the `AdwToastOverlay`'s internal widgets.
+pub fn find_button_with_label(root: &gtk4::Widget, label: &str) -> Option<gtk4::Button> {
+    if let Some(button) = root.downcast_ref::<gtk4::Button>() {
+        if button.label().is_some_and(|text| text == label) {
+            return Some(button.clone());
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = find_button_with_label(&widget, label) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
