@@ -436,6 +436,13 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   rejects the session), the banner swaps to "Session expired — showing what's cached." and grows
   a "Log in again" button routing to the re-login flow (see Home) — on every screen that shows
   the banner, not just Home.
+- **Listening position:** never lost silently. Progress the server hasn't confirmed (listened to
+  offline, or whose push failed) is kept marked on the device and pushed on the next sync or
+  reconnect. Signing out or removing a server says so when it would delete such progress.
+  Resuming after a pause of a minute or more first checks the server; if another device moved
+  the book on, playback continues there and a toast ("Continued at 1:02:03 from another
+  device") offers Undo. "Mark as finished" and "Reset progress" toasts offer Undo too. Quitting
+  saves the final position, and a seek while paused is saved once seeking stops.
 - **Offline-first playback:** downloaded items remain playable and browsable without a server
   connection; the app clearly marks which items are available offline (small download badge on
   covers/rows, and per-chapter offline markers in Item detail). The Home/Library offline-mode
