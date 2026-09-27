@@ -31,12 +31,35 @@ use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
 
 /// The button + its popover. Callers embed `.widget` (a `GtkMenuButton`) wherever their layout
 /// wants a download action — Player's secondary control row, Item Detail's actions row.
+/// `Clone`, so a caller that needs to call [`Self::refresh`] later (from a callback fired after
+/// this was built) can hand out a clone while still keeping the original for layout/`TestHooks` —
+/// every field is itself a cheap, refcounted handle (`Rc`/GTK's own GObject wrappers), the same
+/// clone-is-cheap contract every other widget handle in this crate already has.
+#[derive(Clone)]
 pub struct DownloadScopeMenu {
     pub widget: gtk4::MenuButton,
-    #[cfg(test)]
-    pub popover: gtk4::Popover,
+    pub(crate) popover: gtk4::Popover,
+    /// Rebuilds the popover's rows from whatever `chapter_ranges`/`chapters_ready`/etc. report
+    /// *right now* — shared between `connect_show` (below) and [`Self::refresh`], so a caller
+    /// whose chapters/tracks arrive after the popover is already open can push the update in
+    /// without the popover being closed and reopened. See `populate_download_popover_rows`'s own
+    /// doc for what actually renders while chapters aren't ready yet.
+    repopulate: Rc<dyn Fn()>,
     #[cfg(test)]
     pub popover_box: gtk4::Box,
+}
+
+impl DownloadScopeMenu {
+    /// Re-renders the popover's rows if — and only if — it's currently open. A caller whose
+    /// chapters/tracks/availability changed after the popover was already showing (Item Detail's
+    /// Pass 2 landing after a quick tap) calls this so the popover updates in place; calling it
+    /// while the popover is closed would just waste the work; the very next `connect_show` in
+    /// `build` below re-populates unconditionally anyway.
+    pub fn refresh(&self) {
+        if self.popover.is_visible() {
+            (self.repopulate)();
+        }
+    }
 }
 
 /// Builds the menu. `chapter_ranges`/`current_chapter_index`/`free_space` are all asked fresh
@@ -47,6 +70,19 @@ pub struct DownloadScopeMenu {
 /// once playback starts, so its closure just clones the same list every time — same contract the
 /// pre-extraction Player-only version already had for `current_chapter_index`/`free_space`,
 /// extended to `chapter_ranges` for this reason.
+///
+/// `chapters_ready` tells the popover whether `chapter_ranges`/`current_chapter_index` are
+/// actually meaningful yet. Item Detail resolves chapters from the network after this menu
+/// already needs to exist, and *before* that lands, `chapter_ranges()` returns an empty `Vec` —
+/// indistinguishable, from this widget's side alone, from a book that genuinely has no chapters,
+/// which every scope row's estimate (and the download manager's own fallback) treats as "the
+/// whole book". Opening the menu in that gap used to show every option at the full-book size and
+/// clamp "Next chapters" to 1, and "Current chapter" was still tappable — a real full-book
+/// download when only the current chapter was wanted. `chapters_ready() == false` instead shows
+/// a "Loading chapters…" placeholder with no scope rows at all (see
+/// `populate_download_popover_rows`), and the caller calls [`DownloadScopeMenu::refresh`] once
+/// its chapters actually land so an already-open popover updates in place. Player's chapters are
+/// already known before this is ever built, so its closure just returns `true`.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     pool: SqlitePool,
@@ -54,6 +90,7 @@ pub fn build(
     session: abs_core::auth::Session,
     item_id: String,
     chapter_ranges: impl Fn() -> Vec<(f64, f64)> + 'static,
+    chapters_ready: impl Fn() -> bool + 'static,
     current_chapter_index: impl Fn() -> usize + 'static,
     free_space: impl Fn() -> Option<u64> + 'static,
     toast_overlay: adw::ToastOverlay,
@@ -68,9 +105,20 @@ pub fn build(
     let popover = gtk4::Popover::builder().child(&popover_box).build();
     let widget = gtk4::MenuButton::builder().icon_name("folder-download-symbolic").tooltip_text("Download").popover(&popover).build();
 
-    // Rebuilt on every `connect_show` (not once at construction): whether "Clear downloaded
-    // chapters" applies, and the size estimates/free-space guard, can all change between opens.
-    popover.connect_show({
+    // Shared by `connect_show` below and `DownloadScopeMenu::refresh` — rebuilding whether
+    // "Clear downloaded chapters" applies, the size estimates, the free-space guard, and now
+    // whether chapters are ready at all, since every one of those can change between opens (or,
+    // for chapters, while the popover is already open).
+    // Guards against a *stale* repopulate's async pass landing after a newer repopulate call
+    // already rendered fresher rows — a real race, not just a theoretical one: `refresh()` is
+    // called right as chapters become ready, which for a locally-cached seed (no network wait at
+    // all) can land within milliseconds of the popover's own initial `connect_show`-triggered
+    // populate, whose async pass (also a local DB read) may not have completed yet. Each
+    // `repopulate()` call claims the next generation; its async pass only applies what it found
+    // if its generation is still the current one by the time it lands.
+    let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    let repopulate: Rc<dyn Fn()> = Rc::new({
         let pool = pool.clone();
         let download_manager = download_manager.clone();
         let popover_box = popover_box.clone();
@@ -79,9 +127,14 @@ pub fn build(
         let item_id = item_id.clone();
         let toast_overlay = toast_overlay.clone();
         let on_open_downloads = on_open_downloads.clone();
-        move |_| {
-            // The stepper's count defaults to 10 (ui-spec) on every open and is shared by both
-            // populate passes below, so the async availability rebuild can't reset it mid-open.
+        let generation = generation.clone();
+        move || {
+            let my_generation = generation.get() + 1;
+            generation.set(my_generation);
+            // The stepper's count defaults to 10 (ui-spec) on every (re)population and is shared
+            // by both populate passes below, so the async availability rebuild can't reset a
+            // count the user already stepped.
+            let ready = chapters_ready();
             let chapter_ranges = chapter_ranges();
             let current_chapter_index = current_chapter_index();
             // Free space is one cheap statvfs — available even to the synchronous first pass.
@@ -89,6 +142,7 @@ pub fn build(
             let next_count = Rc::new(Cell::new(10u32));
             populate_download_popover_rows(
                 &popover_box,
+                ready,
                 OfflineAvailability::None,
                 &download_manager,
                 &popover_for_rows,
@@ -113,12 +167,22 @@ pub fn build(
                 let next_count = next_count.clone();
                 let toast_overlay = toast_overlay.clone();
                 let on_open_downloads = on_open_downloads.clone();
+                let generation = generation.clone();
                 async move {
                     let server_id = session.server_id().to_string();
                     let availability = abs_core::download_tracks::item_offline_availability(&pool, &server_id, &item_id).await.unwrap_or(OfflineAvailability::None);
                     let tracks = abs_core::tracks::cached_tracks(&pool, &server_id, &item_id).await.unwrap_or_default();
+                    if generation.get() != my_generation {
+                        // A newer `repopulate()` call has already started (and, since its own
+                        // synchronous pass runs before any `.await` point, already rendered) —
+                        // applying this stale result now would clobber it with what could easily
+                        // be older, wronger state (e.g. `chapters_ready() == false` from before a
+                        // caller's `refresh()`).
+                        return;
+                    }
                     populate_download_popover_rows(
                         &popover_box,
+                        ready,
                         availability,
                         &download_manager,
                         &popover_for_rows,
@@ -135,6 +199,11 @@ pub fn build(
                 }
             });
         }
+    });
+
+    popover.connect_show({
+        let repopulate = repopulate.clone();
+        move |_| repopulate()
     });
 
     // Reflects this item's overall download state on the button's own icon (ui-spec: idle ->
@@ -174,8 +243,8 @@ pub fn build(
 
     DownloadScopeMenu {
         widget,
-        #[cfg(test)]
         popover,
+        repopulate,
         #[cfg(test)]
         popover_box,
     }
@@ -242,9 +311,17 @@ fn started_download_toast(on_open_downloads: &Rc<dyn Fn()>) -> adw::Toast {
 /// aren't synced yet, so no subtitle is shown at all rather than a wrong one). `next_count` is
 /// shared with the caller so the popover's synchronous and async populate passes (same open)
 /// can't clobber a count the user already stepped.
+///
+/// `chapters_ready: false` replaces all four scope rows and the stepper with a single "Loading
+/// chapters…" placeholder — no scope row exists at all, so nothing can be tapped into starting a
+/// download sized for the whole book when only a chapter's worth was ever asked for (see
+/// `build`'s own doc for the report this fixes). The Stop-download row (synchronous, needs no
+/// chapters) and the Clear-downloaded-chapters row (only known once the async availability read
+/// lands, independent of chapters) are unaffected either way.
 #[allow(clippy::too_many_arguments)]
 fn populate_download_popover_rows(
     popover_box: &gtk4::Box,
+    chapters_ready: bool,
     availability: OfflineAvailability,
     download_manager: &DownloadManager,
     popover: &gtk4::Popover,
@@ -327,128 +404,144 @@ fn populate_download_popover_rows(
         popover_box.append(&stop_button);
     }
 
-    add_scope_row("Current chapter", DownloadScope::CurrentChapter);
+    if !chapters_ready {
+        // No scope row exists at all here — see this function's own doc for why. A spinner
+        // rather than a plain label so it's visually obvious this is a transient state, not
+        // a book with a "Loading chapters…" row as one of its permanent options.
+        let loading_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk4::Align::Start)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        loading_row.append(&gtk4::Spinner::builder().spinning(true).build());
+        loading_row.append(&gtk4::Label::builder().label("Loading chapters…").css_classes(["dim-label"]).build());
+        popover_box.append(&loading_row);
+    } else {
+        add_scope_row("Current chapter", DownloadScope::CurrentChapter);
 
-    // "Next chapters" is the one scope row with an inline stepper (ui-spec: "− / count / +, each
-    // button ≥44×44px per the touch-target note"; the row body outside the stepper starts the
-    // download for the stepper's count). The count is clamped to what's actually remaining after
-    // the current chapter — on the last chapter there is nothing after it, so the whole row goes
-    // insensitive rather than offering a download that could only ever no-op. Its subtitle
-    // recomputes on every step, since the count is what the estimate is of.
-    let remaining = chapter_ranges.len().saturating_sub(current_chapter_index + 1);
-    let next_title = gtk4::Label::builder().label("Next chapters").xalign(0.0).build();
-    let next_subtitle = gtk4::Label::builder().css_classes(["dim-label"]).xalign(0.0).visible(false).build();
-    let next_inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).hexpand(true).valign(gtk4::Align::Center).build();
-    next_inner.append(&next_title);
-    next_inner.append(&next_subtitle);
-    let next_button = gtk4::Button::builder().child(&next_inner).css_classes(["flat"]).build();
-    let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
-    let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
-    let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
-    // Whether the Next-chapters estimate currently exceeds free space — flipped by the subtitle
-    // update (which knows) and read by the row's click handler, so stepping into or out of the
-    // blocked range changes what tapping the row does.
-    let next_blocked = Rc::new(Cell::new(false));
+        // "Next chapters" is the one scope row with an inline stepper (ui-spec: "− / count / +, each
+        // button ≥44×44px per the touch-target note"; the row body outside the stepper starts the
+        // download for the stepper's count). The count is clamped to what's actually remaining after
+        // the current chapter — on the last chapter there is nothing after it, so the whole row goes
+        // insensitive rather than offering a download that could only ever no-op. Its subtitle
+        // recomputes on every step, since the count is what the estimate is of.
+        let remaining = chapter_ranges.len().saturating_sub(current_chapter_index + 1);
+        let next_title = gtk4::Label::builder().label("Next chapters").xalign(0.0).build();
+        let next_subtitle = gtk4::Label::builder().css_classes(["dim-label"]).xalign(0.0).visible(false).build();
+        let next_inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).hexpand(true).valign(gtk4::Align::Center).build();
+        next_inner.append(&next_title);
+        next_inner.append(&next_subtitle);
+        let next_button = gtk4::Button::builder().child(&next_inner).css_classes(["flat"]).build();
+        let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
+        let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
+        let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
+        // Whether the Next-chapters estimate currently exceeds free space — flipped by the subtitle
+        // update (which knows) and read by the row's click handler, so stepping into or out of the
+        // blocked range changes what tapping the row does.
+        let next_blocked = Rc::new(Cell::new(false));
 
-    let update_count_label: Rc<dyn Fn()> = {
-        let count_label = count_label.clone();
-        let next_count = next_count.clone();
-        Rc::new(move || count_label.set_label(&next_count.get().to_string()))
-    };
-    let update_next_subtitle: Rc<dyn Fn()> = {
-        let next_subtitle = next_subtitle.clone();
-        let next_count = next_count.clone();
-        let next_blocked = next_blocked.clone();
-        let tracks = tracks.to_vec();
-        let chapter_ranges = chapter_ranges.to_vec();
-        Rc::new(move || {
-            let scope = DownloadScope::NextChapters(next_count.get());
-            match (estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index), free_space) {
-                (Some(bytes), Some(free)) if bytes > free => {
-                    next_subtitle.set_label("Not enough free space");
-                    next_subtitle.remove_css_class("dim-label");
-                    next_subtitle.add_css_class("error");
-                    next_subtitle.set_visible(true);
-                    next_blocked.set(true);
+        let update_count_label: Rc<dyn Fn()> = {
+            let count_label = count_label.clone();
+            let next_count = next_count.clone();
+            Rc::new(move || count_label.set_label(&next_count.get().to_string()))
+        };
+        let update_next_subtitle: Rc<dyn Fn()> = {
+            let next_subtitle = next_subtitle.clone();
+            let next_count = next_count.clone();
+            let next_blocked = next_blocked.clone();
+            let tracks = tracks.to_vec();
+            let chapter_ranges = chapter_ranges.to_vec();
+            Rc::new(move || {
+                let scope = DownloadScope::NextChapters(next_count.get());
+                match (estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index), free_space) {
+                    (Some(bytes), Some(free)) if bytes > free => {
+                        next_subtitle.set_label("Not enough free space");
+                        next_subtitle.remove_css_class("dim-label");
+                        next_subtitle.add_css_class("error");
+                        next_subtitle.set_visible(true);
+                        next_blocked.set(true);
+                    }
+                    (Some(bytes), _) => {
+                        next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
+                        next_subtitle.remove_css_class("error");
+                        next_subtitle.add_css_class("dim-label");
+                        next_subtitle.set_visible(true);
+                        next_blocked.set(false);
+                    }
+                    (None, _) => {
+                        next_subtitle.set_visible(false);
+                        next_blocked.set(false);
+                    }
                 }
-                (Some(bytes), _) => {
-                    next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
-                    next_subtitle.remove_css_class("error");
-                    next_subtitle.add_css_class("dim-label");
-                    next_subtitle.set_visible(true);
-                    next_blocked.set(false);
-                }
-                (None, _) => {
-                    next_subtitle.set_visible(false);
-                    next_blocked.set(false);
-                }
-            }
-        })
-    };
-    next_count.set(next_count.get().clamp(1, remaining.max(1) as u32));
-    update_count_label();
-    update_next_subtitle();
+            })
+        };
+        next_count.set(next_count.get().clamp(1, remaining.max(1) as u32));
+        update_count_label();
+        update_next_subtitle();
 
-    {
-        let next_count = next_count.clone();
-        let update_count_label = update_count_label.clone();
-        let update_next_subtitle = update_next_subtitle.clone();
-        minus_button.connect_clicked(move |_| {
-            next_count.set(next_count.get().saturating_sub(1).max(1));
-            update_count_label();
-            update_next_subtitle();
-        });
-    }
-    {
-        let next_count = next_count.clone();
-        let update_count_label = update_count_label.clone();
-        let update_next_subtitle = update_next_subtitle.clone();
-        plus_button.connect_clicked(move |_| {
-            next_count.set((next_count.get() + 1).min(remaining.max(1) as u32));
-            update_count_label();
-            update_next_subtitle();
-        });
-    }
-
-    next_button.connect_clicked({
-        let download_manager = download_manager.clone();
-        let popover = popover.clone();
-        let session = session.clone();
-        let item_id = item_id.to_string();
-        let toast_overlay = toast_overlay.clone();
-        let next_count = next_count.clone();
-        let next_blocked = next_blocked.clone();
-        let on_open_downloads = on_open_downloads.clone();
-        move |_| {
-            if next_blocked.get() {
-                toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
-                return;
-            }
-            download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
-            popover.popdown();
-            toast_overlay.add_toast(started_download_toast(&on_open_downloads));
+        {
+            let next_count = next_count.clone();
+            let update_count_label = update_count_label.clone();
+            let update_next_subtitle = update_next_subtitle.clone();
+            minus_button.connect_clicked(move |_| {
+                next_count.set(next_count.get().saturating_sub(1).max(1));
+                update_count_label();
+                update_next_subtitle();
+            });
         }
-    });
+        {
+            let next_count = next_count.clone();
+            let update_count_label = update_count_label.clone();
+            let update_next_subtitle = update_next_subtitle.clone();
+            plus_button.connect_clicked(move |_| {
+                next_count.set((next_count.get() + 1).min(remaining.max(1) as u32));
+                update_count_label();
+                update_next_subtitle();
+            });
+        }
 
-    if remaining == 0 {
-        next_button.set_sensitive(false);
-        minus_button.set_sensitive(false);
-        plus_button.set_sensitive(false);
-        count_label.add_css_class("dim-label");
+        next_button.connect_clicked({
+            let download_manager = download_manager.clone();
+            let popover = popover.clone();
+            let session = session.clone();
+            let item_id = item_id.to_string();
+            let toast_overlay = toast_overlay.clone();
+            let next_count = next_count.clone();
+            let next_blocked = next_blocked.clone();
+            let on_open_downloads = on_open_downloads.clone();
+            move |_| {
+                if next_blocked.get() {
+                    toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
+                    return;
+                }
+                download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
+                popover.popdown();
+                toast_overlay.add_toast(started_download_toast(&on_open_downloads));
+            }
+        });
+
+        if remaining == 0 {
+            next_button.set_sensitive(false);
+            minus_button.set_sensitive(false);
+            plus_button.set_sensitive(false);
+            count_label.add_css_class("dim-label");
+        }
+
+        let stepper = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).build();
+        stepper.append(&minus_button);
+        stepper.append(&count_label);
+        stepper.append(&plus_button);
+
+        let next_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).build();
+        next_row.append(&next_button);
+        next_row.append(&stepper);
+        popover_box.append(&next_row);
+
+        add_scope_row("Remaining chapters", DownloadScope::RemainingChapters);
+        add_scope_row("Entire book", DownloadScope::EntireBook);
     }
-
-    let stepper = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).build();
-    stepper.append(&minus_button);
-    stepper.append(&count_label);
-    stepper.append(&plus_button);
-
-    let next_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).build();
-    next_row.append(&next_button);
-    next_row.append(&stepper);
-    popover_box.append(&next_row);
-
-    add_scope_row("Remaining chapters", DownloadScope::RemainingChapters);
-    add_scope_row("Entire book", DownloadScope::EntireBook);
 
     if availability != OfflineAvailability::None {
         let clear_button = gtk4::Button::builder().label("Clear downloaded chapters").css_classes(["destructive-action"]).margin_top(6).build();
@@ -491,6 +584,77 @@ pub(crate) mod tests {
         window
     }
 
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for opening the menu
+    /// before chapters are known: no scope row (not even "Current chapter") may exist while
+    /// `chapters_ready` reports `false` — a "Loading chapters…" placeholder stands in for all
+    /// four instead — since every scope's estimate degenerates to "the whole book" without real
+    /// chapters, and a book-sized download must never be one accidental tap away. Once the caller
+    /// flips `chapters_ready` and calls `refresh()`, the still-open popover must show the real
+    /// rows in place, with no reopen needed.
+    pub(crate) fn run_shows_a_loading_placeholder_until_chapters_are_ready(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::downloads::tests::mock_three_track_item(&mock_server, "item-1"));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(crate::player::tests::account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(crate::player::tests::insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[
+            abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 5.0, offset_seconds: 0.0, size_bytes: Some(1_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "2", duration_seconds: 5.0, offset_seconds: 5.0, size_bytes: Some(2_000_000) },
+            abs_storage::repo::tracks::NewTrack { ino: "3", duration_seconds: 5.0, offset_seconds: 10.0, size_bytes: Some(4_000_000) },
+        ]))
+        .unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)];
+        let ready = Rc::new(Cell::new(false));
+        let download_manager = test_download_manager(pool.clone());
+        let toast_overlay = adw::ToastOverlay::new();
+        let menu = build(
+            pool.clone(),
+            download_manager,
+            session,
+            "item-1".to_string(),
+            move || chapter_ranges.clone(),
+            {
+                let ready = ready.clone();
+                move || ready.get()
+            },
+            || 0,
+            || None,
+            toast_overlay,
+            Rc::new(|| {}),
+        );
+
+        let window = mapped_window(&menu.widget);
+        menu.popover.popup();
+        pump_until(|| menu.popover_box.first_child().is_some(), Duration::from_secs(2));
+
+        assert!(
+            for_each_descendant_labels(&menu.popover_box).iter().any(|t| t == "Loading chapters…"),
+            "chapters not ready yet should show the loading placeholder"
+        );
+        assert!(button_labeled(&menu.popover_box, "Current chapter").is_none(), "no scope row must exist while chapters aren't ready");
+        assert!(button_labeled(&menu.popover_box, "Entire book").is_none(), "no scope row must exist while chapters aren't ready");
+
+        ready.set(true);
+        menu.refresh();
+        pump_until(
+            || estimate_texts(&menu.popover_box) == ["≈1.0 MB".to_string(), "≈6.0 MB".to_string(), "≈7.0 MB".to_string(), "≈7.0 MB".to_string()],
+            Duration::from_secs(2),
+        );
+
+        assert!(
+            !for_each_descendant_labels(&menu.popover_box).iter().any(|t| t == "Loading chapters…"),
+            "the loading placeholder must be gone once chapters are ready"
+        );
+        assert!(button_labeled(&menu.popover_box, "Current chapter").is_some(), "the real scope rows must appear in the still-open popover");
+        let (_, count, _) = stepper_widgets(&menu.popover_box);
+        assert_eq!(count.label(), "2", "the stepper should reflect the real chapter count once ready, not the loading-state fallback of 1");
+
+        window.destroy();
+    }
+
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Next chapters" stepper must
     /// behave per ui-spec (ID-8): default 10, ±1 per tap, clamped to the chapters remaining after
     /// the current one (so a default of 10 displays as 9 for ten chapters at the first one), and
@@ -517,7 +681,7 @@ pub(crate) mod tests {
         let chapter_ranges: Vec<(f64, f64)> = controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || true, || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -560,7 +724,7 @@ pub(crate) mod tests {
         let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0)];
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || true, || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -607,7 +771,7 @@ pub(crate) mod tests {
         let chapter_ranges = vec![(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)];
         let download_manager = test_download_manager(pool.clone());
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay, Rc::new(|| {}));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || true, || 0, || None, toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -660,7 +824,7 @@ pub(crate) mod tests {
         let download_manager = DownloadManager::new(pool.clone(), paths, Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
         let free_space_manager = download_manager.clone();
         let toast_overlay = adw::ToastOverlay::new();
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, move || free_space_manager.free_space_bytes(), toast_overlay, Rc::new(|| {}));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || true, || 0, move || free_space_manager.free_space_bytes(), toast_overlay, Rc::new(|| {}));
 
         let window = mapped_window(&menu.widget);
         menu.popover.popup();
@@ -706,7 +870,7 @@ pub(crate) mod tests {
         let toast_overlay = adw::ToastOverlay::new();
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         toast_overlay.set_child(Some(&content));
-        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || 0, || None, toast_overlay.clone(), Rc::new(|| {}));
+        let menu = build(pool.clone(), download_manager, session, "item-1".to_string(), move || chapter_ranges.clone(), || true, || 0, || None, toast_overlay.clone(), Rc::new(|| {}));
         content.append(&menu.widget);
         let window = gtk4::Window::builder().child(&toast_overlay).build();
         window.present();

@@ -311,6 +311,10 @@ pub fn build(
             let controller = controller.clone();
             move || controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect()
         },
+        // Player only builds this once playback has already started, so its chapters (however
+        // many there are — zero for a chapterless book) are already known by the time this menu
+        // exists; unlike Item Detail, there's no network round trip still in flight to wait on.
+        || true,
         {
             let controller = controller.clone();
             move || controller.current_chapter_index().unwrap_or(0)

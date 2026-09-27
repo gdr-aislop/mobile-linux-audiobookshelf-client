@@ -248,6 +248,13 @@ pub fn build(
     // rebuilding or swapping the widget itself. That keeps a single, stable `MenuButton` for the
     // widget's whole lifetime — simpler for both the layout and `TestHooks`, which grabs it once.
     let chapter_ranges_cell: Rc<std::cell::RefCell<Vec<(f64, f64)>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+    // False until `chapter_ranges_cell` actually reflects something real — either Pass 1's cache
+    // seed or Pass 2's resolve, whichever lands first (see both below). Before that, an empty
+    // `chapter_ranges_cell` is indistinguishable from "this book genuinely has no chapters",
+    // which every scope estimate treats as "the whole book" — opening the download menu in that
+    // gap used to show every option at the full-book size with "Current chapter" still tappable.
+    // See `download_scope_menu::build`'s own doc for the report this fixes.
+    let chapters_ready_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // The chapter the resume position falls in, or 0 before it's known / for an unstarted book.
     let current_chapter_index_cell: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     // The item's duration, filled in by Pass 1 below — needed by the "Mark as finished" action
@@ -268,6 +275,10 @@ pub fn build(
         {
             let chapter_ranges_cell = chapter_ranges_cell.clone();
             move || chapter_ranges_cell.borrow().clone()
+        },
+        {
+            let chapters_ready_cell = chapters_ready_cell.clone();
+            move || chapters_ready_cell.get()
         },
         {
             let current_chapter_index_cell = current_chapter_index_cell.clone();
@@ -478,10 +489,12 @@ pub fn build(
         let item_id = item_id.clone();
         let on_play = on_play.clone();
         let chapter_ranges_cell = chapter_ranges_cell.clone();
+        let chapters_ready_cell = chapters_ready_cell.clone();
         let current_chapter_index_cell = current_chapter_index_cell.clone();
         let duration_seconds_cell = duration_seconds_cell.clone();
         let chapters_cell = chapters_cell.clone();
         let progress_seconds_cell = progress_seconds_cell.clone();
+        let download_menu = download_menu.clone();
         async move {
             let server_id = server.id.clone();
             let account_id = account.id.clone();
@@ -544,6 +557,23 @@ pub fn build(
                     progress_bar.set_fraction((progress_seconds / duration_seconds).clamp(0.0, 1.0));
                     progress_bar.set_visible(true);
                 }
+            }
+
+            // Seeds the download menu from whatever chapters are already cached locally (a
+            // previous play or download) — the same fallback Pass 2 (chapters) below falls back
+            // to when the server can't be reached, just run eagerly here, still as part of Pass
+            // 1's local-only work, so a book that's been played or downloaded before shows the
+            // real per-chapter menu immediately rather than "Loading chapters…" for however long
+            // the network resolve below takes. Pass 2 still runs regardless and overwrites these
+            // same cells with the authoritative (possibly updated) chapter list once it resolves
+            // — this is only ever a head start, never a final answer.
+            let cached_chapters = abs_core::chapters::cached_chapters(&pool, &server_id, &item_id).await.unwrap_or_default();
+            if !cached_chapters.is_empty() {
+                let chapter_ranges: Vec<(f64, f64)> = cached_chapters.iter().map(|c| (c.start_seconds, c.end_seconds)).collect();
+                current_chapter_index_cell.set(current_chapter_index_for(&chapter_ranges, progress_seconds));
+                *chapter_ranges_cell.borrow_mut() = chapter_ranges;
+                chapters_ready_cell.set(true);
+                download_menu.refresh();
             }
 
             // Pass 2 (series): fetches the real "N/M" from the network, async and non-blocking —
@@ -628,13 +658,14 @@ pub fn build(
             // in, or 0 before it's known / for an unstarted book. Fixed once computed: unlike
             // Player (a live, ticking session), this page's position never changes under it, so
             // the closures `download_scope_menu::build` asks on every open just keep returning
-            // the same values from here on.
-            let current_chapter_index = chapters
-                .iter()
-                .position(|(_, start, end)| *start <= progress_seconds && progress_seconds < *end)
-                .unwrap_or(0);
+            // the same values from here on. This is the authoritative chapter list (server-
+            // resolved, or its own offline fallback) — it always wins over Pass 1's cache-seed
+            // above, whether or not that one ran.
+            let current_chapter_index = current_chapter_index_for(&chapter_ranges, progress_seconds);
             *chapter_ranges_cell.borrow_mut() = chapter_ranges;
             current_chapter_index_cell.set(current_chapter_index);
+            chapters_ready_cell.set(true);
+            download_menu.refresh();
         }
     });
 
@@ -683,6 +714,14 @@ pub fn build(
             download_progress_revealer: progress_strip_widget,
         },
     }
+}
+
+/// Which chapter `progress_seconds` (a book-level position) falls in, or `0` before it's known /
+/// for an unstarted book — shared by the cache-seed fast path and Pass 2's own resolve below, so
+/// the download menu's "current chapter" always means the same thing regardless of which of the
+/// two filled it in.
+fn current_chapter_index_for(chapter_ranges: &[(f64, f64)], progress_seconds: f64) -> usize {
+    chapter_ranges.iter().position(|(start, end)| *start <= progress_seconds && progress_seconds < *end).unwrap_or(0)
 }
 
 /// Rebuilds `chapters_list`'s rows from scratch — the "currently playing" heading and the
@@ -833,6 +872,24 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "media": { "audioFiles": [{ "ino": "1", "duration": seconds }], "chapters": chapters_json }
             })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// Like [`mock_item_with_chapters`], but the item endpoint (Pass 2's own `resolve_stream_target`
+    /// call) is held for `delay` before responding — for tests that need a real window in which
+    /// the download menu can be opened *before* chapters have resolved.
+    async fn mock_item_with_chapters_delayed(mock_server: &MockServer, item_id: &str, seconds: f64, chapters: &[(&str, f64, f64)], delay: Duration) {
+        let chapters_json: Vec<_> = chapters.iter().enumerate().map(|(i, (title, start, end))| serde_json::json!({ "id": i, "start": start, "end": end, "title": title })).collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/items/{item_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "media": { "audioFiles": [{ "ino": "1", "duration": seconds }], "chapters": chapters_json }
+                    }))
+                    .set_delay(delay),
+            )
             .mount(mock_server)
             .await;
     }
@@ -1259,7 +1316,11 @@ pub(crate) mod tests {
         pump_until(|| window.is_mapped(), Duration::from_secs(5));
 
         hooks.download_popover.popup();
-        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+        // Waits for the real "Entire book" row specifically, not just any child — the popover's
+        // first child while chapters haven't resolved yet is a "Loading chapters…" placeholder
+        // with no scope row at all (see `download_scope_menu::build`'s own doc), which
+        // `first_child().is_some()` alone can't distinguish from the real rows.
+        pump_until(|| any_label_reads(hooks.download_popover_box.upcast_ref(), "Entire book"), Duration::from_secs(5));
         click_button_labeled(&hooks.download_popover_box, "Entire book");
 
         pump_until(
@@ -1316,6 +1377,108 @@ pub(crate) mod tests {
         pump_until(all_three_chapter_rows_marked, Duration::from_secs(5));
         assert!(all_three_chapter_rows_marked(), "every chapter should show the Downloaded glyph without reopening the screen");
         assert!(hooks.chapters_list.row_at_index(3).is_none(), "the item has exactly 3 chapters");
+
+        window.destroy();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for the reported bug:
+    /// tapping Download right after opening a book, before its chapters have resolved from the
+    /// network, used to show every scope at the whole-book size with "Current chapter" still
+    /// tappable into a full-book download. The item endpoint is held open for 500ms so there's a
+    /// real window to open the menu in before Pass 2 (chapters) can possibly have landed.
+    pub(crate) fn run_download_menu_shows_a_loading_placeholder_until_chapters_resolve(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters_delayed(
+            &mock_server,
+            "item-1",
+            15.0,
+            &[("One", 0.0, 5.0), ("Two", 5.0, 10.0), ("Three", 10.0, 15.0)],
+            Duration::from_millis(500),
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 15.0));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        // Open the menu right away — Pass 2's 500ms delay guarantees chapters can't have landed.
+        hooks.download_popover.popup();
+        pump_until(|| hooks.download_popover_box.first_child().is_some(), Duration::from_secs(2));
+
+        assert!(
+            any_label_reads(hooks.download_popover_box.upcast_ref(), "Loading chapters…"),
+            "opening the menu before chapters resolve must show the loading placeholder"
+        );
+        assert!(
+            !any_label_reads(hooks.download_popover_box.upcast_ref(), "Current chapter"),
+            "no scope row must exist while chapters aren't ready — nothing should be tappable into a whole-book download"
+        );
+
+        // Let Pass 2 land while the popover is still open — it must update in place.
+        pump_until(|| any_label_reads(hooks.download_popover_box.upcast_ref(), "Current chapter"), Duration::from_secs(5));
+        assert!(
+            !any_label_reads(hooks.download_popover_box.upcast_ref(), "Loading chapters…"),
+            "the loading placeholder should be gone once chapters land, with no reopen needed"
+        );
+
+        window.destroy();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book that's been played or
+    /// downloaded before already has its chapters cached locally — the download menu should show
+    /// the real per-chapter options immediately from that cache, with no wait for Pass 2's network
+    /// resolve at all. The item endpoint is delayed generously so any real rows the test observes
+    /// can only have come from the cache seed, not from Pass 2 landing early.
+    pub(crate) fn run_download_menu_uses_cached_chapters_immediately(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters_delayed(
+            &mock_server,
+            "item-1",
+            15.0,
+            &[("One", 0.0, 5.0), ("Two", 5.0, 10.0), ("Three", 10.0, 15.0)],
+            Duration::from_secs(3),
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 15.0));
+        // Seeds exactly what a previous play/download would have left behind — same local DB
+        // rows `abs_core::chapters::cached_chapters` (the cache-seed path's own read) resolves.
+        runtime.block_on(abs_core::chapters::sync_item_chapters(
+            &pool,
+            &server.id,
+            "item-1",
+            &[
+                abs_api::ChapterRef { title: "One".to_string(), start_seconds: 0.0, end_seconds: 5.0 },
+                abs_api::ChapterRef { title: "Two".to_string(), start_seconds: 5.0, end_seconds: 10.0 },
+                abs_api::ChapterRef { title: "Three".to_string(), start_seconds: 10.0, end_seconds: 15.0 },
+            ],
+        ))
+        .unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+
+        let window = gtk4::Window::builder().child(&screen.root).build();
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+
+        hooks.download_popover.popup();
+        pump_until(|| any_label_reads(hooks.download_popover_box.upcast_ref(), "Current chapter"), Duration::from_secs(2));
+
+        assert!(
+            any_label_reads(hooks.download_popover_box.upcast_ref(), "Current chapter"),
+            "cached chapters should populate the real menu immediately, well before Pass 2's 3s delay elapses"
+        );
+        assert!(!any_label_reads(hooks.download_popover_box.upcast_ref(), "Loading chapters…"));
 
         window.destroy();
     }
