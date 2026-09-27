@@ -104,6 +104,10 @@ fn push_unconfirmed_progress(pool: sqlx::SqlitePool, session: abs_core::auth::Se
     });
 }
 
+fn position_adopted_toast_title(to_seconds: f64) -> String {
+    format!("Continued at {} from another device", screens::player::format_hms(to_seconds))
+}
+
 pub struct MainWindow {
     pub root: gtk4::Widget,
     /// Kept alive for the app's whole lifetime — dropping it unsubscribes from ModemManager's
@@ -427,6 +431,37 @@ pub fn build(
             if let Some(title) = progress_sync_toast(&last_failure, outcome) {
                 toast_overlay.add_toast(adw::Toast::new(title));
             }
+        }
+    });
+
+    // Quitting (closing the window, Ctrl+Q) saves the final position first. Weak, so a shell
+    // replaced by a sign-out or account switch doesn't stay alive through this handler.
+    if let Some(app) = window.application() {
+        let controller = mini_bar.controller.downgrade();
+        app.connect_shutdown(move |_| {
+            if let Some(controller) = controller.upgrade() {
+                controller.flush_on_shutdown();
+            }
+        });
+    }
+
+    // Resuming after a long pause jumped to newer progress from another device — say so, and let
+    // the listener put it back if this device's position was the one they wanted.
+    mini_bar.controller.set_on_position_adopted({
+        let toast_overlay = root.clone();
+        let controller = mini_bar.controller.clone();
+        move |from, to| {
+            let toast = adw::Toast::builder()
+                .title(position_adopted_toast_title(to))
+                .button_label("Undo")
+                .timeout(10)
+                .build();
+            let controller = controller.clone();
+            toast.connect_button_clicked(move |_| {
+                controller.seek_to_seconds(from);
+                controller.save_progress_now();
+            });
+            toast_overlay.add_toast(toast);
         }
     });
 
@@ -991,6 +1026,15 @@ pub(crate) mod tests {
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
         crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        // Offline at the moment of pausing: that push fails, so the position is still pending.
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path("/api/me/progress/item-1"))
+                .respond_with(wiremock::ResponseTemplate::new(503))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .mount(&mock_server),
+        );
         controller.pause();
         crate::test_support::pump_until(|| false, std::time::Duration::from_millis(300));
 

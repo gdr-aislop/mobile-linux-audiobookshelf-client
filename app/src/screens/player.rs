@@ -647,7 +647,7 @@ pub(crate) fn format_speed(speed: f64) -> String {
     }
 }
 
-fn format_hms(total_seconds: f64) -> String {
+pub(crate) fn format_hms(total_seconds: f64) -> String {
     let total_seconds = total_seconds.max(0.0) as u64;
     let hours = total_seconds / 3600;
     let minutes = (total_seconds % 3600) / 60;
