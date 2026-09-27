@@ -34,6 +34,21 @@ use crate::widgets::cover_image::CoverImage;
 /// pattern this file already uses for MPRIS album-art URLs, not a raw `format!("file://{}", ..)`.
 /// The access token is only fetched in the streaming branch — pointless (and, if genuinely
 /// offline, noisy) to refresh a token for a track that's about to play from disk anyway.
+/// Where a start should resume from, given the saved progress and the book's duration as just
+/// resolved. A finished book starts over. Anything else resumes at the saved position, even one
+/// at or past the reported end: durations can come back missing or short (and are corrected
+/// upward during playback), and dropping the position there would restart at 0 and save that
+/// over it seconds later. Such a position is clamped just inside the book instead.
+fn resume_position(saved_seconds: f64, is_finished: bool, duration_seconds: f64) -> Option<f64> {
+    if is_finished || saved_seconds <= 0.0 {
+        return None;
+    }
+    if duration_seconds > 0.0 && saved_seconds >= duration_seconds {
+        return Some((duration_seconds - 1.0).max(0.0)).filter(|s| *s > 0.0);
+    }
+    Some(saved_seconds)
+}
+
 async fn resolve_playable_url(
     pool: &SqlitePool,
     connection: &abs_core::connection::ConnectionTarget,
@@ -72,6 +87,10 @@ const LOCAL_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
 /// `write_progress_at`'s `force_server_sync`. 15s matches the interval Audiobookshelf's official
 /// clients use for the same "still playing" push.
 const SERVER_PROGRESS_SYNC_INTERVAL: Duration = Duration::from_secs(15);
+/// How long an issued seek may report a position away from its target before
+/// `Inner::observe_position` asks again.
+const SEEK_REISSUE_AFTER: Duration = Duration::from_secs(2);
+const MAX_SEEK_REISSUES: u8 = 3;
 
 #[derive(Clone)]
 pub struct PlayRequest {
@@ -182,6 +201,18 @@ struct NowPlaying {
     /// current track from `last_known_within_track` instead (the same path a cross-track seek
     /// already uses), and `pause()` skips `backend.pause()` (nothing loaded to pause).
     needs_reload: bool,
+    /// When the seek behind `seek_target_pending` was actually handed to the backend — `None`
+    /// while it hasn't been yet (a cross-track reload or the "did a download just finish" check
+    /// is still in flight). Only an issued seek is ever re-issued by `observe_position`.
+    seek_issued_at: Option<Instant>,
+    /// How many times `observe_position` has re-issued the pending seek. A seek asked for before
+    /// the pipeline could take it silently no-ops; without a re-issue the book would play on from
+    /// the start of the track, and that position would be saved over the real one.
+    seek_retries: u8,
+    /// What to run `start()` with again when this `NowPlaying` came from a start that failed
+    /// before any track could be resolved (`tracks` is empty). Retry then re-runs the whole start
+    /// instead of resuming whatever the backend still held from the previous book.
+    retry_request: Option<(PlayRequest, f64)>,
 }
 
 /// What `seek_to_seconds` decided to do once its synchronous, borrow-scoped decision-making is
@@ -319,9 +350,29 @@ impl Inner {
                 // position) is normally seconds away from a skip/seek's target, not fractions.
                 const SEEK_LANDED_TOLERANCE_SECONDS: f64 = 1.5;
                 if (within - now_playing.last_known_within_track).abs() > SEEK_LANDED_TOLERANCE_SECONDS {
-                    return;
+                    // The pipeline reports a real position, just not the requested one. Either the
+                    // seek is still on its way, or it was asked for before the pipeline could take
+                    // it and silently did nothing — which, left alone, plays on from wherever the
+                    // pipeline happens to be and later saves that over the listener's position.
+                    // Give an issued seek a moment, then ask again; after a few tries accept what
+                    // the pipeline reports, since that is what is actually being heard.
+                    let Some(issued_at) = now_playing.seek_issued_at else { return };
+                    if issued_at.elapsed() < SEEK_REISSUE_AFTER {
+                        return;
+                    }
+                    if now_playing.seek_retries < MAX_SEEK_REISSUES {
+                        now_playing.seek_retries += 1;
+                        now_playing.seek_issued_at = Some(Instant::now());
+                        let target = now_playing.last_known_within_track;
+                        tracing::info!(target, within, "a seek didn't land; asking again");
+                        let _ = self.backend.seek(Duration::from_secs_f64(target));
+                        return;
+                    }
+                    tracing::warn!(target = now_playing.last_known_within_track, within, "a seek never landed; following the pipeline's own position");
                 }
                 now_playing.seek_target_pending = false;
+                now_playing.seek_issued_at = None;
+                now_playing.seek_retries = 0;
             }
             now_playing.last_known_within_track = within;
         }
@@ -362,6 +413,11 @@ impl Inner {
     /// `write_progress` with `true`.
     fn write_progress_at(&mut self, position: f64, is_finished: bool, force_server_sync: bool) {
         let Some(now_playing) = &self.now_playing else { return };
+        // A start that failed before any track resolved never played anything of this item, so
+        // it has no position of its own to record — writing one would overwrite the real one.
+        if now_playing.tracks.is_empty() {
+            return;
+        }
         let pool = self.pool.clone();
         let account_id = now_playing.account_id.clone();
         let server_id = now_playing.server_id.clone();
@@ -454,6 +510,12 @@ impl Inner {
         }
 
         now_playing.current_track = next;
+        // Until `spawn_load_track` swaps the file, the backend still reports the finished one's
+        // position; read against the next track's offset that would overshoot. Pin it to the
+        // next track's start instead.
+        now_playing.last_known_within_track = 0.0;
+        now_playing.seek_target_pending = true;
+        now_playing.seek_issued_at = None;
         Some((now_playing.item_id.clone(), next))
     }
 
@@ -563,9 +625,12 @@ impl Inner {
                     now_playing.needs_reload = false;
                     now_playing.current_source_is_local = is_local;
                     now_playing.last_known_within_track = within_seconds;
-                    // This load's own readiness wait (above) already confirmed the new
-                    // pipeline's position directly — nothing left to reconcile against.
-                    now_playing.seek_target_pending = false;
+                    // The readiness wait above gives up after 5 s, and a seek asked for before
+                    // the pipeline is ready silently does nothing — so a seek is only trusted
+                    // once `observe_position` sees it land (and re-issued if it doesn't).
+                    now_playing.seek_target_pending = within_seconds > 0.0;
+                    now_playing.seek_issued_at = (within_seconds > 0.0).then(Instant::now);
+                    now_playing.seek_retries = 0;
                 }
             }
             if inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.is_playing) {
@@ -835,6 +900,7 @@ impl PlayerController {
                 let title = item.title.clone();
                 let author = item.author.clone();
                 let cached_cover = cached_cover.clone();
+                let retry_request = (item.clone(), default_speed);
                 move |kind: abs_player::PlaybackErrorKind, message: String| NowPlaying {
                     item_id: item_id.clone(),
                     server_id: server_id.clone(),
@@ -854,16 +920,24 @@ impl PlayerController {
                     last_error: Some(abs_player::PlaybackError { kind, message, debug: None }),
                     last_known_within_track: 0.0,
                     seek_target_pending: false,
-                    // `false`, not `true`: with an empty `tracks`, `play()`'s reload path
-                    // (`spawn_load_track` on `current_track: 0`) would just silently no-op on
-                    // the missing-track guard, swallowing a Retry tap with no feedback at all.
-                    // `false` keeps this failure's existing contract instead: Retry calls
-                    // `backend.play()`, which fails the same way every time (nothing was ever
-                    // loaded) and re-populates the same `last_error` — a real "why did nothing
-                    // happen" fix for resolve-time failures like this one is a separate, later
-                    // improvement (it would need `play()`/Retry to re-run the whole resolve, not
-                    // just reload a track), not something this fix's scope covers.
+                    // `false`: with an empty `tracks` there is nothing to reload. `play()` sees
+                    // `retry_request` instead and re-runs the whole start.
                     needs_reload: false,
+                    seek_issued_at: None,
+                    seek_retries: 0,
+                    retry_request: Some(retry_request.clone()),
+                }
+            };
+            // A failed start must not leave the previous book loaded: Retry would otherwise
+            // resume *that* audio under this item's title, and every progress write from then on
+            // would record the previous book's position as this one's.
+            let fail_start = {
+                let inner_rc = inner_rc.clone();
+                move |now_playing: NowPlaying| {
+                    let mut inner = inner_rc.borrow_mut();
+                    inner.backend.reset();
+                    inner.now_playing = Some(now_playing);
+                    inner.publish();
                 }
             };
 
@@ -879,9 +953,7 @@ impl PlayerController {
                     // like it silently did nothing — see this fix's sibling below for the same
                     // reasoning against the resolve failure.
                     tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
-                    let mut inner = inner_rc.borrow_mut();
-                    inner.now_playing = Some(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
-                    inner.publish();
+                    fail_start(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
                     return;
                 }
             };
@@ -922,9 +994,7 @@ impl PlayerController {
                             } else {
                                 abs_player::PlaybackErrorKind::Network
                             };
-                            let mut inner = inner_rc.borrow_mut();
-                            inner.now_playing = Some(failed_now_playing(kind, err.to_string()));
-                            inner.publish();
+                            fail_start(failed_now_playing(kind, err.to_string()));
                             return;
                         }
                     }
@@ -938,8 +1008,7 @@ impl PlayerController {
                 .await
                 .ok()
                 .flatten()
-                .map(|p| p.current_time_seconds)
-                .filter(|s| *s > 0.0 && *s < target.duration_seconds);
+                .and_then(|p| resume_position(p.current_time_seconds, p.is_finished, target.duration_seconds));
 
             // A book-level resume position maps to (track, within-track) — the right file is the
             // one that gets loaded, rather than always starting from the first and trusting the
@@ -1061,9 +1130,14 @@ impl PlayerController {
                 cover_path: cached_cover,
                 last_error,
                 last_known_within_track: start_within,
-                // The load above (when it succeeded) already waited for the resume seek's
-                // readiness before this point — nothing pending to reconcile against.
-                seek_target_pending: false,
+                // The readiness wait above gives up after 5 s on a slow stream, and a seek asked
+                // for before the pipeline can take it silently does nothing — playback would then
+                // run from the track's start and save that over the real position. The resume
+                // seek is only trusted once `observe_position` sees it land.
+                seek_target_pending: is_playing && start_within > 0.0,
+                seek_issued_at: (is_playing && start_within > 0.0).then(Instant::now),
+                seek_retries: 0,
+                retry_request: None,
                 // `is_playing`/`last_error` above already reflect a load failure; `needs_reload`
                 // mirrors that a load failure did (see the `Err` arm just above), so the very
                 // first Retry goes through the reload path rather than a plain `set_state`.
@@ -1117,6 +1191,16 @@ impl PlayerController {
     }
 
     pub fn play(&self) {
+        // A start that failed before anything resolved has nothing loaded to resume — run the
+        // start again (see `NowPlaying::retry_request`).
+        let restart = self.inner.borrow().now_playing.as_ref().and_then(|np| {
+            let (request, default_speed) = np.retry_request.clone()?;
+            Some((np.session.clone(), request, default_speed))
+        });
+        if let Some((session, request, default_speed)) = restart {
+            self.start(session, request, default_speed);
+            return;
+        }
         let mut inner = self.inner.borrow_mut();
         // The backend was released (`AudioBackend::reset`) after a stream error or a failed
         // load left nothing loaded to simply resume — GStreamer never recovers a pipeline from
@@ -1387,7 +1471,9 @@ impl PlayerController {
                 // entirely (`spawn_load_track` sets it back to `false` once its own readiness
                 // wait confirms the *new* pipeline's position).
                 now_playing.seek_target_pending = true;
+                now_playing.seek_retries = 0;
                 if now_playing.current_source_is_local {
+                    now_playing.seek_issued_at = Some(Instant::now());
                     let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     inner.publish();
                     None
@@ -1396,6 +1482,7 @@ impl PlayerController {
                     // a quick check before committing to another network seek (see this plan's
                     // section E). The check itself is async (a cheap local DB read), so it's
                     // resolved just below rather than blocking this call.
+                    now_playing.seek_issued_at = None;
                     let plan = SeekPlan::MaybeLocalNow {
                         item_id: now_playing.item_id.clone(),
                         server_id: now_playing.server_id.clone(),
@@ -1408,6 +1495,11 @@ impl PlayerController {
                 }
             } else {
                 now_playing.current_track = track_index;
+                // Until `spawn_load_track` swaps files, the backend still reports the old file's
+                // position, which read against the new track's offset is meaningless.
+                now_playing.seek_target_pending = true;
+                now_playing.seek_issued_at = None;
+                now_playing.seek_retries = 0;
                 let item_id = now_playing.item_id.clone();
                 inner.publish();
                 Some(SeekPlan::CrossTrack { item_id, track_index, within })
@@ -1438,7 +1530,11 @@ impl PlayerController {
                             .as_ref()
                             .is_some_and(|np| np.item_id == item_id && np.current_track == track_index);
                         if still_current {
-                            let _ = inner_rc.borrow_mut().backend.seek(Duration::from_secs_f64(within));
+                            let mut inner = inner_rc.borrow_mut();
+                            if let Some(now_playing) = &mut inner.now_playing {
+                                now_playing.seek_issued_at = Some(Instant::now());
+                            }
+                            let _ = inner.backend.seek(Duration::from_secs_f64(within));
                         }
                     }
                 });
@@ -3000,15 +3096,20 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
 
         controller.seek_to_seconds(4.0); // 1s into the second 3s file
-        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 3.9), Duration::from_secs(10));
+        // The position reads as the target straight away (it is pinned there until the second
+        // file has loaded), so wait on the fetch itself, then on the seek landing.
+        let fetched_second_file = || {
+            runtime
+                .block_on(mock_server.received_requests())
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2")
+        };
+        pump_until(fetched_second_file, Duration::from_secs(10));
+        assert!(fetched_second_file(), "seeking into the second track should fetch the second file");
+        pump_until(|| false, Duration::from_secs(1));
         let position = controller.snapshot().unwrap().position_seconds;
-        assert!(position <= 4.5, "a paused cross-track seek should land at its target and stay there (got {position})");
-
-        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
-        assert!(
-            requests.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == "/api/items/item-1/file/2"),
-            "seeking into the second track should fetch the second file"
-        );
+        assert!((3.9..=4.5).contains(&position), "a paused cross-track seek should land at its target and stay there (got {position})");
         controller.stop();
     }
 
@@ -3085,6 +3186,9 @@ pub(crate) mod tests {
         seek_calls: Vec<Duration>,
         reset_calls: u32,
         pending_event: Option<abs_player::PlayerEvent>,
+        /// How many upcoming `seek` calls to record but not act on — a seek asked for before a
+        /// real pipeline can take it silently does nothing, which is what this simulates.
+        seeks_to_ignore: u32,
     }
 
     struct ScriptedBackend(Rc<RefCell<ScriptedBackendState>>);
@@ -3106,7 +3210,11 @@ pub(crate) mod tests {
         fn seek(&mut self, position: Duration) -> abs_player::Result<()> {
             let mut state = self.0.borrow_mut();
             state.seek_calls.push(position);
-            state.position = Some(position);
+            if state.seeks_to_ignore > 0 {
+                state.seeks_to_ignore -= 1;
+            } else {
+                state.position = Some(position);
+            }
             Ok(())
         }
         fn set_speed(&mut self, _speed: f64) -> abs_player::Result<()> {
@@ -3202,6 +3310,124 @@ pub(crate) mod tests {
             "the reload must seek back to the position the error left off at, not start from 0"
         );
         controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A resume seek asked for before the
+    /// pipeline could take it silently does nothing. The position must not be read (or saved) as
+    /// the start of the track meanwhile, and the seek must be asked for again until it lands.
+    pub(crate) fn run_a_resume_seek_that_does_not_land_is_reissued(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 10.0, false)).unwrap();
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState { seeks_to_ignore: 1, ..Default::default() }));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        assert_eq!(state.borrow().position, Some(Duration::ZERO), "the scripted first seek must have been ignored");
+
+        let min_seen = std::cell::Cell::new(f64::MAX);
+        let landed = || state.borrow().seek_calls.len() >= 2 && state.borrow().position == Some(Duration::from_secs(10));
+        pump_until(
+            || {
+                if let Some(snapshot) = controller.snapshot() {
+                    min_seen.set(min_seen.get().min(snapshot.position_seconds));
+                }
+                landed()
+            },
+            Duration::from_secs(10),
+        );
+        let min_seen = min_seen.get();
+        assert!(landed(), "the missed resume seek must be asked for again: {:?}", state.borrow().seek_calls);
+        assert!(min_seen >= 9.5, "the position must never read as the start of the track while the seek is outstanding (min seen: {min_seen}s)");
+
+        // Let a periodic write happen, then check nothing below the resume point was saved.
+        state.borrow_mut().position = Some(Duration::from_secs(11));
+        pump_until(|| false, LOCAL_PROGRESS_WRITE_INTERVAL + Duration::from_secs(1));
+        let saved = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert!(saved.current_time_seconds >= 10.0, "saved progress must not fall back below the resume point: {}", saved.current_time_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A stream error followed by starting a
+    /// book that can't resolve must keep the first book's position, must stop the first book's
+    /// audio, and Retry must re-run the start instead of resuming the first book's pipeline under
+    /// the second book's title (which would then save the first book's position as the second's).
+    pub(crate) fn run_a_failed_start_keeps_both_books_positions(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        runtime.block_on(Mock::given(method("GET")).and(path("/api/items/item-2")).respond_with(ResponseTemplate::new(500)).mount(&mock_server));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-2", 500.0, false)).unwrap();
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        controller.start(session.clone(), PlayRequest { item_id: "item-1".to_string(), title: "Book One".to_string(), author: None }, 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(3));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(10));
+
+        // The stream dies: the backend is released and reports no position from here on.
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::Error(abs_player::PlaybackError {
+            kind: abs_player::PlaybackErrorKind::Network,
+            message: "simulated network failure".to_string(),
+            debug: None,
+        }));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
+        let resets_before = state.borrow().reset_calls;
+
+        controller.start(session.clone(), PlayRequest { item_id: "item-2".to_string(), title: "Book Two".to_string(), author: None }, 1.0);
+        let failed = || controller.snapshot().is_some_and(|s| s.title == "Book Two" && s.last_error.is_some());
+        pump_until(failed, Duration::from_secs(10));
+        assert!(failed(), "starting an item that can't resolve should end in an error state");
+        assert!(state.borrow().reset_calls > resets_before, "a failed start must release whatever the backend still held");
+        pump_until(|| false, Duration::from_millis(300));
+
+        let progress = |item_id: &str| {
+            runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, item_id)).unwrap().unwrap().current_time_seconds
+        };
+        assert!((progress("item-1") - 3.0).abs() < 0.5, "the first book keeps the position it errored at, got {}", progress("item-1"));
+        assert_eq!(progress("item-2"), 500.0, "the failed book's saved position must be untouched");
+
+        // Retry re-runs the start (a second resolve request), and the pipeline isn't resumed.
+        let resolves = || {
+            runtime.block_on(mock_server.received_requests()).unwrap().iter().filter(|r| r.url.path() == "/api/items/item-2").count()
+        };
+        let resolves_before = resolves();
+        let loads_before = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| resolves() > resolves_before, Duration::from_secs(10));
+        assert!(resolves() > resolves_before, "Retry after a failed start must resolve the item again");
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(300));
+        assert_eq!(state.borrow().load_calls.len(), loads_before, "nothing may be loaded for an item that still can't resolve");
+        assert!(!controller.snapshot().unwrap().is_playing);
+        assert_eq!(progress("item-2"), 500.0, "Retry must not write anything for the failed book");
+        controller.stop();
+    }
+
+    #[test]
+    fn resume_position_keeps_an_unfinished_position_past_the_reported_end() {
+        assert_eq!(resume_position(0.0, false, 100.0), None);
+        assert_eq!(resume_position(40.0, false, 100.0), Some(40.0));
+        assert_eq!(resume_position(40.0, true, 100.0), None, "a finished book starts over");
+        assert_eq!(resume_position(150.0, false, 100.0), Some(99.0), "past the end is clamped inside, not dropped");
+        assert_eq!(resume_position(150.0, false, 0.0), Some(150.0), "an unknown duration keeps the saved position");
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A download that finishes while the

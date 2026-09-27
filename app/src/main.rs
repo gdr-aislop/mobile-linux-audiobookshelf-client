@@ -263,6 +263,8 @@ mod tests {
         (playback_seek_across_track_boundary_lands_in_the_next_file, crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file),
         (playback_stalled_seek_keeps_the_last_known_position, crate::player::tests::run_stalled_seek_keeps_the_last_known_position),
         (playback_error_then_retry_reloads_from_the_last_good_position, crate::player::tests::run_error_then_retry_reloads_from_the_last_good_position),
+        (playback_a_resume_seek_that_does_not_land_is_reissued, crate::player::tests::run_a_resume_seek_that_does_not_land_is_reissued),
+        (playback_a_failed_start_keeps_both_books_positions, crate::player::tests::run_a_failed_start_keeps_both_books_positions),
         (playback_finished_download_takes_over_at_the_next_seek, crate::player::tests::run_finished_download_takes_over_at_the_next_seek),
         (playback_resume_jumps_straight_to_the_second_track, crate::player::tests::run_resume_jumps_straight_to_the_second_track),
         (playback_end_of_stream_pauses_and_marks_finished, crate::player::tests::run_end_of_stream_pauses_and_marks_finished),
