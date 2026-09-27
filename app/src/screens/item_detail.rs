@@ -384,21 +384,14 @@ pub fn build(
                         // The local write is this action's real outcome — the toast reports
                         // exactly that, not whether the best-effort server push (below) also
                         // landed, which was never something "Marked as finished" promised.
-                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await;
-                        if let Err(err) = &local_result {
-                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
-                        }
-                        match session.connection_target().await {
-                            Ok(connection) => {
-                                let access_token = session.access_token().await;
-                                if let Err(err) =
-                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, duration_seconds, duration_seconds, true).await
-                                {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't push 'mark as finished' to the server; local write already landed");
-                                }
-                            }
-                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only"),
-                        }
+                        let local_result = write_item_progress(
+                            &pool,
+                            &session,
+                            ItemProgress { account_id: &account_id, server_id: &server_id, item_id: &item_id, duration_seconds },
+                            duration_seconds,
+                            true,
+                        )
+                        .await;
                         match local_result {
                             Ok(()) => toast_overlay.add_toast(adw::Toast::new("Marked as finished")),
                             Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Marking as finished", err),
@@ -433,21 +426,14 @@ pub fn build(
                     let item_id = item_id.clone();
                     let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
-                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await;
-                        if let Err(err) = &local_result {
-                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
-                        }
-                        match session.connection_target().await {
-                            Ok(connection) => {
-                                let access_token = session.access_token().await;
-                                if let Err(err) =
-                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, 0.0, duration_seconds, false).await
-                                {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't push 'reset progress' to the server; local write already landed");
-                                }
-                            }
-                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only"),
-                        }
+                        let local_result = write_item_progress(
+                            &pool,
+                            &session,
+                            ItemProgress { account_id: &account_id, server_id: &server_id, item_id: &item_id, duration_seconds },
+                            0.0,
+                            false,
+                        )
+                        .await;
                         match local_result {
                             Ok(()) => toast_overlay.add_toast(adw::Toast::new("Progress reset")),
                             Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Resetting progress", err),
@@ -735,6 +721,49 @@ fn format_duration(total_seconds: f64) -> String {
     } else {
         format!("{}m", (total_seconds / 60.0).round() as u64)
     }
+}
+
+/// Which item a direct progress write (one not going through the player) is for.
+struct ItemProgress<'a> {
+    account_id: &'a str,
+    server_id: &'a str,
+    item_id: &'a str,
+    duration_seconds: f64,
+}
+
+/// Writes an item's progress locally, then pushes it to the server best-effort, clearing the
+/// row's "needs push" mark once the server has it. Only the local write's result is returned: it
+/// is what the action's toast reports. A failed push leaves the row marked, so the next sync or
+/// reconnect pushes it.
+async fn write_item_progress(
+    pool: &sqlx::SqlitePool,
+    session: &abs_core::auth::Session,
+    item: ItemProgress<'_>,
+    position_seconds: f64,
+    is_finished: bool,
+) -> Result<(), abs_storage::StorageError> {
+    let ItemProgress { account_id, server_id, item_id, duration_seconds } = item;
+    if let Err(err) = abs_storage::repo::progress::set(pool, account_id, server_id, item_id, position_seconds, is_finished).await {
+        tracing::warn!(%err, item_id = %item_id, "couldn't write progress locally");
+        return Err(err);
+    }
+    let connection = match session.connection_target().await {
+        Ok(connection) => connection,
+        Err(err) => {
+            tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; progress stays local until the next sync");
+            return Ok(());
+        }
+    };
+    let access_token = session.access_token().await;
+    match abs_core::streaming::sync_progress_to_server(&connection, &access_token, item_id, position_seconds, duration_seconds, is_finished).await {
+        Ok(()) => {
+            if let Err(err) = abs_storage::repo::progress::mark_pushed(pool, account_id, server_id, item_id, position_seconds, is_finished).await {
+                tracing::warn!(%err, item_id = %item_id, "couldn't record that progress reached the server; it will be pushed again");
+            }
+        }
+        Err(err) => tracing::warn!(%err, item_id = %item_id, "couldn't push progress to the server; it stays marked for the next sync"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

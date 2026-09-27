@@ -82,6 +82,28 @@ impl Drop for SuspendInhibitGuard {
     }
 }
 
+/// Pushes every book's progress the server hasn't confirmed yet (listened to offline, or whose
+/// push failed), not just the one loaded in the player — see
+/// `abs_core::progress_sync::reconcile_all_progress`. Best-effort: a failure leaves the rows
+/// marked for the next reconnect or sync.
+fn push_unconfirmed_progress(pool: sqlx::SqlitePool, session: abs_core::auth::Session) {
+    glib::spawn_future_local(async move {
+        let connection = match session.connection_target().await {
+            Ok(connection) => connection,
+            Err(err) => {
+                tracing::info!(%err, "couldn't load connection settings; unconfirmed progress stays local for now");
+                return;
+            }
+        };
+        let access_token = session.access_token().await;
+        if let Err(err) =
+            abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, session.account_id(), session.server_id()).await
+        {
+            tracing::info!(%err, "couldn't push unconfirmed progress on reconnect; will retry on the next one");
+        }
+    });
+}
+
 pub struct MainWindow {
     pub root: gtk4::Widget,
     /// Kept alive for the app's whole lifetime — dropping it unsubscribes from ModemManager's
@@ -272,7 +294,12 @@ pub fn build(
     let connectivity_watcher = match abs_player::connectivity_watch::NetworkManagerConnectivityWatcher::new() {
         Ok(mut watcher) => {
             let controller = mini_bar.controller.clone();
-            watcher.start(Box::new(move || controller.sync_pending_progress()));
+            let pool = pool.clone();
+            let session = session.clone();
+            watcher.start(Box::new(move || {
+                controller.sync_pending_progress();
+                push_unconfirmed_progress(pool.clone(), session.clone());
+            }));
             Some(watcher)
         }
         Err(err) => {

@@ -92,6 +92,8 @@ pub struct Progress {
     pub current_time_seconds: f64,
     pub is_finished: bool,
     pub updated_at: DateTime<Utc>,
+    /// A local write the server hasn't confirmed yet — see migration 0009.
+    pub needs_push: bool,
 }
 
 /// Cached per-item track metadata — mirrors `abs_core::streaming::StreamTrack`, persisted so

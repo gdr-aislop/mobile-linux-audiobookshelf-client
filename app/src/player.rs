@@ -466,7 +466,14 @@ impl Inner {
                 }
             };
             match abs_core::streaming::sync_progress_to_server_with_client(&api, &item_id, position, duration_seconds, is_finished).await {
-                Ok(()) => report(ProgressSyncOutcome::Synced),
+                Ok(()) => {
+                    if let Err(err) =
+                        abs_storage::repo::progress::mark_pushed(&pool, &account_id, &server_id, &item_id, position, is_finished).await
+                    {
+                        tracing::warn!(%err, "couldn't record that progress reached the server; it will be pushed again");
+                    }
+                    report(ProgressSyncOutcome::Synced);
+                }
                 Err(err) => {
                     tracing::warn!(%err, "couldn't sync playback progress to the server");
                     report(outcome_of(&err));
@@ -2328,6 +2335,16 @@ pub(crate) mod tests {
             .expect("pausing should also sync progress to the server");
         let body: serde_json::Value = progress_sync.body_json().unwrap();
         assert_eq!(body["isFinished"], false);
+        // Once the server has it, the row no longer needs a push — otherwise every sync would
+        // push it again.
+        pump_until(
+            || !runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap().needs_push,
+            Duration::from_secs(5),
+        );
+        assert!(
+            !runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap().needs_push,
+            "a successful push must clear the row's needs-push mark"
+        );
         controller.stop();
     }
 
