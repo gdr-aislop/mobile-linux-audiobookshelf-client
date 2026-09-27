@@ -335,16 +335,18 @@ pub fn build(
             let controller = controller.clone();
             let toast_overlay = toast_overlay.clone();
             move || {
+                let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
                 controller.mark_as_finished();
-                toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
+                toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
             }
         },
         {
             let controller = controller.clone();
             let toast_overlay = toast_overlay.clone();
             move || {
+                let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
                 controller.reset_progress();
-                toast_overlay.add_toast(adw::Toast::new("Progress reset"));
+                toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
             }
         },
     );
@@ -651,7 +653,20 @@ pub(crate) fn format_speed(speed: f64) -> String {
     }
 }
 
-fn format_hms(total_seconds: f64) -> String {
+/// A toast for an action that threw the listening position away (Mark as finished, Reset
+/// progress), with an Undo that returns playback to `before` and saves it back — local and
+/// server — as unfinished.
+fn undo_position_toast(controller: &crate::player::PlayerController, title: &str, before: f64) -> adw::Toast {
+    let toast = adw::Toast::builder().title(title).button_label("Undo").timeout(10).build();
+    let controller = controller.clone();
+    toast.connect_button_clicked(move |_| {
+        controller.seek_to_seconds(before);
+        controller.save_progress_now();
+    });
+    toast
+}
+
+pub(crate) fn format_hms(total_seconds: f64) -> String {
     let total_seconds = total_seconds.max(0.0) as u64;
     let hours = total_seconds / 3600;
     let minutes = (total_seconds % 3600) / 60;

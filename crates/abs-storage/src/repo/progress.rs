@@ -4,9 +4,12 @@ use sqlx::SqlitePool;
 use crate::error::Result;
 use crate::models::Progress;
 
+const COLUMNS: &str = "account_id, server_id, item_id, current_time_seconds, is_finished, updated_at, needs_push";
+
 /// Record (or update) playback position for an item, for a given account. This is the local
 /// write path — syncing it up to the server, and reconciling with the server's own progress
-/// record, is `abs-core`'s job, not this repo's.
+/// record, is `abs-core`'s job, not this repo's. The row is marked as needing a push until
+/// [`mark_pushed`] confirms the server has this value.
 pub async fn set(
     pool: &SqlitePool,
     account_id: &str,
@@ -15,14 +18,14 @@ pub async fn set(
     current_time_seconds: f64,
     is_finished: bool,
 ) -> Result<()> {
-    set_at(pool, account_id, server_id, item_id, current_time_seconds, is_finished, Utc::now()).await
+    upsert(pool, account_id, server_id, item_id, current_time_seconds, is_finished, Utc::now(), true).await
 }
 
-/// Like [`set`], but stamps the row with an explicit time instead of "now". The server
-/// reconciliation path uses this to keep the server's own last-update time — otherwise an
-/// imported record looks as recent as the moment it was imported, and Home's "Continue
-/// Listening" shelf (which orders by `updated_at`) would rank a book last touched years
-/// ago above one listened to this morning.
+/// Stores a record taken from the server, keeping the server's own last-update time instead of
+/// "now" — otherwise an imported record looks as recent as the moment it was imported, and Home's
+/// "Continue Listening" shelf (which orders by `updated_at`) would rank a book last touched years
+/// ago above one listened to this morning. The server already has this value, so the row doesn't
+/// need a push.
 pub async fn set_at(
     pool: &SqlitePool,
     account_id: &str,
@@ -32,13 +35,28 @@ pub async fn set_at(
     is_finished: bool,
     updated_at: chrono::DateTime<Utc>,
 ) -> Result<()> {
+    upsert(pool, account_id, server_id, item_id, current_time_seconds, is_finished, updated_at, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert(
+    pool: &SqlitePool,
+    account_id: &str,
+    server_id: &str,
+    item_id: &str,
+    current_time_seconds: f64,
+    is_finished: bool,
+    updated_at: chrono::DateTime<Utc>,
+    needs_push: bool,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO progress (account_id, server_id, item_id, current_time_seconds, is_finished, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        "INSERT INTO progress (account_id, server_id, item_id, current_time_seconds, is_finished, updated_at, needs_push)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(account_id, server_id, item_id) DO UPDATE SET
             current_time_seconds = excluded.current_time_seconds,
             is_finished = excluded.is_finished,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            needs_push = excluded.needs_push",
     )
     .bind(account_id)
     .bind(server_id)
@@ -46,9 +64,57 @@ pub async fn set_at(
     .bind(current_time_seconds)
     .bind(is_finished)
     .bind(updated_at.to_rfc3339())
+    .bind(needs_push)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Records that the server now has `current_time_seconds`/`is_finished` for this item. Only
+/// clears the flag if the row still holds exactly that value: a newer local write that landed
+/// while the push was in flight stays marked, so it is pushed too.
+pub async fn mark_pushed(
+    pool: &SqlitePool,
+    account_id: &str,
+    server_id: &str,
+    item_id: &str,
+    current_time_seconds: f64,
+    is_finished: bool,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE progress SET needs_push = 0
+         WHERE account_id = ? AND server_id = ? AND item_id = ? AND current_time_seconds = ? AND is_finished = ?",
+    )
+    .bind(account_id)
+    .bind(server_id)
+    .bind(item_id)
+    .bind(current_time_seconds)
+    .bind(is_finished)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every row of an account's progress the server hasn't confirmed yet.
+pub async fn list_needing_push(pool: &SqlitePool, account_id: &str) -> Result<Vec<Progress>> {
+    let progress = sqlx::query_as(&format!("SELECT {COLUMNS} FROM progress WHERE account_id = ? AND needs_push = 1"))
+        .bind(account_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(progress)
+}
+
+/// How many books have progress the server hasn't confirmed, for one account (`account_id`) or
+/// every account on a server (`server_id`) — what signing out or removing the server would lose.
+pub async fn count_needing_push(pool: &SqlitePool, account_id: Option<&str>, server_id: Option<&str>) -> Result<i64> {
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM progress WHERE needs_push = 1 AND (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR server_id = ?2)",
+    )
+    .bind(account_id)
+    .bind(server_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count.0)
 }
 
 pub async fn get(
@@ -58,8 +124,7 @@ pub async fn get(
     item_id: &str,
 ) -> Result<Option<Progress>> {
     let progress = sqlx::query_as(
-        "SELECT account_id, server_id, item_id, current_time_seconds, is_finished, updated_at
-         FROM progress WHERE account_id = ? AND server_id = ? AND item_id = ?",
+        &format!("SELECT {COLUMNS} FROM progress WHERE account_id = ? AND server_id = ? AND item_id = ?"),
     )
     .bind(account_id)
     .bind(server_id)
@@ -78,8 +143,7 @@ pub async fn list_recent_for_account(
     limit: i64,
 ) -> Result<Vec<Progress>> {
     let progress = sqlx::query_as(
-        "SELECT account_id, server_id, item_id, current_time_seconds, is_finished, updated_at
-         FROM progress WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?",
+        &format!("SELECT {COLUMNS} FROM progress WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?"),
     )
     .bind(account_id)
     .bind(limit)
@@ -94,8 +158,7 @@ pub async fn list_recent_for_account(
 /// `LIMIT`ed shape of the same read).
 pub async fn list_for_account(pool: &SqlitePool, account_id: &str) -> Result<Vec<Progress>> {
     let progress = sqlx::query_as(
-        "SELECT account_id, server_id, item_id, current_time_seconds, is_finished, updated_at
-         FROM progress WHERE account_id = ?",
+        &format!("SELECT {COLUMNS} FROM progress WHERE account_id = ?"),
     )
     .bind(account_id)
     .fetch_all(pool)
@@ -176,6 +239,31 @@ mod tests {
         let progress = get(&pool, &account_id, &server_id, &item_id).await.unwrap().unwrap();
         assert_eq!(progress.current_time_seconds, 612.0);
         assert!(!progress.is_finished);
+    }
+
+    #[tokio::test]
+    async fn needs_push_follows_local_writes_pushes_and_imports() {
+        let (pool, server_id, account_id, item_id) = pool_with_item_and_account().await;
+        let needs_push = || async { get(&pool, &account_id, &server_id, &item_id).await.unwrap().unwrap().needs_push };
+
+        set(&pool, &account_id, &server_id, &item_id, 100.0, false).await.unwrap();
+        assert!(needs_push().await, "a local write needs a push");
+        assert_eq!(list_needing_push(&pool, &account_id).await.unwrap().len(), 1);
+        assert_eq!(count_needing_push(&pool, Some(&account_id), None).await.unwrap(), 1);
+        assert_eq!(count_needing_push(&pool, None, Some(&server_id)).await.unwrap(), 1);
+
+        // A push of an older value doesn't clear a newer write.
+        set(&pool, &account_id, &server_id, &item_id, 130.0, false).await.unwrap();
+        mark_pushed(&pool, &account_id, &server_id, &item_id, 100.0, false).await.unwrap();
+        assert!(needs_push().await, "a push of an older value must not clear a newer write");
+
+        mark_pushed(&pool, &account_id, &server_id, &item_id, 130.0, false).await.unwrap();
+        assert!(!needs_push().await);
+        assert_eq!(count_needing_push(&pool, Some(&account_id), None).await.unwrap(), 0);
+
+        set(&pool, &account_id, &server_id, &item_id, 140.0, false).await.unwrap();
+        set_at(&pool, &account_id, &server_id, &item_id, 500.0, false, Utc::now()).await.unwrap();
+        assert!(!needs_push().await, "a record imported from the server doesn't need a push");
     }
 
     #[tokio::test]

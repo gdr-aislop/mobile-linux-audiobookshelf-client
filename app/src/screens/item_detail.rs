@@ -357,115 +357,32 @@ pub fn build(
     // nothing at all) — `controller.current_item_id()` decides which of the two write paths
     // below applies: the live controller (also pauses/seeks real playback, exactly like Player)
     // when it matches, or a direct local-write-plus-best-effort-server-push
-    // (`abs_core::progress_sync::push_item_progress`) otherwise. Either path updates this
+    // (`write_item_progress`) otherwise. Either path updates this
     // screen's own `play_button`/`progress_bar` immediately — both actions converge on the same
     // "Play", no progress bar" state Pass 1 below already computes for an unstarted/finished
     // item, so there's no need to wait on the async write to know what to show.
+    let progress_action = ProgressAction {
+        controller: controller.clone(),
+        pool: pool.clone(),
+        session: session.clone(),
+        account_id: account.id.clone(),
+        server_id: server.id.clone(),
+        item_id: item_id.clone(),
+        duration_seconds: duration_seconds_cell.clone(),
+        progress_seconds: progress_seconds_cell.clone(),
+        play_button: play_button.clone(),
+        progress_bar: progress_bar.clone(),
+        toast_overlay: toast_overlay.clone(),
+    };
     let options_menu = item_options_menu::build(
         None,
         {
-            let controller = controller.clone();
-            let item_id = item_id.clone();
-            let pool = pool.clone();
-            let session = session.clone();
-            let account_id = account.id.clone();
-            let server_id = server.id.clone();
-            let duration_seconds_cell = duration_seconds_cell.clone();
-            let play_button = play_button.clone();
-            let progress_bar = progress_bar.clone();
-            let toast_overlay = toast_overlay.clone();
-            move || {
-                play_button.set_label("Play");
-                progress_bar.set_visible(false);
-                if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
-                    // Synchronous from the caller's point of view (the controller's own local
-                    // write is fire-and-forget, same posture as its periodic progress tick) —
-                    // safe to toast success right away, unlike the direct-write branch below.
-                    controller.mark_as_finished();
-                    toast_overlay.add_toast(adw::Toast::new("Marked as finished"));
-                } else {
-                    let duration_seconds = duration_seconds_cell.get();
-                    let pool = pool.clone();
-                    let session = session.clone();
-                    let account_id = account_id.clone();
-                    let server_id = server_id.clone();
-                    let item_id = item_id.clone();
-                    let toast_overlay = toast_overlay.clone();
-                    glib::spawn_future_local(async move {
-                        // The local write is this action's real outcome — the toast reports
-                        // exactly that, not whether the best-effort server push (below) also
-                        // landed, which was never something "Marked as finished" promised.
-                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, duration_seconds, true).await;
-                        if let Err(err) = &local_result {
-                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'mark as finished' locally");
-                        }
-                        match session.connection_target().await {
-                            Ok(connection) => {
-                                let access_token = session.access_token().await;
-                                if let Err(err) =
-                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, duration_seconds, duration_seconds, true).await
-                                {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't push 'mark as finished' to the server; local write already landed");
-                                }
-                            }
-                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; marking finished locally only"),
-                        }
-                        match local_result {
-                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Marked as finished")),
-                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Marking as finished", err),
-                        }
-                    });
-                }
-            }
+            let action = progress_action.clone();
+            move || action.apply("Marked as finished", "Marking as finished", |duration| (duration, true))
         },
         {
-            let controller = controller.clone();
-            let item_id = item_id.clone();
-            let pool = pool.clone();
-            let session = session.clone();
-            let account_id = account.id.clone();
-            let server_id = server.id.clone();
-            let duration_seconds_cell = duration_seconds_cell.clone();
-            let play_button = play_button.clone();
-            let progress_bar = progress_bar.clone();
-            let toast_overlay = toast_overlay.clone();
-            move || {
-                play_button.set_label("Play");
-                progress_bar.set_visible(false);
-                if controller.current_item_id().as_deref() == Some(item_id.as_str()) {
-                    controller.reset_progress();
-                    toast_overlay.add_toast(adw::Toast::new("Progress reset"));
-                } else {
-                    let duration_seconds = duration_seconds_cell.get();
-                    let pool = pool.clone();
-                    let session = session.clone();
-                    let account_id = account_id.clone();
-                    let server_id = server_id.clone();
-                    let item_id = item_id.clone();
-                    let toast_overlay = toast_overlay.clone();
-                    glib::spawn_future_local(async move {
-                        let local_result = abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, 0.0, false).await;
-                        if let Err(err) = &local_result {
-                            tracing::warn!(%err, item_id = %item_id, "couldn't persist 'reset progress' locally");
-                        }
-                        match session.connection_target().await {
-                            Ok(connection) => {
-                                let access_token = session.access_token().await;
-                                if let Err(err) =
-                                    abs_core::streaming::sync_progress_to_server(&connection, &access_token, &item_id, 0.0, duration_seconds, false).await
-                                {
-                                    tracing::warn!(%err, item_id = %item_id, "couldn't push 'reset progress' to the server; local write already landed");
-                                }
-                            }
-                            Err(err) => tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; resetting progress locally only"),
-                        }
-                        match local_result {
-                            Ok(()) => toast_overlay.add_toast(adw::Toast::new("Progress reset")),
-                            Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Resetting progress", err),
-                        }
-                    });
-                }
-            }
+            let action = progress_action.clone();
+            move || action.apply("Progress reset", "Resetting progress", |_| (0.0, false))
         },
     );
     header.pack_end(&options_menu.widget);
@@ -774,6 +691,161 @@ fn format_duration(total_seconds: f64) -> String {
     } else {
         format!("{}m", (total_seconds / 60.0).round() as u64)
     }
+}
+
+/// Everything "Mark as finished"/"Reset progress" need, for either write path (see the comment
+/// above `item_options_menu::build`'s call in `build`).
+#[derive(Clone)]
+struct ProgressAction {
+    controller: crate::player::PlayerController,
+    pool: SqlitePool,
+    session: abs_core::auth::Session,
+    account_id: String,
+    server_id: String,
+    item_id: String,
+    duration_seconds: Rc<Cell<f64>>,
+    /// The unfinished position this screen shows (0 for an unstarted or finished book).
+    progress_seconds: Rc<Cell<f64>>,
+    play_button: gtk4::Button,
+    progress_bar: gtk4::ProgressBar,
+    toast_overlay: adw::ToastOverlay,
+}
+
+impl ProgressAction {
+    fn is_loaded_in_player(&self) -> bool {
+        self.controller.current_item_id().as_deref() == Some(self.item_id.as_str())
+    }
+
+    /// Shows `position_seconds` (0 or finished → "Play" with no bar) on this screen's own
+    /// Play/Resume button and progress bar.
+    fn show(&self, position_seconds: f64, is_finished: bool) {
+        let unfinished_position = if is_finished { 0.0 } else { position_seconds };
+        self.progress_seconds.set(unfinished_position);
+        let duration = self.duration_seconds.get();
+        if unfinished_position > 0.0 {
+            self.play_button.set_label("Resume");
+            if duration > 0.0 {
+                self.progress_bar.set_fraction((unfinished_position / duration).clamp(0.0, 1.0));
+            }
+            self.progress_bar.set_visible(duration > 0.0);
+        } else {
+            self.play_button.set_label("Play");
+            self.progress_bar.set_visible(false);
+        }
+    }
+
+    /// Runs one of the menu's actions: `target` maps the book's duration to the
+    /// `(position, is_finished)` to write. Both actions throw the listening position away, so the
+    /// success toast offers Undo, which writes back what was there before.
+    fn apply(&self, done_title: &'static str, error_context: &'static str, target: impl Fn(f64) -> (f64, bool)) {
+        let (position, is_finished) = target(self.duration_seconds.get());
+        self.show(position, is_finished);
+        if self.is_loaded_in_player() {
+            let before = self.controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
+            // Synchronous from the caller's point of view (the controller's own write runs on
+            // its queue, same posture as its periodic progress tick) — safe to toast right away.
+            if is_finished {
+                self.controller.mark_as_finished();
+            } else {
+                self.controller.reset_progress();
+            }
+            self.toast_overlay.add_toast(self.undo_toast(done_title, before, false));
+            return;
+        }
+        let action = self.clone();
+        glib::spawn_future_local(async move {
+            let before = abs_storage::repo::progress::get(&action.pool, &action.account_id, &action.server_id, &action.item_id).await.ok().flatten();
+            // The local write is this action's real outcome — the toast reports exactly that,
+            // not whether the best-effort server push also landed, which was never something
+            // the toast promised.
+            match action.write(position, is_finished).await {
+                Ok(()) => {
+                    let (before_position, before_finished) = before.map(|p| (p.current_time_seconds, p.is_finished)).unwrap_or((0.0, false));
+                    action.toast_overlay.add_toast(action.undo_toast(done_title, before_position, before_finished));
+                }
+                Err(err) => crate::error_reporting::report_background_error(&action.toast_overlay, error_context, err),
+            }
+        });
+    }
+
+    async fn write(&self, position_seconds: f64, is_finished: bool) -> Result<(), abs_storage::StorageError> {
+        write_item_progress(
+            &self.pool,
+            &self.session,
+            ItemProgress {
+                account_id: &self.account_id,
+                server_id: &self.server_id,
+                item_id: &self.item_id,
+                duration_seconds: self.duration_seconds.get(),
+            },
+            position_seconds,
+            is_finished,
+        )
+        .await
+    }
+
+    fn undo_toast(&self, title: &str, before_position: f64, before_finished: bool) -> adw::Toast {
+        let toast = adw::Toast::builder().title(title).button_label("Undo").timeout(10).build();
+        let action = self.clone();
+        toast.connect_button_clicked(move |_| {
+            action.show(before_position, before_finished);
+            if action.is_loaded_in_player() {
+                action.controller.seek_to_seconds(before_position);
+                action.controller.save_progress_now();
+                return;
+            }
+            let action = action.clone();
+            glib::spawn_future_local(async move {
+                if let Err(err) = action.write(before_position, before_finished).await {
+                    crate::error_reporting::report_background_error(&action.toast_overlay, "Undoing", err);
+                }
+            });
+        });
+        toast
+    }
+}
+
+/// Which item a direct progress write (one not going through the player) is for.
+struct ItemProgress<'a> {
+    account_id: &'a str,
+    server_id: &'a str,
+    item_id: &'a str,
+    duration_seconds: f64,
+}
+
+/// Writes an item's progress locally, then pushes it to the server best-effort, clearing the
+/// row's "needs push" mark once the server has it. Only the local write's result is returned: it
+/// is what the action's toast reports. A failed push leaves the row marked, so the next sync or
+/// reconnect pushes it.
+async fn write_item_progress(
+    pool: &sqlx::SqlitePool,
+    session: &abs_core::auth::Session,
+    item: ItemProgress<'_>,
+    position_seconds: f64,
+    is_finished: bool,
+) -> Result<(), abs_storage::StorageError> {
+    let ItemProgress { account_id, server_id, item_id, duration_seconds } = item;
+    if let Err(err) = abs_storage::repo::progress::set(pool, account_id, server_id, item_id, position_seconds, is_finished).await {
+        tracing::warn!(%err, item_id = %item_id, "couldn't write progress locally");
+        return Err(err);
+    }
+    let connection = match session.connection_target().await {
+        Ok(connection) => connection,
+        Err(err) => {
+            tracing::info!(%err, item_id = %item_id, "couldn't load connection settings; progress stays local until the next sync");
+            return Ok(());
+        }
+    };
+    let access_token = session.access_token().await;
+    match abs_core::streaming::sync_progress_to_server(&connection, &access_token, item_id, position_seconds, duration_seconds, is_finished).await {
+        Ok(()) => {
+            if let Err(err) = abs_storage::repo::progress::mark_pushed(pool, account_id, server_id, item_id, position_seconds, is_finished).await {
+                tracing::warn!(%err, item_id = %item_id, "couldn't record that progress reached the server; it will be pushed again");
+            }
+        }
+        Err(err) => tracing::warn!(%err, item_id = %item_id, "couldn't push progress to the server; it stays marked for the next sync"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1223,6 +1295,49 @@ pub(crate) mod tests {
         // this window too, and counting every request made this flaky.
         pump_until(|| progress_patches(runtime, &mock_server) - requests_before == 1, Duration::from_secs(5));
         assert_eq!(progress_patches(runtime, &mock_server) - requests_before, 1, "the direct write should also push exactly one PATCH to the server");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. "Reset progress" throws the
+    /// listening position away in one tap, so its toast offers Undo, which must put the old
+    /// position back locally, on the server, and on this screen.
+    pub(crate) fn run_options_menu_reset_can_be_undone(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+        runtime.block_on(async {
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+        });
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item", None, None, None, 3600.0));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 1800.0, false)).unwrap();
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let screen = build(pool.clone(), server.clone(), account.clone(), session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
+
+        hooks.reset_progress_button.emit_clicked();
+        let saved = || runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        pump_until(|| crate::test_support::find_button_with_label(&screen.root, "Undo").is_some(), Duration::from_secs(5));
+        assert_eq!(saved().current_time_seconds, 0.0);
+
+        crate::test_support::find_button_with_label(&screen.root, "Undo").expect("the reset toast should offer Undo").emit_clicked();
+        assert_eq!(hooks.play_button.label().as_deref(), Some("Resume"), "Undo should restore the screen right away");
+        assert!(hooks.progress_bar.is_visible());
+        pump_until(|| saved().current_time_seconds == 1800.0, Duration::from_secs(5));
+        assert_eq!(saved().current_time_seconds, 1800.0, "Undo must write the old position back");
+        pump_until(|| !saved().needs_push, Duration::from_secs(5));
+        let last_patch: serde_json::Value = runtime
+            .block_on(mock_server.received_requests())
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|r| r.method.as_str() == "PATCH")
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(last_patch["currentTime"], 1800.0, "and push it back to the server");
     }
 
     /// Regression test for the "the toast said it worked, but the write never landed" gap:

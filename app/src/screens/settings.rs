@@ -246,29 +246,34 @@ pub fn build(
                     let window = window.clone();
                     let account_id = account_id.clone();
                     let toast_overlay = toast_overlay.clone();
-                    confirm(
-                        &dialog_window,
-                        &format!("Sign out of {username}?"),
-                        &format!(
-                            "{username}'s listening progress and bookmarks stored on this device will be \
-                             removed — everything on the server stays where it is."
-                        ),
-                        "Sign Out",
-                        Rc::new(move || {
-                            let pool = pool.clone();
-                            let paths = paths.clone();
-                            let window = window.clone();
-                            let account_id = account_id.clone();
-                            let toast_overlay = toast_overlay.clone();
-                            glib::spawn_future_local(async move {
-                                if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                                    crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
-                                    return;
-                                }
-                                crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
-                            });
-                        }),
-                    );
+                    let username = username.clone();
+                    glib::spawn_future_local(async move {
+                        let unpushed = abs_storage::repo::progress::count_needing_push(&pool, Some(&account_id), None).await.unwrap_or(0);
+                        confirm(
+                            &dialog_window,
+                            &format!("Sign out of {username}?"),
+                            &format!(
+                                "{username}'s listening progress and bookmarks stored on this device will be \
+                                 removed — everything on the server stays where it is.{}",
+                                unpushed_progress_warning(unpushed)
+                            ),
+                            "Sign Out",
+                            Rc::new(move || {
+                                let pool = pool.clone();
+                                let paths = paths.clone();
+                                let window = window.clone();
+                                let account_id = account_id.clone();
+                                let toast_overlay = toast_overlay.clone();
+                                glib::spawn_future_local(async move {
+                                    if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
+                                        crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
+                                        return;
+                                    }
+                                    crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
+                                });
+                            }),
+                        );
+                    });
                 }
             });
         }
@@ -290,30 +295,37 @@ pub fn build(
                 let window = window.clone();
                 let server_id = server_id.clone();
                 let toast_overlay = toast_overlay.clone();
-                confirm(
-                    &dialog_window,
-                    &format!("Remove {server_host}?"),
-                    "Every account, cached library, item and downloaded file for this server will be \
-                     removed from this device. Everything on the server itself stays untouched.",
-                    "Remove Server",
-                    Rc::new(move || {
-                        let pool = pool.clone();
-                        let paths = paths.clone();
-                        let window = window.clone();
-                        let server_id = server_id.clone();
-                        let toast_overlay = toast_overlay.clone();
-                        glib::spawn_future_local(async move {
-                            if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
-                                crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
-                                return;
-                            }
-                            if let Err(err) = paths.purge_server_data(&server_id).await {
-                                tracing::warn!(%err, server_id = %server_id, "couldn't purge the removed server's on-disk files; they are orphaned but harmless");
-                            }
-                            crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
-                        });
-                    }),
-                );
+                let server_host = server_host.clone();
+                glib::spawn_future_local(async move {
+                    let unpushed = abs_storage::repo::progress::count_needing_push(&pool, None, Some(&server_id)).await.unwrap_or(0);
+                    confirm(
+                        &dialog_window,
+                        &format!("Remove {server_host}?"),
+                        &format!(
+                            "Every account, cached library, item and downloaded file for this server will be \
+                             removed from this device. Everything on the server itself stays untouched.{}",
+                            unpushed_progress_warning(unpushed)
+                        ),
+                        "Remove Server",
+                        Rc::new(move || {
+                            let pool = pool.clone();
+                            let paths = paths.clone();
+                            let window = window.clone();
+                            let server_id = server_id.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            glib::spawn_future_local(async move {
+                                if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
+                                    crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
+                                    return;
+                                }
+                                if let Err(err) = paths.purge_server_data(&server_id).await {
+                                    tracing::warn!(%err, server_id = %server_id, "couldn't purge the removed server's on-disk files; they are orphaned but harmless");
+                                }
+                                crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
+                            });
+                        }),
+                    );
+                });
             }
         });
 
@@ -615,6 +627,16 @@ fn push_connection(
 pub(crate) fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     rest.split('/').next().unwrap_or(rest)
+}
+
+/// The extra sentence a sign-out/remove confirmation carries when some listening progress on this
+/// device hasn't reached the server yet — removing the rows would lose it for good.
+fn unpushed_progress_warning(unpushed_books: i64) -> String {
+    match unpushed_books {
+        0 => String::new(),
+        1 => "\n\nListening progress for 1 book hasn't reached the server yet and will be lost.".to_string(),
+        n => format!("\n\nListening progress for {n} books hasn't reached the server yet and will be lost."),
+    }
 }
 
 /// A modal Ok/Cancel confirmation for a destructive session change — the same
@@ -1076,6 +1098,7 @@ pub(crate) mod tests {
         {
             let pool = runtime.block_on(crate::test_support::pool());
             let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+            let (server_id, account_id) = (servers[0].0.id.clone(), servers[0].1[0].id.clone());
             let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
             let app_window = adw::ApplicationWindow::builder().build();
             let screen = build(
@@ -1090,9 +1113,11 @@ pub(crate) mod tests {
             );
             let old_root = screen.root.clone();
             app_window.set_content(Some(&old_root));
+            let dialog_body = || find_message_dialog().and_then(|dialog| dialog.secondary_text()).map(|text| text.to_string()).unwrap_or_default();
 
             screen.hooks.server_rows[0].sign_out_item.emit_clicked();
             pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+            assert!(!dialog_body().contains("hasn't reached the server"), "nothing unpushed, so no warning: {}", dialog_body());
             find_message_dialog().unwrap().response(gtk4::ResponseType::Cancel);
             pump_until(|| find_message_dialog().is_none(), Duration::from_secs(5));
             assert!(
@@ -1100,8 +1125,17 @@ pub(crate) mod tests {
                 "a cancelled sign-out must leave the session intact"
             );
 
+            // Progress listened to offline, not yet on the server: signing out would lose it, and
+            // the confirmation must say so.
+            runtime.block_on(crate::player::tests::insert_synced_item(&pool, &server_id, "item-1", "Offline Book"));
+            runtime.block_on(abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 42.0, false)).unwrap();
             screen.hooks.server_rows[0].sign_out_item.emit_clicked();
             pump_until(|| find_message_dialog().is_some(), Duration::from_secs(5));
+            assert!(
+                dialog_body().contains("Listening progress for 1 book hasn't reached the server yet and will be lost."),
+                "the sign-out confirmation must warn about unpushed progress: {}",
+                dialog_body()
+            );
             find_message_dialog().unwrap().response(gtk4::ResponseType::Ok);
             pump_until(
                 {
