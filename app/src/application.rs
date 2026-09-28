@@ -346,8 +346,15 @@ fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow)
     }
 }
 
-/// The `GtkShortcutsWindow` behind `Ctrl+?` — one item per row of ui-spec §6's tables, grouped
-/// the same way.
+/// The `GtkShortcutsWindow` behind `Ctrl+?` — one item per row of ui-spec §6's table, grouped
+/// the same way, except that two of that table's rows ("Skip back / forward", "Speed up /
+/// down") become *two* rows here. `GtkShortcutsShortcut:accelerator` parses as one or two real
+/// accelerators for a single action (space-separated, each run through
+/// `gtk_accelerator_parse()`), not a human "A / B" display string for two different actions —
+/// using "/" as a delimiter there logs a `Gtk-WARNING` ("Failed to parse /") and was never
+/// actually valid, so each pair of distinct actions gets its own row instead. "Go to Settings"
+/// keeps one row: its two accelerators really are alternates for the same action, so they're
+/// just space- rather than slash-separated.
 ///
 /// Built from an inline `GtkBuilder` definition rather than the Rust widget bindings: the
 /// `ShortcutsWindow` family's `add_section`/`add_group`/`add_shortcut` methods are gated behind
@@ -404,7 +411,7 @@ fn build_shortcuts_overlay() -> gtk4::ShortcutsWindow {
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="title">Go to Settings</property>
-                <property name="accelerator">&lt;Alt&gt;4 / &lt;Control&gt;comma</property>
+                <property name="accelerator">&lt;Alt&gt;4 &lt;Control&gt;comma</property>
               </object>
             </child>
             <child>
@@ -437,14 +444,26 @@ fn build_shortcuts_overlay() -> gtk4::ShortcutsWindow {
             <property name="title">Full player</property>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="title">Skip back / forward</property>
-                <property name="accelerator">Left / Right</property>
+                <property name="title">Skip back</property>
+                <property name="accelerator">Left</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="title">Speed up / down</property>
-                <property name="accelerator">&lt;Control&gt;plus / &lt;Control&gt;minus</property>
+                <property name="title">Skip forward</property>
+                <property name="accelerator">Right</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Speed up</property>
+                <property name="accelerator">&lt;Control&gt;plus plus</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Speed down</property>
+                <property name="accelerator">&lt;Control&gt;minus minus</property>
               </object>
             </child>
             <child>
