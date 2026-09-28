@@ -1655,7 +1655,16 @@ impl PlayerController {
                     }
                 }
                 Err(err) => {
+                    tracing::warn!(%err, "backend.pause() failed; resetting the pipeline and marking it for reload");
+                    // The backend is reset below regardless of what set_state's actual failure
+                    // was — nothing is left running to call this "still playing". Leaving
+                    // `is_playing` at its old value here (a bug this fixes) meant a failed pause
+                    // published a snapshot that still claimed to be playing — indistinguishable
+                    // from a working pause to both the UI and to `handle_route_event`'s own
+                    // `is_playing` check on any *next* route event, even though the pipeline had
+                    // just been torn down to `Null`.
                     if let Some(now_playing) = &mut inner.now_playing {
+                        now_playing.is_playing = false;
                         now_playing.last_error = Some((&err).into());
                         now_playing.needs_reload = true;
                     }
@@ -1779,31 +1788,54 @@ impl PlayerController {
     /// sleep timer or end-of-book pause clears the "paused by unplug" mark (in `pause()` and
     /// `tick()`'s own pause paths), so none of them can ever be overridden by a reconnection.
     pub fn handle_route_event(&self, event: abs_player::route_watch::RouteEvent) {
+        // Every branch logs its decision, including every reason for doing nothing — this is
+        // the only place that can tell "the setting is off", "nothing is playing" and "nothing
+        // is loaded" apart on a device that isn't pausing, once `route_watch`'s own "headphone
+        // route changed" line has confirmed the event was even delivered.
         match event {
             abs_player::route_watch::RouteEvent::Unplugged => {
-                let was_playing = {
+                let (pause_on_unplug, has_now_playing, is_playing) = {
                     let inner = self.inner.borrow();
-                    inner.pause_on_unplug && inner.now_playing.as_ref().is_some_and(|np| np.is_playing)
+                    (inner.pause_on_unplug, inner.now_playing.is_some(), inner.now_playing.as_ref().is_some_and(|np| np.is_playing))
                 };
-                if !was_playing {
+                if !pause_on_unplug {
+                    tracing::info!("headphone unplug ignored: \"pause when headphones disconnect\" is off");
+                    return;
+                }
+                if !has_now_playing {
+                    tracing::info!("headphone unplug ignored: nothing is loaded");
+                    return;
+                }
+                if !is_playing {
+                    tracing::info!("headphone unplug ignored: already paused");
                     return;
                 }
                 // `pause()` clears the mark (it's the generic pause path — also used for calls,
                 // MPRIS and the user); the unplug then re-marks it as *its* pause.
                 self.pause();
                 self.inner.borrow_mut().paused_by_unplug = true;
+                tracing::info!("paused for headphone unplug");
             }
             abs_player::route_watch::RouteEvent::Replugged => {
-                let should_resume = {
+                let (resume_on_replug, paused_by_unplug, is_paused) = {
                     let inner = self.inner.borrow();
-                    inner.resume_on_replug
-                        && inner.paused_by_unplug
-                        && inner.now_playing.as_ref().is_some_and(|np| !np.is_playing)
+                    (inner.resume_on_replug, inner.paused_by_unplug, inner.now_playing.as_ref().is_some_and(|np| !np.is_playing))
                 };
-                if should_resume {
-                    self.inner.borrow_mut().paused_by_unplug = false;
-                    self.play();
+                if !resume_on_replug {
+                    tracing::info!("headphone replug ignored: \"resume when headphones reconnect\" is off");
+                    return;
                 }
+                if !paused_by_unplug {
+                    tracing::info!("headphone replug ignored: the current pause (if any) wasn't caused by an unplug");
+                    return;
+                }
+                if !is_paused {
+                    tracing::info!("headphone replug ignored: not paused");
+                    return;
+                }
+                self.inner.borrow_mut().paused_by_unplug = false;
+                self.play();
+                tracing::info!("resumed for headphone replug");
             }
         }
     }

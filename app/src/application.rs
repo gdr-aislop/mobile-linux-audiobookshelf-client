@@ -9,6 +9,45 @@ use sqlx::SqlitePool;
 
 use crate::screens;
 
+thread_local! {
+    /// The app's currently-built `MainWindow`, retained for as long as it's the shell actually
+    /// shown — the counterpart to every function below that builds one (`show_main`,
+    /// `show_main_or_welcome`) or replaces it with the Welcome/login screen (`show_welcome`,
+    /// `show_add_server`). Without this, a builder's `MainWindow` was just a bare local variable
+    /// dropped the instant its root widget was swapped in — and dropping it ran the `Drop`
+    /// impls on its watcher fields (`ModemManagerCallWatcher`, `NetworkManagerConnectivityWatcher`,
+    /// and `PulseRouteWatcher`, which unsubscribe/stop on drop), silently killing call-pause,
+    /// reconnect-triggered sync and headphone-unplug pause the moment the shell was rebuilt even
+    /// once (sign-out/sign-in, switching server or account) — despite those watchers' own "kept
+    /// alive for the app's whole lifetime" doc comments, which this makes true.
+    ///
+    /// A `thread_local` (rather than a field threaded through every `screens::*::build` call) is
+    /// deliberate: the app has exactly one `AdwApplicationWindow` for its whole life, bound to
+    /// the one GLib main-loop thread everything here already assumes, so there is only ever one
+    /// slot to hold, and nothing outside this file needs a handle to it — every replacement of
+    /// the shell's content already funnels through the handful of functions below.
+    static MAIN_WINDOW: std::cell::RefCell<Option<screens::main_window::MainWindow>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Retires whatever `MainWindow` is currently retained (see the `MAIN_WINDOW` doc comment) and
+/// retains `new` in its place.
+fn retain_main_window(new: screens::main_window::MainWindow) {
+    MAIN_WINDOW.with(|slot| *slot.borrow_mut() = Some(new));
+}
+
+/// Retires the currently retained `MainWindow`, if any — for wherever the shell's content stops
+/// being a `MainWindow` at all (the Welcome/login screen).
+fn release_main_window() {
+    MAIN_WINDOW.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Removes and returns the currently retained `MainWindow` without dropping it — for
+/// `show_add_server`'s Cancel path, which restores the exact previous shell rather than
+/// rebuilding one, and so must hand its watchers back too rather than losing them.
+fn take_main_window() -> Option<screens::main_window::MainWindow> {
+    MAIN_WINDOW.with(|slot| slot.borrow_mut().take())
+}
+
 /// Everything the UI needs a handle to. Constructed once in `main` after the async setup step
 /// (DB connect + migrate, active-account lookup) completes, then moved into the
 /// `connect_activate` closure.
@@ -111,6 +150,12 @@ pub(crate) fn show_welcome(
         },
         on_cancel,
     );
+    // Whatever `MainWindow` was retained (there may be none, on the plain first-run flow) stops
+    // being the shown shell here — see the `MAIN_WINDOW` doc comment. The re-login Cancel path
+    // above deliberately does *not* get its watchers back this way: it rebuilds via `show_main`
+    // from the database rather than restoring the exact prior widget, so a fresh `MainWindow`
+    // (and fresh watchers) is what it gets instead, same as every other session change.
+    release_main_window();
     crate::widgets::swap_content(window, &screen.root);
 }
 
@@ -126,13 +171,22 @@ pub(crate) fn show_add_server(
     playback_settings: abs_core::settings::PlaybackSettings,
 ) {
     // Captured before the swap: Cancel restores this exact widget, so the shell keeps its state
-    // (open tab, scroll positions) — the same policy as collapsing the full player. A successful
-    // connect, by contrast, rebuilds: the new account is the active one and the old shell's
-    // session is stale.
+    // (open tab, scroll positions) — the same policy as collapsing the full player. The
+    // currently retained `MainWindow` (with its watchers) is captured the same way and for the
+    // same reason: Cancel below hands it right back rather than rebuilding, so its watchers
+    // (call-pause, reconnect sync, headphone-unplug pause) are exactly as continuous across the
+    // detour as the widget itself. A successful connect, by contrast, rebuilds: the new account
+    // is the active one and the old shell's session is stale, so `show_main` retains a fresh one.
+    let previous_main_window = std::cell::RefCell::new(take_main_window());
     let on_cancel: std::rc::Rc<dyn Fn()> = match window.content() {
         Some(previous_root) => {
             let window = window.clone();
-            std::rc::Rc::new(move || crate::widgets::swap_content(&window, &previous_root))
+            std::rc::Rc::new(move || {
+                if let Some(main_window) = previous_main_window.borrow_mut().take() {
+                    retain_main_window(main_window);
+                }
+                crate::widgets::swap_content(&window, &previous_root);
+            })
         }
         None => {
             let pool = pool.clone();
@@ -177,6 +231,7 @@ pub(crate) fn show_main_or_welcome(
                     build_main_window(pool, paths, playback_settings, window_for_callback.clone())
                         .await;
                 crate::widgets::swap_content(&window_for_callback, &main_window.root);
+                retain_main_window(main_window);
             }
             None => show_welcome(&window_for_callback, pool, paths, playback_settings, None),
         }
@@ -196,6 +251,7 @@ pub(crate) fn show_main(
     glib::spawn_future_local(async move {
         let main_window = build_main_window(pool, paths, playback_settings, window_for_content.clone()).await;
         crate::widgets::swap_content(&window_for_content, &main_window.root);
+        retain_main_window(main_window);
     });
 }
 

@@ -181,6 +181,13 @@ impl RouteClassifier {
 /// re-established with backoff (see `RECONNECT_BACKOFF`), never silently given up on.
 pub struct PulseRouteWatcher {
     sender: EventSender,
+    /// Set by `Drop`, checked by the watcher thread once per `iterate()` return — so a watcher
+    /// dropped when the shell that built it is torn down (sign-out, switching server/account:
+    /// see `app/src/application.rs`'s `show_main`/`show_main_or_welcome`) doesn't keep its
+    /// libpulse connection and OS thread running forever. This only takes effect on the *next*
+    /// audio-server event, since `iterate(true)` blocks until one arrives; `Drop` doesn't wait
+    /// for that — see its own doc comment for the part that matters immediately.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 type EventSender = std::sync::Arc<std::sync::Mutex<Option<futures::channel::mpsc::UnboundedSender<RouteEvent>>>>;
@@ -232,9 +239,11 @@ fn headphone_availability(sink_ports: &[libpulse_binding::context::introspect::S
 impl PulseRouteWatcher {
     pub fn new() -> Result<Self, RouteWatchError> {
         let sender: EventSender = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), RouteWatchError>>();
 
         let sender_for_thread = sender.clone();
+        let stop_for_thread = stop.clone();
         std::thread::Builder::new()
             .name("abs-route-watch".into())
             .spawn(move || {
@@ -242,7 +251,10 @@ impl PulseRouteWatcher {
                 let mut init_tx = Some(init_tx);
                 let mut backoff = RECONNECT_BACKOFF.0;
                 loop {
-                    match watch_connection(&mut init_tx, &sender_for_thread, &mut backoff) {
+                    if stop_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    match watch_connection(&mut init_tx, &sender_for_thread, &mut backoff, &stop_for_thread) {
                         ConnectionEnd::Quit => return,
                         ConnectionEnd::Failed(reason) => {
                             if let Some(tx) = init_tx.take() {
@@ -261,13 +273,28 @@ impl PulseRouteWatcher {
             .map_err(|err| RouteWatchError::NoAudioServer(format!("couldn't spawn the watcher thread: {err}")))?;
 
         match init_rx.recv_timeout(INIT_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self { sender }),
+            Ok(Ok(())) => Ok(Self { sender, stop }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err(RouteWatchError::NoAudioServer(format!(
                 "the audio server didn't become ready within {}s",
                 INIT_TIMEOUT.as_secs()
             ))),
         }
+    }
+}
+
+impl Drop for PulseRouteWatcher {
+    fn drop(&mut self) {
+        // Closing the channel (clearing the sender) stops event delivery immediately: it ends
+        // the `rx.next()` loop `start()` spawned onto the GLib main context, which otherwise
+        // has no way to notice this watcher went away and would keep calling `start()`'s
+        // callback — and with it, whatever `PlayerController` that callback closed over — for as
+        // long as the process runs. That closure holding the controller alive is what actually
+        // matters here: the OS thread and its libpulse connection are lower stakes (no more
+        // events reach anyone once the sender is cleared) and are asked to stop via `stop`, but
+        // only notice on the next audio-server event, since `iterate(true)` blocks until one.
+        *self.sender.lock().expect("route-watch sender mutex") = None;
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -279,6 +306,7 @@ fn watch_connection(
     init_tx: &mut Option<std::sync::mpsc::Sender<Result<(), RouteWatchError>>>,
     sender: &EventSender,
     backoff: &mut std::time::Duration,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> ConnectionEnd {
     use libpulse_binding::callbacks::ListResult;
     use libpulse_binding::context::subscribe::{Facility, InterestMaskSet, Operation};
@@ -325,6 +353,12 @@ fn watch_connection(
             IterateResult::Success(_) => {}
             IterateResult::Quit(_) => return ConnectionEnd::Quit,
             IterateResult::Err(err) => return ConnectionEnd::Failed(format!("the audio-server connection failed: {err}")),
+        }
+        // Checked once per audio-server event (see `PulseRouteWatcher::stop`'s doc comment for
+        // why that's good enough — the channel close on `Drop` is what stops event delivery
+        // immediately; this just eventually releases the connection and this thread).
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return ConnectionEnd::Quit;
         }
 
         let mut rescan = false;
@@ -591,6 +625,86 @@ mod tests {
 
         let speakers_only = vec![make_port(Some("analog-output-speaker"), PortAvailability::Yes)];
         assert_eq!(headphone_availability(&speakers_only), None);
+    }
+
+    /// Drains the default `MainContext` — the same one `glib::spawn_future_local` schedules
+    /// onto — until `done()` returns true or `timeout` elapses. `iteration(false)` is
+    /// non-blocking, so this is a plain poll loop, not a nested main loop (same shape as
+    /// `app`'s own `test_support::pump_until`, which this crate has no dependency on).
+    fn pump_until(done: impl Fn() -> bool, timeout: std::time::Duration) {
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + timeout;
+        while !done() && std::time::Instant::now() < deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Builds a `PulseRouteWatcher` around an unconnected sender/stop pair — same struct the real
+    /// `new()` produces, minus the libpulse connection — so `start()`/`Drop` can be exercised by
+    /// feeding `dispatch()` (what the watcher thread actually calls from inside libpulse
+    /// callbacks) directly.
+    fn test_watcher() -> PulseRouteWatcher {
+        PulseRouteWatcher { sender: std::sync::Arc::new(std::sync::Mutex::new(None)), stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    /// Both scenarios below touch `glib::MainContext::default()`, which — unlike a `Mainloop`
+    /// this module builds itself — is a single **process-wide** singleton, not one per thread.
+    /// Rust's test harness gives every `#[test]` fn its own OS thread (true even under
+    /// `--test-threads=1`, which only limits concurrency, not which thread each runs on; `app`'s
+    /// own `gtk_fast_scenarios` driver exists for the same reason). A `!Send` future
+    /// `spawn_future_local` attaches to that shared context can only be touched from the thread
+    /// that created it — two separate `#[test]` fns each spawning one onto it crashes the process
+    /// ("non-unwinding panic" out of glib's `ThreadGuard`) the moment either context iteration
+    /// touches the other's leftover source. One `#[test]` fn running both scenarios in sequence,
+    /// on the one thread it owns, sidesteps that — this crate has nothing else touching the
+    /// default context, so nothing else can collide with it either.
+    #[test]
+    fn route_watcher_delivery() {
+        // `dispatch()` (what the watcher thread calls from inside libpulse callbacks) crosses a
+        // real OS thread boundary into the `futures` channel `start()` set up, and the assertion
+        // only passes if `start()`'s `glib::spawn_future_local` task actually receives it on the
+        // default `MainContext` and invokes the callback. This is the link the classifier's unit
+        // tests (all synchronous, no thread, no main loop) don't cover, and the one most likely
+        // to go silently wrong on a real device: the watcher thread logs "headphone route
+        // changed" from inside `dispatch()` regardless of whether anything downstream ever
+        // receives it.
+        {
+            let mut watcher = test_watcher();
+            let received: std::rc::Rc<std::cell::RefCell<Vec<RouteEvent>>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            watcher.start(Box::new({
+                let received = received.clone();
+                move |event| received.borrow_mut().push(event)
+            }));
+
+            // A real background thread, not just a same-thread call — this is what would catch
+            // e.g. `spawn_future_local` requiring a context this test's thread never acquired.
+            let sender = watcher.sender.clone();
+            std::thread::spawn(move || dispatch(&sender, RouteEvent::Unplugged));
+
+            pump_until(|| !received.borrow().is_empty(), std::time::Duration::from_secs(5));
+            assert_eq!(*received.borrow(), vec![RouteEvent::Unplugged], "an event dispatched from another thread must reach start()'s callback on the main context");
+        }
+
+        // `Drop`'s whole point: without it, `start()`'s callback — and whatever it closed over (a
+        // `PlayerController`, on a real device) — would go on receiving events forever after the
+        // watcher itself was dropped (a shell rebuild: sign-out, switching server/account).
+        {
+            let mut watcher = test_watcher();
+            let received: std::rc::Rc<std::cell::RefCell<Vec<RouteEvent>>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            watcher.start(Box::new({
+                let received = received.clone();
+                move |event| received.borrow_mut().push(event)
+            }));
+            let sender = watcher.sender.clone();
+
+            drop(watcher);
+            std::thread::spawn(move || dispatch(&sender, RouteEvent::Unplugged));
+            // Give the (dead) callback every chance to run before asserting it didn't.
+            pump_until(|| false, std::time::Duration::from_millis(200));
+
+            assert!(received.borrow().is_empty(), "an event dispatched after the watcher was dropped must not reach the old callback");
+        }
     }
 
     /// Registers against a *real* audio server — only checkable when one is reachable. This

@@ -720,7 +720,16 @@ Needs a real GNOME/phosh session.
 - [ ] **HW-5 — Unplugging wired headphones pauses.** While playing through wired headphones,
       unplug them.
       *Expected:* playback pauses immediately — audio never continues through the phone's
-      speaker.
+      speaker. If it doesn't: at the default log level (no `RUST_LOG` needed) the app logs the
+      audio server's own port-availability event (`route_watch`, "headphone route changed")
+      separately from the player's decision on it (`player`, one of "paused for headphone
+      unplug" or an "ignored:" line naming why — the setting is off, nothing is loaded, or it
+      was already paused). Seeing the first without the second means the audio server saw the
+      unplug but the app didn't act on it — the "ignored:" reason says which; seeing neither
+      means the audio server itself never reported the unplug (see HW-6c, and run with
+      `RUST_LOG=debug` for the per-scan sink detail behind it). Check the rotating log file
+      under `~/.local/state/io.github.gdr-aislop.abs-app/logs/abs-app.<date>`
+      (`abs_storage::AppPaths::logs_dir()`) for a run where stderr wasn't captured.
 
 - [ ] **HW-6 — Bluetooth loss pauses.** While playing through Bluetooth headphones, turn the
       headphones off / walk out of range.
