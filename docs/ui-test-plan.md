@@ -736,7 +736,16 @@ Needs a real GNOME/phosh session.
       right back; a later `player` warning that a pause "never reached Paused" means the
       GStreamer pipeline itself got stuck mid-transition — the app recovers from that
       automatically (reloads the track), but it takes a few seconds and is worth reporting if
-      it happens routinely on this hardware.
+      it happens routinely on this hardware. With a TRRS headset (inline button or mic), pulling
+      the plug also produces an MPRIS `PlayPause` a few milliseconds later — the button contact
+      shorting on the way out. Expect it in the log followed by "ignored MPRIS PlayPause right
+      after a headphone-unplug pause"; playback must stay paused.
+
+- [ ] **HW-5b — A real play/pause press still works after an unplug.** With a TRRS headset,
+      unplug while playing, wait a few seconds, then press play/pause on the lock screen's media
+      controls.
+      *Expected:* playback resumes (through the speaker). Only a `PlayPause` arriving within
+      about a second and a half of the unplug is treated as the plug's spurious button press.
 
 - [ ] **HW-6 — Bluetooth loss pauses.** While playing through Bluetooth headphones, turn the
       headphones off / walk out of range.

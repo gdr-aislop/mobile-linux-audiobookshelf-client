@@ -175,7 +175,14 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
         .register_object(OBJECT_PATH, &player_info)
         .method_call({
             let commands = commands.clone();
-            move |_conn, _sender, _path, _iface, method, params, invocation| {
+            move |_conn, sender, _path, _iface, method, params, invocation| {
+                // One chokepoint for every inbound Player-interface call (the desktop shell's
+                // media widget, media keys — including the spurious headset-button press a TRRS
+                // unplug generates — a Bluetooth AVRCP peer, `playerctl`, …). Without it, an
+                // external `PlayPause` resuming playback left no trace in the log at all. The
+                // sender is the caller's unique bus name; `busctl --user status <name>` maps it
+                // to a process.
+                tracing::info!(%method, sender = sender.unwrap_or("?"), "MPRIS command received");
                 match dispatch_player_method(method, &params, commands.as_ref()) {
                     Ok(reply) => invocation.return_value(reply.as_ref()),
                     Err(err) => invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", &err.to_string()),
@@ -291,12 +298,6 @@ fn metadata_variant(metadata: &TrackMetadata) -> glib::Variant {
 /// module (a real bus round-trip can only be smoke-tested, gated on whatever D-Bus tooling exists
 /// in a given build/test environment).
 fn dispatch_player_method(method: &str, params: &glib::Variant, commands: &dyn MprisCommands) -> Result<Option<glib::Variant>, glib::Error> {
-    // One chokepoint for every inbound Player-interface call (from the desktop shell's media
-    // widget, a Bluetooth AVRCP peer, `playerctl`, or anything else on the session bus) — without
-    // this, an external `Play`/`PlayPause` reaching `MprisBridge` and resuming playback left
-    // absolutely no trace in the log: every *other* route into `play()`/`pause()` is logged
-    // (route-watch's unplug/replug handling, `backend.pause()` failures), but this one wasn't.
-    tracing::info!(%method, "MPRIS command received");
     match method {
         "PlayPause" => {
             commands.play_pause();

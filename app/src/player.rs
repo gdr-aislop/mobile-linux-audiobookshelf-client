@@ -109,6 +109,11 @@ const SHUTDOWN_PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 /// request was accepted, not that it landed — see its doc comment.
 const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
 const PAUSE_CONFIRM_ATTEMPTS: u32 = 10;
+/// How soon after an unplug pause an MPRIS `PlayPause` is treated as the spurious headset-button
+/// press a TRRS unplug generates rather than a real one — see
+/// `PlayerController::external_play_pause`. Observed on the Librem 5: the spurious one ~2ms
+/// after the pause, a deliberate one ~3s after.
+const SPURIOUS_UNPLUG_TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
 
 #[derive(Clone)]
 pub struct PlayRequest {
@@ -494,6 +499,10 @@ struct Inner {
     /// to a manual pause, a phone call, a sleep timer or end-of-book). Only a pause this specific
     /// may ever be lifted by a replug. Cleared by every other pause path.
     paused_by_unplug: bool,
+    /// When `handle_route_event` last paused for an unplug — what
+    /// `PlayerController::external_play_pause` measures [`SPURIOUS_UNPLUG_TOGGLE_WINDOW`] from.
+    /// Only meaningful while `paused_by_unplug` is still set.
+    unplug_paused_at: Option<Instant>,
     /// Mirrors whatever was last forwarded to `backend.set_burst_buffering` — the backend itself
     /// has no getter (it's a `Box<dyn AudioBackend>`), so this is what `PlayerController`'s own
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
@@ -980,6 +989,7 @@ impl PlayerController {
                 skip_back_seconds: 15.0,
                 skip_forward_seconds: 30.0,
                 paused_by_unplug: false,
+                unplug_paused_at: None,
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
@@ -1877,7 +1887,11 @@ impl PlayerController {
                 // `pause()` clears the mark (it's the generic pause path — also used for calls,
                 // MPRIS and the user); the unplug then re-marks it as *its* pause.
                 self.pause();
-                self.inner.borrow_mut().paused_by_unplug = true;
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    inner.paused_by_unplug = true;
+                    inner.unplug_paused_at = Some(Instant::now());
+                }
                 tracing::info!("paused for headphone unplug");
             }
             abs_player::route_watch::RouteEvent::Replugged => {
@@ -1902,6 +1916,40 @@ impl PlayerController {
                 tracing::info!("resumed for headphone replug");
             }
         }
+    }
+
+    /// MPRIS's `PlayPause`, as opposed to the app's own play/pause buttons (which call
+    /// `toggle_play_pause` directly — a tap on the screen is always deliberate).
+    ///
+    /// Pulling a TRRS headset's plug (one with an inline button or mic) drags the contacts past
+    /// the button ring, which the kernel reports as a headset Play/Pause key press; the desktop's
+    /// media-key handling forwards it to the active player as exactly this call. It lands within
+    /// milliseconds of the unplug — on the Librem 5 field report, ~2ms after
+    /// `handle_route_event` had paused — and, being a *toggle*, it resumed the playback the unplug
+    /// had just paused, through the phone's speaker. So a `PlayPause` arriving within
+    /// [`SPURIOUS_UNPLUG_TOGGLE_WINDOW`] of an unplug pause is ignored. The window is far shorter
+    /// than any deliberate reaction (the same report's real press on the lock screen came ~3s
+    /// later), and it only applies while that unplug pause is still the reason playback is
+    /// paused — any other pause path clears `paused_by_unplug`, so a manual pause followed by a
+    /// quick `PlayPause` still toggles as usual.
+    pub fn external_play_pause(&self) {
+        let since_unplug_pause = {
+            let inner = self.inner.borrow();
+            let paused = inner.now_playing.as_ref().is_some_and(|np| !np.is_playing);
+            if paused && inner.paused_by_unplug {
+                inner.unplug_paused_at.map(|at| at.elapsed())
+            } else {
+                None
+            }
+        };
+        if let Some(elapsed) = since_unplug_pause.filter(|elapsed| *elapsed < SPURIOUS_UNPLUG_TOGGLE_WINDOW) {
+            tracing::info!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                "ignored MPRIS PlayPause right after a headphone-unplug pause (a headset button contact shorting as the plug is pulled)"
+            );
+            return;
+        }
+        self.toggle_play_pause();
     }
 
     pub fn toggle_play_pause(&self) {
@@ -2442,7 +2490,7 @@ impl MprisBridge {
 
 impl abs_player::mpris::MprisCommands for MprisBridge {
     fn play_pause(&self) {
-        self.controller.toggle_play_pause();
+        self.controller.external_play_pause();
     }
     fn play(&self) {
         self.controller.play();
@@ -3900,6 +3948,50 @@ pub(crate) mod tests {
             controller.snapshot().is_some_and(|s| s.is_playing && s.last_error.is_none()),
             "once reloaded, playback should be running again with no error showing"
         );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for the Librem 5
+    /// field report `PlayerController::external_play_pause` describes: unplugging a TRRS headset
+    /// makes the desktop send an MPRIS `PlayPause` ~2ms after the unplug pause, which used to
+    /// toggle playback straight back on. It must be ignored — but only right after an *unplug*
+    /// pause: a later `PlayPause`, or one right after a manual pause, must still toggle.
+    pub(crate) fn run_mpris_play_pause_right_after_an_unplug_is_ignored(runtime: &tokio::runtime::Runtime) {
+        use abs_player::mpris::MprisCommands;
+
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        controller.set_headphone_behavior(true, false);
+        let mpris = MprisBridge::new(controller.clone());
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        // The unplug, immediately followed by the headset-button `PlayPause` the plug generates.
+        controller.handle_route_event(abs_player::route_watch::RouteEvent::Unplugged);
+        mpris.play_pause();
+        assert!(!controller.snapshot().unwrap().is_playing, "a PlayPause right after an unplug pause must not resume playback");
+
+        // Well past the window, a PlayPause is a real press again.
+        pump_until(|| false, SPURIOUS_UNPLUG_TOGGLE_WINDOW + Duration::from_millis(200));
+        mpris.play_pause();
+        assert!(controller.snapshot().unwrap().is_playing, "a PlayPause well after the unplug must toggle as usual");
+
+        // A manual pause is not an unplug pause: a PlayPause right after it must still toggle.
+        controller.pause();
+        mpris.play_pause();
+        assert!(controller.snapshot().unwrap().is_playing, "the guard must only apply to an unplug pause, never to a manual one");
         controller.stop();
     }
 

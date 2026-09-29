@@ -277,6 +277,7 @@ mod tests {
         (playback_stalled_seek_keeps_the_last_known_position, crate::player::tests::run_stalled_seek_keeps_the_last_known_position),
         (playback_error_then_retry_reloads_from_the_last_good_position, crate::player::tests::run_error_then_retry_reloads_from_the_last_good_position),
         (playback_a_pause_that_never_lands_is_recovered, crate::player::tests::run_a_pause_that_never_lands_is_recovered),
+        (playback_mpris_play_pause_right_after_an_unplug_is_ignored, crate::player::tests::run_mpris_play_pause_right_after_an_unplug_is_ignored),
         (playback_a_resume_seek_that_does_not_land_is_reissued, crate::player::tests::run_a_resume_seek_that_does_not_land_is_reissued),
         (playback_a_failed_start_keeps_both_books_positions, crate::player::tests::run_a_failed_start_keeps_both_books_positions),
         (playback_an_unchanged_position_is_not_pushed_twice, crate::player::tests::run_an_unchanged_position_is_not_pushed_twice),
