@@ -103,6 +103,12 @@ const PAUSED_SEEK_WRITE_DELAY: Duration = Duration::from_secs(2);
 const PREMATURE_EOS_MIN_GAP_SECONDS: f64 = 60.0;
 /// How long quitting may wait for the final progress push.
 const SHUTDOWN_PUSH_TIMEOUT: Duration = Duration::from_secs(3);
+/// How `pause()`'s confirmation poll (`Inner::confirm_pause_landed`) is paced: checked this
+/// often, for up to this many attempts, before treating a pause that never actually reached
+/// GStreamer's `Paused` state as stuck. `AudioBackend::pause()` returning `Ok` only means the
+/// request was accepted, not that it landed — see its doc comment.
+const PAUSE_CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
+const PAUSE_CONFIRM_ATTEMPTS: u32 = 10;
 
 #[derive(Clone)]
 pub struct PlayRequest {
@@ -861,6 +867,60 @@ impl Inner {
                 let _ = inner.backend.play();
             }
             inner.publish();
+        });
+    }
+
+    /// Confirms a `pause()` call whose `backend.pause()` returned `Ok` actually landed — see
+    /// `AudioBackend::pause`'s doc comment for why `Ok` alone doesn't mean that. Polls
+    /// `backend.is_paused()` on the GTK main loop (never blocking it, unlike a real
+    /// `pipeline.state(timeout)` wait would) every [`PAUSE_CONFIRM_INTERVAL`] for up to
+    /// [`PAUSE_CONFIRM_ATTEMPTS`] tries.
+    ///
+    /// Bails out quietly the moment there is nothing left for it to confirm: nothing is loaded
+    /// any more, playback resumed (a legitimate `play()` in the meantime is not a race this poll
+    /// needs to win against), or the backend was already reloaded/reset by something else. Only
+    /// escalates — the same recovery `backend.pause()`'s own `Err` branch already uses: mark
+    /// `needs_reload`, set a friendly `last_error`, release the backend — if none of that
+    /// happened and `is_paused()` never once came back true across the whole window: a pipeline
+    /// stuck in GStreamer's `Async` state, which on a network-streamed source mid-buffer-read can
+    /// persist far longer than this window, or effectively forever (the Librem 5 field report
+    /// this fixes: `pause()` logged success and audio kept playing, indefinitely, through the
+    /// speaker).
+    fn spawn_pause_confirmation(inner_rc: Rc<RefCell<Inner>>) {
+        glib::spawn_future_local(async move {
+            for attempt in 0..PAUSE_CONFIRM_ATTEMPTS {
+                glib::timeout_future(PAUSE_CONFIRM_INTERVAL).await;
+
+                let still_pending = {
+                    let inner = inner_rc.borrow();
+                    let Some(now_playing) = &inner.now_playing else { return };
+                    if now_playing.is_playing || now_playing.needs_reload {
+                        return;
+                    }
+                    !inner.backend.is_paused()
+                };
+                if !still_pending {
+                    return;
+                }
+
+                if attempt + 1 == PAUSE_CONFIRM_ATTEMPTS {
+                    let mut inner = inner_rc.borrow_mut();
+                    tracing::warn!(
+                        waited = ?(PAUSE_CONFIRM_INTERVAL * PAUSE_CONFIRM_ATTEMPTS),
+                        "pause() never reached Paused; resetting the pipeline and marking it for reload"
+                    );
+                    if let Some(now_playing) = &mut inner.now_playing {
+                        now_playing.last_error = Some(abs_player::PlaybackError {
+                            kind: abs_player::PlaybackErrorKind::AudioOutput,
+                            message: "the audio pipeline never actually paused".to_string(),
+                            debug: None,
+                        });
+                        now_playing.needs_reload = true;
+                    }
+                    inner.backend.reset();
+                    inner.publish();
+                }
+            }
         });
     }
 }
@@ -1653,6 +1713,10 @@ impl PlayerController {
                     if let Some(now_playing) = &mut inner.now_playing {
                         now_playing.is_playing = false;
                     }
+                    // `Ok` here only means GStreamer accepted the request, not that the pipeline
+                    // has actually reached `Paused` — see `AudioBackend::pause`'s doc comment.
+                    // Confirms it did, or recovers if it never does.
+                    Inner::spawn_pause_confirmation(self.inner.clone());
                 }
                 Err(err) => {
                     tracing::warn!(%err, "backend.pause() failed; resetting the pipeline and marking it for reload");
@@ -2436,6 +2500,11 @@ impl abs_player::AudioBackend for NullBackend {
     fn pause(&mut self) -> abs_player::Result<()> {
         Err(abs_player::PlayerError::NoSourceLoaded)
     }
+    fn is_paused(&self) -> bool {
+        // `pause()` above always errors — this is never consulted in practice, but the trait
+        // still needs an answer: nothing is ever loaded, so nothing is ever paused either.
+        false
+    }
     fn seek(&mut self, _position: Duration) -> abs_player::Result<()> {
         Err(abs_player::PlayerError::NoSourceLoaded)
     }
@@ -2536,6 +2605,9 @@ pub(crate) mod tests {
         }
         fn pause(&mut self) -> abs_player::Result<()> {
             Err(abs_player::PlayerError::NoSourceLoaded)
+        }
+        fn is_paused(&self) -> bool {
+            false
         }
         fn seek(&mut self, _position: Duration) -> abs_player::Result<()> {
             Err(abs_player::PlayerError::NoSourceLoaded)
@@ -3641,6 +3713,12 @@ pub(crate) mod tests {
         /// How many upcoming `seek` calls to record but not act on — a seek asked for before a
         /// real pipeline can take it silently does nothing, which is what this simulates.
         seeks_to_ignore: u32,
+        /// When set, `is_paused()` reports `false` forever — simulating a pipeline stuck in an
+        /// async, never-completing `Paused` transition (`pause()` itself still returns `Ok`,
+        /// same as a real pipeline's `Async` result). Defaults to `false` (not stuck) so every
+        /// pre-existing test using `ScriptedBackend` is unaffected: its `pause()` "succeeding"
+        /// is immediately confirmed, exactly as if a real pipeline settled right away.
+        stuck_paused: bool,
     }
 
     struct ScriptedBackend(Rc<RefCell<ScriptedBackendState>>);
@@ -3658,6 +3736,9 @@ pub(crate) mod tests {
         }
         fn pause(&mut self) -> abs_player::Result<()> {
             Ok(())
+        }
+        fn is_paused(&self) -> bool {
+            !self.0.borrow().stuck_paused
         }
         fn seek(&mut self, position: Duration) -> abs_player::Result<()> {
             let mut state = self.0.borrow_mut();
@@ -3760,6 +3841,64 @@ pub(crate) mod tests {
             state.borrow().seek_calls.last().copied(),
             Some(Duration::from_secs(3)),
             "the reload must seek back to the position the error left off at, not start from 0"
+        );
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Regression test for the Librem 5
+    /// field report `pause()`'s doc comment describes: `backend.pause()` returning `Ok` only
+    /// means GStreamer *accepted* the request, not that the pipeline actually reached `Paused` —
+    /// a network-streamed source mid-buffer-read can sit `Async` indefinitely. Simulated here via
+    /// `ScriptedBackend`'s `stuck_paused` flag (`is_paused()` never returns `true`, exactly like
+    /// a pipeline stuck in `Async`), since a real `GstBackend` has no seam to force that
+    /// deterministically. `PlayerController::pause()`'s confirmation poll must eventually notice
+    /// and recover: mark the item for reload, surface an error, and release the backend — the
+    /// same recovery an outright `backend.pause()` failure already gets.
+    pub(crate) fn run_a_pause_that_never_lands_is_recovered(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        state.borrow_mut().stuck_paused = true;
+        controller.pause();
+        // `pause()` itself reports success immediately (`backend.pause()` returned `Ok`, exactly
+        // like a real pipeline's `Async` result) — the bug this fixes is that nothing used to
+        // check any further than that.
+        let snapshot = controller.snapshot().unwrap();
+        assert!(!snapshot.is_playing, "pause() should still report not-playing right away");
+        assert!(snapshot.last_error.is_none(), "no error yet — the confirmation window hasn't elapsed");
+        assert_eq!(state.borrow().reset_calls, 0, "not recovered yet — still within the confirmation window");
+
+        // `PAUSE_CONFIRM_INTERVAL * PAUSE_CONFIRM_ATTEMPTS` is the whole window; give it a wide
+        // margin rather than pinning the exact constants here.
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
+
+        let snapshot = controller.snapshot().unwrap();
+        assert!(!snapshot.is_playing, "must stay paused (not silently reported as playing)");
+        assert!(snapshot.last_error.is_some(), "a pause that never lands must eventually surface as an error");
+        assert_eq!(state.borrow().reset_calls, 1, "a pause stuck forever must release the backend, same as an outright pause failure");
+
+        // The item must be recoverable exactly like any other `needs_reload` case: the next
+        // `play()` reloads rather than trying to resume a pipeline that was already released.
+        let load_calls_before_retry = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| state.borrow().load_calls.len() > load_calls_before_retry, Duration::from_secs(10));
+        assert!(
+            controller.snapshot().is_some_and(|s| s.is_playing && s.last_error.is_none()),
+            "once reloaded, playback should be running again with no error showing"
         );
         controller.stop();
     }

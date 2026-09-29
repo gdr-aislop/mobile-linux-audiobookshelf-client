@@ -729,7 +729,14 @@ Needs a real GNOME/phosh session.
       means the audio server itself never reported the unplug (see HW-6c, and run with
       `RUST_LOG=debug` for the per-scan sink detail behind it). Check the rotating log file
       under `~/.local/state/io.github.gdr-aislop.abs-app/logs/abs-app.<date>`
-      (`abs_storage::AppPaths::logs_dir()`) for a run where stderr wasn't captured.
+      (`abs_storage::AppPaths::logs_dir()`) for a run where stderr wasn't captured. Two more
+      things worth checking if "paused for headphone unplug" appears but audio never actually
+      stops: a `mpris` "MPRIS command received" line shortly after it means something external
+      (a Bluetooth peer, the lock screen's media widget, `playerctl`) sent a `Play`/`PlayPause`
+      right back; a later `player` warning that a pause "never reached Paused" means the
+      GStreamer pipeline itself got stuck mid-transition — the app recovers from that
+      automatically (reloads the track), but it takes a few seconds and is worth reporting if
+      it happens routinely on this hardware.
 
 - [ ] **HW-6 — Bluetooth loss pauses.** While playing through Bluetooth headphones, turn the
       headphones off / walk out of range.

@@ -59,13 +59,16 @@ pub struct AppState {
     pub theme: abs_core::settings::Theme,
 }
 
-/// The user-facing version string. Sourced at compile time from this crate's manifest, which
-/// itself inherits the workspace's single `[workspace.package].version` — there is exactly one
-/// place a version number is written. Shared by the `--version`/`-v` command-line flags
-/// (handled in `main` before any setup) and, eventually, the Settings screen's About row
-/// (docs/design/ui-spec.md).
+/// The user-facing version string, including the short git commit it was built from. The
+/// version number is sourced at compile time from this crate's manifest, which itself inherits
+/// the workspace's single `[workspace.package].version` — there is exactly one place a version
+/// number is written; the commit hash comes from `build.rs`'s `ABS_APP_GIT_HASH` (`"unknown"`
+/// for a non-git build, e.g. a distro source tarball). Shared by the `--version`/`-v`
+/// command-line flags (handled in `main` before any setup), main's startup diagnostics log line,
+/// and, eventually, the Settings screen's About row (docs/design/ui-spec.md) — one line a user
+/// can paste into a bug report that identifies exactly which build they're running.
 pub fn version_line() -> String {
-    format!("Audiobookshelf {}", env!("CARGO_PKG_VERSION"))
+    format!("Audiobookshelf {} ({})", env!("CARGO_PKG_VERSION"), env!("ABS_APP_GIT_HASH"))
 }
 
 /// Applies a Theme to libadwaita's global style manager — the one place that knows the
@@ -507,11 +510,15 @@ mod tests {
     use super::version_line;
 
     #[test]
-    fn version_line_is_the_display_name_plus_a_dotted_version() {
+    fn version_line_is_the_display_name_plus_a_dotted_version_plus_a_commit() {
         let line = version_line();
-        let version = line
+        let rest = line
             .strip_prefix("Audiobookshelf ")
             .expect("version line should start with the display name");
+        let (version, commit) = rest.split_once(" (").expect("version line should have a parenthesized commit after the version");
+        let commit = commit.strip_suffix(')').expect("the commit part should be closed with a parenthesis");
+        assert!(!commit.is_empty(), "commit must not be empty (should be at least \"unknown\")");
+
         assert!(!version.is_empty(), "version must not be empty");
         let parts: Vec<&str> = version.split('.').collect();
         assert!(parts.len() >= 2, "version should be dotted, got: {version}");

@@ -44,6 +44,16 @@ fn main() -> adw::glib::ExitCode {
     paths.ensure_early_dirs().expect("create the logging/crash-dump directories");
 
     let log_handle = crash_reporting::init_logging(&paths);
+    // One of the very first lines in every log, on purpose: a user's pasted log snippet should
+    // be self-identifying — which build it came from, which OS/architecture, and where the rest
+    // of this log file lives — without anyone having to ask.
+    tracing::info!(
+        version = %application::version_line(),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        state_dir = %paths.state_dir().display(),
+        "starting up"
+    );
     crash_reporting::install_panic_hook(log_handle.clone());
     // Failure here degrades to a warning inside `attach_crash_handler` itself — crash-dump
     // capture must never block the app from starting (e.g. under a sandboxed/seccomp environment
@@ -266,6 +276,7 @@ mod tests {
         (playback_seek_across_track_boundary_lands_in_the_next_file, crate::player::tests::run_seek_across_track_boundary_lands_in_the_next_file),
         (playback_stalled_seek_keeps_the_last_known_position, crate::player::tests::run_stalled_seek_keeps_the_last_known_position),
         (playback_error_then_retry_reloads_from_the_last_good_position, crate::player::tests::run_error_then_retry_reloads_from_the_last_good_position),
+        (playback_a_pause_that_never_lands_is_recovered, crate::player::tests::run_a_pause_that_never_lands_is_recovered),
         (playback_a_resume_seek_that_does_not_land_is_reissued, crate::player::tests::run_a_resume_seek_that_does_not_land_is_reissued),
         (playback_a_failed_start_keeps_both_books_positions, crate::player::tests::run_a_failed_start_keeps_both_books_positions),
         (playback_an_unchanged_position_is_not_pushed_twice, crate::player::tests::run_an_unchanged_position_is_not_pushed_twice),

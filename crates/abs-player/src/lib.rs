@@ -95,7 +95,21 @@ pub trait AudioBackend {
     /// up by the next track without rebuilding the backend.
     fn apply_connection(&mut self, properties: &ConnectionProperties);
     fn play(&mut self) -> Result<()>;
+    /// Asks the pipeline to pause. `Ok` here means GStreamer accepted the request, **not** that
+    /// the pipeline has actually reached `Paused` yet — `gst_element_set_state` returns `Ok` for
+    /// an in-progress (`Async`) transition exactly as it does for one already complete; only a
+    /// synchronous `Failure` is an `Err`. A network-streamed source mid-buffer-read can sit in
+    /// `Async` for a long time, or effectively forever, entirely silently — see [`is_paused`]
+    /// for how a caller confirms the pause actually landed rather than trusting this `Ok` alone.
+    ///
+    /// [`is_paused`]: AudioBackend::is_paused
     fn pause(&mut self) -> Result<()>;
+    /// Whether the pipeline has actually reached, and settled in, `Paused` right now — `false`
+    /// both while a `pause()` is still asynchronously in flight and if it landed somewhere else
+    /// entirely. Reads GStreamer's last-known state instantly and never blocks (unlike this
+    /// crate's own tests' `wait_for_state_change`, which blocks on purpose — appropriate for a
+    /// test, not for a call a caller might make from the GTK main thread).
+    fn is_paused(&self) -> bool;
     /// Requires the pipeline to have already reached at least `PAUSED` (i.e. `play()` or
     /// `pause()` must have been called since the last `load()`) — GStreamer cannot seek a
     /// pipeline still in `NULL`/`READY`. Callers that want duration/position available before
@@ -239,6 +253,14 @@ impl AudioBackend for GstBackend {
     fn pause(&mut self) -> Result<()> {
         self.pipeline.set_state(gst::State::Paused)?;
         Ok(())
+    }
+
+    fn is_paused(&self) -> bool {
+        // `pending_state()` is `VoidPending` exactly when no transition is in flight — checking
+        // it alongside `current_state()` is what tells "reached Paused" apart from "requested
+        // Paused, still Async". Both are plain non-blocking reads of GStreamer's last-known
+        // state (`ElementExt`, already used by this file's own tests).
+        self.pipeline.current_state() == gst::State::Paused && self.pipeline.pending_state() == gst::State::VoidPending
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
@@ -449,6 +471,33 @@ mod tests {
         wait_for_state_change(&player);
 
         assert_eq!(player.pipeline.current_state(), gst::State::Paused);
+    }
+
+    /// Pins `is_paused()`'s whole contract — the gap `pause()`'s own doc comment describes: `Ok`
+    /// from `pause()` means only that GStreamer *accepted* the request, not that it landed.
+    /// `is_paused()` is what tells those apart, and it must never block (checked here by never
+    /// calling `wait_for_state_change` before the first assertion — if `is_paused()` secretly
+    /// blocked until the pipeline settled, this test would still pass, but a real caller on the
+    /// GTK main thread would freeze on every pause).
+    #[test]
+    fn is_paused_distinguishes_an_in_flight_pause_from_a_landed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut player = backend();
+        player.load(&silent_wav_uri(&tmp, 2)).unwrap();
+        player.play().unwrap();
+        wait_for_state_change(&player);
+        assert!(!player.is_paused(), "still playing — must not report paused");
+
+        player.pause().unwrap();
+        // Deliberately no `wait_for_state_change` here: this is the exact moment production
+        // code's own `pause()` call returns, before anything has had a chance to settle.
+        // Whether this pipeline happens to reach `Paused` synchronously or is still `Async` is
+        // itself timing-dependent (and not the point) — either way `is_paused()` must return an
+        // instant, non-blocking answer.
+        let _ = player.is_paused();
+
+        wait_for_state_change(&player);
+        assert!(player.is_paused(), "settled in Paused — must report paused");
     }
 
     #[test]

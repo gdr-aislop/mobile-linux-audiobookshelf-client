@@ -291,6 +291,12 @@ fn metadata_variant(metadata: &TrackMetadata) -> glib::Variant {
 /// module (a real bus round-trip can only be smoke-tested, gated on whatever D-Bus tooling exists
 /// in a given build/test environment).
 fn dispatch_player_method(method: &str, params: &glib::Variant, commands: &dyn MprisCommands) -> Result<Option<glib::Variant>, glib::Error> {
+    // One chokepoint for every inbound Player-interface call (from the desktop shell's media
+    // widget, a Bluetooth AVRCP peer, `playerctl`, or anything else on the session bus) — without
+    // this, an external `Play`/`PlayPause` reaching `MprisBridge` and resuming playback left
+    // absolutely no trace in the log: every *other* route into `play()`/`pause()` is logged
+    // (route-watch's unplug/replug handling, `backend.pause()` failures), but this one wasn't.
+    tracing::info!(%method, "MPRIS command received");
     match method {
         "PlayPause" => {
             commands.play_pause();
