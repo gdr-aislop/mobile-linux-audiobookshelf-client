@@ -869,6 +869,11 @@ impl Inner {
     }
 
     fn publish(&self) {
+        // Home's and Library's progress sync leave the book the player holds to the player.
+        let held = self.now_playing.as_ref().map(|np| (np.server_id.as_str(), np.account_id.as_str(), np.item_id.as_str())).or_else(|| {
+            self.pending_start.as_ref().map(|p| (p.server_id.as_str(), p.account_id.as_str(), p.item_id.as_str()))
+        });
+        crate::sync_coordinator::set_loaded_item(held);
         let Some(snapshot) = self.snapshot() else { return };
         for listener in &self.listeners {
             listener(&snapshot);

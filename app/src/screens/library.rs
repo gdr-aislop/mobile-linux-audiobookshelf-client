@@ -1065,7 +1065,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                 };
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
 
-                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id).await
+                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id, crate::sync_coordinator::loaded_item(&server_id, &account_id).as_deref()).await
                 {
                     tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
                 }

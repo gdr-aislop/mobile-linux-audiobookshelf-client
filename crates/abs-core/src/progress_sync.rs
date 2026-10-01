@@ -82,23 +82,29 @@ pub async fn push_item_progress(
 /// Runs in both directions: local progress the server hasn't confirmed yet (listened to offline,
 /// or whose push failed) is pushed first, unless the server has something newer for that item.
 /// Before, such progress was only ever retried while the same book stayed loaded in the player.
+///
+/// `skip_item` is the book the player has loaded, if any: the player owns that item's row (it
+/// writes and pushes it on its own schedule, and reconciles it against the server when resuming),
+/// so a push of the row's up-to-5-seconds-stale copy or an overwrite from a snapshot fetched
+/// before the player's own push landed would only race it.
 pub async fn reconcile_all_progress(
     pool: &sqlx::SqlitePool,
     connection: &crate::connection::ConnectionTarget,
     access_token: &str,
     account_id: &str,
     server_id: &str,
+    skip_item: Option<&str>,
 ) -> Result<()> {
     let api = connection
         .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
         .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
     let all_progress = api.get_all_media_progress().await.map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
 
-    let pushed = push_unconfirmed_progress(pool, connection, access_token, account_id, server_id, &all_progress).await?;
+    let pushed = push_unconfirmed_progress(pool, connection, access_token, account_id, server_id, &all_progress, skip_item).await?;
 
     for server_progress in &all_progress {
         // Just pushed: the server's copy fetched above is already out of date.
-        if pushed.contains(&server_progress.library_item_id) {
+        if pushed.contains(&server_progress.library_item_id) || skip_item == Some(server_progress.library_item_id.as_str()) {
             continue;
         }
         if abs_storage::repo::items::get(pool, server_id, &server_progress.library_item_id).await.is_err() {
@@ -120,10 +126,11 @@ async fn push_unconfirmed_progress(
     account_id: &str,
     server_id: &str,
     server_progress: &[abs_api::ServerProgress],
+    skip_item: Option<&str>,
 ) -> Result<std::collections::HashSet<String>> {
     let mut pushed = std::collections::HashSet::new();
     for local in abs_storage::repo::progress::list_needing_push(pool, account_id).await? {
-        if local.server_id != server_id {
+        if local.server_id != server_id || skip_item == Some(local.item_id.as_str()) {
             continue;
         }
         let server_copy = server_progress.iter().find(|p| p.library_item_id == local.item_id);
@@ -349,7 +356,7 @@ mod tests {
             .await;
 
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
-        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id).await.unwrap();
+        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, None).await.unwrap();
 
         let known = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap();
         assert_eq!(known.unwrap().current_time_seconds, 42.0);
@@ -376,7 +383,7 @@ mod tests {
         // Listened offline: newer than the server's copy, never pushed.
         abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 70.0, false).await.unwrap();
 
-        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id).await.unwrap();
+        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, None).await.unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         let patch = requests.iter().find(|r| r.method.as_str() == "PATCH").expect("the unconfirmed local progress should be pushed");
@@ -403,7 +410,7 @@ mod tests {
         let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
         abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 70.0, false).await.unwrap();
 
-        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id).await.unwrap();
+        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, None).await.unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         assert!(!requests.iter().any(|r| r.method.as_str() == "PATCH"), "an older local write must not be pushed over newer server progress");
@@ -464,5 +471,31 @@ mod tests {
 
         let progress = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap().unwrap();
         assert_eq!(progress.current_time_seconds, 0.0, "the local write must land even though the server push failed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_progress_leaves_the_skipped_item_to_its_owner() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "mediaProgress": [
+                    { "libraryItemId": "item-1", "currentTime": 10.0, "duration": 100.0, "isFinished": false, "lastUpdate": chrono::Utc::now().timestamp_millis() + 60_000 },
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server).await;
+
+        let (pool, server_id, account_id) = pool_with_synced_item(&mock_server.uri(), "item-1").await;
+        abs_storage::repo::progress::set(&pool, &account_id, &server_id, "item-1", 70.0, false).await.unwrap();
+
+        reconcile_all_progress(&pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &account_id, &server_id, Some("item-1")).await.unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|r| r.method.as_str() == "PATCH"), "the loaded item's row must not be pushed from here");
+        let local = abs_storage::repo::progress::get(&pool, &account_id, &server_id, "item-1").await.unwrap().unwrap();
+        assert_eq!(local.current_time_seconds, 70.0, "nor overwritten with the server's snapshot");
+        assert!(local.needs_push, "it stays marked for its owner to push");
     }
 }

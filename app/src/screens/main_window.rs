@@ -97,7 +97,15 @@ fn push_unconfirmed_progress(pool: sqlx::SqlitePool, session: abs_core::auth::Se
         };
         let access_token = session.access_token().await;
         if let Err(err) =
-            abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, session.account_id(), session.server_id()).await
+            abs_core::progress_sync::reconcile_all_progress(
+                &pool,
+                &connection,
+                &access_token,
+                session.account_id(),
+                session.server_id(),
+                crate::sync_coordinator::loaded_item(session.server_id(), session.account_id()).as_deref(),
+            )
+            .await
         {
             tracing::info!(%err, "couldn't push unconfirmed progress on reconnect; will retry on the next one");
         }
