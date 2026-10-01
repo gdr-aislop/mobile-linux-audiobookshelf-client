@@ -4,7 +4,6 @@ An [Audiobookshelf](https://audiobookshelf.org/) client for Librem 5 / Phosh.
 Offline-first, fast Rust native code, installable on PureOS Crimson as a deb.
 For other Linux phones, Appimage and Flatpak builds are available.
 
-(TODO: SCREENSHOT 1 GOES HERE)
 ![Home Screen](docs/images/shot6.png) ![Player](docs/images/shot3.png)
 
 ## Features
@@ -31,14 +30,19 @@ Prompts by [GDR!](https://github.com/gjedeer/)
 
 ## Screenshots
 
+Library Screen
 ![Library Screen](docs/images/shot7.png)
 
+Book Details
 ![Book Details](docs/images/shot4.png)
 
+Chapter download options
 ![Download](docs/images/shot5.png)
 
+Settings
 ![Settings](docs/images/shot2.png)
 
+Settings, in the light theme
 ![Light mode](docs/images/shot1.png)
 
 ## Installing
@@ -123,11 +127,9 @@ Output lands in `build/appimage/abs-app-<version>-<arch>.AppImage`.
 (`ABS_APP_BIN`, `LINUXDEPLOY`, `APPIMAGE_TOOLS_DIR`); the docker wrapper
 mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfile`.
 
-## Diagnosing a crash report
+## Reporting problems
 
-The app never phones home; everything below stays on the user's device. If
-someone reports a crash, ask for whatever exists under
-`~/.local/state/io.github.gdr_aislop.abs-app/`:
+When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislop.abs-app/`:
 
 - `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without
