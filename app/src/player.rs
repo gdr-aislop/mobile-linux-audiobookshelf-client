@@ -805,11 +805,21 @@ impl Inner {
     /// For a write at an explicit position (marking finished, resetting), see
     /// `write_progress_at`. Held back while a resume's reconcile is in flight (see
     /// `PlayerController::play`): the position may be about to move to another device's.
-    fn write_progress(&mut self, is_finished: bool) {
+    ///
+    /// A finished book (`NowPlaying::ended`) is recorded finished, at its full duration — every
+    /// one of these writes used to record it unfinished at wherever the pipeline stopped, so a
+    /// pause, a quit, a book switch or a reconnect after the end un-finished it again (here and
+    /// on the server).
+    fn write_progress(&mut self) {
         if self.holding_writes_for_reconcile.is_some() {
             return;
         }
-        let position = self.book_position();
+        let Some(now_playing) = &self.now_playing else { return };
+        let (position, is_finished) = if now_playing.ended {
+            (now_playing.duration_seconds, true)
+        } else {
+            (self.book_position(), false)
+        };
         self.write_progress_at(position, is_finished, true);
     }
 
@@ -1338,6 +1348,8 @@ impl PlayerController {
         inner.pause_backend_if_loaded();
         if let Some(now_playing) = &mut inner.now_playing {
             now_playing.is_playing = false;
+            // Every later write (a quit, a switch) keeps it finished, and Play starts it over.
+            now_playing.ended = true;
         }
         inner.paused_by_unplug = false;
         inner.paused_by_call = false;
@@ -1377,12 +1389,29 @@ impl PlayerController {
     ///
     /// The previous book is stopped and dropped right away, and the new one is pending (see
     /// [`PendingStart`]) until it has resolved and loaded. Starting the book that is already
-    /// pending only updates it. Starting the book that is already *loaded* reloads it like any
-    /// other — that is what starts a finished book over, and picks up progress from elsewhere.
+    /// pending only updates it. Starting the book that is already *loaded* doesn't reload it: it
+    /// seeks to the chapter, if one was asked for, and plays — `play()` starts a finished book
+    /// over, reloads after an error, and checks for progress made elsewhere after a long pause.
+    /// Only a book whose start failed before anything resolved is started again from scratch.
     pub fn start_with(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64, start_chapter: Option<usize>) {
         let same_book = |item_id: &str, server_id: &str, account_id: &str| {
             item_id == item.item_id && server_id == session.server_id() && account_id == session.account_id()
         };
+        let loaded_chapter_start = {
+            let inner = self.inner.borrow();
+            inner.now_playing.as_ref().filter(|np| {
+                same_book(&np.item_id, &np.server_id, &np.account_id) && !np.tracks.is_empty() && np.retry_request.is_none()
+            }).map(|np| start_chapter.and_then(|index| np.chapters.get(index)).map(|c| c.start_seconds.max(0.0)))
+        };
+        if let Some(chapter_start) = loaded_chapter_start {
+            tracing::info!(item_id = %item.item_id, ?start_chapter, "already loaded; playing");
+            // The chapter first, so the position is pinned before the pipeline is asked to play.
+            if let Some(at) = chapter_start {
+                self.seek_to_seconds(at);
+            }
+            self.play();
+            return;
+        }
         {
             let mut inner = self.inner.borrow_mut();
             if let Some(pending) = &mut inner.pending_start {
@@ -1402,7 +1431,7 @@ impl PlayerController {
             // Flush the outgoing book's position before it's dropped — otherwise switching while
             // it plays loses up to `LOCAL_PROGRESS_WRITE_INTERVAL` of it.
             if inner.now_playing.is_some() {
-                inner.write_progress(false);
+                inner.write_progress();
             }
             let previous = inner.now_playing.as_ref().map(|np| np.item_id.clone());
             inner.session_generation += 1;
@@ -1808,6 +1837,33 @@ impl PlayerController {
             self.start(session, request, default_speed);
             return;
         }
+        // A finished book starts over. Resuming the pipeline where it stopped would only reach
+        // its end-of-stream again at once; a fresh load of the first file can't (the reset in
+        // `prepare_track_load` drops whatever the old one left on the bus).
+        {
+            let mut inner = self.inner.borrow_mut();
+            let ended = inner.now_playing.as_ref().is_some_and(|np| np.ended && !np.tracks.is_empty());
+            if ended {
+                let Some(now_playing) = &mut inner.now_playing else { return };
+                tracing::info!(item_id = %now_playing.item_id, "finished book restarted");
+                now_playing.ended = false;
+                now_playing.is_playing = true;
+                now_playing.last_error = None;
+                let item_id = now_playing.item_id.clone();
+                inner.paused_by_unplug = false;
+                inner.paused_by_call = false;
+                let generation = inner.prepare_track_load(0, 0.0);
+                inner.write_progress_at(0.0, false, true);
+                inner.last_played_at = Instant::now();
+                inner.publish();
+                drop(inner);
+                self.ensure_ticking();
+                if let Some(generation) = generation {
+                    Inner::spawn_load_track(self.inner.clone(), item_id, generation);
+                }
+                return;
+            }
+        }
         self.reconcile_before_resuming();
         let mut inner = self.inner.borrow_mut();
         let position = inner.book_position();
@@ -1952,7 +2008,7 @@ impl PlayerController {
                 None => {
                     let paused = controller.inner.borrow().now_playing.as_ref().is_some_and(|np| !np.is_playing);
                     if paused {
-                        controller.inner.borrow_mut().write_progress(false);
+                        controller.inner.borrow_mut().write_progress();
                     }
                 }
             }
@@ -1970,7 +2026,7 @@ impl PlayerController {
     pub fn save_progress_now(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.progress_writer.forget_pushed();
-        inner.write_progress(false);
+        inner.write_progress();
     }
 
     /// A seek while paused used to be saved only at the next play/pause, so skipping to where
@@ -1992,7 +2048,7 @@ impl PlayerController {
             let mut inner = inner.borrow_mut();
             let still_paused = inner.now_playing.as_ref().is_some_and(|np| !np.is_playing);
             if inner.paused_seek_generation == generation && still_paused {
-                inner.write_progress(false);
+                inner.write_progress();
             }
         });
     }
@@ -2003,7 +2059,7 @@ impl PlayerController {
     pub fn flush_on_shutdown(&self) {
         let writer = {
             let mut inner = self.inner.borrow_mut();
-            inner.write_progress(false);
+            inner.write_progress();
             inner.progress_writer.clone()
         };
         writer.drain_blocking(SHUTDOWN_PUSH_TIMEOUT);
@@ -2072,7 +2128,7 @@ impl PlayerController {
             }
         }
         inner.publish();
-        inner.write_progress(false);
+        inner.write_progress();
     }
 
     /// For when connectivity returns while paused/idle — the only place progress otherwise syncs
@@ -2113,7 +2169,7 @@ impl PlayerController {
                 _ => false,
             };
             if !server_had_something_newer {
-                inner_rc.borrow_mut().write_progress(false);
+                inner_rc.borrow_mut().write_progress();
             }
         });
     }
@@ -2390,6 +2446,10 @@ impl PlayerController {
                 return;
             }
             let target = clamp_to_book(seconds, now_playing.duration_seconds);
+            // Moving anywhere in a finished book takes it back to unfinished, there.
+            now_playing.ended = false;
+            // A seek the listener asked for gets its own chance to land (see `observe_position`).
+            now_playing.seek_reload_used = false;
             let (track_index, within) = locate_track(&now_playing.tracks, target);
             let cross_track = track_index != now_playing.current_track;
             tracing::info!(item_id = %now_playing.item_id, from, to = target, track = track_index, within, cross_track, "seek");
@@ -2614,12 +2674,13 @@ impl PlayerController {
                         inner.pause_backend_if_loaded();
                         if let Some(now_playing) = &mut inner.now_playing {
                             now_playing.is_playing = false;
+                            now_playing.ended = true;
                         }
                         // End-of-book is not an unplug pause — a replug must not revive it
                         // (nor a call ending).
                         inner.paused_by_unplug = false;
                         inner.paused_by_call = false;
-                        inner.write_progress(true);
+                        inner.write_progress();
                     }
                 }
                 abs_player::PlayerEvent::Error(err) => {
@@ -2682,7 +2743,7 @@ impl PlayerController {
                     };
                     inner.paused_by_unplug = false;
                     inner.paused_by_call = false;
-                    inner.write_progress(false);
+                    inner.write_progress();
 
                     if let Some(recovery) = recovery {
                         let pool = inner.pool.clone();
@@ -2737,7 +2798,7 @@ impl PlayerController {
                 // override it.
                 inner.paused_by_unplug = false;
                 inner.paused_by_call = false;
-                inner.write_progress(false);
+                inner.write_progress();
             }
         }
 
@@ -5470,14 +5531,16 @@ pub(crate) mod tests {
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Starting at a tapped chapter loads
-    /// the book straight at the chapter (the saved position doesn't win) — also when it's the
-    /// book already loaded, and also when it's the book already starting.
+    /// the book straight at the chapter (the saved position doesn't win). On the book already
+    /// loaded it is just a seek, with no reload; on the book already starting, the latest tap wins.
     pub(crate) fn run_starting_at_a_chapter(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[(0.0, 20.0), (20.0, 40.0), (40.0, 60.0)], None));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[60], &[], None));
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
         runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 50.0, false)).unwrap();
         let (controller, state) = scripted_controller(&pool);
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
@@ -5487,17 +5550,101 @@ pub(crate) mod tests {
         assert_eq!(state.borrow().seek_calls.first().copied(), Some(Duration::from_secs(20)), "loaded straight at the chapter");
         assert!((controller.snapshot().unwrap().position_seconds - 20.0).abs() < 0.5);
 
+        let loads = state.borrow().load_calls.len();
         controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(2));
-        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| (s.position_seconds - 40.0).abs() < 0.5), Duration::from_secs(5));
         assert!((controller.snapshot().unwrap().position_seconds - 40.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        assert_eq!(state.borrow().load_calls.len(), loads, "a chapter of the loaded book is a seek, not a reload");
+        assert!(controller.snapshot().unwrap().is_playing);
 
-        // Tapped again while it's still starting: the latest chapter is where it starts.
+        // Tapped twice while it's still starting: the latest chapter is where it starts.
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
         let loads = state.borrow().load_calls.len();
         controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(0));
         controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(1));
         pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
         assert_eq!(state.borrow().load_calls.len(), loads + 1, "one start, one load");
         assert!((controller.snapshot().unwrap().position_seconds - 20.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Play or Resume on the book that's
+    /// already loaded used to stop it and fetch it from the server again — a gap, a loading
+    /// state, and a long wait offline. It now just plays, from where it is.
+    pub(crate) fn run_starting_the_loaded_book_does_not_reload_it(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(30));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 29.5), Duration::from_secs(5));
+        controller.pause();
+        let (loads, resets) = (state.borrow().load_calls.len(), state.borrow().reset_calls);
+
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        let snapshot = controller.snapshot().unwrap();
+        assert!(!snapshot.is_loading && snapshot.is_playing, "it plays at once, without loading again");
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(state.borrow().load_calls.len(), loads, "no reload");
+        assert_eq!(state.borrow().reset_calls, resets, "the pipeline is kept");
+        assert!((controller.snapshot().unwrap().position_seconds - 30.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A finished book used to come back
+    /// unfinished: every later write (a pause, a quit, switching books) recorded it unfinished at
+    /// wherever the pipeline stopped, here and on the server. And Play on it resumed the pipeline
+    /// at its end, which only ended again — it now starts over.
+    pub(crate) fn run_a_finished_book_stays_finished(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let row = |item_id: &str| runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, item_id)).unwrap();
+        let finished = |item_id: &str| row(item_id).is_some_and(|r| r.is_finished);
+
+        // Listened to the end.
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(60));
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+        pump_until(|| finished("item-1"), Duration::from_secs(5));
+        // A pause (MPRIS sends them whatever the state) and the switch to another book.
+        controller.pause();
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        assert!(finished("item-1"), "a pause or a switch after the end keeps it finished");
+
+        // Marked finished by hand, then quit.
+        state.borrow_mut().position = Some(Duration::from_secs(20));
+        pump_until(|| false, Duration::from_millis(300));
+        controller.mark_as_finished();
+        controller.flush_on_shutdown();
+        let marked = row("item-2").unwrap();
+        assert!(marked.is_finished, "quitting after marking it finished keeps it finished");
+        assert!((marked.current_time_seconds - 60.0).abs() < 0.5, "got {}", marked.current_time_seconds);
+
+        // Play on a finished book starts it over, with a fresh load of its first file.
+        let loads = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| state.borrow().load_calls.len() > loads && controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(5));
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "a finished book is loaded again from its start");
+        assert!(controller.snapshot().unwrap().position_seconds < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        pump_until(|| !finished("item-2"), Duration::from_secs(5));
+        assert!(!finished("item-2"), "started over, it's no longer finished");
         controller.stop();
     }
 
