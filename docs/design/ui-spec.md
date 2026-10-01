@@ -368,12 +368,17 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   row is what makes a second server possible), with a Cancel affordance back to the shell; a
   successful connect activates the new account and rebuilds the shell.
 - **About** group: a single `AdwActionRow` with the app version as its subtitle, opening an
-  `AdwAboutWindow` (app name, version, website, license) on tap — not `AdwAboutDialog`, which
-  needs libadwaita 1.5+ and is out of reach of this app's `v1_2` feature ceiling (see
-  `app/Cargo.toml`'s `adw` dependency); `AdwAboutWindow` is the equivalent widget already
-  available at `v1_2`. The version is sourced at compile time from `CARGO_PKG_VERSION` — the
-  workspace's single version number — and is the exact same string the `--version`/`-v`
-  command-line flags print, so it can never drift between the two.
+  in-window About screen on tap (app name, version, a Website row, a License row) — swapping the
+  main window's own content via `push_about`, with its own back button, the same way Settings'
+  own Connection page (`push_connection`) and every other secondary screen in this app already
+  work, rather than opening a second top-level window. It used to be `adw::AboutWindow` (chosen
+  because `AdwAboutDialog` needs libadwaita 1.5+, out of reach of this app's `v1_2` feature
+  ceiling — see `app/Cargo.toml`'s `adw` dependency) — a real Librem 5 field report found that
+  genuine second window had no reliable way to be dismissed under Phosh's default compositor
+  (phoc), so About stopped being the one screen in this app that opens a second window. The
+  version is sourced at compile time from `CARGO_PKG_VERSION` — the workspace's single version
+  number — and is the exact same string the `--version`/`-v` command-line flags print, so it can
+  never drift between the two.
 
 ### Connection
 - Per-server connection settings, pushed from a server row in Settings' Servers group (or the
