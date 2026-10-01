@@ -293,6 +293,11 @@ struct NowPlaying {
     /// write then records it finished (at its full duration) rather than unfinished at wherever
     /// the pipeline stopped, and the next play starts it over. Cleared by any seek.
     ended: bool,
+    /// `Some(speed the backend actually runs at)` while a speed picked during a pause on a
+    /// stream hasn't been handed to the backend yet — applying it is a flushing seek, i.e. a
+    /// range request to the server, and nothing is heard until Play anyway. `play()` applies it;
+    /// if the backend refuses it, this is the speed to show again. `speed` is the picked one.
+    speed_unapplied: Option<f64>,
     /// The seek target never landed after its re-issues and the file was reloaded once to get
     /// there (see `Inner::observe_position`). A second failure then stops with an error instead
     /// of reloading forever. Reset by a landed seek and by any seek the listener asks for.
@@ -325,6 +330,13 @@ enum SeekPlan {
 /// and mark the book finished; a book is finished by listening to its end, or by the explicit
 /// "Mark as finished".
 const SEEK_END_MARGIN_SECONDS: f64 = 1.0;
+
+/// A playback speed the backend can be given: finite and within the range the speed picker
+/// offers. Anything else (a hand-edited setting, a stored NaN) is brought into range, or is
+/// `None` when there is nothing sensible to bring it to.
+fn usable_speed(speed: f64) -> Option<f64> {
+    speed.is_finite().then(|| speed.clamp(abs_core::playback::MIN_SPEED, abs_core::playback::MAX_SPEED))
+}
 
 /// A seek target clamped into the book, short of its very end by `SEEK_END_MARGIN_SECONDS`. A
 /// book whose duration came back unknown (0) is only clamped below — clamping to its "end" would
@@ -1236,6 +1248,7 @@ impl Inner {
             // and a cross-track seek converge.
             now_playing.needs_reload = false;
             now_playing.loading_track = None;
+            now_playing.speed_unapplied = None;
             now_playing.current_source_is_local = is_local;
             // The readiness wait above gives up after 5 s, and a seek asked for before the
             // pipeline is ready silently does nothing — so a seek is only trusted once
@@ -1250,6 +1263,24 @@ impl Inner {
             }
             inner.publish();
         });
+    }
+
+    /// Hands the backend a speed picked while paused on a stream (`NowPlaying::speed_unapplied`),
+    /// right before it plays. A refusal puts the speed it still runs at back on display.
+    fn apply_deferred_speed(&mut self) {
+        let Some(now_playing) = &mut self.now_playing else { return };
+        let Some(applied) = now_playing.speed_unapplied.take() else { return };
+        let speed = now_playing.speed;
+        let within = now_playing.last_known_within_track;
+        let within = if now_playing.seek_target_pending { within } else { self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(within) };
+        self.seek_count += 1;
+        self.drop_stale_end_of_stream();
+        if let Err(err) = self.backend.set_speed(speed, Duration::from_secs_f64(within)) {
+            tracing::warn!(%err, speed, "couldn't apply the speed picked while paused; staying at the previous one");
+            if let Some(now_playing) = &mut self.now_playing {
+                now_playing.speed = applied;
+            }
+        }
     }
 
     /// Before a paused pipeline is asked to play again: the tick doesn't run while paused, so
@@ -1630,6 +1661,7 @@ impl PlayerController {
     /// over, reloads after an error, and checks for progress made elsewhere after a long pause.
     /// Only a book whose start failed before anything resolved is started again from scratch.
     pub fn start_with(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64, start_chapter: Option<usize>) {
+        let default_speed = usable_speed(default_speed).unwrap_or(abs_core::playback::DEFAULT_SPEED);
         let same_book = |item_id: &str, server_id: &str, account_id: &str| {
             item_id == item.item_id && server_id == session.server_id() && account_id == session.account_id()
         };
@@ -1773,6 +1805,7 @@ impl PlayerController {
                     premature_eos_at: None,
                     loading_track: None,
                     ended: false,
+                speed_unapplied: None,
                     seek_reload_used: false,
                 }
             };
@@ -2007,6 +2040,7 @@ impl PlayerController {
                 needs_reload: !loaded,
                 loading_track: None,
                 ended: false,
+                speed_unapplied: None,
                 seek_reload_used: false,
             });
             inner.last_progress_write = Instant::now();
@@ -2137,6 +2171,7 @@ impl PlayerController {
             }
             return;
         }
+        inner.apply_deferred_speed();
         let started = match inner.backend.play() {
             Ok(()) => {
                 if let Some(now_playing) = &mut inner.now_playing {
@@ -2470,7 +2505,7 @@ impl PlayerController {
     /// `MprisBridge`) read the getters below at call time instead.
     pub fn set_playback_config(&self, default_speed: f64, skip_back_seconds: f64, skip_forward_seconds: f64) {
         let mut inner = self.inner.borrow_mut();
-        inner.default_speed = default_speed;
+        inner.default_speed = usable_speed(default_speed).unwrap_or(abs_core::playback::DEFAULT_SPEED);
         inner.skip_back_seconds = skip_back_seconds;
         inner.skip_forward_seconds = skip_forward_seconds;
     }
@@ -2804,15 +2839,36 @@ impl PlayerController {
     /// after a seek. With no usable pipeline (a track load in flight, or released after an
     /// error), only the speed is recorded; the load applies it.
     pub fn set_speed(&self, speed: f64) {
+        let Some(speed) = usable_speed(speed) else {
+            tracing::warn!(speed, "ignored an unusable playback speed");
+            return;
+        };
         let mut inner = self.inner.borrow_mut();
         let holds_track = inner.backend_holds_track();
         let Some(now_playing) = &inner.now_playing else { return };
+        if (now_playing.speed - speed).abs() < f64::EPSILON {
+            return;
+        }
         let within = if now_playing.seek_target_pending {
             now_playing.last_known_within_track
         } else {
             inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(now_playing.last_known_within_track)
         };
         tracing::info!(item_id = %now_playing.item_id, speed, "speed");
+        // Paused on a stream: record the speed and let Play apply it. Applying it now is a
+        // flushing seek — a range request that stalls on a bad connection — for nothing audible.
+        if holds_track && !now_playing.is_playing && !now_playing.current_source_is_local {
+            if let Some(now_playing) = &mut inner.now_playing {
+                let applied = *now_playing.speed_unapplied.get_or_insert(now_playing.speed);
+                now_playing.speed = speed;
+                // Back at what the backend runs at: nothing left to apply.
+                if (applied - speed).abs() < f64::EPSILON {
+                    now_playing.speed_unapplied = None;
+                }
+            }
+            inner.publish();
+            return;
+        }
         // A rate change is a seek to the pipeline: a pause confirmation in flight must not read
         // the preroll it causes as a pause that never landed.
         inner.seek_count += 1;
@@ -2823,6 +2879,7 @@ impl PlayerController {
         if accepted {
             if let Some(now_playing) = &mut inner.now_playing {
                 now_playing.speed = speed;
+                now_playing.speed_unapplied = None;
             }
         }
         inner.publish();
@@ -6369,5 +6426,48 @@ pub(crate) mod tests {
         let started = Instant::now();
         writer.drain_blocking(Duration::from_secs(1));
         assert!(started.elapsed() < Duration::from_secs(3), "the drain took {:?}", started.elapsed());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A speed picked while paused on a
+    /// stream is shown at once but only handed to the backend (a range request) at Play; a
+    /// repeated pick and an unusable value do nothing.
+    pub(crate) fn run_a_speed_picked_while_paused_on_a_stream_is_applied_at_play(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        controller.pause();
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+
+        controller.set_speed(2.0);
+        assert_eq!(controller.snapshot().unwrap().speed, 2.0, "the pick is shown right away");
+        assert!(state.borrow().speed_calls.is_empty(), "but the backend isn't asked while paused on a stream");
+
+        controller.set_speed(f64::NAN);
+        controller.set_speed(f64::INFINITY);
+        controller.set_speed(2.0);
+        assert!(state.borrow().speed_calls.is_empty());
+        assert_eq!(controller.snapshot().unwrap().speed, 2.0);
+
+        controller.play();
+        assert_eq!(state.borrow().speed_calls.len(), 1, "Play applies it, once");
+        assert_eq!(state.borrow().speed_calls[0].0, 2.0);
+
+        // Picked and put back while paused: the backend never hears of it.
+        controller.pause();
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+        controller.set_speed(1.5);
+        controller.set_speed(2.0);
+        controller.play();
+        assert_eq!(state.borrow().speed_calls.len(), 1, "no net change, nothing to apply");
+
+        // Out of range is brought into range.
+        controller.set_speed(10.0);
+        assert_eq!(controller.snapshot().unwrap().speed, abs_core::playback::MAX_SPEED);
+        controller.stop();
     }
 }

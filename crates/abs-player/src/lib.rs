@@ -310,6 +310,11 @@ impl AudioBackend for GstBackend {
         // a new rate, to the position the caller knows is right (see the trait's doc comment).
         // The rate is only kept if that seek was accepted: every later seek reuses
         // `current_speed`, which would otherwise quietly apply a rate the caller was told failed.
+        // GStreamer rejects a rate of zero (and has no use for NaN or infinity); say so here
+        // rather than record a rate every later seek would then fail with.
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(PlayerError::SeekFailed);
+        }
         let previous = self.current_speed;
         self.current_speed = speed;
         let result = self.seek(position);
@@ -601,6 +606,20 @@ mod tests {
         // No `load()` call: playbin has no URI set, so a seek must error, not panic.
         let result = player.seek(Duration::from_secs(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_unusable_speed_is_refused_and_not_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut player = backend();
+        player.load(&silent_wav_uri(&tmp, 5)).unwrap();
+        player.pause().unwrap();
+        wait_for_state_change(&player);
+        for speed in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(player.set_speed(speed, Duration::from_secs(1)).is_err(), "{speed} should be refused");
+            assert_eq!(player.current_speed, 1.0);
+        }
+        assert!(player.seek(Duration::from_secs(1)).is_ok(), "later seeks must be unaffected");
     }
 
     #[test]
