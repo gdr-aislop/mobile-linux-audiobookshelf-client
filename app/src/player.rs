@@ -844,7 +844,15 @@ impl Inner {
         } else {
             self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(now_playing.last_known_within_track)
         };
-        now_playing.tracks.get(now_playing.current_track).map(|t| t.offset_seconds).unwrap_or(0.0) + within_track
+        // Never past the end of the file as the server's timeline has it (when it says): a file
+        // that runs longer than reported stalls the reading at the boundary instead of showing
+        // the next file's part of the book early.
+        let track = now_playing.tracks.get(now_playing.current_track);
+        let within_track = match track {
+            Some(t) if t.duration_seconds > 0.0 => within_track.min(t.duration_seconds),
+            _ => within_track,
+        };
+        track.map(|t| t.offset_seconds).unwrap_or(0.0) + within_track
     }
 
     /// Refreshes `last_known_within_track` from the backend's own position, when it has one and
@@ -1096,9 +1104,8 @@ impl Inner {
         verdict
     }
 
-    /// At end-of-stream: if another track follows the current one, refines the track map against
-    /// the file that just finished and returns `(item_id, next_index)` for
-    /// `spawn_load_track` — leaving `is_playing` set, since from the state machine's point of
+    /// At end-of-stream: if another track follows the current one, returns `(item_id, next_index)`
+    /// for `spawn_load_track` — leaving `is_playing` set, since from the state machine's point of
     /// view playback continues. `None` means the item really is over and the caller should run
     /// its existing pause-and-mark-finished path.
     fn next_track_after_end_of_stream(&mut self) -> Option<(String, usize)> {
@@ -1108,28 +1115,11 @@ impl Inner {
             return None;
         }
 
-        // Prefer the pipeline's *actual* duration for the file that just ended over the
-        // server-reported one (which can be missing — parsed as 0.0 — or slightly off): shift
-        // the following tracks' offsets by the difference, so book-level positions stay
-        // continuous across the boundary and don't jump backwards when a duration was unknown.
-        if let Some(actual) = self.backend.duration().filter(|d| !d.is_zero()) {
-            let delta =
-                now_playing.tracks[now_playing.current_track].offset_seconds + actual.as_secs_f64()
-                    - now_playing.tracks[next].offset_seconds;
-            if delta.abs() > f64::EPSILON {
-                for track in &mut now_playing.tracks[next..] {
-                    track.offset_seconds += delta;
-                }
-                // The book-level total is exactly the last track's offset plus its own duration
-                // — shifting every later offset by `delta` shifts that sum by `delta` too, so the
-                // total has to move with it. Left stale, it would silently drift from the
-                // corrected timeline on every mismatch, throwing off `mark_as_finished`'s
-                // recorded position, `seek_to_seconds`/`skip`'s clamp bound, and the book-level
-                // duration shown in the scrubber and reported to MPRIS.
-                now_playing.duration_seconds += delta;
-            }
-        }
-
+        // The server's timeline is canonical: a file whose real length differs from the reported
+        // one doesn't move the later offsets. Progress is saved against that timeline and read
+        // back by every other client, so shifting it here (in memory only) made saved positions
+        // map to the wrong place on the next start. `book_position` keeps the reading from
+        // overshooting into the next file meanwhile.
         now_playing.current_track = next;
         // Until `spawn_load_track` swaps the file, the backend still reports the finished one's
         // position; read against the next track's offset that would overshoot. Pin it to the
@@ -3896,7 +3886,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| controller.current_download_context().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         assert!(
             controller.current_download_context().is_some(),
             "now_playing must exist even when the backend can't load anything — this is what \
@@ -3934,7 +3924,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| controller.current_download_context().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         assert!(
             controller.current_download_context().is_some(),
             "now_playing must exist even when the resolve fails entirely — otherwise the shell's \
@@ -4221,14 +4211,12 @@ pub(crate) mod tests {
             .await;
     }
 
-    /// Regression test: `next_track_after_end_of_stream` corrects later tracks' offsets against
-    /// the pipeline's *actual* duration when the server-reported one for the file that just ended
-    /// was wrong — this seeds exactly that mismatch (server says 10s, the real WAV is 2s) and
-    /// checks the book-level *total* duration is corrected along with the offsets. It's the one
-    /// piece of that correction the original implementation missed: the offsets shifted, but
-    /// `NowPlaying.duration_seconds` (the total the scrubber, MPRIS, and `mark_as_finished`/
-    /// `seek_to_seconds`'s clamp all read) stayed at the stale, server-reported sum.
-    pub(crate) fn run_track_duration_correction_updates_the_book_total(runtime: &tokio::runtime::Runtime) {
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The server's timeline is canonical:
+    /// when a file's real length differs from the one the server reported (seeded here: the server
+    /// says 10s, the real WAV is 2s), the offsets and the book total stay as the server has them
+    /// — saved positions are read back against that timeline by every client — and the reported
+    /// position never runs past the end of the file in the server's terms.
+    pub(crate) fn run_track_duration_mismatch_leaves_the_server_timeline_alone(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(async {
             Mock::given(method("GET"))
@@ -4268,13 +4256,10 @@ pub(crate) mod tests {
             1.0,
         );
 
-        // Before the first track ends, the book total is still the stale server-reported sum
-        // (10 + 2 = 12s) — nothing has had a reason to correct it yet.
         pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         assert_eq!(controller.snapshot().unwrap().duration_seconds, 12.0);
 
-        // Once the real (2s) first track ends and hands over to the second, the correction fires:
-        // the true book total is 2 (corrected track 1) + 2 (track 2) = 4s, not the stale 12s.
+        // The real first file (2s) ends and hands over to the second. Nothing is shifted.
         pump_until(
             || {
                 let requests = runtime.block_on(mock_server.received_requests()).unwrap();
@@ -4283,8 +4268,9 @@ pub(crate) mod tests {
             Duration::from_secs(15),
         );
         pump_until(|| false, Duration::from_millis(200));
-        let duration = controller.snapshot().unwrap().duration_seconds;
-        assert!((duration - 4.0).abs() < 0.5, "book total should be corrected to ~4s, got {duration}");
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.duration_seconds, 12.0, "the book total stays what the server reported");
+        assert!(snapshot.position_seconds >= 10.0, "the second file starts at the server's offset, got {}", snapshot.position_seconds);
 
         controller.stop();
     }
@@ -5686,7 +5672,7 @@ pub(crate) mod tests {
         let snapshot = controller.snapshot().unwrap();
         assert_eq!(snapshot.title, "Book Two", "the new book is shown from the moment it's started");
         assert!(snapshot.is_loading && !snapshot.is_playing && snapshot.position_seconds == 0.0);
-        assert!(controller.current_download_context().is_none(), "nothing may act on a book that isn't loaded yet");
+        assert_eq!(controller.current_item_id().as_deref(), Some("item-2"), "the book that is starting is the current one, never the old one");
 
         // Transport while it resolves acts on nothing.
         pump_until(|| false, Duration::from_millis(200));
@@ -6110,15 +6096,16 @@ pub(crate) mod tests {
         assert_eq!(state.borrow().reset_calls, resets, "the paused pipeline is kept");
         assert!((snapshot.position_seconds - 5.0).abs() < 0.5, "got {}", snapshot.position_seconds);
 
-        // A speed change is a seek to the pipeline, too.
+        // A speed picked while paused on a stream isn't handed to the pipeline until Play, so it
+        // can't disturb the pause either.
         state.borrow_mut().stuck_paused = false;
         controller.play();
         controller.pause();
         controller.set_speed(1.5);
-        state.borrow_mut().stuck_paused = true;
         pump_until(|| false, PAUSE_CONFIRM_INTERVAL * (PAUSE_CONFIRM_ATTEMPTS + 2));
         assert!(controller.snapshot().unwrap().last_error.is_none());
         assert_eq!(state.borrow().reset_calls, resets);
+        assert!(state.borrow().speed_calls.is_empty());
         controller.stop();
     }
 
@@ -6628,6 +6615,26 @@ pub(crate) mod tests {
         };
         pump_until(reset, Duration::from_secs(5));
         assert!(reset(), "the reset reaches the saved progress");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A file that runs longer than the
+    /// server said stalls the reported position at its end instead of showing the next file's
+    /// stretch of the book early.
+    pub(crate) fn run_the_position_never_runs_past_its_file_in_the_server_timeline(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[10, 10], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        state.borrow_mut().position = Some(Duration::from_secs(14));
+        pump_until(|| false, Duration::from_millis(600));
+        let position = controller.snapshot().unwrap().position_seconds;
+        assert!(position <= 10.0, "still in the first file, which the server says ends at 10s: got {position}");
         controller.stop();
     }
 }
