@@ -74,6 +74,16 @@ gpg --verify abs-app_<version>_<arch>.deb.asc abs-app_<version>_<arch>.deb
 gpg --verify abs-app-<version>-<arch>.AppImage.asc abs-app-<version>-<arch>.AppImage
 ```
 
+The signing key's fingerprint is:
+
+```
+CC77 E444 A5CD 5384 0459  1237 08D0 546C 9455 D910
+```
+
+Check it against `gpg --fingerprint` after importing `abs-app.asc`, since that
+file is hosted alongside the binaries it verifies and shouldn't be the only
+source trusted for the key itself.
+
 ### Building an AppImage manually
 
 ```sh
