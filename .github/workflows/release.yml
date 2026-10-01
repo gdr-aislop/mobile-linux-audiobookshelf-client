@@ -190,7 +190,7 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils python3-venv
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils librsvg2-common python3-venv
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub \
             org.gnome.Platform//47 org.gnome.Sdk//47 \
