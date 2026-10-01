@@ -79,7 +79,7 @@ jobs:
             build-essential pkg-config git curl ca-certificates \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libssl-dev
+            libssl-dev libpulse-dev
 
       - name: Install Rust (stable)
         run: |
@@ -134,7 +134,7 @@ jobs:
             build-essential pkg-config git curl ca-certificates file patchelf zsync \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libssl-dev \
+            libssl-dev libpulse-dev \
             libgdk-pixbuf-2.0-dev \
             glib-networking dconf-gsettings-backend gsettings-desktop-schemas \
             librsvg2-common adwaita-icon-theme \
@@ -143,6 +143,14 @@ jobs:
             libsoup-3.0-0
 
       - uses: actions/checkout@v4
+
+      # Container jobs run as root over a workspace owned by the runner's host user, and that
+      # mismatch isn't visible to actions/checkout's own safe.directory handling — only to a git
+      # invocation inside a later step. build-appimage.sh calls `git rev-parse`/`git describe`
+      # (to resolve REPO_ROOT and the fallback version), so without this they fail with "detected
+      # dubious ownership" before the build even starts.
+      - name: Mark the workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install Rust (stable)
         run: |
@@ -186,7 +194,7 @@ jobs:
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub \
             org.gnome.Platform//47 org.gnome.Sdk//47 \
-            org.freedesktop.Sdk.Extension.rust-stable//47
+            org.freedesktop.Sdk.Extension.rust-stable//24.08
 
       - name: Generate vendored cargo sources
         run: ./scripts/gen-flatpak-cargo-sources.sh
