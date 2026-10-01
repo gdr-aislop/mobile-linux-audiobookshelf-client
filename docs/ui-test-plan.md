@@ -544,6 +544,32 @@ was and wasn't verified.
       second logs `resuming with a fresh connection` and audio starts within a few seconds rather
       than after a long silence.
 
+- [ ] **MP-15 — Speed picked while paused.** Stream a book, pause, pick another speed in the
+      full player, wait, then press Play.
+      *Expected:* the speed label changes at once; no network activity or stall while paused; the
+      audio resumes at the new speed (the log shows one `speed` line, applied at Play).
+
+- [ ] **MP-16 — Quit and signals keep the position.** Play for a minute, then quit with Ctrl+Q;
+      separately, play and send `kill <pid>` (SIGTERM) or press Ctrl+C in the launching terminal.
+      *Expected:* the log shows `asked to terminate; quitting` for the signals; the next launch
+      resumes within a few seconds of where each stopped, and Home shows the same position.
+
+- [ ] **MP-17 — Switching accounts retires the old player.** Play a book, then sign in as another
+      account (or sign out). Press a media key or use the lock-screen card.
+      *Expected:* the old book stops (its position saved, log: `retired the previous player`);
+      the media controls no longer start or move it, and the new shell has nothing playing.
+
+- [ ] **MP-18 — Opening the player while a book loads.** On a slow connection, tap Play on a book
+      detail screen.
+      *Expected:* the full player opens at once, showing the title and cover with the controls
+      greyed out; once the book has loaded they enable and (if you tapped Play) audio starts. Mark
+      as finished / Reset progress chosen while it loads take effect once loaded.
+
+- [ ] **MP-19 — Headphone jack bounce.** With "Resume when headphones reconnect" on, unplug the
+      headphones (playback pauses), then wiggle the plug so it connects and disconnects quickly.
+      *Expected:* playback stays paused until the plug has held for a moment; a firm replug
+      resumes it.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

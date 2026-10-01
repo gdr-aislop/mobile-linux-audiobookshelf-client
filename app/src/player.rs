@@ -114,6 +114,16 @@ const PAUSE_CONFIRM_ATTEMPTS: u32 = 10;
 /// `PlayerController::external_play_pause`. Observed on the Librem 5: the spurious one ~2ms
 /// after the pause, a deliberate one ~3s after.
 const SPURIOUS_UNPLUG_TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
+
+/// How many 100 ms polls a track load or a start waits for the pipeline to preroll before a
+/// seek is attempted anyway (and then trusted only once `observe_position` sees it land): 15 s,
+/// matching the HTTP timeout. 5 s gave up on slow mobile connections that were still connecting.
+const PREROLL_WAIT_ATTEMPTS: u32 = 150;
+
+/// How long a headphone replug has to hold before it resumes playback: a jack that bounces
+/// (plugged, unplugged, plugged again within a few hundred ms) is not one reconnection. The
+/// unplug side is not delayed — pausing at once is the point of it.
+const REPLUG_SETTLE: Duration = Duration::from_millis(300);
 /// A stream error while playing reloads the file once by itself (a fresh URL, token and
 /// connection) — a dropped connection or an expired token is the common cause, and a reload is
 /// exactly what Retry would do. A second error within this window stops with the error instead.
@@ -332,8 +342,9 @@ enum SeekPlan {
     /// Seeking into a different file than the one currently loaded — always a reload,
     /// regardless of source. `prepare_track_load` has already run; this is its load generation.
     CrossTrack { item_id: String, generation: u64 },
-    /// Seeking within the currently-loaded, still-streamed track: worth checking whether a
-    /// download finished since it started streaming before committing to another network seek.
+    /// Seeking within the currently-loaded, still-streamed track (the seek itself is already
+    /// issued): worth checking whether a download finished since it started streaming, in which
+    /// case the file is loaded instead.
     /// `load_generation` is the backend's at the time of the seek.
     MaybeLocalNow { item_id: String, server_id: String, track_index: usize, ino: Option<String>, load_generation: u64 },
 }
@@ -372,6 +383,8 @@ fn chapter_end_at(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
 /// Returns whether to keep listening: a listener that returns `false` (its screen is gone) is
 /// dropped after that call.
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot) -> bool>;
+/// The one optional slot the full player screen fills while it is open.
+type FullUpdateListener = Box<dyn Fn(&PlayerSnapshot)>;
 
 /// How one background push of playback progress to the server ended — see
 /// `PlayerController::set_on_progress_sync`.
@@ -661,7 +674,7 @@ struct Inner {
     /// Listeners registered from inside a publish (a listener building a screen that listens
     /// too); added once that publish is over.
     listeners_added_meanwhile: RefCell<Vec<SnapshotListener>>,
-    full_update: Option<Box<dyn Fn(&PlayerSnapshot)>>,
+    full_update: Option<FullUpdateListener>,
     /// When the local progress row was last refreshed — the periodic tick's own throttle (see
     /// `LOCAL_PROGRESS_WRITE_INTERVAL`).
     last_progress_write: Instant,
@@ -690,6 +703,9 @@ struct Inner {
     /// `PlayerController::external_play_pause` measures [`SPURIOUS_UNPLUG_TOGGLE_WINDOW`] from.
     /// Only meaningful while `paused_by_unplug` is still set.
     unplug_paused_at: Option<Instant>,
+    /// Bumped by every headphone route event: a replug resumes only if no other event came in
+    /// during `REPLUG_SETTLE`.
+    route_event_seq: u64,
     /// Whether the current pause was caused by `handle_call_event` — an incoming call ringing.
     /// Only a pause this specific may be lifted when that call ends unanswered. Cleared by every
     /// other pause path, and by the call being picked up.
@@ -1227,7 +1243,7 @@ impl Inner {
             };
 
             if needs_seek_readiness {
-                for _ in 0..50 {
+                for _ in 0..PREROLL_WAIT_ATTEMPTS {
                     {
                         let inner = inner_rc.borrow();
                         if !current(&inner) {
@@ -1262,7 +1278,7 @@ impl Inner {
             now_playing.loading_track = None;
             now_playing.speed_unapplied = None;
             now_playing.current_source_is_local = is_local;
-            // The readiness wait above gives up after 5 s, and a seek asked for before the
+            // The readiness wait above gives up after 15 s, and a seek asked for before the
             // pipeline is ready silently does nothing — so a seek is only trusted once
             // `observe_position` sees it land (and re-issued if it doesn't).
             now_playing.seek_target_pending = within > 0.0;
@@ -1485,6 +1501,7 @@ impl PlayerController {
                 skip_forward_seconds: 30.0,
                 paused_by_unplug: false,
                 unplug_paused_at: None,
+                route_event_seq: 0,
                 paused_by_call: false,
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
@@ -1677,14 +1694,14 @@ impl PlayerController {
     /// testing (no more manually scrubbing to the end or editing the DB by hand) and a real,
     /// shippable action in its own right — Audiobookshelf's other clients let you do the same. A
     /// no-op if nothing is playing.
-    pub fn mark_as_finished(&self) {
+    pub fn mark_as_finished(&self) -> bool {
         let mut inner = self.inner.borrow_mut();
         if let Some(pending) = &mut inner.pending_start {
             tracing::info!(item_id = %pending.item_id, "mark as finished: will apply once loaded");
             pending.intent = Some(StartIntent::MarkFinished);
-            return;
+            return true;
         }
-        let Some(duration_seconds) = inner.now_playing.as_ref().map(|np| np.duration_seconds) else { return };
+        let Some(duration_seconds) = inner.now_playing.as_ref().map(|np| np.duration_seconds) else { return false };
         tracing::info!("marking the current book finished");
         inner.pause_backend_if_loaded();
         if let Some(now_playing) = &mut inner.now_playing {
@@ -1696,6 +1713,7 @@ impl PlayerController {
         inner.paused_by_call = false;
         inner.publish();
         inner.write_progress_at(duration_seconds, true, true);
+        true
     }
 
     /// Resets the current item's progress back to the start — local and server — and seeks
@@ -1703,16 +1721,16 @@ impl PlayerController {
     /// Useful for testing (repeatedly restarting a book from scratch) and, per the same reasoning
     /// as `mark_as_finished`, worth keeping as real functionality rather than a debug-only
     /// backdoor. A no-op if nothing is playing.
-    pub fn reset_progress(&self) {
+    pub fn reset_progress(&self) -> bool {
         {
             let mut inner = self.inner.borrow_mut();
             if let Some(pending) = &mut inner.pending_start {
                 tracing::info!(item_id = %pending.item_id, "reset progress: will apply once loaded");
                 pending.intent = Some(StartIntent::Reset);
-                return;
+                return true;
             }
             if inner.now_playing.is_none() {
-                return;
+                return false;
             }
         }
         // Book position 0 is track 0's start — which is a cross-track seek whenever a later file
@@ -1722,6 +1740,7 @@ impl PlayerController {
         let mut inner = self.inner.borrow_mut();
         inner.publish();
         inner.write_progress_at(0.0, false, true);
+        true
     }
 
     /// Resolves a playable URL and starts playback, resuming from any existing progress for this
@@ -2043,7 +2062,7 @@ impl PlayerController {
                         // `position()` only starts returning a value once preroll has genuinely
                         // completed (unlike `duration()`, which container metadata alone can
                         // answer), so it's the accurate "ready to seek" signal.
-                        for _ in 0..50 {
+                        for _ in 0..PREROLL_WAIT_ATTEMPTS {
                             {
                                 let inner = inner_rc.borrow();
                                 if superseded(&inner) || inner.load_generation != load_generation {
@@ -2113,7 +2132,7 @@ impl PlayerController {
                 cover_path: cached_cover,
                 last_error,
                 last_known_within_track: start_within,
-                // The readiness wait above gives up after 5 s on a slow stream, and a seek asked
+                // The readiness wait above gives up after 15 s on a slow stream, and a seek asked
                 // for before the pipeline can take it silently does nothing — playback would then
                 // run from the track's start and save that over the real position. The resume
                 // seek is only trusted once `observe_position` sees it land.
@@ -2138,8 +2157,12 @@ impl PlayerController {
             }
             // Asked for during the start: the book is loaded now, so it is a plain action on it.
             match intent {
-                Some(StartIntent::Reset) => controller.reset_progress(),
-                Some(StartIntent::MarkFinished) => controller.mark_as_finished(),
+                Some(StartIntent::Reset) => {
+                    controller.reset_progress();
+                }
+                Some(StartIntent::MarkFinished) => {
+                    controller.mark_as_finished();
+                }
                 None => {}
             }
 
@@ -2178,6 +2201,14 @@ impl PlayerController {
     }
 
     pub fn play(&self) {
+        // Whatever paused it, it is being resumed now: a pause mark left behind (the user pressed
+        // Play before the replug, say) would let a later replug or call ending "resume" a
+        // different, deliberate pause.
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.paused_by_unplug = false;
+            inner.paused_by_call = false;
+        }
         // A book still resolving plays once it's loaded.
         {
             let mut inner = self.inner.borrow_mut();
@@ -2515,9 +2546,11 @@ impl PlayerController {
     /// the server — pushing unconditionally would silently undo that correction. A no-op if
     /// nothing is loaded.
     pub fn sync_pending_progress(&self) {
-        let Some((pool, account_id, server_id, item_id, session)) = ({
+        let Some((pool, account_id, server_id, item_id, session, generation)) = ({
             let inner = self.inner.borrow();
-            inner.now_playing.as_ref().map(|np| (inner.pool.clone(), np.account_id.clone(), np.server_id.clone(), np.item_id.clone(), np.session.clone()))
+            inner.now_playing.as_ref().map(|np| {
+                (inner.pool.clone(), np.account_id.clone(), np.server_id.clone(), np.item_id.clone(), np.session.clone(), inner.session_generation)
+            })
         }) else {
             return;
         };
@@ -2544,8 +2577,13 @@ impl PlayerController {
                 (None, Some(_)) => true,
                 _ => false,
             };
-            if !server_had_something_newer {
-                inner_rc.borrow_mut().write_progress();
+            if server_had_something_newer {
+                return;
+            }
+            // The awaits above took a while: only the book this started for gets written.
+            let mut inner = inner_rc.borrow_mut();
+            if inner.session_generation == generation && inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id) {
+                inner.write_progress();
             }
         });
     }
@@ -2623,6 +2661,11 @@ impl PlayerController {
         // the only place that can tell "the setting is off", "nothing is playing" and "nothing
         // is loaded" apart on a device that isn't pausing, once `route_watch`'s own "headphone
         // route changed" line has confirmed the event was even delivered.
+        let seq = {
+            let mut inner = self.inner.borrow_mut();
+            inner.route_event_seq += 1;
+            inner.route_event_seq
+        };
         match event {
             abs_player::route_watch::RouteEvent::Unplugged => {
                 let (pause_on_unplug, intent) = {
@@ -2670,9 +2713,22 @@ impl PlayerController {
                     tracing::info!("headphone replug ignored: not paused");
                     return;
                 }
-                self.inner.borrow_mut().paused_by_unplug = false;
-                self.play();
-                tracing::info!("resumed for headphone replug");
+                // Resumes once the plug has held for `REPLUG_SETTLE`.
+                let controller = self.downgrade();
+                glib::timeout_add_local_once(REPLUG_SETTLE, move || {
+                    let Some(controller) = controller.upgrade() else { return };
+                    let still_pending = {
+                        let inner = controller.inner.borrow();
+                        inner.route_event_seq == seq && inner.paused_by_unplug && inner.playing_intent() == Some(false)
+                    };
+                    if !still_pending {
+                        tracing::info!("headphone replug ignored: the jack bounced, or something else resumed or paused meanwhile");
+                        return;
+                    }
+                    controller.inner.borrow_mut().paused_by_unplug = false;
+                    controller.play();
+                    tracing::info!("resumed for headphone replug");
+                });
             }
         }
     }
@@ -2858,11 +2914,15 @@ impl PlayerController {
                     let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     None
                 } else {
-                    // A download may have completed since this track started streaming — worth
-                    // a quick check before committing to another network seek. The check itself
-                    // is async (a cheap local DB read), so it's resolved just below rather than
-                    // blocking this call.
-                    now_playing.seek_issued_at = None;
+                    // The seek is issued at once — it used to wait on the check below, a read
+                    // that queues behind whatever else holds the database pool. A download may
+                    // have completed since this track started streaming, which the check
+                    // resolves just below, switching to the file if so (the seek then lands in
+                    // it instead).
+                    now_playing.seek_issued_at = Some(Instant::now());
+                    inner.drop_stale_end_of_stream();
+                    let _ = inner.backend.seek(Duration::from_secs_f64(within));
+                    let now_playing = inner.now_playing.as_ref().expect("checked above");
                     Some(SeekPlan::MaybeLocalNow {
                         item_id: now_playing.item_id.clone(),
                         server_id: now_playing.server_id.clone(),
@@ -2911,12 +2971,6 @@ impl PlayerController {
                             drop(inner);
                             Inner::spawn_load_track(inner_rc, item_id, generation);
                         }
-                    } else {
-                        if let Some(now_playing) = &mut inner.now_playing {
-                            now_playing.seek_issued_at = Some(Instant::now());
-                        }
-                        inner.drop_stale_end_of_stream();
-                        let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     }
                 });
             }
@@ -5779,6 +5833,7 @@ pub(crate) mod tests {
         assert_eq!(state.borrow().play_calls, 0);
         // It was the unplug's pause, so a replug resumes it.
         controller.handle_route_event(abs_player::route_watch::RouteEvent::Replugged);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(5));
         assert!(controller.snapshot().unwrap().is_playing);
         controller.stop();
     }
@@ -6724,6 +6779,35 @@ pub(crate) mod tests {
         let calls = permanent_calls.get();
         pump_until(|| false, Duration::from_millis(600));
         assert!(permanent_calls.get() > calls, "permanent listeners keep hearing");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A bouncing headphone jack (replugged,
+    /// then unplugged again within moments) is not a reconnection and must not resume playback
+    /// (which would play out of the speaker the moment it bounced back); a replug that holds does.
+    pub(crate) fn run_a_bouncing_headphone_jack_does_not_resume(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let (controller, _state) = scripted_controller(&pool);
+        controller.set_headphone_behavior(true, true);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Test Item"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        use abs_player::route_watch::RouteEvent;
+        controller.handle_route_event(RouteEvent::Unplugged);
+        assert!(!controller.snapshot().unwrap().is_playing, "an unplug pauses at once");
+        controller.handle_route_event(RouteEvent::Replugged);
+        controller.handle_route_event(RouteEvent::Unplugged);
+        pump_until(|| false, REPLUG_SETTLE * 3);
+        assert!(!controller.snapshot().unwrap().is_playing, "the jack bounced; nothing may resume");
+
+        controller.handle_route_event(RouteEvent::Replugged);
+        assert!(!controller.snapshot().unwrap().is_playing, "not before the plug has held");
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(5));
+        assert!(controller.snapshot().unwrap().is_playing, "a replug that holds resumes");
         controller.stop();
     }
 }

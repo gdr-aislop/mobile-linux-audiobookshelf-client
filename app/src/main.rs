@@ -322,6 +322,7 @@ mod tests {
         (playback_a_retired_player_goes_silent_and_stays_that_way, crate::player::tests::run_a_retired_player_goes_silent_and_stays_that_way),
         (playback_progress_actions_during_a_start_apply_once_loaded, crate::player::tests::run_progress_actions_during_a_start_apply_once_loaded),
         (playback_listeners_of_discarded_screens_are_dropped, crate::player::tests::run_listeners_of_discarded_screens_are_dropped),
+        (playback_a_bouncing_headphone_jack_does_not_resume, crate::player::tests::run_a_bouncing_headphone_jack_does_not_resume),
         (player_screen_renders, crate::screens::player::tests::run),
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),

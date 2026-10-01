@@ -41,6 +41,9 @@ use crate::screens;
 /// call, and never a valid cookie itself) — reused here as the initial/cleared state rather than
 /// wrapping it in an `Option`, so a session manager that's unreachable at inhibit time is
 /// silently treated the same as "not currently playing" instead of a special case.
+/// A suspend inhibit that takes longer than this to be answered gets a warning in the log.
+const SLOW_SESSION_MANAGER_CALL: std::time::Duration = std::time::Duration::from_millis(100);
+
 struct SuspendInhibitGuard {
     app: Option<gtk4::Application>,
     window: adw::ApplicationWindow,
@@ -53,6 +56,9 @@ impl SuspendInhibitGuard {
     /// never on every unchanged snapshot in between.
     fn update(&self, is_playing: bool) {
         let Some(app) = &self.app else { return };
+        // Both calls are synchronous D-Bus round trips to the session manager, made on the main
+        // loop: a slow one is a frozen UI (and a late pause/play response), so say so.
+        let started = std::time::Instant::now();
         match (is_playing, self.cookie.get()) {
             (true, 0) => {
                 let cookie = app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::SUSPEND, Some("Playing an audiobook"));
@@ -62,7 +68,10 @@ impl SuspendInhibitGuard {
                 app.uninhibit(cookie);
                 self.cookie.set(0);
             }
-            _ => {}
+            _ => return,
+        }
+        if started.elapsed() > SLOW_SESSION_MANAGER_CALL {
+            tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64, is_playing, "the session manager was slow to answer the suspend inhibit; the UI waited for it");
         }
     }
 }

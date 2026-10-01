@@ -79,7 +79,15 @@ pub fn build(
 ) -> PlayerScreen {
     // Shared by the down-chevron header button and the Escape action below.
     let on_collapse = Rc::new(on_collapse);
-    let on_open_downloads: Rc<dyn Fn()> = Rc::new(on_open_downloads);
+    // Leaving for the Downloads tab is a way out of the Player like collapsing it: the screen's
+    // snapshot hook must not stay on the controller, updating widgets nobody sees.
+    let on_open_downloads: Rc<dyn Fn()> = Rc::new({
+        let controller = controller.clone();
+        move || {
+            controller.clear_full_update();
+            on_open_downloads();
+        }
+    });
     let header = adw::HeaderBar::new();
     let collapse_button = gtk4::Button::from_icon_name("go-down-symbolic");
     collapse_button.connect_clicked({
@@ -338,8 +346,10 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             move || {
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
-                controller.mark_as_finished();
-                toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
+                // Only a controller that acted has anything to undo.
+                if controller.mark_as_finished() {
+                    toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
+                }
             }
         },
         {
@@ -347,8 +357,9 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             move || {
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
-                controller.reset_progress();
-                toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
+                if controller.reset_progress() {
+                    toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
+                }
             }
         },
     );
@@ -529,6 +540,9 @@ pub fn build(
         let remaining_label = remaining_label.clone();
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
+        let skip_back = skip_back.clone();
+        let skip_forward = skip_forward.clone();
+        let speed_button = speed_button.clone();
         let cover = cover.clone();
         let error_banner = error_banner.clone();
         move |snapshot: &PlayerSnapshot| {
@@ -554,8 +568,13 @@ pub fn build(
                 updating_from_snapshot.set(false);
                 set_time_labels(&elapsed_label, &remaining_label, snapshot.position_seconds, snapshot.duration_seconds);
             }
-            // Nothing to seek in until the book has loaded.
+            // Nothing to seek in, skip over, speed up or time until the book has loaded — each
+            // of these would be a no-op the controller swallows, which reads as a dead button.
             scrubber.set_sensitive(!snapshot.is_loading);
+            skip_back.set_sensitive(!snapshot.is_loading);
+            skip_forward.set_sensitive(!snapshot.is_loading);
+            speed_button.set_sensitive(!snapshot.is_loading);
+            sleep_timer_button.set_sensitive(!snapshot.is_loading);
 
             speed_label.set_label(&format_speed(snapshot.speed));
             if snapshot.sleep_timer_active {

@@ -277,6 +277,22 @@ Fractal) rather than copying Lissen's Material Design look.
   target stays the saved position.
 - **Pausing then seeking** (rewind, scrub, speed) keeps the pipeline paused while it re-buffers;
   it is never mistaken for a pause that failed.
+- **A speed picked while paused on a stream** is shown at once and applied when playback resumes
+  — changing the rate is a network seek nobody can hear. Speeds outside the picker's range (or
+  not numbers) are brought into range or ignored.
+- **Starting a book opens the full player at once**, in a loading state (controls greyed out),
+  instead of waiting for the load; the book that is starting counts as the current one, so
+  Mark as finished / Reset progress chosen meanwhile are applied once it has loaded.
+- **The server's track timeline is the book's timeline.** A file that turns out longer or shorter
+  than the server said does not move the later files' offsets (progress is saved against them, and
+  other clients read it back the same way); the position shown stalls at a file's end rather than
+  running into the next file's part early.
+- **Quitting saves the position** however the app is asked to go: Ctrl+Q, closing the window,
+  SIGTERM or Ctrl+C. Home and Library sync leave the loaded book's progress to the player.
+- **A bouncing headphone jack** doesn't resume playback: a replug resumes only after it has held
+  for about 300 ms. An unplug still pauses at once.
+- **Replacing the shell** (account switch, sign-out) stops the old player, saves its position and
+  takes it off the system media controls.
 
 ### System media integration
 Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,
