@@ -737,6 +737,13 @@ impl Inner {
     fn observe_position(&mut self) {
         let Some(within) = self.backend.position().map(|d| d.as_secs_f64()) else { return };
         if let Some(now_playing) = &mut self.now_playing {
+            // Mid-load, the target hasn't been asked of the new pipeline yet (`spawn_load_track`
+            // does that once it's ready, reading it back from `last_known_within_track`), so its
+            // fresh ~0.0 can't mean the seek landed — and within the tolerance below of a target
+            // near the file's start it would pass for one and overwrite the target.
+            if now_playing.loading_track.is_some() {
+                return;
+            }
             if now_playing.seek_target_pending {
                 // A generous tolerance: burst-buffering and container framing mean a landed seek
                 // rarely reports the exact requested second, and the only failure mode of being
@@ -3470,8 +3477,18 @@ pub(crate) mod tests {
             1.0,
         );
         // The flush is a synchronous call inside `start()`, but the DB write/server sync it
-        // spawns still needs a pump to land.
-        pump_until(|| false, Duration::from_millis(300));
+        // spawns still needs a pump to land. Wait for the PATCH itself rather than a fixed sleep:
+        // it typically lands ~300ms in, right where a fixed window would race it.
+        pump_until(
+            || {
+                runtime
+                    .block_on(mock_server.received_requests())
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+            },
+            Duration::from_secs(5),
+        );
 
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap();
         let progress = progress.expect("switching items should flush the outgoing item's progress locally");
