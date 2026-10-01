@@ -389,10 +389,14 @@ impl WrittenProgress {
     }
 }
 
-/// Runs progress writes one at a time, in the order they were asked for. Each write used to be
-/// its own spawned future, so a slow periodic push could reach the server after the pause push
-/// that followed it and leave the server behind. A queued write that hasn't started yet is
-/// replaced by a newer one for the same item.
+/// Runs progress writes on two queues, each one write at a time in the order they were asked
+/// for: local rows (fast, and the source of truth Home reads) and pushes to the server (slow, and
+/// able to hang for the HTTP timeout). A single queue had a hanging push delay every later local
+/// write — and the final one at shutdown — behind it. A push always starts after its own local
+/// write has landed, so the row it marks as pushed is there. Each write used to be its own
+/// spawned future, so a slow periodic push could reach the server after the pause push that
+/// followed it and leave the server behind; a queued write that hasn't started yet is replaced
+/// by a newer one for the same item.
 ///
 /// Also remembers the last value written locally and the last one the server confirmed, so a
 /// write of the same value again (a second pause, a new book started over a paused one) is
@@ -400,13 +404,31 @@ impl WrittenProgress {
 /// progress made since on another device.
 #[derive(Clone, Default)]
 struct ProgressWriter {
-    queue: Rc<RefCell<std::collections::VecDeque<ProgressWrite>>>,
-    running: Rc<std::cell::Cell<bool>>,
+    local_queue: Rc<RefCell<std::collections::VecDeque<ProgressWrite>>>,
+    local_running: Rc<std::cell::Cell<bool>>,
+    push_queue: Rc<RefCell<std::collections::VecDeque<ProgressWrite>>>,
+    push_running: Rc<std::cell::Cell<bool>>,
     last_local: Rc<RefCell<Option<WrittenProgress>>>,
     last_pushed: Rc<RefCell<Option<WrittenProgress>>>,
     /// The push currently running, if any — a push of the same value asked for meanwhile is a
     /// duplicate too.
     in_flight_push: Rc<RefCell<Option<WrittenProgress>>>,
+}
+
+/// Puts `write` last in `queue`, replacing a queued write for the same item and keeping what
+/// that one was going to do.
+fn coalesce_into(queue: &RefCell<std::collections::VecDeque<ProgressWrite>>, write: ProgressWrite) {
+    let mut queue = queue.borrow_mut();
+    let mut write = write;
+    queue.retain(|queued| {
+        if queued.item_id != write.item_id {
+            return true;
+        }
+        write.write_local |= queued.write_local;
+        write.push |= queued.push;
+        false
+    });
+    queue.push_back(write);
 }
 
 impl ProgressWriter {
@@ -417,9 +439,13 @@ impl ProgressWriter {
     /// Whether the server has (or is about to have, from a push already queued or running) this
     /// value.
     fn is_pushed(&self, item_id: &str, position: f64, is_finished: bool) -> bool {
+        let queued = |queue: &RefCell<std::collections::VecDeque<ProgressWrite>>| {
+            queue.borrow().iter().any(|w| w.push && w.item_id == item_id && w.is_finished == is_finished && (w.position - position).abs() < 0.5)
+        };
         self.last_pushed.borrow().as_ref().is_some_and(|w| w.matches(item_id, position, is_finished))
             || self.in_flight_push.borrow().as_ref().is_some_and(|w| w.matches(item_id, position, is_finished))
-            || self.queue.borrow().iter().any(|w| w.push && w.item_id == item_id && w.is_finished == is_finished && (w.position - position).abs() < 0.5)
+            || queued(&self.local_queue)
+            || queued(&self.push_queue)
     }
 
     /// Makes the next write push even if the server already had that value — for a deliberate
@@ -430,52 +456,72 @@ impl ProgressWriter {
     }
 
     fn enqueue(&self, write: ProgressWrite) {
-        {
-            let mut queue = self.queue.borrow_mut();
-            let mut write = write;
-            queue.retain(|queued| {
-                if queued.item_id != write.item_id {
-                    return true;
-                }
-                write.write_local |= queued.write_local;
-                write.push |= queued.push;
-                false
-            });
-            queue.push_back(write);
-        }
-        if self.running.get() {
+        if !write.write_local {
+            self.enqueue_push(write);
             return;
         }
-        self.running.set(true);
+        coalesce_into(&self.local_queue, write);
+        if self.local_running.get() {
+            return;
+        }
+        self.local_running.set(true);
         let writer = self.clone();
         glib::spawn_future_local(async move {
             loop {
-                let next = writer.queue.borrow_mut().pop_front();
+                let next = writer.local_queue.borrow_mut().pop_front();
                 let Some(next) = next else { break };
-                writer.run(next).await;
+                writer.run_local(next).await;
             }
-            writer.running.set(false);
+            writer.local_running.set(false);
+        });
+    }
+
+    fn enqueue_push(&self, write: ProgressWrite) {
+        if !write.push {
+            return;
+        }
+        coalesce_into(&self.push_queue, write);
+        if self.push_running.get() {
+            return;
+        }
+        self.push_running.set(true);
+        let writer = self.clone();
+        glib::spawn_future_local(async move {
+            loop {
+                let next = writer.push_queue.borrow_mut().pop_front();
+                let Some(next) = next else { break };
+                writer.run_push(next).await;
+            }
+            writer.push_running.set(false);
         });
     }
 
     /// Runs whatever is queued to completion, blocking, for at most `timeout` — for app
-    /// shutdown, where a spawned future would never get to run. Each write's local half comes
-    /// first and is fast; only a slow push is cut short (its row stays marked for the next
-    /// launch's sync).
+    /// shutdown, where a spawned future would never get to run. The local writes go first and
+    /// in full; only a slow push is cut short (its row stays marked for the next launch's sync).
     fn drain_blocking(&self, timeout: Duration) {
         let writer = self.clone();
         let drained = glib::MainContext::default().block_on(glib::future_with_timeout(timeout, async move {
+            // While a queue's own runner (spawned by `enqueue`) is active, let it finish the
+            // queue — `block_on` keeps iterating the main context — rather than taking writes
+            // from under it, which could run two at once and land them out of order.
             loop {
-                // While the queue's own runner (spawned by `enqueue`) is active, let it finish
-                // the queue — `block_on` keeps iterating the main context — rather than taking
-                // writes from under it, which could run two at once and land them out of order.
-                if writer.running.get() {
+                if writer.local_running.get() {
                     glib::timeout_future(Duration::from_millis(10)).await;
                     continue;
                 }
-                let next = writer.queue.borrow_mut().pop_front();
+                let next = writer.local_queue.borrow_mut().pop_front();
                 let Some(next) = next else { break };
-                writer.run(next).await;
+                writer.run_local(next).await;
+            }
+            loop {
+                if writer.push_running.get() {
+                    glib::timeout_future(Duration::from_millis(10)).await;
+                    continue;
+                }
+                let next = writer.push_queue.borrow_mut().pop_front();
+                let Some(next) = next else { break };
+                writer.run_push(next).await;
             }
         }));
         if drained.is_err() {
@@ -483,18 +529,22 @@ impl ProgressWriter {
         }
     }
 
-    async fn run(&self, write: ProgressWrite) {
-        let ProgressWrite { pool, session, account_id, server_id, item_id, position, is_finished, duration_seconds, write_local, push, on_progress_sync } =
-            write;
-        if write_local {
-            match abs_storage::repo::progress::set(&pool, &account_id, &server_id, &item_id, position, is_finished).await {
-                Ok(()) => *self.last_local.borrow_mut() = Some(WrittenProgress { item_id: item_id.clone(), position, is_finished }),
+    /// The local half of a write, then hands the push half (if any) to the push queue.
+    async fn run_local(&self, write: ProgressWrite) {
+        if write.write_local {
+            match abs_storage::repo::progress::set(&write.pool, &write.account_id, &write.server_id, &write.item_id, write.position, write.is_finished).await {
+                Ok(()) => {
+                    *self.last_local.borrow_mut() =
+                        Some(WrittenProgress { item_id: write.item_id.clone(), position: write.position, is_finished: write.is_finished })
+                }
                 Err(err) => tracing::warn!(%err, "couldn't persist playback progress"),
             }
         }
-        if !push {
-            return;
-        }
+        self.enqueue_push(write);
+    }
+
+    async fn run_push(&self, write: ProgressWrite) {
+        let ProgressWrite { pool, session, account_id, server_id, item_id, position, is_finished, duration_seconds, on_progress_sync, .. } = write;
         *self.in_flight_push.borrow_mut() = Some(WrittenProgress { item_id: item_id.clone(), position, is_finished });
         self.push(pool, session, account_id, server_id, item_id, position, is_finished, duration_seconds, on_progress_sync).await;
         self.in_flight_push.borrow_mut().take();
@@ -6268,5 +6318,56 @@ pub(crate) mod tests {
         pump_until(saved, Duration::from_secs(5));
         assert!(saved(), "the outgoing book's position must be saved even while its resume check is still in flight");
         controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A push that hangs on the server must
+    /// not hold up the local writes behind it (they used to share one queue), and a push still
+    /// starts only after its own local write.
+    pub(crate) fn run_a_hanging_push_does_not_delay_local_writes(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("PATCH"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(8)))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-2")).respond_with(ResponseTemplate::new(200)).mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "First Book"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Second Book"));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let write = |item_id: &str, position: f64| ProgressWrite {
+            pool: pool.clone(),
+            session: session.clone(),
+            account_id: account.id.clone(),
+            server_id: server.id.clone(),
+            item_id: item_id.to_string(),
+            position,
+            is_finished: false,
+            duration_seconds: 100.0,
+            write_local: true,
+            push: true,
+            on_progress_sync: None,
+        };
+
+        let writer = ProgressWriter::default();
+        writer.enqueue(write("item-1", 10.0));
+        pump_until(|| writer.in_flight_push.borrow().is_some(), Duration::from_secs(5));
+        assert!(writer.in_flight_push.borrow().is_some(), "the first push should be in flight (and hanging)");
+
+        let started = Instant::now();
+        writer.enqueue(write("item-2", 20.0));
+        let row = || runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-2")).unwrap();
+        pump_until(|| row().is_some(), Duration::from_secs(5));
+        assert_eq!(row().expect("the later local write should not wait for the hanging push").current_time_seconds, 20.0);
+        assert!(started.elapsed() < Duration::from_secs(4), "the local write took {:?}", started.elapsed());
+
+        // The hanging push is cut short at shutdown, not waited for in full.
+        let started = Instant::now();
+        writer.drain_blocking(Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3), "the drain took {:?}", started.elapsed());
     }
 }

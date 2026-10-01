@@ -90,7 +90,25 @@ pub fn build_application(state: AppState) -> adw::Application {
         build_window(app, &state);
     });
 
+    quit_cleanly_on_termination_signals(&app);
+
     app
+}
+
+/// SIGTERM (a service manager or `kill`) and SIGINT (Ctrl+C in a terminal) quit the way Ctrl+Q
+/// does, so the player's shutdown flush saves the listening position — they used to kill the
+/// process outright, losing up to the last few seconds of it.
+fn quit_cleanly_on_termination_signals(app: &adw::Application) {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    for signal in [SIGINT, SIGTERM] {
+        let app = app.clone();
+        glib::unix_signal_add_local(signal, move || {
+            tracing::info!(signal, "asked to terminate; quitting");
+            app.quit();
+            glib::ControlFlow::Break
+        });
+    }
 }
 
 fn build_window(app: &adw::Application, state: &AppState) {
