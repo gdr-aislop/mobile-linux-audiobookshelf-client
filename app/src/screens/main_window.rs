@@ -138,8 +138,18 @@ pub struct MainWindow {
     /// field itself is never read back (hence the allow), only retained.
     #[allow(dead_code)]
     pub download_manager: crate::downloads::DownloadManager,
+    /// Retired when this shell is dropped (replaced by the next account's, or by the login
+    /// screen) — see `PlayerController::retire`. Without it the old player kept playing, and kept
+    /// answering the media keys, behind the new shell.
+    controller: player::PlayerController,
     #[cfg(test)]
     hooks: TestHooks,
+}
+
+impl Drop for MainWindow {
+    fn drop(&mut self) {
+        self.controller.retire();
+    }
 }
 
 #[cfg(test)]
@@ -853,6 +863,7 @@ pub fn build(
         _route_watcher: route_watcher,
         _connectivity_watcher: connectivity_watcher,
         download_manager,
+        controller: mini_bar.controller.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             stack,

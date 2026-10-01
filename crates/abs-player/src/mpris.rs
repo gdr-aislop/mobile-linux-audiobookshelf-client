@@ -199,7 +199,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
     // Owning the well-known name is best-effort: a failure here (e.g. the name is already taken
     // by another instance of this app) shouldn't tear down the object registrations above —
     // clients that already know the object path can still reach it directly.
-    let _owner_id = gio::bus_own_name_on_connection(
+    let owner_id = gio::bus_own_name_on_connection(
         &connection,
         &format!("org.mpris.MediaPlayer2.{app_name}"),
         gio::BusNameOwnerFlags::NONE,
@@ -207,14 +207,37 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
         |_conn, name| tracing::warn!(name, "couldn't own the MPRIS well-known bus name"),
     );
 
-    Ok(MprisHandle { connection, state, _media_player2_registration: media_player2_registration, _player_registration: player_registration })
+    Ok(MprisHandle {
+        connection,
+        state,
+        media_player2_registration: Some(media_player2_registration),
+        player_registration: Some(player_registration),
+        owner_id: Some(owner_id),
+    })
 }
 
+/// Dropping the handle takes the app off the bus again: both objects are unregistered and the
+/// well-known name released, so media keys and the lock-screen card stop reaching a player that
+/// has been replaced (an account switch builds a new one).
 pub struct MprisHandle {
     connection: gio::DBusConnection,
     state: Rc<RefCell<PlayerState>>,
-    _media_player2_registration: gio::RegistrationId,
-    _player_registration: gio::RegistrationId,
+    media_player2_registration: Option<gio::RegistrationId>,
+    player_registration: Option<gio::RegistrationId>,
+    owner_id: Option<gio::OwnerId>,
+}
+
+impl Drop for MprisHandle {
+    fn drop(&mut self) {
+        for registration in [self.media_player2_registration.take(), self.player_registration.take()].into_iter().flatten() {
+            if let Err(err) = self.connection.unregister_object(registration) {
+                tracing::warn!(%err, "couldn't unregister an MPRIS object");
+            }
+        }
+        if let Some(owner_id) = self.owner_id.take() {
+            gio::bus_unown_name(owner_id);
+        }
+    }
 }
 
 impl MprisHandle {

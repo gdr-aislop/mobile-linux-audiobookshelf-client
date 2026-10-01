@@ -1524,6 +1524,31 @@ impl PlayerController {
         }
     }
 
+    /// Takes this controller out of service for good — the shell that owned it is being replaced
+    /// (an account switch, a sign-out). Saves the book's position, stops its audio, invalidates
+    /// anything still on its way back from the network, and drops every listener (which also
+    /// drops the MPRIS registration the shell's listener owns), so media keys and the lock-screen
+    /// card can no longer drive a player nobody sees any more.
+    pub fn retire(&self) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.now_playing.is_some() {
+                inner.write_progress_now();
+            }
+            inner.session_generation += 1;
+            inner.reset_backend();
+            inner.now_playing = None;
+            inner.pending_start = None;
+            inner.listeners.clear();
+            inner.full_update = None;
+        }
+        if let Some(id) = self.tick_source.borrow_mut().take() {
+            id.remove();
+        }
+        crate::sync_coordinator::set_loaded_item(None);
+        tracing::info!("retired the previous player");
+    }
+
     pub fn set_full_update(&self, update: impl Fn(&PlayerSnapshot) + 'static) {
         self.inner.borrow_mut().full_update = Some(Box::new(update));
     }
@@ -6469,5 +6494,48 @@ pub(crate) mod tests {
         controller.set_speed(10.0);
         assert_eq!(controller.snapshot().unwrap().speed, abs_core::playback::MAX_SPEED);
         controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A retired controller (its shell was
+    /// replaced) saves the position, stops its audio, tells its listeners nothing more, and
+    /// ignores everything that arrives for it afterwards.
+    pub(crate) fn run_a_retired_player_goes_silent_and_stays_that_way(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let (controller, state) = scripted_controller(&pool);
+        let heard = Rc::new(std::cell::Cell::new(0_u32));
+        controller.add_listener({
+            let heard = heard.clone();
+            move |_| heard.set(heard.get() + 1)
+        });
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Test Item"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(7));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 6.5), Duration::from_secs(5));
+
+        let resets_before = state.borrow().reset_calls;
+        controller.retire();
+        assert!(state.borrow().reset_calls > resets_before, "the backend is released");
+        assert!(controller.snapshot().is_none(), "nothing is loaded any more");
+        let heard_at_retirement = heard.get();
+
+        // Late arrivals: media-key presses and a stale start's network answer.
+        controller.play();
+        controller.skip(30.0);
+        pump_until(|| false, Duration::from_millis(800));
+        assert_eq!(heard.get(), heard_at_retirement, "no listener hears from a retired controller");
+        assert!(controller.snapshot().is_none());
+        let saved = || {
+            runtime
+                .block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1"))
+                .ok()
+                .flatten()
+                .is_some_and(|p| (p.current_time_seconds - 7.0).abs() < 0.6)
+        };
+        pump_until(saved, Duration::from_secs(5));
+        assert!(saved(), "the position at retirement is saved");
     }
 }
