@@ -315,6 +315,7 @@ mod tests {
         (playback_a_seek_that_never_lands_reloads_once_then_stops, crate::player::tests::run_a_seek_that_never_lands_reloads_once_then_stops),
         (playback_an_early_end_of_the_last_file_does_not_finish_the_book, crate::player::tests::run_an_early_end_of_the_last_file_does_not_finish_the_book),
         (playback_an_end_of_stream_from_before_a_seek_is_dropped, crate::player::tests::run_an_end_of_stream_from_before_a_seek_is_dropped),
+        (playback_switching_books_during_a_resume_check_still_saves_the_outgoing_position, crate::player::tests::run_switching_books_during_a_resume_check_still_saves_the_outgoing_position),
         (player_screen_renders, crate::screens::player::tests::run),
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),

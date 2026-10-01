@@ -897,6 +897,14 @@ impl Inner {
         if self.holding_writes_for_reconcile.is_some() {
             return;
         }
+        self.write_progress_now();
+    }
+
+    /// `write_progress` for moments that must not be lost to a resume check still in flight: the
+    /// outgoing book's flush on a book switch, quitting, the end of the book, a sleep timer. The
+    /// hold exists because the position may be about to move to another device's, which only
+    /// matters while the player is still going to keep playing from here.
+    fn write_progress_now(&mut self) {
         let Some(now_playing) = &self.now_playing else { return };
         let (position, is_finished) = if now_playing.ended {
             (now_playing.duration_seconds, true)
@@ -1609,7 +1617,7 @@ impl PlayerController {
             // Flush the outgoing book's position before it's dropped — otherwise switching while
             // it plays loses up to `LOCAL_PROGRESS_WRITE_INTERVAL` of it.
             if inner.now_playing.is_some() {
-                inner.write_progress();
+                inner.write_progress_now();
             }
             let previous = inner.now_playing.as_ref().map(|np| np.item_id.clone());
             inner.session_generation += 1;
@@ -2238,7 +2246,7 @@ impl PlayerController {
     pub fn flush_on_shutdown(&self) {
         let writer = {
             let mut inner = self.inner.borrow_mut();
-            inner.write_progress();
+            inner.write_progress_now();
             inner.progress_writer.clone()
         };
         writer.drain_blocking(SHUTDOWN_PUSH_TIMEOUT);
@@ -2908,7 +2916,7 @@ impl PlayerController {
                         // (nor a call ending).
                         inner.paused_by_unplug = false;
                         inner.paused_by_call = false;
-                        inner.write_progress();
+                        inner.write_progress_now();
                     }
                 }
                 abs_player::PlayerEvent::Error(err) => {
@@ -3038,7 +3046,7 @@ impl PlayerController {
                 // override it.
                 inner.paused_by_unplug = false;
                 inner.paused_by_call = false;
-                inner.write_progress();
+                inner.write_progress_now();
             }
         }
 
@@ -6192,6 +6200,73 @@ pub(crate) mod tests {
         assert_eq!(state.borrow().load_calls.len(), loads, "still in the first file");
         assert!(snapshot.is_playing);
         assert!((snapshot.position_seconds - 29.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The outgoing book's final position is
+    /// saved even while a resume check (which holds the ordinary writes back) is still waiting on
+    /// a slow server: it used to be dropped.
+    pub(crate) fn run_switching_books_during_a_resume_check_still_saves_the_outgoing_position(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        runtime.block_on(mock_playable_item(&mock_server, "item-2", 20));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "First Book"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Second Book"));
+
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "First Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(3));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(10));
+        controller.pause();
+        pump_until(|| progress_patches(runtime, &mock_server, "item-1").len() == 1, Duration::from_secs(5));
+
+        // The resume check's server answer is slow, so the hold is still in place when the
+        // user moves on to the other book.
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "libraryItemId": "item-1",
+                            "currentTime": 3.0,
+                            "duration": 20.0,
+                            "isFinished": false,
+                            "lastUpdate": 1,
+                        }))
+                        .set_delay(Duration::from_secs(3)),
+                )
+                .with_priority(1)
+                .mount(&mock_server),
+        );
+        controller.set_resume_reconcile_after(Duration::ZERO);
+        controller.play();
+        state.borrow_mut().position = Some(Duration::from_secs(9));
+        pump_until(|| false, Duration::from_millis(400));
+
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-2".to_string(), title: "Second Book".to_string(), author: None },
+            1.0,
+        );
+        let saved = || {
+            runtime
+                .block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1"))
+                .ok()
+                .flatten()
+                .is_some_and(|p| (p.current_time_seconds - 9.0).abs() < 0.5)
+        };
+        pump_until(saved, Duration::from_secs(5));
+        assert!(saved(), "the outgoing book's position must be saved even while its resume check is still in flight");
         controller.stop();
     }
 }
