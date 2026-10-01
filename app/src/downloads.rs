@@ -80,7 +80,8 @@ pub enum DownloadEvent {
     },
 }
 
-type EventListener = Box<dyn Fn(&DownloadEvent)>;
+/// Returns whether to keep listening: `false` (its screen is gone) drops the listener.
+type EventListener = Box<dyn Fn(&DownloadEvent) -> bool>;
 
 /// Bookkeeping for one item's in-flight download batch: how many tracks were queued, how each one
 /// finished so far, and every in-flight track's cooperative cancel flag so `cancel_item` can stop
@@ -110,7 +111,9 @@ struct Inner {
     network_monitor: Box<dyn NetworkMonitor>,
     wifi_only: bool,
     semaphore: Rc<tokio::sync::Semaphore>,
-    listeners: Vec<EventListener>,
+    listeners: RefCell<Vec<EventListener>>,
+    /// Listeners registered from inside a publish; added once it is over.
+    listeners_added_meanwhile: RefCell<Vec<EventListener>>,
     /// Keyed by `(server_id, item_id)` rather than just `item_id` — the same item id is only ever
     /// meaningful within one server, but nothing stops two different servers from happening to
     /// reuse the same id, and this manager is shared for the app's whole lifetime, potentially
@@ -120,9 +123,9 @@ struct Inner {
 
 impl Inner {
     fn publish(&self, event: DownloadEvent) {
-        for listener in &self.listeners {
-            listener(&event);
-        }
+        self.listeners.borrow_mut().retain(|listener| listener(&event));
+        let mut added = self.listeners_added_meanwhile.borrow_mut();
+        self.listeners.borrow_mut().append(&mut added);
     }
 }
 
@@ -140,7 +143,8 @@ impl DownloadManager {
                 network_monitor,
                 wifi_only,
                 semaphore: Rc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
-                listeners: Vec::new(),
+                listeners: RefCell::new(Vec::new()),
+                listeners_added_meanwhile: RefCell::new(Vec::new()),
                 batches: HashMap::new(),
             })),
         }
@@ -150,7 +154,29 @@ impl DownloadManager {
     /// "no corresponding unregister" shape as `PlayerController::add_listener` (nothing needs to
     /// stop listening once registered).
     pub fn add_listener(&self, listener: impl Fn(&DownloadEvent) + 'static) {
-        self.inner.borrow_mut().listeners.push(Box::new(listener));
+        self.add_scoped_listener(move |event| {
+            listener(event);
+            true
+        });
+    }
+
+    /// Like `add_listener`, for a listener tied to a screen that comes and goes (Item Detail and
+    /// the Player are built afresh per visit): it returns `false` once that screen is gone and is
+    /// then dropped, instead of staying registered — and keeping the screen's widgets alive — for
+    /// the manager's whole lifetime.
+    pub fn add_scoped_listener(&self, listener: impl Fn(&DownloadEvent) -> bool + 'static) {
+        let inner = self.inner.borrow();
+        let listener = Box::new(listener);
+        let added_now = match inner.listeners.try_borrow_mut() {
+            Ok(mut listeners) => {
+                listeners.push(listener);
+                None
+            }
+            Err(_) => Some(listener),
+        };
+        if let Some(listener) = added_now {
+            inner.listeners_added_meanwhile.borrow_mut().push(listener);
+        }
     }
 
     /// This item's in-flight batch's progress as `(finished tracks, total tracks)`. `finished`

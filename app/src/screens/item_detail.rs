@@ -313,7 +313,7 @@ pub fn build(
     // the glyphs stayed exactly as Pass 2 first found them until the screen was reopened. Refetch
     // is cheap (one indexed query over this item's chapter ranges), so this re-derives markers on
     // every event rather than trying to track "did a track just finish" precisely.
-    download_manager.add_listener({
+    download_manager.add_scoped_listener({
         let pool = pool.clone();
         let server_id = server.id.clone();
         let item_id = item_id.clone();
@@ -323,19 +323,24 @@ pub fn build(
         let progress_seconds_cell = progress_seconds_cell.clone();
         let on_play = on_play.clone();
         move |event| {
+            // This screen is built afresh per visit; once it is gone its list has no parent any
+            // more, and the listener goes with it.
+            if chapters_list.parent().is_none() {
+                return false;
+            }
             let event_item_id = match event {
                 crate::downloads::DownloadEvent::ItemStateChanged { item_id, .. } => item_id,
                 crate::downloads::DownloadEvent::TrackProgress { item_id, .. } => item_id,
             };
             if *event_item_id != item_id {
-                return;
+                return true;
             }
             let chapters = chapters_cell.clone();
             let chapter_ranges = chapter_ranges_cell.borrow().clone();
             if chapter_ranges.is_empty() {
                 // Pass 2 hasn't landed yet (or this item has no chapters at all) — nothing to
                 // refresh against.
-                return;
+                return true;
             }
             let pool = pool.clone();
             let server_id = server_id.clone();
@@ -347,6 +352,7 @@ pub fn build(
                 let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
                 refresh_chapter_rows(&chapters_list, &chapters.borrow(), progress_seconds_cell.get(), &markers, &on_play, &item_id);
             });
+            true
         }
     });
 

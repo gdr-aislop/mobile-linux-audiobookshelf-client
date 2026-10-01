@@ -215,14 +215,16 @@ pub fn build(
     // per screen-open (Player, on every mini-bar tap) or per item (Item Detail), so its own item
     // id never actually changes across the instance's lifetime — matching `DownloadEvent` itself,
     // which carries no server id to disambiguate further.
-    download_manager.add_listener({
-        let widget = widget.clone();
+    download_manager.add_scoped_listener({
+        // Weak: the screen this button lives on comes and goes, and the manager outlives it.
+        let widget = widget.downgrade();
         let item_id = item_id.clone();
-        let toast_overlay = toast_overlay.clone();
+        let toast_overlay = toast_overlay.downgrade();
         move |event| {
-            let DownloadEvent::ItemStateChanged { item_id: event_item_id, state } = event else { return };
+            let (Some(widget), Some(toast_overlay)) = (widget.upgrade(), toast_overlay.upgrade()) else { return false };
+            let DownloadEvent::ItemStateChanged { item_id: event_item_id, state } = event else { return true };
             if *event_item_id != item_id {
-                return;
+                return true;
             }
             widget.set_icon_name(match state {
                 ItemDownloadState::Downloading => "content-loading-symbolic",
@@ -238,6 +240,7 @@ pub fn build(
             if let ItemDownloadState::Failed(reason) = state {
                 toast_overlay.add_toast(adw::Toast::new(&format!("Download failed — {reason}")));
             }
+            true
         }
     });
 

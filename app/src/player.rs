@@ -369,7 +369,9 @@ fn chapter_end_at(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
     chapters.iter().find(|c| c.start_seconds <= position && position < c.end_seconds).map(|c| c.end_seconds)
 }
 
-type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
+/// Returns whether to keep listening: a listener that returns `false` (its screen is gone) is
+/// dropped after that call.
+type SnapshotListener = Box<dyn Fn(&PlayerSnapshot) -> bool>;
 
 /// How one background push of playback progress to the server ended — see
 /// `PlayerController::set_on_progress_sync`.
@@ -655,8 +657,11 @@ struct Inner {
     /// the mini-player bar's closure is pushed here at construction, and MPRIS (once wired) is
     /// pushed here too via `PlayerController::add_listener`. Distinct from `full_update`, the one
     /// optional slot toggled as the full player screen opens/closes.
-    listeners: Vec<SnapshotListener>,
-    full_update: Option<SnapshotListener>,
+    listeners: RefCell<Vec<SnapshotListener>>,
+    /// Listeners registered from inside a publish (a listener building a screen that listens
+    /// too); added once that publish is over.
+    listeners_added_meanwhile: RefCell<Vec<SnapshotListener>>,
+    full_update: Option<Box<dyn Fn(&PlayerSnapshot)>>,
     /// When the local progress row was last refreshed — the periodic tick's own throttle (see
     /// `LOCAL_PROGRESS_WRITE_INTERVAL`).
     last_progress_write: Instant,
@@ -958,9 +963,13 @@ impl Inner {
         });
         crate::sync_coordinator::set_loaded_item(held);
         let Some(snapshot) = self.snapshot() else { return };
-        for listener in &self.listeners {
-            listener(&snapshot);
-        }
+        // A listener whose screen is gone says so and is dropped here — Item Detail builds a
+        // mini bar per visit, and each used to stay registered (and keep its widgets alive) for
+        // good.
+        self.listeners.borrow_mut().retain(|listener| listener(&snapshot));
+        let mut added = self.listeners_added_meanwhile.borrow_mut();
+        self.listeners.borrow_mut().append(&mut added);
+        drop(added);
         if let Some(full_update) = &self.full_update {
             full_update(&snapshot);
         }
@@ -1457,7 +1466,11 @@ impl PlayerController {
                 session_generation: 0,
                 load_generation: 0,
                 seek_count: 0,
-                listeners: vec![Box::new(mini_update)],
+                listeners: RefCell::new(vec![Box::new(move |snapshot: &PlayerSnapshot| {
+                    mini_update(snapshot);
+                    true
+                })]),
+                listeners_added_meanwhile: RefCell::new(Vec::new()),
                 full_update: None,
                 last_progress_write: Instant::now(),
                 last_server_sync: Instant::now(),
@@ -1542,7 +1555,7 @@ impl PlayerController {
             inner.reset_backend();
             inner.now_playing = None;
             inner.pending_start = None;
-            inner.listeners.clear();
+            inner.listeners.borrow_mut().clear();
             inner.full_update = None;
         }
         if let Some(id) = self.tick_source.borrow_mut().take() {
@@ -1564,7 +1577,32 @@ impl PlayerController {
     /// app's whole lifetime — unlike `set_full_update`, this has no corresponding "clear" (nothing
     /// needs to stop listening once registered; MPRIS is the first user of this).
     pub fn add_listener(&self, listener: impl Fn(&PlayerSnapshot) + 'static) {
-        self.inner.borrow_mut().listeners.push(Box::new(listener));
+        self.add_scoped_listener(move |snapshot| {
+            listener(snapshot);
+            true
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn listener_count(&self) -> usize {
+        self.inner.borrow().listeners.borrow().len()
+    }
+
+    /// Like `add_listener`, for a listener tied to a screen that comes and goes: it returns
+    /// `false` once that screen is gone and is then dropped.
+    pub fn add_scoped_listener(&self, listener: impl Fn(&PlayerSnapshot) -> bool + 'static) {
+        let inner = self.inner.borrow();
+        let listener = Box::new(listener);
+        let added_now = match inner.listeners.try_borrow_mut() {
+            Ok(mut listeners) => {
+                listeners.push(listener);
+                None
+            }
+            Err(_) => Some(listener),
+        };
+        if let Some(listener) = added_now {
+            inner.listeners_added_meanwhile.borrow_mut().push(listener);
+        }
     }
 
     pub fn snapshot(&self) -> Option<PlayerSnapshot> {
@@ -3318,8 +3356,12 @@ fn build_mini_bar_widgets() -> MiniBarWidgets {
 /// The closure that applies a snapshot to `widgets` — shared between `build_mini_bar` (registered
 /// via `PlayerController::new`) and `build_mini_bar_for` (registered via `add_listener`, and also
 /// called once immediately to prime from whatever's already playing).
-fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapshot) + 'static {
-    let bar = widgets.bar.clone();
+///
+/// Returns `false` once the bar itself is gone (it is held weakly — the closure keeping its own
+/// bar alive is what let every Item Detail visit's mini bar outlive its screen), which a scoped
+/// listener takes as "stop calling me".
+fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapshot) -> bool + 'static {
+    let bar = widgets.bar.downgrade();
     let title_label = widgets.title_label.clone();
     let author_label = widgets.author_label.clone();
     let play_icon = widgets.play_icon.clone();
@@ -3327,6 +3369,7 @@ fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapsho
     let cover = widgets.cover.clone();
     let error_icon = widgets.error_icon.clone();
     move |snapshot: &PlayerSnapshot| {
+        let Some(bar) = bar.upgrade() else { return false };
         bar.set_visible(true);
         title_label.set_label(&snapshot.title);
         author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
@@ -3344,6 +3387,7 @@ fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapsho
             0.0
         };
         progress.set_fraction(fraction);
+        true
     }
 }
 
@@ -3372,7 +3416,9 @@ fn mini_bar_from_widgets(widgets: MiniBarWidgets, controller: PlayerController) 
 pub fn build_mini_bar(pool: SqlitePool, paths: AppPaths, backend: Box<dyn abs_player::AudioBackend>) -> MiniPlayerBar {
     let widgets = build_mini_bar_widgets();
     let apply_snapshot = mini_bar_snapshot_applier(&widgets);
-    let controller = PlayerController::new(pool, paths, backend, apply_snapshot);
+    let controller = PlayerController::new(pool, paths, backend, move |snapshot| {
+        apply_snapshot(snapshot);
+    });
     mini_bar_from_widgets(widgets, controller)
 }
 
@@ -3388,7 +3434,7 @@ pub fn build_mini_bar_for(controller: PlayerController) -> MiniPlayerBar {
     if let Some(snapshot) = controller.snapshot() {
         apply_snapshot(&snapshot);
     }
-    controller.add_listener(apply_snapshot);
+    controller.add_scoped_listener(apply_snapshot);
     mini_bar_from_widgets(widgets, controller)
 }
 
@@ -6635,6 +6681,49 @@ pub(crate) mod tests {
         pump_until(|| false, Duration::from_millis(600));
         let position = controller.snapshot().unwrap().position_seconds;
         assert!(position <= 10.0, "still in the first file, which the server says ends at 10s: got {position}");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A listener tied to a screen that has
+    /// gone is dropped by the publish that finds out, and so is a mini bar built for a screen
+    /// that is then discarded (Item Detail builds one per visit; each used to stay registered,
+    /// updating widgets nobody could see, for good).
+    pub(crate) fn run_listeners_of_discarded_screens_are_dropped(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let (controller, _state) = scripted_controller(&pool);
+        let permanent_before = controller.listener_count();
+        let permanent_calls = Rc::new(std::cell::Cell::new(0_u32));
+        controller.add_listener({
+            let permanent_calls = permanent_calls.clone();
+            move |_| permanent_calls.set(permanent_calls.get() + 1)
+        });
+        let scoped_calls = Rc::new(std::cell::Cell::new(0_u32));
+        controller.add_scoped_listener({
+            let scoped_calls = scoped_calls.clone();
+            move |_| {
+                scoped_calls.set(scoped_calls.get() + 1);
+                scoped_calls.get() < 2
+            }
+        });
+        let bar = build_mini_bar_for(controller.clone());
+        assert_eq!(controller.listener_count(), permanent_before + 3);
+
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Test Item"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(600));
+        assert_eq!(scoped_calls.get(), 2, "told to stop after its second call, never called again");
+        assert_eq!(controller.listener_count(), permanent_before + 2, "the scoped listener is gone, the mini bar's is still there");
+
+        drop(bar);
+        pump_until(|| false, Duration::from_millis(600));
+        assert_eq!(controller.listener_count(), permanent_before + 1, "the discarded screen's mini bar listener is gone");
+        let calls = permanent_calls.get();
+        pump_until(|| false, Duration::from_millis(600));
+        assert!(permanent_calls.get() > calls, "permanent listeners keep hearing");
         controller.stop();
     }
 }

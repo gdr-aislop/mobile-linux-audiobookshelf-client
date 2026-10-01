@@ -99,9 +99,17 @@ impl DownloadProgressStrip {
             move |_| download_manager.cancel_item(&server_id, &item_id)
         });
 
-        download_manager.add_listener({
+        download_manager.add_scoped_listener({
             let strip = strip.clone();
-            move |event| Self::handle_event(&strip, event)
+            move |event| {
+                // Once the screen holding the strip is gone, the strip has no parent any more
+                // (it is built attached to its screen, right away): stop listening.
+                if strip.revealer.parent().is_none() {
+                    return false;
+                }
+                Self::handle_event(&strip, event);
+                true
+            }
         });
 
         if download_manager.is_downloading(&server_id, &item_id) {
