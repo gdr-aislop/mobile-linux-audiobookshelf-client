@@ -283,11 +283,22 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   transport commands from the shell) and has no concept of inbound "audio focus" events, so it
   can't be used to detect an incoming call — unlike Android, Linux mobile has no OS-level audio
   focus API. Instead, `abs-player` watches call state via **ModemManager**
-  (`org.freedesktop.ModemManager1`'s voice-call interface) and pauses playback immediately when a
-  call becomes active. Playback is **not** auto-resumed when the call ends — the user resumes
-  manually via the mini-player or the lock-screen MPRIS card, since auto-resuming audio at an
-  arbitrary moment after a call (still mid-conversation, walking away, etc.) would be more
-  surprising than useful.
+  (`org.freedesktop.ModemManager1`'s voice-call interface):
+  - **Pause as soon as the phone rings** (or, for a call this phone places, as soon as it
+    dials) — not only once the call is picked up. ModemManager exports an incoming call already
+    in its ringing state, with no state-change signal for the ringing itself, so the watcher
+    picks new calls up from the voice interface's `CallAdded` and reads their state; watching
+    state changes alone only ever saw the pickup (the first version's Librem 5 field report).
+  - **Resume if the call is never answered** — rejected, missed, or the caller hung up first:
+    nothing interrupted the listener but the ringing, so the book carries on. Only when the
+    call's own pause is still the reason playback is paused: if the user paused or played
+    while it rang, or playback was already paused, the call ending changes nothing.
+  - **Stay paused after a call that was answered**, and after any outgoing call — the user
+    resumes manually via the mini-player or the lock-screen MPRIS card, since auto-resuming
+    audio at an arbitrary moment after a conversation (still talking, walking away, etc.) would
+    be more surprising than useful.
+  Every call state ModemManager reports, and every decision taken on it, is logged at the
+  default level, like headphone plug events.
 - **Headphone unplug**: MPRIS likewise can't see audio-routing events, and the audio server
   (PulseAudio / PipeWire's `pipewire-pulse` socket) handles rerouting silently — on unplug the
   stream simply moves to the speakers and playback would continue, unheard, with progress

@@ -112,7 +112,9 @@ pub struct MainWindow {
     pub root: gtk4::Widget,
     /// Kept alive for the app's whole lifetime — dropping it unsubscribes from ModemManager's
     /// D-Bus signals. `None` when no system bus (or no ModemManager on it) was reachable; call
-    /// interruption is simply unavailable in that case, never a fatal error.
+    /// interruption (pause on ringing, resume after an unanswered call — see
+    /// `PlayerController::handle_call_event`) is simply unavailable in that case, never a fatal
+    /// error.
     _call_watcher: Option<abs_player::call_watch::ModemManagerCallWatcher>,
     /// Same lifetime contract as `_call_watcher`: retained forever, `None` when no audio server
     /// (PulseAudio/PipeWire) was reachable — headphone unplug/replug reaction is then simply
@@ -241,14 +243,15 @@ pub fn build(
     let last_toasted_error: Rc<RefCell<Option<abs_player::PlaybackErrorKind>>> = Rc::new(RefCell::new(None));
 
     // Phone-call interruption is best-effort in the same way: no system bus, or no ModemManager
-    // on it, must never be fatal — it just means this feature is unavailable. There is
-    // deliberately no "call ended" handling anywhere (see `call_watch`'s module docs): a call
-    // going active only ever pauses, never auto-resumes. The watcher itself is retained on
-    // `MainWindow` (see its field doc) — dropping it would unsubscribe immediately.
+    // on it, must never be fatal — it just means this feature is unavailable. The callback is
+    // one line by design, like the route watcher's below: all the semantics (pause on ringing;
+    // resume only after an unanswered incoming call that was itself the reason for the pause)
+    // live in `handle_call_event`, where the tests can reach them. The watcher itself is
+    // retained on `MainWindow` (see its field doc) — dropping it would unsubscribe immediately.
     let call_watcher = match abs_player::call_watch::ModemManagerCallWatcher::new() {
         Ok(mut watcher) => {
             let controller = mini_bar.controller.clone();
-            watcher.start(Box::new(move || controller.pause()));
+            watcher.start(Box::new(move |event| controller.handle_call_event(event)));
             Some(watcher)
         }
         Err(err) => {
@@ -972,16 +975,14 @@ pub(crate) mod tests {
         hooks.bookmark.activate(None::<&gtk4::glib::Variant>);
     }
 
-    /// Covers the actual risk in the call-interruption wiring — the closure `build()` registers
-    /// with `ModemManagerCallWatcher` — without needing a real system bus or ModemManager (this
-    /// sandbox has neither; see `abs_player::call_watch`'s own tests for the D-Bus-level
-    /// coverage). `abs_player::call_watch::FakeCallWatcher` is `#[cfg(test)]`-only inside
-    /// `abs-player` and so isn't visible across the crate boundary from here, but the wiring
-    /// itself is just one line (`move || controller.pause()`) — reproducing and invoking that
-    /// exact closure is what actually needs checking, not the D-Bus plumbing around it.
+    /// `handle_call_event`'s full behavior matrix — all the semantics the one-line closure
+    /// `build()` registers with `ModemManagerCallWatcher` delegates to (the D-Bus-level call
+    /// tracking lives in `abs_player::call_watch`'s own tests; its `FakeCallWatcher` is
+    /// `#[cfg(test)]`-only inside `abs-player` and so isn't visible across the crate boundary).
     pub(crate) fn run_call_interruption_wiring_pauses_playback(runtime: &tokio::runtime::Runtime) {
         use crate::player::tests::{account_and_server, insert_synced_item, mock_playable_item, test_backend};
         use crate::player::PlayRequest;
+        use abs_player::call_watch::CallEvent;
 
         let mock_server = runtime.block_on(wiremock::MockServer::start());
         runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
@@ -989,17 +990,71 @@ pub(crate) mod tests {
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
 
-        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
-        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
-        crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
-
-        let on_call_active: Box<dyn Fn()> = {
-            let controller = controller.clone();
-            Box::new(move || controller.pause())
+        let playing_controller = || {
+            let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+            controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None }, 1.0);
+            crate::test_support::pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+            controller
         };
-        on_call_active();
+        let is_playing = |controller: &crate::player::PlayerController| controller.snapshot().unwrap().is_playing;
+        let ringing = CallEvent::Started { incoming: true };
+        let rejected = CallEvent::Ended { answered: false, outgoing: false };
 
-        assert!(!controller.snapshot().unwrap().is_playing, "a call becoming active should pause playback");
+        // The field report: ringing pauses straight away, not only once picked up — the build()
+        // closure is reproduced and invoked exactly as registered.
+        let controller = playing_controller();
+        let on_event: Box<dyn Fn(CallEvent)> = {
+            let controller = controller.clone();
+            Box::new(move |event| controller.handle_call_event(event))
+        };
+        on_event(ringing);
+        assert!(!is_playing(&controller), "an incoming call should pause as soon as it rings");
+        // Rejected (or missed): playback picks up again.
+        on_event(rejected);
+        crate::test_support::pump_until(|| is_playing(&controller), std::time::Duration::from_secs(10));
+        controller.stop();
+
+        // Picked up, then hung up later: stays paused.
+        let controller = playing_controller();
+        controller.handle_call_event(ringing);
+        controller.handle_call_event(CallEvent::Answered);
+        assert!(!is_playing(&controller));
+        controller.handle_call_event(CallEvent::Ended { answered: true, outgoing: false });
+        assert!(!is_playing(&controller), "a call that was answered must not resume playback when it ends");
+        controller.stop();
+
+        // An outgoing call pauses when dialing and never resumes, even unanswered.
+        let controller = playing_controller();
+        controller.handle_call_event(CallEvent::Started { incoming: false });
+        assert!(!is_playing(&controller), "dialing out should pause");
+        controller.handle_call_event(CallEvent::Ended { answered: false, outgoing: true });
+        assert!(!is_playing(&controller), "an outgoing call ending must not resume playback");
+        controller.stop();
+
+        // The user taking over while it rings — pausing again (via any path) or playing — means
+        // the call's pause is no longer the reason; a later rejection changes nothing.
+        let controller = playing_controller();
+        controller.handle_call_event(ringing);
+        controller.play();
+        crate::test_support::pump_until(|| is_playing(&controller), std::time::Duration::from_secs(10));
+        controller.pause();
+        controller.handle_call_event(rejected);
+        assert!(!is_playing(&controller), "a manual pause during the ringing must not be lifted by the call ending");
+        controller.stop();
+
+        // Already paused when the call rings: the call isn't the reason, so it's not resumed.
+        let controller = playing_controller();
+        controller.pause();
+        controller.handle_call_event(ringing);
+        controller.handle_call_event(rejected);
+        assert!(!is_playing(&controller), "a call must never start playback that was already paused");
+        controller.stop();
+
+        // Call events with nothing loaded are no-ops by contract.
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.handle_call_event(ringing);
+        controller.handle_call_event(rejected);
+        assert!(controller.snapshot().is_none());
         controller.stop();
     }
 

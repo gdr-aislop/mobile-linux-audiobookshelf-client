@@ -503,6 +503,10 @@ struct Inner {
     /// `PlayerController::external_play_pause` measures [`SPURIOUS_UNPLUG_TOGGLE_WINDOW`] from.
     /// Only meaningful while `paused_by_unplug` is still set.
     unplug_paused_at: Option<Instant>,
+    /// Whether the current pause was caused by `handle_call_event` — an incoming call ringing.
+    /// Only a pause this specific may be lifted when that call ends unanswered. Cleared by every
+    /// other pause path, and by the call being picked up.
+    paused_by_call: bool,
     /// Mirrors whatever was last forwarded to `backend.set_burst_buffering` — the backend itself
     /// has no getter (it's a `Box<dyn AudioBackend>`), so this is what `PlayerController`'s own
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
@@ -990,6 +994,7 @@ impl PlayerController {
                 skip_forward_seconds: 30.0,
                 paused_by_unplug: false,
                 unplug_paused_at: None,
+                paused_by_call: false,
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
@@ -1711,6 +1716,7 @@ impl PlayerController {
     pub fn pause(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.paused_by_unplug = false;
+        inner.paused_by_call = false;
         // Nothing is loaded to pause once `needs_reload` is set (the backend was already
         // released) — just record the intent; the next `play()` goes through the reload path.
         if inner.now_playing.as_ref().is_some_and(|np| np.needs_reload) {
@@ -1914,6 +1920,73 @@ impl PlayerController {
                 self.inner.borrow_mut().paused_by_unplug = false;
                 self.play();
                 tracing::info!("resumed for headphone replug");
+            }
+        }
+    }
+
+    /// Reacts to `abs_player::call_watch` events: a call starting to ring (or dial) pauses —
+    /// right away, not only once it's picked up; an incoming call that ends without ever being
+    /// answered (rejected, missed, the caller gave up) resumes, but **only** if that call's own
+    /// pause is still the reason playback is paused; a call that was answered, or one this phone
+    /// placed, never resumes anything — the user picks the book back up themselves once they're
+    /// off the phone.
+    pub fn handle_call_event(&self, event: abs_player::call_watch::CallEvent) {
+        // Every branch logs its decision, like `handle_route_event` — `call_watch`'s own "phone
+        // call event" line confirms the event was delivered, this says what came of it.
+        use abs_player::call_watch::CallEvent;
+        match event {
+            CallEvent::Started { incoming } => {
+                let kind = if incoming { "incoming" } else { "outgoing" };
+                let (has_now_playing, is_playing) = {
+                    let inner = self.inner.borrow();
+                    (inner.now_playing.is_some(), inner.now_playing.as_ref().is_some_and(|np| np.is_playing))
+                };
+                if !has_now_playing {
+                    tracing::info!(kind, "phone call ignored: nothing is loaded");
+                    return;
+                }
+                if !is_playing {
+                    tracing::info!(kind, "phone call ignored: already paused");
+                    return;
+                }
+                // `pause()` clears the mark (it's the generic pause path); the call then
+                // re-marks it as *its* pause.
+                self.pause();
+                self.inner.borrow_mut().paused_by_call = true;
+                tracing::info!(kind, "paused for phone call");
+            }
+            CallEvent::Answered => {
+                let was_marked = std::mem::replace(&mut self.inner.borrow_mut().paused_by_call, false);
+                if was_marked {
+                    tracing::info!("phone call answered; playback will stay paused after it ends");
+                } else {
+                    tracing::info!("phone call answered");
+                }
+            }
+            CallEvent::Ended { answered, outgoing } => {
+                let (paused_by_call, is_paused) = {
+                    let mut inner = self.inner.borrow_mut();
+                    let is_paused = inner.now_playing.as_ref().is_some_and(|np| !np.is_playing);
+                    (std::mem::replace(&mut inner.paused_by_call, false), is_paused)
+                };
+                if answered {
+                    tracing::info!("phone call ended after being answered; not resuming");
+                    return;
+                }
+                if outgoing {
+                    tracing::info!("outgoing phone call ended; not resuming");
+                    return;
+                }
+                if !paused_by_call {
+                    tracing::info!("unanswered phone call ended; not resuming: the current pause (if any) wasn't caused by the call");
+                    return;
+                }
+                if !is_paused {
+                    tracing::info!("unanswered phone call ended; not resuming: not paused");
+                    return;
+                }
+                self.play();
+                tracing::info!("resumed after an unanswered phone call");
             }
         }
     }
@@ -2184,8 +2257,10 @@ impl PlayerController {
                         if let Some(now_playing) = &mut inner.now_playing {
                             now_playing.is_playing = false;
                         }
-                        // End-of-book is not an unplug pause — a replug must not revive it.
+                        // End-of-book is not an unplug pause — a replug must not revive it
+                        // (nor a call ending).
                         inner.paused_by_unplug = false;
+                        inner.paused_by_call = false;
                         inner.write_progress(true);
                     }
                 }
@@ -2247,6 +2322,7 @@ impl PlayerController {
                         }
                     };
                     inner.paused_by_unplug = false;
+                    inner.paused_by_call = false;
                     inner.write_progress(false);
 
                     if let Some(recovery) = recovery {
@@ -2288,8 +2364,10 @@ impl PlayerController {
                     now_playing.is_playing = false;
                     now_playing.sleep_timer = SleepTimerState::Off;
                 }
-                // A sleep-timer pause is deliberate; a replug must not override it.
+                // A sleep-timer pause is deliberate; a replug (or a call ending) must not
+                // override it.
                 inner.paused_by_unplug = false;
+                inner.paused_by_call = false;
                 inner.write_progress(false);
             }
         }
