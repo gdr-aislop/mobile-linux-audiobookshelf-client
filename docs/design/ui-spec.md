@@ -253,6 +253,15 @@ Fractal) rather than copying Lissen's Material Design look.
   tab, not just Home — see the "Home" and "Library browse" mockups, both of which show it fixed
   below their scrollable content. It reflects whatever's currently loaded regardless of which
   screen the user navigated to since starting playback.
+- **Switching books.** Starting a book stops the previous one at once — its position is saved
+  first — and the bar switches to the new book's title and cover immediately, with an empty
+  progress line, while the new book resolves (network lookup, then loading its file). Nothing
+  acts on a book until it has loaded: seeking does nothing meanwhile, play/pause (from the bar,
+  MPRIS, a headphone unplug or a phone call) only decide whether it starts playing once loaded,
+  and tapping the bar opens the full player once it has. A tapped chapter is part of the start
+  itself. Every start, load, seek, play and pause is logged, as is anything discarded because a
+  newer start or load replaced it. *(Field report: the previous book used to stay loaded through
+  the whole resolve, and a rewind in that window loaded its audio behind the new book's title.)*
 
 ### System media integration
 Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,
@@ -283,11 +292,22 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   transport commands from the shell) and has no concept of inbound "audio focus" events, so it
   can't be used to detect an incoming call — unlike Android, Linux mobile has no OS-level audio
   focus API. Instead, `abs-player` watches call state via **ModemManager**
-  (`org.freedesktop.ModemManager1`'s voice-call interface) and pauses playback immediately when a
-  call becomes active. Playback is **not** auto-resumed when the call ends — the user resumes
-  manually via the mini-player or the lock-screen MPRIS card, since auto-resuming audio at an
-  arbitrary moment after a call (still mid-conversation, walking away, etc.) would be more
-  surprising than useful.
+  (`org.freedesktop.ModemManager1`'s voice-call interface):
+  - **Pause as soon as the phone rings** (or, for a call this phone places, as soon as it
+    dials) — not only once the call is picked up. ModemManager exports an incoming call already
+    in its ringing state, with no state-change signal for the ringing itself, so the watcher
+    picks new calls up from the voice interface's `CallAdded` and reads their state; watching
+    state changes alone only ever saw the pickup (the first version's Librem 5 field report).
+  - **Resume if the call is never answered** — rejected, missed, or the caller hung up first:
+    nothing interrupted the listener but the ringing, so the book carries on. Only when the
+    call's own pause is still the reason playback is paused: if the user paused or played
+    while it rang, or playback was already paused, the call ending changes nothing.
+  - **Stay paused after a call that was answered**, and after any outgoing call — the user
+    resumes manually via the mini-player or the lock-screen MPRIS card, since auto-resuming
+    audio at an arbitrary moment after a conversation (still talking, walking away, etc.) would
+    be more surprising than useful.
+  Every call state ModemManager reports, and every decision taken on it, is logged at the
+  default level, like headphone plug events.
 - **Headphone unplug**: MPRIS likewise can't see audio-routing events, and the audio server
   (PulseAudio / PipeWire's `pipewire-pulse` socket) handles rerouting silently — on unplug the
   stream simply moves to the speakers and playback would continue, unheard, with progress
@@ -368,12 +388,17 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   row is what makes a second server possible), with a Cancel affordance back to the shell; a
   successful connect activates the new account and rebuilds the shell.
 - **About** group: a single `AdwActionRow` with the app version as its subtitle, opening an
-  `AdwAboutWindow` (app name, version, website, license) on tap — not `AdwAboutDialog`, which
-  needs libadwaita 1.5+ and is out of reach of this app's `v1_2` feature ceiling (see
-  `app/Cargo.toml`'s `adw` dependency); `AdwAboutWindow` is the equivalent widget already
-  available at `v1_2`. The version is sourced at compile time from `CARGO_PKG_VERSION` — the
-  workspace's single version number — and is the exact same string the `--version`/`-v`
-  command-line flags print, so it can never drift between the two.
+  in-window About screen on tap (app name, version, a Website row, a License row) — swapping the
+  main window's own content via `push_about`, with its own back button, the same way Settings'
+  own Connection page (`push_connection`) and every other secondary screen in this app already
+  work, rather than opening a second top-level window. It used to be `adw::AboutWindow` (chosen
+  because `AdwAboutDialog` needs libadwaita 1.5+, out of reach of this app's `v1_2` feature
+  ceiling — see `app/Cargo.toml`'s `adw` dependency) — a real Librem 5 field report found that
+  genuine second window had no reliable way to be dismissed under Phosh's default compositor
+  (phoc), so About stopped being the one screen in this app that opens a second window. The
+  version is sourced at compile time from `CARGO_PKG_VERSION` — the workspace's single version
+  number — and is the exact same string the `--version`/`-v` command-line flags print, so it can
+  never drift between the two.
 
 ### Connection
 - Per-server connection settings, pushed from a server row in Settings' Servers group (or the

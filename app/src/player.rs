@@ -141,6 +141,40 @@ pub struct PlayerSnapshot {
     /// whenever the corresponding action next succeeds. `screens::player`'s error banner and the
     /// mini bar's warning glyph are this field's only two readers.
     pub last_error: Option<abs_player::PlaybackError>,
+    /// Set from the moment `start()` is asked for a book until that book has resolved and is
+    /// loaded — position and duration are 0 meanwhile, and `is_playing` is `false` because
+    /// nothing is audible yet; `will_play_when_loaded` says whether it will start playing once
+    /// loaded (the user, an unplug or a call can pause it before then).
+    pub is_loading: bool,
+    pub will_play_when_loaded: bool,
+}
+
+impl PlayerSnapshot {
+    /// Whether a play/pause button should currently offer "pause": playing, or loading with the
+    /// intent to play once loaded.
+    pub fn shows_pause_button(&self) -> bool {
+        self.is_playing || (self.is_loading && self.will_play_when_loaded)
+    }
+}
+
+/// A book `start()` has been asked for that hasn't resolved and loaded yet. Held apart from
+/// `NowPlaying` so nothing can act on a book that isn't loaded: every transport action already
+/// does nothing without a `NowPlaying`, and only play/pause need to know about this (they change
+/// `wants_play`). The previous book is stopped and dropped the moment a start is asked for — it
+/// used to stay loaded through the whole resolve, and a rewind or a track change in that window
+/// loaded the old book's audio after the new one's, playing it under the new book's title.
+struct PendingStart {
+    /// `Inner::session_generation` of the `start()` this is for.
+    session_generation: u64,
+    item_id: String,
+    server_id: String,
+    account_id: String,
+    title: String,
+    author: Option<String>,
+    cover_path: Option<std::path::PathBuf>,
+    wants_play: bool,
+    /// The chapter to start at instead of the saved position, if one was tapped.
+    start_chapter: Option<usize>,
 }
 
 /// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
@@ -239,6 +273,11 @@ struct NowPlaying {
     /// Where the last end-of-stream that looked premature happened, as `(track, within)` — see
     /// `Inner::premature_end_of_stream`.
     premature_eos_at: Option<(usize, f64)>,
+    /// `Some(load generation)` while `spawn_load_track` is bringing `current_track`'s file into
+    /// the backend. Meanwhile the backend holds nothing usable: a seek within that track only
+    /// moves `last_known_within_track` (the load seeks there once ready), play/pause only change
+    /// `is_playing` (the load applies it), and a speed change only changes `speed`.
+    loading_track: Option<u64>,
 }
 
 /// What `seek_to_seconds` decided to do once its synchronous, borrow-scoped decision-making is
@@ -246,11 +285,27 @@ struct NowPlaying {
 /// async DB check first.
 enum SeekPlan {
     /// Seeking into a different file than the one currently loaded — always a reload,
-    /// regardless of source.
-    CrossTrack { item_id: String, track_index: usize, within: f64 },
+    /// regardless of source. `prepare_track_load` has already run; this is its load generation.
+    CrossTrack { item_id: String, generation: u64 },
     /// Seeking within the currently-loaded, still-streamed track: worth checking whether a
     /// download finished since it started streaming before committing to another network seek.
-    MaybeLocalNow { item_id: String, server_id: String, track_index: usize, within: f64, ino: Option<String> },
+    /// `load_generation` is the backend's at the time of the seek.
+    MaybeLocalNow { item_id: String, server_id: String, track_index: usize, ino: Option<String>, load_generation: u64 },
+}
+
+/// A seek target clamped into the book. A book whose duration came back unknown (0) is only
+/// clamped below — clamping to its "end" would send every seek to 0.
+fn clamp_to_book(seconds: f64, duration_seconds: f64) -> f64 {
+    if duration_seconds > 0.0 {
+        seconds.clamp(0.0, duration_seconds)
+    } else {
+        seconds.max(0.0)
+    }
+}
+
+/// The end of the chapter `position` falls in, if any.
+fn chapter_end_at(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
+    chapters.iter().find(|c| c.start_seconds <= position && position < c.end_seconds).map(|c| c.end_seconds)
 }
 
 type SnapshotListener = Box<dyn Fn(&PlayerSnapshot)>;
@@ -469,6 +524,22 @@ struct Inner {
     pool: SqlitePool,
     paths: AppPaths,
     now_playing: Option<NowPlaying>,
+    /// See [`PendingStart`]. `Some` exactly while a `start()` is resolving; `now_playing` is
+    /// `None` meanwhile.
+    pending_start: Option<PendingStart>,
+    /// Bumped by every `start()`. Async work that belongs to one start (the start itself, a
+    /// resume's reconcile, the cover fetch) checks it after every await and gives up once a
+    /// newer start has replaced it — comparing item ids isn't enough, since the same book can be
+    /// started again.
+    session_generation: u64,
+    /// Bumped by every load and every backend reset (`begin_load`, `reset_backend`). Async work
+    /// that is about to act on the backend (a track load, a deferred seek, a pause confirmation,
+    /// an error recovery) checks it first: if anything has loaded or released the pipeline since,
+    /// its action would land on the wrong file.
+    load_generation: u64,
+    /// Bumped by every seek — a resume's reconcile doesn't override a position the listener
+    /// chose while it was running.
+    seek_count: u64,
     /// Permanent listeners, notified on every published snapshot for the app's whole lifetime —
     /// the mini-player bar's closure is pushed here at construction, and MPRIS (once wired) is
     /// pushed here too via `PlayerController::add_listener`. Distinct from `full_update`, the one
@@ -503,6 +574,10 @@ struct Inner {
     /// `PlayerController::external_play_pause` measures [`SPURIOUS_UNPLUG_TOGGLE_WINDOW`] from.
     /// Only meaningful while `paused_by_unplug` is still set.
     unplug_paused_at: Option<Instant>,
+    /// Whether the current pause was caused by `handle_call_event` — an incoming call ringing.
+    /// Only a pause this specific may be lifted when that call ends unanswered. Cleared by every
+    /// other pause path, and by the call being picked up.
+    paused_by_call: bool,
     /// Mirrors whatever was last forwarded to `backend.set_burst_buffering` — the backend itself
     /// has no getter (it's a `Box<dyn AudioBackend>`), so this is what `PlayerController`'s own
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
@@ -518,9 +593,10 @@ struct Inner {
     /// A resume after a pause at least this long first checks the server for newer progress
     /// (see `PlayerController::play`). A field rather than a const only so tests can shorten it.
     resume_reconcile_after: Duration,
-    /// Set while that check is in flight: position writes are held back, since the position may
-    /// be about to move to another device's.
-    holding_writes_for_reconcile: bool,
+    /// Set while that check is in flight, to the session generation it belongs to: position
+    /// writes are held back, since the position may be about to move to another device's. Only
+    /// the check that set it clears it.
+    holding_writes_for_reconcile: Option<u64>,
     /// Told `(from, to)` when a resume adopted newer progress from the server — see
     /// `PlayerController::set_on_position_adopted`.
     on_position_adopted: Option<Rc<dyn Fn(f64, f64)>>,
@@ -530,6 +606,21 @@ struct Inner {
 
 impl Inner {
     fn snapshot(&self) -> Option<PlayerSnapshot> {
+        if let Some(pending) = &self.pending_start {
+            return Some(PlayerSnapshot {
+                title: pending.title.clone(),
+                author: pending.author.clone(),
+                position_seconds: 0.0,
+                duration_seconds: 0.0,
+                is_playing: false,
+                speed: self.default_speed,
+                sleep_timer_active: false,
+                cover_path: pending.cover_path.clone(),
+                last_error: None,
+                is_loading: true,
+                will_play_when_loaded: pending.wants_play,
+            });
+        }
         let now_playing = self.now_playing.as_ref()?;
         Some(PlayerSnapshot {
             title: now_playing.title.clone(),
@@ -541,7 +632,71 @@ impl Inner {
             sleep_timer_active: now_playing.sleep_timer != SleepTimerState::Off,
             cover_path: now_playing.cover_path.clone(),
             last_error: now_playing.last_error.clone(),
+            is_loading: false,
+            will_play_when_loaded: false,
         })
+    }
+
+    /// Whether playback is on (or, while a start is resolving, will be once loaded). `None`
+    /// when nothing is loaded or starting.
+    fn playing_intent(&self) -> Option<bool> {
+        if let Some(pending) = &self.pending_start {
+            return Some(pending.wants_play);
+        }
+        self.now_playing.as_ref().map(|np| np.is_playing)
+    }
+
+    /// Whether `generation`'s start is still the one resolving.
+    fn pending_is(&self, generation: u64) -> bool {
+        self.pending_start.as_ref().is_some_and(|p| p.session_generation == generation)
+    }
+
+    /// Releases the backend (see `AudioBackend::reset`) and invalidates whatever async work was
+    /// about to act on it. Every reset goes through here.
+    fn reset_backend(&mut self) {
+        self.backend.reset();
+        self.load_generation += 1;
+        if let Some(now_playing) = &mut self.now_playing {
+            now_playing.loading_track = None;
+        }
+    }
+
+    /// Starts a new load generation, for the load about to happen.
+    fn begin_load(&mut self) -> u64 {
+        self.load_generation += 1;
+        self.load_generation
+    }
+
+    /// Whether the backend currently holds the current track, loaded and usable — not released
+    /// after an error, and not in the middle of a track load.
+    fn backend_holds_track(&self) -> bool {
+        self.now_playing.as_ref().is_some_and(|np| !np.needs_reload && np.loading_track.is_none() && !np.tracks.is_empty())
+    }
+
+    /// Pauses the backend if it holds anything to pause (see `backend_holds_track`). Asking a
+    /// released pipeline to pause would re-open its stale source.
+    fn pause_backend_if_loaded(&mut self) {
+        if self.backend_holds_track() {
+            let _ = self.backend.pause();
+        }
+    }
+
+    /// Switches the current track to `track_index` and starts bringing it into the backend at
+    /// `within`: releases the old file right away (so it can neither keep playing nor deliver a
+    /// stale end-of-stream or error against the new track), and pins the position to the target
+    /// until the load lands. Returns the load generation to hand to `spawn_load_track`.
+    fn prepare_track_load(&mut self, track_index: usize, within: f64) -> Option<u64> {
+        self.now_playing.as_ref()?;
+        self.reset_backend();
+        let generation = self.begin_load();
+        let now_playing = self.now_playing.as_mut()?;
+        now_playing.current_track = track_index;
+        now_playing.last_known_within_track = within;
+        now_playing.seek_target_pending = true;
+        now_playing.seek_issued_at = None;
+        now_playing.seek_retries = 0;
+        now_playing.loading_track = Some(generation);
+        Some(generation)
     }
 
     /// The book-level playback position: the current track's offset within the book plus the
@@ -634,7 +789,7 @@ impl Inner {
     /// `write_progress_at`. Held back while a resume's reconcile is in flight (see
     /// `PlayerController::play`): the position may be about to move to another device's.
     fn write_progress(&mut self, is_finished: bool) {
-        if self.holding_writes_for_reconcile {
+        if self.holding_writes_for_reconcile.is_some() {
             return;
         }
         let position = self.book_position();
@@ -758,26 +913,50 @@ impl Inner {
         Some((now_playing.item_id.clone(), next))
     }
 
-    /// Loads item `track_index`'s file and optionally seeks `within_seconds` into it, on the GLib
-    /// main loop rather than synchronously — both callers (end-of-track advance and cross-track
-    /// seeks) run from the tick handler, which must not block on a network-streamed pipeline's
-    /// preroll. Seeking — including `set_speed`, which is itself a seek-with-rate — needs the
-    /// pipeline to have actually *reached* `PAUSED` (the same readiness requirement and polling
-    /// pattern as `start()`'s resume seek), so anything needing a seek waits for `position()` to
-    /// become available first; a plain start-of-track load skips the wait entirely. `load()`
-    /// resets the pipeline's speed to 1.0, so the item's speed is re-applied afterwards.
-    /// Resumes playing only if the item is still flagged as playing at that point, so a user
-    /// pausing mid-transition is respected rather than overridden.
-    fn spawn_load_track(inner_rc: Rc<RefCell<Inner>>, item_id: String, track_index: usize, within_seconds: f64) {
+    /// Brings the track `prepare_track_load` just switched to (load generation `generation`) into
+    /// the backend, on the GLib main loop rather than synchronously — the callers run from the
+    /// tick handler or a GTK signal, which must not block on a network-streamed pipeline's
+    /// preroll. Gives up silently the moment anything newer has loaded or released the backend,
+    /// or another book was started: checked after every await, before touching the backend.
+    ///
+    /// Seeking — including a speed other than 1×, which is itself a seek-with-rate — needs the
+    /// pipeline to have actually *reached* `PAUSED`, so anything needing a seek waits for
+    /// `position()` to become available first. The target position and speed are read from
+    /// `now_playing` only once that wait is over, so a seek or speed change asked for during the
+    /// load is the one applied. Resumes playing only if the item is still flagged as playing at
+    /// that point, so a pause mid-load is respected rather than overridden.
+    fn spawn_load_track(inner_rc: Rc<RefCell<Inner>>, item_id: String, generation: u64) {
+        // Still the load this was spawned for, on the same book.
+        let current = move |inner: &Inner| {
+            inner.load_generation == generation
+                && inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.loading_track == Some(generation))
+        };
         glib::spawn_future_local(async move {
-            let (pool, server_id, session, ino, speed) = {
+            let (pool, server_id, item_id, session, ino, track_index) = {
                 let inner = inner_rc.borrow();
-                let Some(now_playing) = &inner.now_playing else { return };
-                if now_playing.item_id != item_id {
+                if !current(&inner) {
                     return;
                 }
-                let Some(track) = now_playing.tracks.get(track_index) else { return };
-                (inner.pool.clone(), now_playing.server_id.clone(), now_playing.session.clone(), track.ino.clone(), now_playing.speed)
+                let Some(now_playing) = &inner.now_playing else { return };
+                let Some(track) = now_playing.tracks.get(now_playing.current_track) else { return };
+                (
+                    inner.pool.clone(),
+                    now_playing.server_id.clone(),
+                    now_playing.item_id.clone(),
+                    now_playing.session.clone(),
+                    track.ino.clone(),
+                    now_playing.current_track,
+                )
+            };
+            // Marks the load failed: nothing usable is loaded, and the next play reloads.
+            let fail = |inner: &mut Inner, error: abs_player::PlaybackError| {
+                inner.reset_backend();
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.is_playing = false;
+                    now_playing.needs_reload = true;
+                    now_playing.last_error = Some(error);
+                }
+                inner.publish();
             };
             // The connection is asked at load time — a mid-book settings change (local address,
             // headers, TLS) is honored by the next track. Failure means the server row is gone
@@ -785,25 +964,11 @@ impl Inner {
             let connection = match session.connection_target().await {
                 Ok(connection) => connection,
                 Err(err) => {
-                    tracing::warn!(%err, track = track_index, "couldn't load the server's connection settings");
                     let mut inner = inner_rc.borrow_mut();
-                    // Nothing was touched on the backend for this attempt, but the pipeline is
-                    // about to sit idle indefinitely with no plan to retry on its own — release
-                    // it rather than leave a stale stream open on the audio server (see
-                    // `AudioBackend::reset`'s doc comment).
-                    inner.backend.reset();
-                    if let Some(now_playing) = &mut inner.now_playing {
-                        if now_playing.item_id == item_id {
-                            now_playing.is_playing = false;
-                            now_playing.needs_reload = true;
-                            now_playing.last_error = Some(abs_player::PlaybackError {
-                                kind: abs_player::PlaybackErrorKind::Network,
-                                message: err.to_string(),
-                                debug: None,
-                            });
-                        }
+                    if current(&inner) {
+                        tracing::warn!(%err, %item_id, track = track_index, "couldn't load the server's connection settings");
+                        fail(&mut inner, abs_player::PlaybackError { kind: abs_player::PlaybackErrorKind::Network, message: err.to_string(), debug: None });
                     }
-                    inner.publish();
                     return;
                 }
             };
@@ -813,66 +978,72 @@ impl Inner {
             // later) that one can be expired.
             let (url, is_local) = resolve_playable_url(&pool, &connection, &server_id, &item_id, &ino, &session).await;
 
-            {
+            let needs_seek_readiness = {
                 let mut inner = inner_rc.borrow_mut();
+                if !current(&inner) {
+                    tracing::info!(%item_id, track = track_index, "discarded a superseded track load");
+                    return;
+                }
                 // Transport properties must be applied before the load: GStreamer creates the
                 // HTTP source during it, and source-setup reads what was last applied here.
                 inner.backend.apply_connection(&playback_properties(&connection));
                 if let Err(err) = inner.backend.load(&url) {
-                    tracing::warn!(%err, track = track_index, "couldn't load the next track");
-                    // As above: a failed load leaves nothing worth holding onto — release it
-                    // rather than leaving a half-set-up pipeline sitting on the audio server.
-                    inner.backend.reset();
-                    if let Some(now_playing) = &mut inner.now_playing {
-                        if now_playing.item_id == item_id {
-                            now_playing.is_playing = false;
-                            now_playing.needs_reload = true;
-                            now_playing.last_error = Some((&err).into());
-                        }
-                    }
-                    inner.publish();
+                    tracing::warn!(%err, %item_id, track = track_index, "couldn't load the track");
+                    fail(&mut inner, (&err).into());
                     return;
                 }
-            }
+                let Some(now_playing) = &inner.now_playing else { return };
+                let needs = now_playing.last_known_within_track > 0.0 || (now_playing.speed - 1.0).abs() > f64::EPSILON;
+                if needs {
+                    let _ = inner.backend.pause();
+                }
+                needs
+            };
 
-            let needs_seek_readiness = within_seconds > 0.0 || (speed - 1.0).abs() > f64::EPSILON;
             if needs_seek_readiness {
-                let _ = inner_rc.borrow_mut().backend.pause();
                 for _ in 0..50 {
-                    if inner_rc.borrow().backend.position().is_some() {
-                        break;
+                    {
+                        let inner = inner_rc.borrow();
+                        if !current(&inner) {
+                            tracing::info!(%item_id, track = track_index, "discarded a superseded track load");
+                            return;
+                        }
+                        if inner.backend.position().is_some() {
+                            break;
+                        }
                     }
                     glib::timeout_future(Duration::from_millis(100)).await;
-                }
-                if within_seconds > 0.0 {
-                    let _ = inner_rc.borrow_mut().backend.seek(Duration::from_secs_f64(within_seconds));
-                }
-                if (speed - 1.0).abs() > f64::EPSILON {
-                    let _ = inner_rc.borrow_mut().backend.set_speed(speed);
                 }
             }
 
             let mut inner = inner_rc.borrow_mut();
-            if let Some(now_playing) = &mut inner.now_playing {
-                if now_playing.item_id == item_id {
-                    now_playing.last_error = None;
-                    // The load above (whether it's a fresh reload after an error or a plain
-                    // track advance/seek) fully replaces the pipeline, so every bit of
-                    // load-scoped state gets set fresh here rather than only on the success
-                    // path that originally created `NowPlaying` — this is the one place a
-                    // reload (self-heal, Retry) and a normal track load converge.
-                    now_playing.needs_reload = false;
-                    now_playing.current_source_is_local = is_local;
-                    now_playing.last_known_within_track = within_seconds;
-                    // The readiness wait above gives up after 5 s, and a seek asked for before
-                    // the pipeline is ready silently does nothing — so a seek is only trusted
-                    // once `observe_position` sees it land (and re-issued if it doesn't).
-                    now_playing.seek_target_pending = within_seconds > 0.0;
-                    now_playing.seek_issued_at = (within_seconds > 0.0).then(Instant::now);
-                    now_playing.seek_retries = 0;
-                }
+            if !current(&inner) {
+                tracing::info!(%item_id, track = track_index, "discarded a superseded track load");
+                return;
             }
-            if inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.is_playing) {
+            let Some((within, speed)) = inner.now_playing.as_ref().map(|np| (np.last_known_within_track, np.speed)) else { return };
+            if (speed - 1.0).abs() > f64::EPSILON {
+                let _ = inner.backend.set_speed(speed, Duration::from_secs_f64(within));
+            } else if within > 0.0 {
+                let _ = inner.backend.seek(Duration::from_secs_f64(within));
+            }
+            let Some(now_playing) = &mut inner.now_playing else { return };
+            now_playing.last_error = None;
+            // The load above fully replaces the pipeline, so every bit of load-scoped state gets
+            // set fresh here — this is the one place a reload (self-heal, Retry), a track advance
+            // and a cross-track seek converge.
+            now_playing.needs_reload = false;
+            now_playing.loading_track = None;
+            now_playing.current_source_is_local = is_local;
+            // The readiness wait above gives up after 5 s, and a seek asked for before the
+            // pipeline is ready silently does nothing — so a seek is only trusted once
+            // `observe_position` sees it land (and re-issued if it doesn't).
+            now_playing.seek_target_pending = within > 0.0;
+            now_playing.seek_issued_at = (within > 0.0).then(Instant::now);
+            now_playing.seek_retries = 0;
+            let is_playing = now_playing.is_playing;
+            tracing::info!(%item_id, track = track_index, within, speed, local = is_local, playing = is_playing, "track loaded");
+            if is_playing {
                 let _ = inner.backend.play();
             }
             inner.publish();
@@ -895,13 +1066,19 @@ impl Inner {
     /// persist far longer than this window, or effectively forever (the Librem 5 field report
     /// this fixes: `pause()` logged success and audio kept playing, indefinitely, through the
     /// speaker).
-    fn spawn_pause_confirmation(inner_rc: Rc<RefCell<Inner>>) {
+    ///
+    /// `generation` is the load generation the pause was asked of: a load or reset since leaves
+    /// the pipeline not paused for reasons of its own, which is not this pause failing.
+    fn spawn_pause_confirmation(inner_rc: Rc<RefCell<Inner>>, generation: u64) {
         glib::spawn_future_local(async move {
             for attempt in 0..PAUSE_CONFIRM_ATTEMPTS {
                 glib::timeout_future(PAUSE_CONFIRM_INTERVAL).await;
 
                 let still_pending = {
                     let inner = inner_rc.borrow();
+                    if inner.load_generation != generation {
+                        return;
+                    }
                     let Some(now_playing) = &inner.now_playing else { return };
                     if now_playing.is_playing || now_playing.needs_reload {
                         return;
@@ -926,7 +1103,7 @@ impl Inner {
                         });
                         now_playing.needs_reload = true;
                     }
-                    inner.backend.reset();
+                    inner.reset_backend();
                     inner.publish();
                 }
             }
@@ -975,6 +1152,10 @@ impl PlayerController {
                 pool,
                 paths,
                 now_playing: None,
+                pending_start: None,
+                session_generation: 0,
+                load_generation: 0,
+                seek_count: 0,
                 listeners: vec![Box::new(mini_update)],
                 full_update: None,
                 last_progress_write: Instant::now(),
@@ -990,6 +1171,7 @@ impl PlayerController {
                 skip_forward_seconds: 30.0,
                 paused_by_unplug: false,
                 unplug_paused_at: None,
+                paused_by_call: false,
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
@@ -997,7 +1179,7 @@ impl PlayerController {
                 progress_writer: ProgressWriter::default(),
                 last_played_at: Instant::now(),
                 resume_reconcile_after: RESUME_RECONCILE_AFTER,
-                holding_writes_for_reconcile: false,
+                holding_writes_for_reconcile: None,
                 on_position_adopted: None,
                 paused_seek_generation: 0,
             })),
@@ -1128,11 +1310,13 @@ impl PlayerController {
     pub fn mark_as_finished(&self) {
         let mut inner = self.inner.borrow_mut();
         let Some(duration_seconds) = inner.now_playing.as_ref().map(|np| np.duration_seconds) else { return };
-        if inner.backend.pause().is_ok() {
-            if let Some(now_playing) = &mut inner.now_playing {
-                now_playing.is_playing = false;
-            }
+        tracing::info!("marking the current book finished");
+        inner.pause_backend_if_loaded();
+        if let Some(now_playing) = &mut inner.now_playing {
+            now_playing.is_playing = false;
         }
+        inner.paused_by_unplug = false;
+        inner.paused_by_call = false;
         inner.publish();
         inner.write_progress_at(duration_seconds, true, true);
     }
@@ -1160,51 +1344,110 @@ impl PlayerController {
     /// `PlaybackSettings::default_speed`, applied once at the start of every session (the user can
     /// change it afterwards via `set_speed`).
     pub fn start(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64) {
-        // Flush whatever was loaded before it's replaced below — otherwise switching to a new
-        // item while another is still actively playing loses up to `LOCAL_PROGRESS_WRITE_INTERVAL`'s
-        // worth of the outgoing item's progress (the only other writes are the periodic tick and
-        // an explicit `pause()`, neither of which fires on a session switch). Harmless if the
-        // outgoing item was already paused/up to date — same blind-push shape `pause()` already
-        // uses, not a new risk.
+        self.start_with(session, item, default_speed, None);
+    }
+
+    /// `start`, beginning at chapter `start_chapter` (when it exists) instead of the saved
+    /// position. The chapter is applied as part of the start, so nothing seeks a book that
+    /// isn't loaded yet.
+    ///
+    /// The previous book is stopped and dropped right away, and the new one is pending (see
+    /// [`PendingStart`]) until it has resolved and loaded. Starting the book that is already
+    /// pending only updates it. Starting the book that is already *loaded* reloads it like any
+    /// other — that is what starts a finished book over, and picks up progress from elsewhere.
+    pub fn start_with(&self, session: abs_core::auth::Session, item: PlayRequest, default_speed: f64, start_chapter: Option<usize>) {
+        let same_book = |item_id: &str, server_id: &str, account_id: &str| {
+            item_id == item.item_id && server_id == session.server_id() && account_id == session.account_id()
+        };
         {
             let mut inner = self.inner.borrow_mut();
+            if let Some(pending) = &mut inner.pending_start {
+                if same_book(&pending.item_id, &pending.server_id, &pending.account_id) {
+                    pending.wants_play = true;
+                    if start_chapter.is_some() {
+                        pending.start_chapter = start_chapter;
+                    }
+                    tracing::info!(item_id = %item.item_id, ?start_chapter, "this book is already starting");
+                    inner.publish();
+                    return;
+                }
+            }
+        }
+        let generation = {
+            let mut inner = self.inner.borrow_mut();
+            // Flush the outgoing book's position before it's dropped — otherwise switching while
+            // it plays loses up to `LOCAL_PROGRESS_WRITE_INTERVAL` of it.
             if inner.now_playing.is_some() {
                 inner.write_progress(false);
             }
-        }
+            let previous = inner.now_playing.as_ref().map(|np| np.item_id.clone());
+            inner.session_generation += 1;
+            let generation = inner.session_generation;
+            // Stops the outgoing book's audio now, and invalidates anything still on its way to
+            // the backend for it (a track load, a deferred seek).
+            inner.reset_backend();
+            inner.now_playing = None;
+            // Marks belong to the outgoing book's pause; nothing may resume this one for them.
+            inner.paused_by_unplug = false;
+            inner.paused_by_call = false;
+            inner.holding_writes_for_reconcile = None;
+            inner.pending_start = Some(PendingStart {
+                session_generation: generation,
+                item_id: item.item_id.clone(),
+                server_id: session.server_id().to_string(),
+                account_id: session.account_id().to_string(),
+                title: item.title.clone(),
+                author: item.author.clone(),
+                cover_path: None,
+                wants_play: true,
+                start_chapter,
+            });
+            tracing::info!(item_id = %item.item_id, title = %item.title, ?previous, ?start_chapter, session = generation, "starting playback");
+            inner.publish();
+            generation
+        };
         let inner_rc = self.inner.clone();
         let controller = self.clone();
         glib::spawn_future_local(async move {
+            // Every await below is followed by this check: a newer start replaces this one, and
+            // from then on nothing here may touch the backend or the player state.
+            let superseded = |inner: &Inner| {
+                let stale = !inner.pending_is(generation);
+                if stale {
+                    tracing::info!(item_id = %item.item_id, session = generation, "discarded a superseded start");
+                }
+                stale
+            };
             let (pool, paths) = {
                 let inner = inner_rc.borrow();
                 (inner.pool.clone(), inner.paths.clone())
             };
 
             // The cover the player shows is, first of all, whatever is already cached locally —
-            // the same `cover_cache_path` Home/Library render from. Seeding `now_playing` with it
-            // below (rather than starting from `None` and waiting on a fetch) is what makes the
-            // cover appear with the very first snapshot: the detached fetch task used to run
-            // *here*, but its result only landed when a matching `now_playing` already existed —
-            // so on a first play a fast cache hit was discarded (the cover stayed blank), and on
-            // a re-play it landed in the *previous* session's struct only to be wiped by this
-            // function's tail (the cover appeared, then vanished). A local DB read never delays
-            // anything, so this runs inline, and — moved ahead of the connection lookup below —
-            // is available even on the earliest failure path, so a failed start still shows the
-            // right cover next to its error rather than a blank one.
+            // the same `cover_cache_path` Home/Library render from — so it appears while the
+            // book is still resolving. The download (if any) runs once the book is loaded.
             let cached_cover = abs_core::covers::cached_cover_path(&pool, session.server_id(), &item.item_id).await;
+            {
+                let mut inner = inner_rc.borrow_mut();
+                if superseded(&inner) {
+                    return;
+                }
+                if cached_cover.is_some() {
+                    if let Some(pending) = &mut inner.pending_start {
+                        pending.cover_path = cached_cover.clone();
+                    }
+                    inner.publish();
+                }
+            }
             // Captured up front — `item` and `session` move into `NowPlaying` below, and the
             // detached cover task needs these after that.
             let item_id = item.item_id.clone();
             let server_id = session.server_id().to_string();
 
             // Builds the "nothing could start" `now_playing` shared by every early-failure branch
-            // below: same reasoning as the load-failure path further down (`now_playing` is always
-            // constructed, even on failure, so the mini bar/Full Player have something to show
-            // instead of quietly never appearing) — just for failures that happen before a
-            // `StreamTarget` even exists, so there are no tracks/chapters/duration to report.
-            // Owns its own clones (rather than borrowing `item`/`session`/`cached_cover`) so it
-            // doesn't hold a borrow across the rest of this future, which later moves each of
-            // those into the success-path `NowPlaying`.
+            // below: `now_playing` is always constructed, even on failure, so the mini bar/Full
+            // Player have something to show (with the error) instead of quietly never appearing.
+            // Owns its own clones so it doesn't hold a borrow across the rest of this future.
             let failed_now_playing = {
                 let item_id = item_id.clone();
                 let server_id = server_id.clone();
@@ -1239,16 +1482,19 @@ impl PlayerController {
                     seek_retries: 0,
                     retry_request: Some(retry_request.clone()),
                     premature_eos_at: None,
+                    loading_track: None,
                 }
             };
-            // A failed start must not leave the previous book loaded: Retry would otherwise
-            // resume *that* audio under this item's title, and every progress write from then on
-            // would record the previous book's position as this one's.
             let fail_start = {
                 let inner_rc = inner_rc.clone();
                 move |now_playing: NowPlaying| {
                     let mut inner = inner_rc.borrow_mut();
-                    inner.backend.reset();
+                    if !inner.pending_is(generation) {
+                        tracing::info!(item_id = %now_playing.item_id, session = generation, "discarded a superseded start's failure");
+                        return;
+                    }
+                    inner.reset_backend();
+                    inner.pending_start = None;
                     inner.now_playing = Some(now_playing);
                     inner.publish();
                 }
@@ -1261,15 +1507,14 @@ impl PlayerController {
             let connection = match session.connection_target().await {
                 Ok(connection) => connection,
                 Err(err) => {
-                    // Previously a bare `return`: `now_playing` stayed `None` forever, so
-                    // `main_window::start_playback`'s readiness poll just expired and Play looked
-                    // like it silently did nothing — see this fix's sibling below for the same
-                    // reasoning against the resolve failure.
                     tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
                     fail_start(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
                     return;
                 }
             };
+            if superseded(&inner_rc.borrow()) {
+                return;
+            }
 
             // Resolving the stream URL is required to proceed — unless the item can be played
             // from locally cached state instead (below). Reconciling progress is a nice-to-have
@@ -1279,6 +1524,9 @@ impl PlayerController {
                 abs_core::streaming::resolve_stream_target(&connection, &access_token, &item.item_id),
                 abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item.item_id),
             );
+            if superseded(&inner_rc.borrow()) {
+                return;
+            }
             if let Err(err) = reconcile_result {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't reconcile progress with the server; using local progress");
             }
@@ -1296,11 +1544,8 @@ impl PlayerController {
                             offline
                         }
                         Err(offline_err) => {
-                            // Previously a bare `return` here too — same silent-Play-button
-                            // symptom as the connection failure above, and the most common trigger
-                            // in practice: an expired session (`resolve_stream_target` now
-                            // distinguishes a 401/403 as `CoreError::Auth`), which nothing else
-                            // catches until Home/Library's next sync.
+                            // An expired session is the most common trigger in practice
+                            // (`resolve_stream_target` distinguishes a 401/403 as `CoreError::Auth`).
                             tracing::warn!(%err, offline = %offline_err, item_id = %item.item_id, "couldn't resolve a playable URL");
                             let kind = if matches!(err, abs_core::CoreError::Auth) {
                                 abs_player::PlaybackErrorKind::NotAuthorized
@@ -1314,14 +1559,21 @@ impl PlayerController {
                 }
             };
 
+            // A tapped chapter wins over the saved position. Read now rather than captured: the
+            // same book started again while this one resolves can change it.
+            let start_chapter = inner_rc.borrow().pending_start.as_ref().and_then(|p| p.start_chapter);
+            let chapter_start = start_chapter.and_then(|index| target.chapters.get(index)).map(|c| c.start_seconds.max(0.0));
             // Reads whatever `reconcile_item_progress` just wrote, if it succeeded — falling back
             // to this client's own last local write (or nothing) otherwise. Book-level, so it can
             // fall in any track of a multi-file item.
-            let resume_at = abs_storage::repo::progress::get(&pool, session.account_id(), session.server_id(), &item.item_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|p| resume_position(p.current_time_seconds, p.is_finished, target.duration_seconds));
+            let saved = abs_storage::repo::progress::get(&pool, session.account_id(), session.server_id(), &item.item_id).await.ok().flatten();
+            if superseded(&inner_rc.borrow()) {
+                return;
+            }
+            let resume_at = match chapter_start {
+                Some(at) => Some(at).filter(|at| *at > 0.0),
+                None => saved.and_then(|p| resume_position(p.current_time_seconds, p.is_finished, target.duration_seconds)),
+            };
 
             // A book-level resume position maps to (track, within-track) — the right file is the
             // one that gets loaded, rather than always starting from the first and trusting the
@@ -1329,12 +1581,9 @@ impl PlayerController {
             let (start_track, start_within) =
                 resume_at.map(|at| locate_track(&target.tracks, at)).unwrap_or((0, 0.0));
 
-            // Local DB write only, no network involved — inline rather than part of the
-            // `tokio::join!` above, which is reserved for concurrent network calls. (Deliberately
-            // NOT syncing tracks here: `upsert_all` deletes and re-inserts the item's track rows,
-            // and `download_tracks` cascades on that FK, so a playback-time sync would wipe
-            // existing download state. The download manager syncs tracks itself, before any
-            // download of an item that was never synced before.)
+            // Local DB write only, no network involved. (Deliberately NOT syncing tracks here:
+            // `upsert_all` deletes and re-inserts the item's track rows, and `download_tracks`
+            // cascades on that FK, so a playback-time sync would wipe existing download state.)
             if let Err(err) = abs_core::chapters::sync_item_chapters(&pool, session.server_id(), &item.item_id, &target.chapters).await {
                 tracing::warn!(%err, item_id = %item.item_id, "couldn't persist chapters locally");
             }
@@ -1346,81 +1595,96 @@ impl PlayerController {
 
             let (start_url, start_is_local) =
                 resolve_playable_url(&pool, &connection, session.server_id(), &item.item_id, &target.tracks[start_track].ino, &session).await;
+            tracing::info!(
+                item_id = %item.item_id,
+                resume_at = resume_at.unwrap_or(0.0),
+                ?start_chapter,
+                track = start_track,
+                within = start_within,
+                tracks = target.tracks.len(),
+                duration = target.duration_seconds,
+                local = start_is_local,
+                "resolved; loading"
+            );
 
-            let load_result = {
+            let load = {
                 let mut inner = inner_rc.borrow_mut();
+                if superseded(&inner) {
+                    return;
+                }
                 // As in `spawn_load_track`: transport properties go on before the load, so the
                 // HTTP source created during it is set up with the connection's settings.
                 inner.backend.apply_connection(&playback_properties(&connection));
-                inner.backend.load(&start_url)
+                let load_generation = inner.begin_load();
+                inner.backend.load(&start_url).map(|()| load_generation)
             };
 
             // Everything needed to show this item (title/author/cover/duration/chapters) is
             // already resolved above regardless of whether the load below succeeds — so
-            // `now_playing` is always constructed, even on a load failure, rather than bailing out
-            // silently. That used to leave `now_playing` (and `current_download_context()`,
-            // `main_window`'s `start_playback` polls on exactly that) `None` forever whenever the
-            // audio engine couldn't come up at all (e.g. no GStreamer plugins for this format, no
-            // PulseAudio/PipeWire) — the Full Player screen would then never open at all, and
-            // tapping Play looked like it silently did nothing. Constructing `now_playing` with
-            // `last_error` set instead means the screen opens showing the real item info plus why
-            // it isn't playing, exactly like a mid-playback failure does once one is already open.
-            let (is_playing, applied_speed, last_error) = match load_result {
-                Ok(()) => {
+            // `now_playing` is always constructed, even on a load failure (e.g. no GStreamer
+            // plugins for this format, no PulseAudio/PipeWire), with `last_error` saying why.
+            let (loaded, applied_speed, last_error) = match load {
+                Ok(load_generation) => {
                     // A seek needs the pipeline to have actually *reached* PAUSED, not just been
-                    // asked to — pausing is itself an async state change, and for a
-                    // network-streamed source (connecting, buffering) it can take a real moment.
-                    // Requesting the seek before that lands is not an error `AudioBackend`
-                    // reports; it silently no-ops, which used to mean "resume mid-book" quietly
-                    // resumed from 0 instead.
+                    // asked to — for a network-streamed source (connecting, buffering) that can
+                    // take a real moment, and a seek asked for before then silently does nothing.
                     let _ = inner_rc.borrow_mut().backend.pause();
-                    // A non-default speed also needs a seek internally (`AudioBackend::set_speed`
-                    // is implemented as a seek-with-rate, GStreamer having no rate-only call), so
-                    // it has the same readiness requirement as the resume seek below.
+                    // A non-default speed is itself a seek-with-rate, with the same requirement.
                     let needs_seek_ready = start_within > 0.0 || (default_speed - 1.0).abs() > f64::EPSILON;
                     if needs_seek_ready {
-                        // `duration()` can come back `Some` from container metadata alone, before
-                        // the pipeline has actually finished prerolling into `PAUSED` — which is
-                        // what seeking actually requires. `position()` only starts returning a
-                        // value once preroll has genuinely completed, so it's the more accurate
-                        // "ready to seek" signal.
+                        // `position()` only starts returning a value once preroll has genuinely
+                        // completed (unlike `duration()`, which container metadata alone can
+                        // answer), so it's the accurate "ready to seek" signal.
                         for _ in 0..50 {
-                            if inner_rc.borrow().backend.position().is_some() {
-                                break;
+                            {
+                                let inner = inner_rc.borrow();
+                                if superseded(&inner) || inner.load_generation != load_generation {
+                                    return;
+                                }
+                                if inner.backend.position().is_some() {
+                                    break;
+                                }
                             }
                             glib::timeout_future(Duration::from_millis(100)).await;
                         }
                     }
 
                     let mut inner = inner_rc.borrow_mut();
-                    if start_within > 0.0 {
-                        let _ = inner.backend.seek(Duration::from_secs_f64(start_within));
+                    if superseded(&inner) || inner.load_generation != load_generation {
+                        return;
                     }
-                    // `set_speed` is itself a seek-with-rate (see `abs-player`'s own doc comment)
-                    // — even setting it to the already-default 1.0 would perform a redundant seek
-                    // that queries `position()` and re-seeks to it, which can race the resume seek
-                    // just above (if the resume seek's position update hasn't propagated yet, this
-                    // would re-seek back to the stale pre-resume position). Skip it entirely when
-                    // there's nothing to change.
+                    // One call for position and rate together (see `AudioBackend::set_speed`).
                     let applied_speed = if (default_speed - 1.0).abs() > f64::EPSILON {
-                        if inner.backend.set_speed(default_speed).is_ok() { default_speed } else { 1.0 }
+                        if inner.backend.set_speed(default_speed, Duration::from_secs_f64(start_within)).is_ok() { default_speed } else { 1.0 }
                     } else {
+                        if start_within > 0.0 {
+                            let _ = inner.backend.seek(Duration::from_secs_f64(start_within));
+                        }
                         1.0
                     };
-                    let _ = inner.backend.play();
                     (true, applied_speed, None)
                 }
                 Err(err) => {
-                    tracing::warn!(%err, "couldn't load the audio stream");
+                    tracing::warn!(%err, item_id = %item.item_id, "couldn't load the audio stream");
+                    let mut inner = inner_rc.borrow_mut();
+                    if superseded(&inner) {
+                        return;
+                    }
                     // Nothing was successfully set up on the backend — release it rather than
-                    // leave a half-loaded pipeline sitting on the audio server (see
-                    // `AudioBackend::reset`'s doc comment).
-                    inner_rc.borrow_mut().backend.reset();
+                    // leave a half-loaded pipeline sitting on the audio server.
+                    inner.reset_backend();
                     (false, 1.0, Some(abs_player::PlaybackError::from(&err)))
                 }
             };
 
             let mut inner = inner_rc.borrow_mut();
+            // Play only if nothing paused it while it resolved: the user, an unplug, a call.
+            let wants_play = inner.pending_start.take().is_some_and(|p| p.wants_play);
+            let is_playing = loaded && wants_play;
+            if is_playing {
+                let _ = inner.backend.play();
+            }
+            tracing::info!(item_id = %item.item_id, loaded, playing = is_playing, speed = applied_speed, "playback ready");
             inner.now_playing = Some(NowPlaying {
                 item_id: item.item_id,
                 server_id: session.server_id().to_string(),
@@ -1436,10 +1700,6 @@ impl PlayerController {
                 chapters,
                 speed: applied_speed,
                 sleep_timer: SleepTimerState::Off,
-                // Seeded from the local cover cache (read at the top of `start()`), so the very
-                // first snapshot already shows the same cover Home/Library do. Only the detached
-                // task below ever replaces it, and only with a valid, different downloaded
-                // cover — a failed fetch simply leaves the cached one in place.
                 cover_path: cached_cover,
                 last_error,
                 last_known_within_track: start_within,
@@ -1447,36 +1707,27 @@ impl PlayerController {
                 // for before the pipeline can take it silently does nothing — playback would then
                 // run from the track's start and save that over the real position. The resume
                 // seek is only trusted once `observe_position` sees it land.
-                seek_target_pending: is_playing && start_within > 0.0,
-                seek_issued_at: (is_playing && start_within > 0.0).then(Instant::now),
+                seek_target_pending: loaded && start_within > 0.0,
+                seek_issued_at: (loaded && start_within > 0.0).then(Instant::now),
                 seek_retries: 0,
                 retry_request: None,
                 premature_eos_at: None,
-                // `is_playing`/`last_error` above already reflect a load failure; `needs_reload`
-                // mirrors that a load failure did (see the `Err` arm just above), so the very
-                // first Retry goes through the reload path rather than a plain `set_state`.
-                needs_reload: !is_playing,
+                // A load failure leaves nothing loaded, so the first Retry reloads.
+                needs_reload: !loaded,
+                loading_track: None,
             });
             inner.last_progress_write = Instant::now();
             inner.last_played_at = Instant::now();
-            inner.holding_writes_for_reconcile = false;
             inner.publish();
             drop(inner);
             if is_playing {
                 controller.ensure_ticking();
             }
 
-            // The cover fetch, spawned only now that it can't race `now_playing` into existence.
-            // Still detached from anything time-critical (its own timeout only bounds a slow
-            // server — it must never gate the first note), and it runs on the GTK main loop
-            // (`spawn_future_local`, not `tokio::spawn`): it holds `Rc`s and borrows main-loop
-            // state, and the reqwest-driven fetch works because main.rs keeps the Tokio runtime
-            // entered for the GTK loop's lifetime — the same shape as every other future in this
-            // file. The snapshot was seeded from the local cache above, so this only ever
-            // *replaces* it: a fetch failure changes nothing (the cached cover stays), and a
-            // success replaces only a *different* path — a cache hit re-returns the seeded path,
-            // and republishing it would make every listener react to a no-op (CoverImage
-            // short-circuits same-path calls, but MPRIS would still re-notify).
+            // The cover download, spawned only now that it can't race `now_playing` into
+            // existence, and never gating the first note. It only ever *replaces* the cached
+            // cover the snapshot was seeded with: a failure changes nothing, and the same path
+            // again (a cache hit) isn't republished.
             {
                 let inner_rc = inner_rc.clone();
                 let pool = pool.clone();
@@ -1490,14 +1741,15 @@ impl PlayerController {
                         return;
                     };
                     let mut inner = inner_rc.borrow_mut();
+                    if inner.session_generation != generation {
+                        return;
+                    }
                     match &mut inner.now_playing {
                         Some(now_playing)
                             if now_playing.item_id == item_id && now_playing.cover_path.as_deref() != Some(cover_path.as_path()) =>
                         {
                             now_playing.cover_path = Some(cover_path);
                         }
-                        // Same cover as already shown (cache hit), playback ended, or switched
-                        // items while the fetch was in flight — nothing to publish.
                         _ => return,
                     }
                     inner.publish();
@@ -1507,6 +1759,16 @@ impl PlayerController {
     }
 
     pub fn play(&self) {
+        // A book still resolving plays once it's loaded.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(pending) = &mut inner.pending_start {
+                pending.wants_play = true;
+                tracing::info!(item_id = %pending.item_id, "play: will start once loaded");
+                inner.publish();
+                return;
+            }
+        }
         // A start that failed before anything resolved has nothing loaded to resume — run the
         // start again (see `NowPlaying::retry_request`).
         let restart = self.inner.borrow().now_playing.as_ref().and_then(|np| {
@@ -1514,11 +1776,23 @@ impl PlayerController {
             Some((np.session.clone(), request, default_speed))
         });
         if let Some((session, request, default_speed)) = restart {
+            tracing::info!(item_id = %request.item_id, "play: retrying a start that failed");
             self.start(session, request, default_speed);
             return;
         }
         self.reconcile_before_resuming();
         let mut inner = self.inner.borrow_mut();
+        let position = inner.book_position();
+        let Some(now_playing) = &mut inner.now_playing else { return };
+        tracing::info!(item_id = %now_playing.item_id, position, "play");
+        // A track load in flight applies `is_playing` itself once the file is ready.
+        if now_playing.loading_track.is_some() {
+            now_playing.is_playing = true;
+            inner.publish();
+            drop(inner);
+            self.ensure_ticking();
+            return;
+        }
         // The backend was released (`AudioBackend::reset`) after a stream error or a failed
         // load left nothing loaded to simply resume — GStreamer never recovers a pipeline from
         // an error state without a fresh `load()`. Reload the current track from the last
@@ -1526,17 +1800,20 @@ impl PlayerController {
         // resume path (this method) — the banner's Retry, MPRIS `Play`/`PlayPause`, a headphone
         // replug, a plain re-tap of the play button — funnels through here, so all of them
         // recover the same way, rather than each needing its own reload logic.
-        if inner.now_playing.as_ref().is_some_and(|np| np.needs_reload) {
-            let Some(now_playing) = &mut inner.now_playing else { return };
+        if now_playing.needs_reload {
             now_playing.is_playing = true;
             now_playing.last_error = None;
             let item_id = now_playing.item_id.clone();
             let track_index = now_playing.current_track;
             let within = now_playing.last_known_within_track;
+            tracing::info!(%item_id, track = track_index, within, "reloading the track to resume");
+            let generation = inner.prepare_track_load(track_index, within);
             inner.publish();
             drop(inner);
             self.ensure_ticking();
-            Inner::spawn_load_track(self.inner.clone(), item_id, track_index, within);
+            if let Some(generation) = generation {
+                Inner::spawn_load_track(self.inner.clone(), item_id, generation);
+            }
             return;
         }
         let started = match inner.backend.play() {
@@ -1547,18 +1824,16 @@ impl PlayerController {
                 }
                 true
             }
-            // A synchronous failure here means the pipeline itself is broken (e.g. a prior load
-            // failed and left `now_playing` in the error state `start()`/`spawn_load_track` build
-            // — see their own doc comments) — this is the retry path a banner's "Retry" action and
-            // a plain re-tap of Play both go through, so it must also (re-)populate `last_error`
-            // rather than silently doing nothing, which is what made a broken Play button
-            // indistinguishable from a working one before this existed.
+            // A synchronous failure here means the pipeline itself is broken — this is the retry
+            // path a banner's "Retry" action and a plain re-tap of Play both go through, so it
+            // must also (re-)populate `last_error` rather than silently doing nothing.
             Err(err) => {
+                tracing::warn!(%err, "backend.play() failed; resetting the pipeline and marking it for reload");
                 if let Some(now_playing) = &mut inner.now_playing {
                     now_playing.last_error = Some((&err).into());
                     now_playing.needs_reload = true;
                 }
-                inner.backend.reset();
+                inner.reset_backend();
                 false
             }
         };
@@ -1572,16 +1847,22 @@ impl PlayerController {
     /// When playback resumes after a long pause, another device may have moved this book on
     /// meanwhile (the mini bar keeps a paused book loaded for days). Resuming here without
     /// checking would carry on from the old position and push it over the newer one. So playback
-    /// starts right away, and in parallel the server's copy is fetched: if it is newer and
-    /// elsewhere, playback jumps there and `on_position_adopted` is told, so the shell can offer
-    /// Undo. Position writes are held until the check resolves.
+    /// starts right away, and in parallel the server's copy is fetched: if it is elsewhere and
+    /// isn't simply this device's own last write, playback jumps there and `on_position_adopted`
+    /// is told, so the shell can offer Undo. Position writes are held until the check resolves.
+    ///
+    /// The local row may already hold the newer server value before this runs — Home and Library
+    /// pull progress from the server on their own — so what counts is whether the reconciled value
+    /// is this device's own, not whether it changed during this check.
     fn reconcile_before_resuming(&self) {
-        let (pool, session, account_id, server_id, item_id, from) = {
+        let (pool, session, account_id, server_id, item_id, from, generation, seek_count) = {
             let mut inner = self.inner.borrow_mut();
             let due = inner.last_played_at.elapsed() >= inner.resume_reconcile_after;
             let from = inner.book_position();
+            let generation = inner.session_generation;
+            let seek_count = inner.seek_count;
             let Some(now_playing) = &inner.now_playing else { return };
-            if now_playing.is_playing || now_playing.tracks.is_empty() || !due || inner.holding_writes_for_reconcile {
+            if now_playing.is_playing || now_playing.tracks.is_empty() || !due || inner.holding_writes_for_reconcile.is_some() {
                 return;
             }
             let context = (
@@ -1591,13 +1872,14 @@ impl PlayerController {
                 now_playing.server_id.clone(),
                 now_playing.item_id.clone(),
                 from,
+                generation,
+                seek_count,
             );
-            inner.holding_writes_for_reconcile = true;
+            inner.holding_writes_for_reconcile = Some(generation);
             context
         };
         let controller = self.clone();
         glib::spawn_future_local(async move {
-            let before = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
             let reconciled = match session.connection_target().await {
                 Ok(connection) => {
                     let access_token = session.access_token().await;
@@ -1606,27 +1888,29 @@ impl PlayerController {
                 Err(err) => Err(err),
             };
             let after = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
-            let adopt_to = match (&reconciled, &before, &after) {
-                (Ok(()), before, Some(after))
-                    if !after.is_finished
-                        && before.as_ref().is_none_or(|b| b.current_time_seconds != after.current_time_seconds || b.is_finished != after.is_finished)
-                        && (after.current_time_seconds - from).abs() > ADOPT_SERVER_POSITION_MIN_DELTA_SECONDS =>
+            if let Err(err) = &reconciled {
+                tracing::info!(%err, item_id = %item_id, "couldn't check the server for newer progress before resuming");
+            }
+            let (still_current, seeked_since, own_write) = {
+                let mut inner = controller.inner.borrow_mut();
+                if inner.holding_writes_for_reconcile == Some(generation) {
+                    inner.holding_writes_for_reconcile = None;
+                }
+                let still_current = inner.session_generation == generation && inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id);
+                let own_write = after.as_ref().is_some_and(|a| inner.progress_writer.is_written_locally(&item_id, a.current_time_seconds, a.is_finished));
+                (still_current, inner.seek_count != seek_count, own_write)
+            };
+            if !still_current {
+                return;
+            }
+            let adopt_to = match (&reconciled, &after) {
+                (Ok(()), Some(after))
+                    if !after.is_finished && !own_write && !seeked_since && (after.current_time_seconds - from).abs() > ADOPT_SERVER_POSITION_MIN_DELTA_SECONDS =>
                 {
                     Some(after.current_time_seconds)
                 }
                 _ => None,
             };
-            if let Err(err) = &reconciled {
-                tracing::info!(%err, item_id = %item_id, "couldn't check the server for newer progress before resuming");
-            }
-            let still_current = {
-                let mut inner = controller.inner.borrow_mut();
-                inner.holding_writes_for_reconcile = false;
-                inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id)
-            };
-            if !still_current {
-                return;
-            }
             match adopt_to {
                 Some(to) => {
                     tracing::info!(item_id = %item_id, from, to, "resuming from newer progress made on another device");
@@ -1711,9 +1995,22 @@ impl PlayerController {
     pub fn pause(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.paused_by_unplug = false;
+        inner.paused_by_call = false;
+        // A book still resolving stays paused once it's loaded.
+        if let Some(pending) = &mut inner.pending_start {
+            pending.wants_play = false;
+            tracing::info!(item_id = %pending.item_id, "pause: will stay paused once loaded");
+            inner.publish();
+            return;
+        }
+        let position = inner.book_position();
+        if let Some(now_playing) = &inner.now_playing {
+            tracing::info!(item_id = %now_playing.item_id, position, "pause");
+        }
         // Nothing is loaded to pause once `needs_reload` is set (the backend was already
-        // released) — just record the intent; the next `play()` goes through the reload path.
-        if inner.now_playing.as_ref().is_some_and(|np| np.needs_reload) {
+        // released), nor while a track load is in flight — just record the intent; the next
+        // `play()` goes through the reload path, and a load applies `is_playing` itself.
+        if inner.now_playing.as_ref().is_some_and(|np| np.needs_reload || np.loading_track.is_some()) {
             if let Some(now_playing) = &mut inner.now_playing {
                 now_playing.is_playing = false;
             }
@@ -1726,7 +2023,7 @@ impl PlayerController {
                     // `Ok` here only means GStreamer accepted the request, not that the pipeline
                     // has actually reached `Paused` — see `AudioBackend::pause`'s doc comment.
                     // Confirms it did, or recovers if it never does.
-                    Inner::spawn_pause_confirmation(self.inner.clone());
+                    Inner::spawn_pause_confirmation(self.inner.clone(), inner.load_generation);
                 }
                 Err(err) => {
                     tracing::warn!(%err, "backend.pause() failed; resetting the pipeline and marking it for reload");
@@ -1742,7 +2039,7 @@ impl PlayerController {
                         now_playing.last_error = Some((&err).into());
                         now_playing.needs_reload = true;
                     }
-                    inner.backend.reset();
+                    inner.reset_backend();
                 }
             }
         }
@@ -1868,10 +2165,12 @@ impl PlayerController {
         // route changed" line has confirmed the event was even delivered.
         match event {
             abs_player::route_watch::RouteEvent::Unplugged => {
-                let (pause_on_unplug, has_now_playing, is_playing) = {
+                let (pause_on_unplug, intent) = {
                     let inner = self.inner.borrow();
-                    (inner.pause_on_unplug, inner.now_playing.is_some(), inner.now_playing.as_ref().is_some_and(|np| np.is_playing))
+                    (inner.pause_on_unplug, inner.playing_intent())
                 };
+                let has_now_playing = intent.is_some();
+                let is_playing = intent == Some(true);
                 if !pause_on_unplug {
                     tracing::info!("headphone unplug ignored: \"pause when headphones disconnect\" is off");
                     return;
@@ -1897,7 +2196,7 @@ impl PlayerController {
             abs_player::route_watch::RouteEvent::Replugged => {
                 let (resume_on_replug, paused_by_unplug, is_paused) = {
                     let inner = self.inner.borrow();
-                    (inner.resume_on_replug, inner.paused_by_unplug, inner.now_playing.as_ref().is_some_and(|np| !np.is_playing))
+                    (inner.resume_on_replug, inner.paused_by_unplug, inner.playing_intent() == Some(false))
                 };
                 if !resume_on_replug {
                     tracing::info!("headphone replug ignored: \"resume when headphones reconnect\" is off");
@@ -1914,6 +2213,71 @@ impl PlayerController {
                 self.inner.borrow_mut().paused_by_unplug = false;
                 self.play();
                 tracing::info!("resumed for headphone replug");
+            }
+        }
+    }
+
+    /// Reacts to `abs_player::call_watch` events: a call starting to ring (or dial) pauses —
+    /// right away, not only once it's picked up; an incoming call that ends without ever being
+    /// answered (rejected, missed, the caller gave up) resumes, but **only** if that call's own
+    /// pause is still the reason playback is paused; a call that was answered, or one this phone
+    /// placed, never resumes anything — the user picks the book back up themselves once they're
+    /// off the phone.
+    pub fn handle_call_event(&self, event: abs_player::call_watch::CallEvent) {
+        // Every branch logs its decision, like `handle_route_event` — `call_watch`'s own "phone
+        // call event" line confirms the event was delivered, this says what came of it.
+        use abs_player::call_watch::CallEvent;
+        match event {
+            CallEvent::Started { incoming } => {
+                let kind = if incoming { "incoming" } else { "outgoing" };
+                let intent = self.inner.borrow().playing_intent();
+                let (has_now_playing, is_playing) = (intent.is_some(), intent == Some(true));
+                if !has_now_playing {
+                    tracing::info!(kind, "phone call ignored: nothing is loaded");
+                    return;
+                }
+                if !is_playing {
+                    tracing::info!(kind, "phone call ignored: already paused");
+                    return;
+                }
+                // `pause()` clears the mark (it's the generic pause path); the call then
+                // re-marks it as *its* pause.
+                self.pause();
+                self.inner.borrow_mut().paused_by_call = true;
+                tracing::info!(kind, "paused for phone call");
+            }
+            CallEvent::Answered => {
+                let was_marked = std::mem::replace(&mut self.inner.borrow_mut().paused_by_call, false);
+                if was_marked {
+                    tracing::info!("phone call answered; playback will stay paused after it ends");
+                } else {
+                    tracing::info!("phone call answered");
+                }
+            }
+            CallEvent::Ended { answered, outgoing } => {
+                let (paused_by_call, is_paused) = {
+                    let mut inner = self.inner.borrow_mut();
+                    let is_paused = inner.playing_intent() == Some(false);
+                    (std::mem::replace(&mut inner.paused_by_call, false), is_paused)
+                };
+                if answered {
+                    tracing::info!("phone call ended after being answered; not resuming");
+                    return;
+                }
+                if outgoing {
+                    tracing::info!("outgoing phone call ended; not resuming");
+                    return;
+                }
+                if !paused_by_call {
+                    tracing::info!("unanswered phone call ended; not resuming: the current pause (if any) wasn't caused by the call");
+                    return;
+                }
+                if !is_paused {
+                    tracing::info!("unanswered phone call ended; not resuming: not paused");
+                    return;
+                }
+                self.play();
+                tracing::info!("resumed after an unanswered phone call");
             }
         }
     }
@@ -1935,7 +2299,7 @@ impl PlayerController {
     pub fn external_play_pause(&self) {
         let since_unplug_pause = {
             let inner = self.inner.borrow();
-            let paused = inner.now_playing.as_ref().is_some_and(|np| !np.is_playing);
+            let paused = inner.playing_intent() == Some(false);
             if paused && inner.paused_by_unplug {
                 inner.unplug_paused_at.map(|at| at.elapsed())
             } else {
@@ -1953,7 +2317,9 @@ impl PlayerController {
     }
 
     pub fn toggle_play_pause(&self) {
-        let is_playing = self.snapshot().map(|s| s.is_playing).unwrap_or(false);
+        // The intent, not what's audible: a book still loading counts as playing if it will
+        // play once loaded, so the button that shows "pause" pauses it.
+        let is_playing = self.inner.borrow().playing_intent().unwrap_or(false);
         if is_playing {
             self.pause();
         } else {
@@ -1966,13 +2332,16 @@ impl PlayerController {
             let inner = self.inner.borrow();
             let Some(now_playing) = &inner.now_playing else { return };
             let current = inner.book_position();
-            (current + delta_seconds).clamp(0.0, now_playing.duration_seconds)
+            clamp_to_book(current + delta_seconds, now_playing.duration_seconds)
         };
         self.seek_to_seconds(target);
     }
 
     pub fn seek_fraction(&self, fraction: f64) {
         let Some(duration_seconds) = self.inner.borrow().now_playing.as_ref().map(|np| np.duration_seconds) else { return };
+        if duration_seconds <= 0.0 {
+            return;
+        }
         self.seek_to_seconds(fraction.clamp(0.0, 1.0) * duration_seconds);
     }
 
@@ -1984,64 +2353,74 @@ impl PlayerController {
     pub fn seek_to_seconds(&self, seconds: f64) {
         let plan = {
             let mut inner = self.inner.borrow_mut();
+            let from = inner.book_position();
+            let load_generation = inner.load_generation;
             let Some(now_playing) = &mut inner.now_playing else { return };
-            let target = seconds.clamp(0.0, now_playing.duration_seconds);
+            // A start that failed before anything resolved has nothing to seek in.
+            if now_playing.tracks.is_empty() {
+                tracing::info!(item_id = %now_playing.item_id, "seek ignored: nothing is loaded");
+                return;
+            }
+            let target = clamp_to_book(seconds, now_playing.duration_seconds);
             let (track_index, within) = locate_track(&now_playing.tracks, target);
+            let cross_track = track_index != now_playing.current_track;
+            tracing::info!(item_id = %now_playing.item_id, from, to = target, track = track_index, within, cross_track, "seek");
+            // An end-of-chapter sleep timer follows the listener to the chapter they're now in.
+            if let SleepTimerState::Armed(SleepTimerDeadline::Position(_)) = now_playing.sleep_timer {
+                let end = chapter_end_at(&now_playing.chapters, target).unwrap_or(now_playing.duration_seconds);
+                now_playing.sleep_timer = SleepTimerState::Armed(SleepTimerDeadline::Position(end));
+            }
             // Set before the seek/reload below even starts — see `book_position`'s doc comment:
             // a `FLUSH` seek on a streamed file has no reported position until the new HTTP
             // response arrives (seconds, or forever on a dead connection), and without this,
             // every tick/progress-write in that window would misread the position as "start of
             // the current track" rather than the position just requested.
             now_playing.last_known_within_track = within;
-            if track_index == now_playing.current_track {
+            let plan = if !cross_track {
                 // Marks the position as unconfirmed until `observe_position` sees the backend
                 // actually agree with `within` — covers both a real network seek's stall and
                 // (for the non-local branch below) the brief async gap before that seek is even
-                // issued. Cleared by `observe_position`, or by a reload superseding this seek
-                // entirely (`spawn_load_track` sets it back to `false` once its own readiness
-                // wait confirms the *new* pipeline's position).
+                // issued.
                 now_playing.seek_target_pending = true;
                 now_playing.seek_retries = 0;
-                if now_playing.current_source_is_local {
+                if now_playing.loading_track.is_some() || now_playing.needs_reload {
+                    // Nothing usable is loaded: the load in flight (or the next play's reload)
+                    // starts at `last_known_within_track`, which now holds this target.
+                    now_playing.seek_issued_at = None;
+                    None
+                } else if now_playing.current_source_is_local {
                     now_playing.seek_issued_at = Some(Instant::now());
                     let _ = inner.backend.seek(Duration::from_secs_f64(within));
-                    inner.publish();
                     None
                 } else {
                     // A download may have completed since this track started streaming — worth
-                    // a quick check before committing to another network seek (see this plan's
-                    // section E). The check itself is async (a cheap local DB read), so it's
-                    // resolved just below rather than blocking this call.
+                    // a quick check before committing to another network seek. The check itself
+                    // is async (a cheap local DB read), so it's resolved just below rather than
+                    // blocking this call.
                     now_playing.seek_issued_at = None;
-                    let plan = SeekPlan::MaybeLocalNow {
+                    Some(SeekPlan::MaybeLocalNow {
                         item_id: now_playing.item_id.clone(),
                         server_id: now_playing.server_id.clone(),
                         track_index,
-                        within,
                         ino: now_playing.tracks.get(track_index).map(|t| t.ino.clone()),
-                    };
-                    inner.publish();
-                    Some(plan)
+                        load_generation,
+                    })
                 }
             } else {
-                now_playing.current_track = track_index;
-                // Until `spawn_load_track` swaps files, the backend still reports the old file's
-                // position, which read against the new track's offset is meaningless.
-                now_playing.seek_target_pending = true;
-                now_playing.seek_issued_at = None;
-                now_playing.seek_retries = 0;
                 let item_id = now_playing.item_id.clone();
-                inner.publish();
-                Some(SeekPlan::CrossTrack { item_id, track_index, within })
-            }
+                inner.prepare_track_load(track_index, within).map(|generation| SeekPlan::CrossTrack { item_id, generation })
+            };
+            inner.seek_count += 1;
+            inner.publish();
+            plan
         };
         self.save_paused_seek_later();
         match plan {
             None => {}
-            Some(SeekPlan::CrossTrack { item_id, track_index, within }) => {
-                Inner::spawn_load_track(self.inner.clone(), item_id, track_index, within);
+            Some(SeekPlan::CrossTrack { item_id, generation }) => {
+                Inner::spawn_load_track(self.inner.clone(), item_id, generation);
             }
-            Some(SeekPlan::MaybeLocalNow { item_id, server_id, track_index, within, ino }) => {
+            Some(SeekPlan::MaybeLocalNow { item_id, server_id, track_index, ino, load_generation }) => {
                 let inner_rc = self.inner.clone();
                 glib::spawn_future_local(async move {
                     let pool = inner_rc.borrow().pool.clone();
@@ -2049,24 +2428,29 @@ impl PlayerController {
                         Some(ino) => abs_core::download_tracks::local_track_path(&pool, &server_id, &item_id, ino).await.is_some(),
                         None => false,
                     };
+                    let mut inner = inner_rc.borrow_mut();
+                    // Still the same pipeline, book and track this seek was for — anything that
+                    // loaded or released the backend meanwhile makes this seek stale, and a stale
+                    // seek must never land on a pipeline that has since moved on.
+                    let still_current = inner.load_generation == load_generation
+                        && inner.now_playing.as_ref().is_some_and(|np| np.item_id == item_id && np.current_track == track_index);
+                    if !still_current {
+                        return;
+                    }
+                    // The newest target, not this seek's own: a later seek may have been asked
+                    // for while this check ran.
+                    let Some(within) = inner.now_playing.as_ref().map(|np| np.last_known_within_track) else { return };
                     if has_local {
-                        Inner::spawn_load_track(inner_rc, item_id, track_index, within);
-                    } else {
-                        // Still the same track/item this seek was for — a fast follow-up seek or
-                        // a source change could have raced this check, and a stale seek must
-                        // never land on a pipeline that has since moved on.
-                        let still_current = inner_rc
-                            .borrow()
-                            .now_playing
-                            .as_ref()
-                            .is_some_and(|np| np.item_id == item_id && np.current_track == track_index);
-                        if still_current {
-                            let mut inner = inner_rc.borrow_mut();
-                            if let Some(now_playing) = &mut inner.now_playing {
-                                now_playing.seek_issued_at = Some(Instant::now());
-                            }
-                            let _ = inner.backend.seek(Duration::from_secs_f64(within));
+                        tracing::info!(%item_id, track = track_index, "a download finished since this track started streaming; switching to it");
+                        if let Some(generation) = inner.prepare_track_load(track_index, within) {
+                            drop(inner);
+                            Inner::spawn_load_track(inner_rc, item_id, generation);
                         }
+                    } else {
+                        if let Some(now_playing) = &mut inner.now_playing {
+                            now_playing.seek_issued_at = Some(Instant::now());
+                        }
+                        let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     }
                 });
             }
@@ -2075,9 +2459,23 @@ impl PlayerController {
 
     /// Changes the playback rate. Only updates the reported speed if the backend actually
     /// accepted it, matching `play()`/`pause()`'s existing "state reflects reality" pattern.
+    ///
+    /// The backend is handed the position this controller knows to be right (a pending seek's
+    /// target included) rather than asked for its own, which can be stale or missing right
+    /// after a seek. With no usable pipeline (a track load in flight, or released after an
+    /// error), only the speed is recorded; the load applies it.
     pub fn set_speed(&self, speed: f64) {
         let mut inner = self.inner.borrow_mut();
-        if inner.backend.set_speed(speed).is_ok() {
+        let holds_track = inner.backend_holds_track();
+        let Some(now_playing) = &inner.now_playing else { return };
+        let within = if now_playing.seek_target_pending {
+            now_playing.last_known_within_track
+        } else {
+            inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(now_playing.last_known_within_track)
+        };
+        tracing::info!(item_id = %now_playing.item_id, speed, "speed");
+        let accepted = !holds_track || inner.backend.set_speed(speed, Duration::from_secs_f64(within)).is_ok();
+        if accepted {
             if let Some(now_playing) = &mut inner.now_playing {
                 now_playing.speed = speed;
             }
@@ -2113,12 +2511,10 @@ impl PlayerController {
         let mut inner = self.inner.borrow_mut();
         let position = inner.book_position();
         let Some(now_playing) = &mut inner.now_playing else { return };
-        let end = now_playing
-            .chapters
-            .iter()
-            .find(|c| c.start_seconds <= position && position < c.end_seconds)
-            .map(|c| c.end_seconds)
-            .unwrap_or(now_playing.duration_seconds);
+        if now_playing.tracks.is_empty() {
+            return;
+        }
+        let end = chapter_end_at(&now_playing.chapters, position).unwrap_or(now_playing.duration_seconds);
         now_playing.sleep_timer = SleepTimerState::Armed(SleepTimerDeadline::Position(end));
         inner.publish();
     }
@@ -2166,7 +2562,10 @@ impl PlayerController {
                     if let Some((item_id, next_track)) = inner.next_track_after_end_of_stream() {
                         // The next file exists — keep going. The load happens on the main loop
                         // (see `spawn_load_track`); the state machine has already moved on.
-                        Inner::spawn_load_track(self.inner.clone(), item_id, next_track, 0.0);
+                        tracing::info!(%item_id, track = next_track, "file ended; moving on to the next one");
+                        if let Some(generation) = inner.prepare_track_load(next_track, 0.0) {
+                            Inner::spawn_load_track(self.inner.clone(), item_id, generation);
+                        }
                         // `spawn_load_track` hasn't run `backend.load()` yet — the backend still
                         // reports the *old* pipeline's position, which `book_position()` would
                         // now misattribute to the new (already-bumped) `current_track`'s offset,
@@ -2180,12 +2579,15 @@ impl PlayerController {
                         // next file is about to load) — keep the timer running.
                         return true;
                     } else {
-                        let _ = inner.backend.pause();
+                        tracing::info!("reached the end of the book");
+                        inner.pause_backend_if_loaded();
                         if let Some(now_playing) = &mut inner.now_playing {
                             now_playing.is_playing = false;
                         }
-                        // End-of-book is not an unplug pause — a replug must not revive it.
+                        // End-of-book is not an unplug pause — a replug must not revive it
+                        // (nor a call ending).
                         inner.paused_by_unplug = false;
+                        inner.paused_by_call = false;
                         inner.write_progress(true);
                     }
                 }
@@ -2197,7 +2599,8 @@ impl PlayerController {
                     // Librem 5 field report (a broken pipeline was previously left holding the
                     // audio device across every failed Retry).
                     let position = inner.book_position();
-                    inner.backend.reset();
+                    inner.reset_backend();
+                    let load_generation = inner.load_generation;
 
                     // Everything a possible recovery needs, captured while `now_playing` is
                     // still borrowed — `err` travels inside `Recovery` rather than as a bare
@@ -2247,6 +2650,7 @@ impl PlayerController {
                         }
                     };
                     inner.paused_by_unplug = false;
+                    inner.paused_by_call = false;
                     inner.write_progress(false);
 
                     if let Some(recovery) = recovery {
@@ -2259,15 +2663,24 @@ impl PlayerController {
                                     .is_some(),
                                 None => false,
                             };
+                            let mut inner = inner_rc.borrow_mut();
+                            // Anything that loaded or released the backend since (a Retry, a
+                            // seek, another book) has taken over from this recovery.
+                            if inner.load_generation != load_generation
+                                || inner.now_playing.as_ref().is_none_or(|np| np.item_id != recovery.item_id)
+                            {
+                                return;
+                            }
                             if has_local {
-                                Inner::spawn_load_track(inner_rc, recovery.item_id, recovery.track_index, recovery.within);
+                                tracing::info!(item_id = %recovery.item_id, track = recovery.track_index, "the stream failed but the file is downloaded now; switching to it");
+                                if let Some(generation) = inner.prepare_track_load(recovery.track_index, recovery.within) {
+                                    drop(inner);
+                                    Inner::spawn_load_track(inner_rc, recovery.item_id, generation);
+                                }
                             } else {
-                                let mut inner = inner_rc.borrow_mut();
                                 if let Some(now_playing) = &mut inner.now_playing {
-                                    if now_playing.item_id == recovery.item_id {
-                                        now_playing.is_playing = false;
-                                        now_playing.last_error = Some(recovery.err);
-                                    }
+                                    now_playing.is_playing = false;
+                                    now_playing.last_error = Some(recovery.err);
                                 }
                                 inner.publish();
                             }
@@ -2283,13 +2696,16 @@ impl PlayerController {
                 SleepTimerDeadline::Position(end) => inner.book_position() >= end,
             };
             if reached {
-                let _ = inner.backend.pause();
+                tracing::info!("sleep timer reached; pausing");
+                inner.pause_backend_if_loaded();
                 if let Some(now_playing) = &mut inner.now_playing {
                     now_playing.is_playing = false;
                     now_playing.sleep_timer = SleepTimerState::Off;
                 }
-                // A sleep-timer pause is deliberate; a replug must not override it.
+                // A sleep-timer pause is deliberate; a replug (or a call ending) must not
+                // override it.
                 inner.paused_by_unplug = false;
+                inner.paused_by_call = false;
                 inner.write_progress(false);
             }
         }
@@ -2300,7 +2716,7 @@ impl PlayerController {
         if is_playing {
             inner.last_played_at = Instant::now();
         }
-        if is_playing && !inner.holding_writes_for_reconcile && inner.last_progress_write.elapsed() >= LOCAL_PROGRESS_WRITE_INTERVAL {
+        if is_playing && inner.holding_writes_for_reconcile.is_none() && inner.last_progress_write.elapsed() >= LOCAL_PROGRESS_WRITE_INTERVAL {
             // Not `write_progress`: this is the routine "still playing" heartbeat, not a
             // meaningful state change, so it must not force a server round trip on every firing —
             // `write_progress_at`'s own `force_server_sync: false` still syncs once
@@ -2415,7 +2831,7 @@ fn mini_bar_snapshot_applier(widgets: &MiniBarWidgets) -> impl Fn(&PlayerSnapsho
         author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
         author_label.set_visible(snapshot.author.is_some());
         cover.set_path(snapshot.cover_path.as_deref());
-        play_icon.set_icon_name(Some(if snapshot.is_playing {
+        play_icon.set_icon_name(Some(if snapshot.shows_pause_button() {
             "media-playback-pause-symbolic"
         } else {
             "media-playback-start-symbolic"
@@ -2556,7 +2972,7 @@ impl abs_player::AudioBackend for NullBackend {
     fn seek(&mut self, _position: Duration) -> abs_player::Result<()> {
         Err(abs_player::PlayerError::NoSourceLoaded)
     }
-    fn set_speed(&mut self, _speed: f64) -> abs_player::Result<()> {
+    fn set_speed(&mut self, _speed: f64, _position: Duration) -> abs_player::Result<()> {
         Err(abs_player::PlayerError::NoSourceLoaded)
     }
     fn position(&self) -> Option<Duration> {
@@ -2660,7 +3076,7 @@ pub(crate) mod tests {
         fn seek(&mut self, _position: Duration) -> abs_player::Result<()> {
             Err(abs_player::PlayerError::NoSourceLoaded)
         }
-        fn set_speed(&mut self, _speed: f64) -> abs_player::Result<()> {
+        fn set_speed(&mut self, _speed: f64, _position: Duration) -> abs_player::Result<()> {
             Err(abs_player::PlayerError::NoSourceLoaded)
         }
         fn position(&self) -> Option<Duration> {
@@ -2855,7 +3271,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         let first = seen.borrow().last().cloned().expect("starting playback should publish a snapshot");
         assert_eq!(first.title, "Test Book");
         assert_eq!(first.author.as_deref(), Some("Some Author"));
@@ -3203,7 +3619,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         // `add_bookmark` hands back the write rather than spawning it itself (see its own doc
         // comment) — the caller (here, and every real call site) is what actually runs it.
@@ -3247,7 +3663,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         // A `FLUSH` seek's position update lands on the pipeline's own streaming thread, not
         // synchronously inside `seek()` — give it a brief moment to actually land. 500ms of real
         // (sync'd) playback is nowhere near enough to "catch up" from 0 to past 5s on its own, so
@@ -3335,7 +3751,7 @@ pub(crate) mod tests {
 
         // Before the first track ends, the book total is still the stale server-reported sum
         // (10 + 2 = 12s) — nothing has had a reason to correct it yet.
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         assert_eq!(controller.snapshot().unwrap().duration_seconds, 12.0);
 
         // Once the real (2s) first track ends and hands over to the second, the correction fires:
@@ -3508,7 +3924,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         let snapshot = controller.snapshot().unwrap();
         assert!(snapshot.is_playing, "a fully-downloaded item must play offline");
         assert_eq!(snapshot.duration_seconds, 5.0, "the book total must come from the locally cached track metadata, not the failed resolve");
@@ -3630,7 +4046,7 @@ pub(crate) mod tests {
 
         // `is_playing` stays true through the first track's handover, so the first false reading
         // is the final end-of-stream.
-        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_playing), Duration::from_secs(15));
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_loading && !s.is_playing), Duration::from_secs(15));
 
         pump_until(|| false, Duration::from_millis(300));
         let progress =
@@ -3665,7 +4081,7 @@ pub(crate) mod tests {
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds > 0.5), Duration::from_secs(10));
         controller.pause();
-        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && !s.is_playing), Duration::from_secs(5));
 
         controller.seek_to_seconds(4.0); // 1s into the second 3s file
         // The position reads as the target straight away (it is pinned there until the second
@@ -3767,6 +4183,11 @@ pub(crate) mod tests {
         /// pre-existing test using `ScriptedBackend` is unaffected: its `pause()` "succeeding"
         /// is immediately confirmed, exactly as if a real pipeline settled right away.
         stuck_paused: bool,
+        /// When set, a `load()` leaves `position()` at `None` — the pipeline hasn't prerolled —
+        /// until the test sets a position, so a load's readiness wait really waits.
+        hold_preroll: bool,
+        play_calls: u32,
+        speed_calls: Vec<(f64, Duration)>,
     }
 
     struct ScriptedBackend(Rc<RefCell<ScriptedBackendState>>);
@@ -3775,11 +4196,12 @@ pub(crate) mod tests {
         fn load(&mut self, uri: &str) -> abs_player::Result<()> {
             let mut state = self.0.borrow_mut();
             state.load_calls.push(uri.to_string());
-            state.position = Some(Duration::ZERO);
+            state.position = if state.hold_preroll { None } else { Some(Duration::ZERO) };
             Ok(())
         }
         fn apply_connection(&mut self, _properties: &abs_player::ConnectionProperties) {}
         fn play(&mut self) -> abs_player::Result<()> {
+            self.0.borrow_mut().play_calls += 1;
             Ok(())
         }
         fn pause(&mut self) -> abs_player::Result<()> {
@@ -3798,7 +4220,10 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        fn set_speed(&mut self, _speed: f64) -> abs_player::Result<()> {
+        fn set_speed(&mut self, speed: f64, position: Duration) -> abs_player::Result<()> {
+            let mut state = self.0.borrow_mut();
+            state.speed_calls.push((speed, position));
+            state.position = Some(position);
             Ok(())
         }
         fn position(&self) -> Option<Duration> {
@@ -3840,6 +4265,8 @@ pub(crate) mod tests {
             1.0,
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        // Starting releases whatever the backend held before; count only what follows.
+        let resets_after_start = state.borrow().reset_calls;
 
         // The scripted backend has no real clock — move its position directly to simulate
         // playback having advanced, then let a tick observe it via `observe_position`.
@@ -3863,7 +4290,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             state.borrow().reset_calls,
-            1,
+            resets_after_start + 1,
             "a bus error must release the backend (AudioBackend::reset) rather than leave it holding a dead pipeline"
         );
 
@@ -3919,6 +4346,8 @@ pub(crate) mod tests {
             1.0,
         );
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        // Starting releases whatever the backend held before; count only what follows.
+        let resets_after_start = state.borrow().reset_calls;
 
         state.borrow_mut().stuck_paused = true;
         controller.pause();
@@ -3928,7 +4357,7 @@ pub(crate) mod tests {
         let snapshot = controller.snapshot().unwrap();
         assert!(!snapshot.is_playing, "pause() should still report not-playing right away");
         assert!(snapshot.last_error.is_none(), "no error yet — the confirmation window hasn't elapsed");
-        assert_eq!(state.borrow().reset_calls, 0, "not recovered yet — still within the confirmation window");
+        assert_eq!(state.borrow().reset_calls, resets_after_start, "not recovered yet — still within the confirmation window");
 
         // `PAUSE_CONFIRM_INTERVAL * PAUSE_CONFIRM_ATTEMPTS` is the whole window; give it a wide
         // margin rather than pinning the exact constants here.
@@ -3937,7 +4366,7 @@ pub(crate) mod tests {
         let snapshot = controller.snapshot().unwrap();
         assert!(!snapshot.is_playing, "must stay paused (not silently reported as playing)");
         assert!(snapshot.last_error.is_some(), "a pause that never lands must eventually surface as an error");
-        assert_eq!(state.borrow().reset_calls, 1, "a pause stuck forever must release the backend, same as an outright pause failure");
+        assert_eq!(state.borrow().reset_calls, resets_after_start + 1, "a pause stuck forever must release the backend, same as an outright pause failure");
 
         // The item must be recoverable exactly like any other `needs_reload` case: the next
         // `play()` reloads rather than trying to resume a pipeline that was already released.
@@ -4444,8 +4873,8 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| !seen.borrow().is_empty(), Duration::from_secs(10));
-        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_playing), Duration::from_secs(10));
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+        pump_until(|| seen.borrow().last().is_some_and(|s| !s.is_loading && !s.is_playing), Duration::from_secs(10));
 
         assert!(
             !seen.borrow().last().unwrap().is_playing,
@@ -4509,7 +4938,7 @@ pub(crate) mod tests {
             1.0,
         );
 
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
         assert!(
             seen.borrow().iter().any(|s| s.cover_path.as_deref() == Some(cached_cover.as_path())),
             "snapshots must carry the cached cover from the first publish on, with no network involved"
@@ -4656,5 +5085,388 @@ pub(crate) mod tests {
         assert!(hooks.error_icon.is_visible(), "a failed load must show the mini bar's warning glyph");
 
         mini_bar.controller.stop();
+    }
+
+    /// Serves `item_id` with one audio file per entry of `track_seconds` (optionally answering the
+    /// item lookup only after `resolve_delay`, to hold a start in its resolving state) and accepts
+    /// progress pushes for it.
+    async fn mock_item(mock_server: &MockServer, item_id: &str, track_seconds: &[u32], chapters: &[(f64, f64)], resolve_delay: Option<Duration>) {
+        let audio_files: Vec<_> =
+            track_seconds.iter().enumerate().map(|(i, secs)| serde_json::json!({ "ino": (i + 1).to_string(), "duration": f64::from(*secs) })).collect();
+        let chapters: Vec<_> = chapters
+            .iter()
+            .enumerate()
+            .map(|(i, (start, end))| serde_json::json!({ "id": i, "start": start, "end": end, "title": format!("Chapter {}", i + 1) }))
+            .collect();
+        let mut response =
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "media": { "audioFiles": audio_files, "chapters": chapters } }));
+        if let Some(delay) = resolve_delay {
+            response = response.set_delay(delay);
+        }
+        Mock::given(method("GET")).and(path(format!("/api/items/{item_id}"))).respond_with(response).mount(mock_server).await;
+        for (i, secs) in track_seconds.iter().enumerate() {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/items/{item_id}/file/{}", i + 1)))
+                .respond_with(ranged_response(silent_wav_bytes(*secs)))
+                .mount(mock_server)
+                .await;
+        }
+        Mock::given(method("PATCH")).and(path(format!("/api/me/progress/{item_id}"))).respond_with(ResponseTemplate::new(200)).mount(mock_server).await;
+    }
+
+    fn scripted_controller(pool: &SqlitePool) -> (PlayerController, Rc<RefCell<ScriptedBackendState>>) {
+        let state = Rc::new(RefCell::new(ScriptedBackendState::default()));
+        let controller =
+            PlayerController::new(pool.clone(), crate::test_support::test_paths(), Box::new(ScriptedBackend(state.clone())), |_| {});
+        (controller, state)
+    }
+
+    fn request(item_id: &str, title: &str) -> PlayRequest {
+        PlayRequest { item_id: item_id.to_string(), title: title.to_string(), author: None }
+    }
+
+    fn is_loaded(controller: &PlayerController) -> bool {
+        controller.snapshot().is_some_and(|s| !s.is_loading)
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The Librem 5 field report: switched
+    /// books, pressed play, rewound — and the *old* book played under the new book's cover, at the
+    /// old book's position. Starting a book must drop the old one at once: nothing asked of the
+    /// old book (a cross-track seek already on its way) or of the player while the new one
+    /// resolves (rewind, seek, play) may load or seek anything, and the new book loads exactly
+    /// once, at its own position.
+    pub(crate) fn run_switching_books_never_plays_the_old_book(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20, 20], &[], None));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[30], &[], Some(Duration::from_millis(800))));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-2", 10.0, false)).unwrap();
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(15));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 14.5), Duration::from_secs(5));
+
+        // A rewind into the old book's other file, and the new book started right behind it —
+        // before the old book's load has had a chance to run.
+        controller.seek_to_seconds(25.0);
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        let loads_at_switch = state.borrow().load_calls.len();
+        let seeks_at_switch = state.borrow().seek_calls.len();
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.title, "Book Two", "the new book is shown from the moment it's started");
+        assert!(snapshot.is_loading && !snapshot.is_playing && snapshot.position_seconds == 0.0);
+        assert!(controller.current_download_context().is_none(), "nothing may act on a book that isn't loaded yet");
+
+        // Transport while it resolves acts on nothing.
+        pump_until(|| false, Duration::from_millis(200));
+        controller.skip(-15.0);
+        controller.seek_to_seconds(5.0);
+        controller.seek_fraction(0.5);
+        controller.play();
+        assert_eq!(state.borrow().load_calls.len(), loads_at_switch, "nothing is loaded while the new book resolves");
+        assert_eq!(state.borrow().seek_calls.len(), seeks_at_switch, "nothing is seeked while the new book resolves");
+
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        let loads: Vec<String> = state.borrow().load_calls[loads_at_switch..].to_vec();
+        assert_eq!(loads.len(), 1, "the new book loads exactly once: {loads:?}");
+        assert!(loads[0].contains("/api/items/item-2/file/1"), "only the new book's file may load: {loads:?}");
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.title, "Book Two");
+        assert!(snapshot.is_playing, "play asked for while loading is honored");
+        assert!((snapshot.position_seconds - 10.0).abs() < 0.5, "the new book resumes at its own position, got {}", snapshot.position_seconds);
+
+        let progress = |item_id: &str| {
+            runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, item_id)).unwrap().unwrap().current_time_seconds
+        };
+        assert!((progress("item-1") - 25.0).abs() < 0.5, "the old book keeps the position it was left at, got {}", progress("item-1"));
+        assert!((progress("item-2") - 10.0).abs() < 0.5, "the new book's position is untouched, got {}", progress("item-2"));
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A pause while a book is still
+    /// resolving — the user's, or an unplug's — holds once it's loaded; it used to start playing
+    /// regardless, through the speaker after an unplug.
+    pub(crate) fn run_a_pause_while_a_book_loads_holds(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20], &[], Some(Duration::from_millis(500))));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[20], &[], Some(Duration::from_millis(500))));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.set_headphone_behavior(true, true);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        controller.toggle_play_pause();
+        assert!(controller.snapshot().is_some_and(|s| s.is_loading && !s.will_play_when_loaded && !s.shows_pause_button()));
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(!controller.snapshot().unwrap().is_playing, "paused while loading stays paused once loaded");
+        assert_eq!(state.borrow().play_calls, 0, "the backend is never asked to play");
+
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        assert!(controller.snapshot().is_some_and(|s| s.shows_pause_button()), "starting a book means it will play");
+        controller.handle_route_event(abs_player::route_watch::RouteEvent::Unplugged);
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(!controller.snapshot().unwrap().is_playing, "an unplug while loading keeps it paused once loaded");
+        assert_eq!(state.borrow().play_calls, 0);
+        // It was the unplug's pause, so a replug resumes it.
+        controller.handle_route_event(abs_player::route_watch::RouteEvent::Replugged);
+        assert!(controller.snapshot().unwrap().is_playing);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Of two starts, the later one wins
+    /// however the resolves finish — including a slower *failing* start, which used to reset the
+    /// backend and replace the book that had loaded since.
+    pub(crate) fn run_the_latest_start_wins(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20], &[], Some(Duration::from_millis(1200))));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[20], &[], None));
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-3"))
+                .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(1200)))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        for (id, title) in [("item-1", "Book One"), ("item-2", "Book Two"), ("item-3", "Book Three")] {
+            runtime.block_on(insert_synced_item(&pool, &server.id, id, title));
+        }
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(1800));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.title, "Book Two");
+        assert!(snapshot.is_playing && snapshot.last_error.is_none());
+        assert!(state.borrow().load_calls.iter().all(|uri| !uri.contains("item-1")), "the superseded start loads nothing: {:?}", state.borrow().load_calls);
+
+        controller.start(session.clone(), request("item-3", "Book Three"), 1.0);
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        pump_until(|| is_loaded(&controller), Duration::from_secs(10));
+        let resets = state.borrow().reset_calls;
+        pump_until(|| false, Duration::from_millis(1800));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.title, "Book Two", "a superseded start's failure must not replace the book loaded since");
+        assert!(snapshot.is_playing && snapshot.last_error.is_none());
+        assert_eq!(state.borrow().reset_calls, resets, "nor release its pipeline");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book whose start failed before
+    /// anything resolved has no tracks; seeking it used to index an empty track list and crash
+    /// the app (the scrubber, skip buttons and MPRIS all reach it).
+    pub(crate) fn run_controls_on_a_book_that_failed_to_start_do_not_crash(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(Mock::given(method("GET")).and(path("/api/items/item-1")).respond_with(ResponseTemplate::new(500)).mount(&mock_server));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(10));
+
+        controller.skip(-15.0);
+        controller.skip(30.0);
+        controller.seek_fraction(0.5);
+        controller.seek_to_seconds(100.0);
+        controller.set_speed(1.5);
+        controller.set_sleep_timer_end_of_chapter();
+        controller.reset_progress();
+        controller.mark_as_finished();
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(controller.snapshot().unwrap().last_error.is_some(), "still showing why it couldn't start");
+        assert!(state.borrow().seek_calls.is_empty());
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A stream error while a track load is
+    /// waiting for its pipeline used to be overridden by that load finishing: it cleared the error
+    /// and asked the released pipeline to play, restarting the file from its start.
+    pub(crate) fn run_an_error_during_a_track_load_is_not_overridden(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20, 20], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        state.borrow_mut().hold_preroll = true;
+        controller.seek_to_seconds(25.0);
+        let loaded_second = || state.borrow().load_calls.iter().any(|uri| uri.contains("/file/2"));
+        pump_until(loaded_second, Duration::from_secs(5));
+        assert!(loaded_second());
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::Error(abs_player::PlaybackError {
+            kind: abs_player::PlaybackErrorKind::Network,
+            message: "simulated network failure".to_string(),
+            debug: None,
+        }));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(5));
+        let plays = state.borrow().play_calls;
+        // The pipeline "prerolls" now — the abandoned load must not pick that up.
+        state.borrow_mut().position = Some(Duration::ZERO);
+        pump_until(|| false, Duration::from_millis(800));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_some() && !snapshot.is_playing, "the error stands until the user retries");
+        assert_eq!(state.borrow().play_calls, plays, "the abandoned load must not resume the released pipeline");
+        assert!((snapshot.position_seconds - 25.0).abs() < 0.5, "the position is where the load was headed, got {}", snapshot.position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A speed change and a seek made while
+    /// a track is loading are the ones applied once it's ready — the load used to re-apply the
+    /// speed it captured when it began, and to seek to its own original target.
+    pub(crate) fn run_changes_during_a_track_load_are_applied_by_it(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20, 20], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        state.borrow_mut().hold_preroll = true;
+        controller.seek_to_seconds(25.0);
+        let loaded_second = || state.borrow().load_calls.iter().any(|uri| uri.contains("/file/2"));
+        pump_until(loaded_second, Duration::from_secs(5));
+        controller.set_speed(1.5);
+        controller.seek_to_seconds(32.0);
+        assert!(state.borrow().speed_calls.is_empty(), "nothing is applied to a pipeline that isn't ready");
+        state.borrow_mut().position = Some(Duration::ZERO);
+        pump_until(|| !state.borrow().speed_calls.is_empty(), Duration::from_secs(5));
+        assert_eq!(state.borrow().speed_calls.last().copied(), Some((1.5, Duration::from_secs(12))), "the latest speed, at the latest target");
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.speed, 1.5);
+        assert!((snapshot.position_seconds - 32.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+        assert!(snapshot.is_playing);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A pause's confirmation must not take
+    /// a load that followed it for a pause that never landed — it used to flag "the audio pipeline
+    /// never actually paused" and release the freshly loaded pipeline.
+    pub(crate) fn run_a_load_after_a_pause_is_not_a_stuck_pause(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20, 20], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        // From here on the pipeline never reports Paused — after the load below, that is simply
+        // because it was replaced, not because the pause got stuck.
+        state.borrow_mut().stuck_paused = true;
+        controller.pause();
+        controller.seek_to_seconds(25.0);
+        pump_until(|| false, PAUSE_CONFIRM_INTERVAL * (PAUSE_CONFIRM_ATTEMPTS + 2));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_none(), "a load after a pause is not a stuck pause: {:?}", snapshot.last_error);
+        assert!((snapshot.position_seconds - 25.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Home and Library pull the server's
+    /// progress into the local row on their own; by the time a long-paused book is resumed, the
+    /// row may already hold another device's newer position. The resume used to adopt only a
+    /// value that changed during its own check, so it carried on from the stale position and
+    /// pushed it over the newer one.
+    pub(crate) fn run_resuming_adopts_newer_progress_already_pulled_locally(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        let adopted: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+        controller.set_on_position_adopted({
+            let adopted = adopted.clone();
+            move |from, to| *adopted.borrow_mut() = Some((from, to))
+        });
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(3));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(5));
+        controller.pause();
+        pump_until(|| progress_patches(runtime, &mock_server, "item-1").len() == 1, Duration::from_secs(5));
+
+        // Another device listened on to 15s, and Home has already pulled that in.
+        let last_update = chrono::Utc::now().timestamp_millis() + 60_000;
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/me/progress/item-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraryItemId": "item-1", "currentTime": 15.0, "duration": 20.0, "isFinished": false, "lastUpdate": last_update,
+                })))
+                .with_priority(1)
+                .mount(&mock_server),
+        );
+        let connection = abs_core::connection::ConnectionTarget::direct(&mock_server.uri());
+        runtime
+            .block_on(abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &account.token, &account.id, &server.id, "item-1"))
+            .unwrap();
+        let local = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        assert_eq!(local.current_time_seconds, 15.0, "precondition: the local row already holds the newer position");
+
+        controller.set_resume_reconcile_after(Duration::ZERO);
+        controller.play();
+        pump_until(|| adopted.borrow().is_some(), Duration::from_secs(10));
+        let (from, to) = adopted.borrow().expect("resuming should adopt the newer position already in the local row");
+        assert!((from - 3.0).abs() < 0.5 && to == 15.0, "adopted {from} -> {to}");
+        let pushes_of_old_position =
+            progress_patches(runtime, &mock_server, "item-1").iter().filter(|body| (body["currentTime"].as_f64().unwrap() - 3.0).abs() < 0.5).count();
+        assert_eq!(pushes_of_old_position, 1, "only the pause pushed the old position");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Starting at a tapped chapter loads
+    /// the book straight at the chapter (the saved position doesn't win) — also when it's the
+    /// book already loaded, and also when it's the book already starting.
+    pub(crate) fn run_starting_at_a_chapter(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[(0.0, 20.0), (20.0, 40.0), (40.0, 60.0)], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 50.0, false)).unwrap();
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+
+        controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(1));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        assert_eq!(state.borrow().seek_calls.first().copied(), Some(Duration::from_secs(20)), "loaded straight at the chapter");
+        assert!((controller.snapshot().unwrap().position_seconds - 20.0).abs() < 0.5);
+
+        controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(2));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
+        assert!((controller.snapshot().unwrap().position_seconds - 40.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+
+        // Tapped again while it's still starting: the latest chapter is where it starts.
+        let loads = state.borrow().load_calls.len();
+        controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(0));
+        controller.start_with(session.clone(), request("item-1", "Book One"), 1.0, Some(1));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "one start, one load");
+        assert!((controller.snapshot().unwrap().position_seconds - 20.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        controller.stop();
     }
 }

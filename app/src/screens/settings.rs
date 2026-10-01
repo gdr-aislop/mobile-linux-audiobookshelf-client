@@ -556,19 +556,7 @@ pub fn build(
     about_row.set_activatable(true);
     about_row.connect_activated({
         let window = window.clone();
-        move |_| {
-            // `AdwAboutWindow`, not `AdwAboutDialog` — the dialog needs libadwaita 1.5+, out of
-            // reach of this crate's v1.2 ceiling (see `app/Cargo.toml`).
-            adw::AboutWindow::builder()
-                .application_name("Audiobookshelf")
-                .version(env!("CARGO_PKG_VERSION"))
-                .website("https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client")
-                .license_type(gtk4::License::Gpl30)
-                .transient_for(&window)
-                .modal(true)
-                .build()
-                .present();
-        }
+        move |_| push_about(&window)
     });
     about_group.add(&about_row);
     page.add(&about_group);
@@ -621,6 +609,74 @@ fn push_connection(
     );
     crate::widgets::swap_content(window, &screen.root);
 }
+
+/// Shows the About screen the same way `push_connection` shows the Connection page: swapping
+/// the main window's own content, with its own back button, rather than opening a second
+/// top-level window. This used to be `adw::AboutWindow` — a genuine second `GtkWindow`, chosen
+/// only because `AdwAboutDialog` needs libadwaita 1.5+, out of reach of this crate's v1.2
+/// feature ceiling (`app/Cargo.toml`). A real Librem 5 field report found it had no reliable way
+/// to be dismissed under Phosh's default compositor (phoc) — every *other* secondary screen in
+/// this app already avoids opening a second window for exactly this class of reason, and About
+/// was the one deliberate exception. It no longer is: see `docs/design/ui-spec.md`'s About
+/// section.
+fn push_about(window: &adw::ApplicationWindow) {
+    let Some(shell_root) = window.content() else { return };
+
+    let toast_overlay = adw::ToastOverlay::new();
+
+    let back_button = gtk4::Button::builder().icon_name("go-previous-symbolic").css_classes(["flat"]).build();
+    back_button.connect_clicked({
+        let window = window.clone();
+        let shell_root = shell_root.clone();
+        move |_| crate::widgets::swap_content(&window, &shell_root)
+    });
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new("About Audiobookshelf", "")));
+    header.pack_start(&back_button);
+
+    let page = adw::PreferencesPage::new();
+
+    let info_group = adw::PreferencesGroup::new();
+    let version_row = adw::ActionRow::builder()
+        .title("Audiobookshelf")
+        .subtitle(format!("Version {}", env!("CARGO_PKG_VERSION")))
+        .build();
+    info_group.add(&version_row);
+    page.add(&info_group);
+
+    let links_group = adw::PreferencesGroup::new();
+    let website_row = adw::ActionRow::builder()
+        .title("Website")
+        .subtitle(WEBSITE_URL)
+        .activatable(true)
+        .build();
+    website_row.add_suffix(&gtk4::Image::from_icon_name("adw-external-link-symbolic"));
+    website_row.connect_activated({
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            // Firing the launch is all this needs to wait for — the default handler (a browser
+            // via the desktop's URL-opening portal) runs as its own detached process, so there's
+            // nothing further to await.
+            if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(WEBSITE_URL, None::<&gtk4::gio::AppLaunchContext>) {
+                crate::error_reporting::report_background_error(&toast_overlay, "Opening the website", err);
+            }
+        }
+    });
+    links_group.add(&website_row);
+    let license_row = adw::ActionRow::builder().title("License").subtitle("GNU General Public License v3.0").build();
+    links_group.add(&license_row);
+    page.add(&links_group);
+
+    let content = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
+    content.append(&header);
+    content.append(&page);
+    toast_overlay.set_child(Some(&content));
+
+    crate::widgets::swap_content(window, &toast_overlay);
+}
+
+const WEBSITE_URL: &str = "https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client";
 
 /// The `host[:port]` part of a server URL — what Account/Servers rows show instead of the full
 /// scheme-and-path form (the URL in full stays on the server's Connection page).
@@ -889,6 +945,7 @@ pub(crate) mod tests {
         let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
         let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
         let download_manager = test_download_manager(pool.clone());
+        let window = adw::ApplicationWindow::builder().build();
         let screen = build(
             pool.clone(),
             controller.clone(),
@@ -897,8 +954,12 @@ pub(crate) mod tests {
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
-            adw::ApplicationWindow::builder().build(),
+            window.clone(),
         );
+        // About's back button swaps back to whatever the window was showing before — needs a
+        // real shell root in place for that to be meaningful, same as `push_connection`'s own
+        // tests (`crate::screens::connection::tests`).
+        window.set_content(Some(&screen.root));
 
         assert_eq!(screen.hooks.default_speed_row.selected(), 1, "1.0× is the second speed preset");
         assert_eq!(screen.hooks.skip_back_row.selected(), 2, "15 seconds is the third skip choice");
@@ -948,14 +1009,21 @@ pub(crate) mod tests {
         assert!(!saved.burst_buffering, "the burst-buffering switch must persist");
         assert_eq!(saved_theme, abs_core::settings::Theme::Dark, "the theme must persist");
 
-        // About: activating the row opens the app's one about window, transient to the shell's
-        // window. `ActionRowExt::activate` — the row-level activation that emits `activated` —
-        // not the ambiguous widget-level one.
+        // About: activating the row swaps the window's content to the About screen (not a
+        // second window — see `push_about`'s doc comment for why) and shows a back button that
+        // swaps back. `ActionRowExt::activate` — the row-level activation that emits `activated`
+        // — not the ambiguous widget-level one.
+        let shell_root = window.content().expect("the shell must already be showing");
         adw::prelude::ActionRowExt::activate(&screen.hooks.about_row);
         pump_until(
-            || gtk4::Window::list_toplevels().iter().any(|w| w.is::<adw::AboutWindow>()),
+            || window.content().is_some_and(|c| c != shell_root && crate::test_support::any_label_reads(&c, "Audiobookshelf")),
             Duration::from_secs(2),
         );
+        let about_content = window.content().expect("the About screen should be showing");
+        let back_button: gtk4::Button =
+            crate::widgets::find_descendant(&about_content).expect("the About screen must have a back button");
+        back_button.emit_clicked();
+        pump_until(|| window.content().is_some_and(|c| c == shell_root), Duration::from_secs(2));
     }
 
     /// A theme or playback-setting change that applies live but fails to persist must say so,
