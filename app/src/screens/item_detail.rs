@@ -1625,7 +1625,7 @@ pub(crate) mod tests {
             crate::player::PlayRequest { item_id: "item-1".to_string(), title: "Test Item".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let opened_player = Rc::new(Cell::new(false));
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, {

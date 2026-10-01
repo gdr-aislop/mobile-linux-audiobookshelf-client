@@ -75,8 +75,12 @@ pub async fn resolve_stream_target(connection: &crate::connection::ConnectionTar
 /// on the start of a later track must resolve to that later track, not linger on the end of the
 /// previous one. Shared by playback (mapping the resume position and seek targets onto the
 /// currently-loaded track) and downloads (mapping a chapter's `[start, end)` range onto the set of
-/// tracks it touches) — one definition, tested once.
+/// tracks it touches) — one definition, tested once. With no tracks at all (an item whose start
+/// failed before anything resolved) this is `(0, 0.0)` rather than a panic.
 pub fn locate_track(tracks: &[StreamTrack], book_seconds: f64) -> (usize, f64) {
+    if tracks.is_empty() {
+        return (0, 0.0);
+    }
     let index = tracks.iter().rposition(|t| t.offset_seconds <= book_seconds + 1e-6).unwrap_or(0);
     (index, (book_seconds - tracks[index].offset_seconds).max(0.0))
 }
@@ -422,6 +426,11 @@ mod tests {
     #[test]
     fn locate_track_before_the_first_track_clamps_to_it() {
         assert_eq!(locate_track(&two_tracks(), -5.0), (0, 0.0));
+    }
+
+    #[test]
+    fn locate_track_with_no_tracks_does_not_panic() {
+        assert_eq!(locate_track(&[], 120.0), (0, 0.0));
     }
 
     #[tokio::test]

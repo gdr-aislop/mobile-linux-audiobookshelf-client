@@ -508,7 +508,7 @@ pub fn build(
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
             author_label.set_visible(snapshot.author.is_some());
             cover.set_path(snapshot.cover_path.as_deref());
-            play_icon.set_icon_name(Some(if snapshot.is_playing {
+            play_icon.set_icon_name(Some(if snapshot.shows_pause_button() {
                 "media-playback-pause-symbolic"
             } else {
                 "media-playback-start-symbolic"
@@ -522,6 +522,8 @@ pub fn build(
             updating_from_snapshot.set(true);
             scrubber.set_value(fraction);
             updating_from_snapshot.set(false);
+            // Nothing to seek in until the book has loaded.
+            scrubber.set_sensitive(!snapshot.is_loading);
 
             elapsed_label.set_label(&format_hms(snapshot.position_seconds));
             remaining_label.set_label(&format!("-{}", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0))));
@@ -659,7 +661,14 @@ pub(crate) fn format_speed(speed: f64) -> String {
 fn undo_position_toast(controller: &crate::player::PlayerController, title: &str, before: f64) -> adw::Toast {
     let toast = adw::Toast::builder().title(title).button_label("Undo").timeout(10).build();
     let controller = controller.clone();
+    // The Undo belongs to the book it was offered for; another book may be loaded by the time
+    // it's tapped.
+    let item_id = controller.current_item_id();
     toast.connect_button_clicked(move |_| {
+        if item_id.is_none() || controller.current_item_id() != item_id {
+            tracing::info!("undo ignored: a different book is loaded now");
+            return;
+        }
         controller.seek_to_seconds(before);
         controller.save_progress_now();
     });
@@ -743,7 +752,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: Some("Some Author".to_string()) },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
@@ -805,7 +814,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
@@ -985,7 +994,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
@@ -1019,7 +1028,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), {
@@ -1129,7 +1138,7 @@ pub(crate) mod tests {
             PlayRequest { item_id: "item-1".to_string(), title: "Test Book".to_string(), author: None },
             1.0,
         );
-        pump_until(|| controller.snapshot().is_some(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
 
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();

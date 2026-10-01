@@ -69,6 +69,26 @@ fn classify_gst_error(err: &gst::glib::Error) -> PlaybackErrorKind {
     PlaybackErrorKind::Other
 }
 
+/// Replaces the value of every `token=` query parameter in `text` with `REDACTED` — stream URLs
+/// authenticate with `?token=<access token>`, and GStreamer quotes the URL in its error messages.
+pub fn redact_tokens(text: &str) -> String {
+    const KEY: &str = "token=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        let value_start = at + KEY.len();
+        out.push_str(&rest[..value_start]);
+        let value = &rest[value_start..];
+        let value_len = value.find(|c: char| c == '&' || c == '#' || c == '"' || c == '\'' || c == ')' || c == '>' || c.is_whitespace()).unwrap_or(value.len());
+        if value_len > 0 {
+            out.push_str("REDACTED");
+        }
+        rest = &value[value_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Transport properties for HTTP(S) playback URIs — the playback-side mirror of the Connection
 /// page's Advanced settings (custom headers, user agent, TLS verification). Plain data, no
 /// reqwest: `abs-player` never touches the HTTP stack, it only hands these to GStreamer's HTTP
@@ -116,9 +136,13 @@ pub trait AudioBackend {
     /// the user presses play should call `pause()` immediately after `load()`, which is also
     /// what unblocks seeking.
     fn seek(&mut self, position: Duration) -> Result<()>;
-    /// Implemented as a seek to the current position with a new rate (GStreamer has no
-    /// rate-only call), so it inherits `seek`'s same "at least PAUSED" requirement.
-    fn set_speed(&mut self, speed: f64) -> Result<()>;
+    /// Seeks to `position` (within the loaded file) at a new rate — GStreamer has no rate-only
+    /// call, so a rate change is always a seek, and inherits `seek`'s same "at least PAUSED"
+    /// requirement. The caller passes the position rather than this querying the pipeline's own:
+    /// right after a flushing seek, or while a streamed seek is stalled, the pipeline reports the
+    /// pre-seek position or none at all, and re-seeking to that would undo the seek or jump to the
+    /// start of the file.
+    fn set_speed(&mut self, speed: f64, position: Duration) -> Result<()>;
     fn position(&self) -> Option<Duration>;
     fn duration(&self) -> Option<Duration>;
     /// Non-blocking: returns the next pending bus event, if any, without waiting.
@@ -279,11 +303,9 @@ impl AudioBackend for GstBackend {
         Ok(())
     }
 
-    fn set_speed(&mut self, speed: f64) -> Result<()> {
-        // GStreamer has no standalone "set rate" call — a rate change is expressed as a seek to
-        // the current position with a new rate. Querying position first keeps this a no-op on
-        // position, matching what a caller setting "just the speed" expects.
-        let position = self.position().unwrap_or_default();
+    fn set_speed(&mut self, speed: f64, position: Duration) -> Result<()> {
+        // GStreamer has no standalone "set rate" call — a rate change is expressed as a seek with
+        // a new rate, to the position the caller knows is right (see the trait's doc comment).
         self.current_speed = speed;
         self.seek(position)
     }
@@ -313,7 +335,14 @@ impl AudioBackend for GstBackend {
                 gst::MessageView::Error(e) => {
                     let error = e.error();
                     let kind = classify_gst_error(&error);
-                    return Some(PlayerEvent::Error(PlaybackError { kind, message: error.to_string(), debug: e.debug().map(|d| d.to_string()) }));
+                    // An HTTP source's messages quote the stream URL, which carries the access
+                    // token as a query parameter — and these strings reach the log and the error
+                    // banner's details.
+                    return Some(PlayerEvent::Error(PlaybackError {
+                        kind,
+                        message: redact_tokens(&error.to_string()),
+                        debug: e.debug().map(|d| redact_tokens(&d)),
+                    }));
                 }
                 _ => continue,
             }
@@ -552,7 +581,7 @@ mod tests {
         player.seek(Duration::from_secs(2)).unwrap();
         wait_for_state_change(&player);
 
-        player.set_speed(1.5).unwrap();
+        player.set_speed(1.5, Duration::from_secs(2)).unwrap();
         wait_for_state_change(&player);
 
         let position = player.position().unwrap();
@@ -670,11 +699,22 @@ mod tests {
         player.load(&silent_wav_uri(&tmp, 2)).unwrap();
         player.pause().unwrap(); // a seek (which set_speed performs) needs at least PAUSED
         wait_for_state_change(&player);
-        player.set_speed(2.0).unwrap();
+        player.set_speed(2.0, Duration::ZERO).unwrap();
         assert_eq!(player.current_speed, 2.0);
 
         player.load(&silent_wav_uri(&tmp, 2)).unwrap();
         assert_eq!(player.current_speed, 1.0, "a fresh load should not inherit the old speed");
+    }
+
+    #[test]
+    fn redact_tokens_hides_every_token_value_and_keeps_the_rest() {
+        assert_eq!(
+            redact_tokens("Could not read from resource. URL: https://abs.example/api/items/i/file/1?token=eyJ.abc-123&x=1 (x)"),
+            "Could not read from resource. URL: https://abs.example/api/items/i/file/1?token=REDACTED&x=1 (x)"
+        );
+        assert_eq!(redact_tokens("a?token=one b?token=two"), "a?token=REDACTED b?token=REDACTED");
+        assert_eq!(redact_tokens("ends with token="), "ends with token=");
+        assert_eq!(redact_tokens("no secrets here"), "no secrets here");
     }
 
     #[test]

@@ -253,6 +253,15 @@ Fractal) rather than copying Lissen's Material Design look.
   tab, not just Home — see the "Home" and "Library browse" mockups, both of which show it fixed
   below their scrollable content. It reflects whatever's currently loaded regardless of which
   screen the user navigated to since starting playback.
+- **Switching books.** Starting a book stops the previous one at once — its position is saved
+  first — and the bar switches to the new book's title and cover immediately, with an empty
+  progress line, while the new book resolves (network lookup, then loading its file). Nothing
+  acts on a book until it has loaded: seeking does nothing meanwhile, play/pause (from the bar,
+  MPRIS, a headphone unplug or a phone call) only decide whether it starts playing once loaded,
+  and tapping the bar opens the full player once it has. A tapped chapter is part of the start
+  itself. Every start, load, seek, play and pause is logged, as is anything discarded because a
+  newer start or load replaced it. *(Field report: the previous book used to stay loaded through
+  the whole resolve, and a rewind in that window loaded its audio behind the new book's title.)*
 
 ### System media integration
 Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,

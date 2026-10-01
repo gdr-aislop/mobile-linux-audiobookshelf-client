@@ -503,6 +503,17 @@ was and wasn't verified.
       *Expected:* position, speed setting, and sleep-timer state are exactly as before — nothing
       resets, playback never stops.
 
+- [ ] **MP-9 — Switching books never plays the old one.** Play book A well into it (ideally a
+      multi-file book, an hour or more in). Open book B and tap Play, then *immediately* rewind,
+      tap play/pause, and tap the mini bar — all while B is still loading.
+      *Expected:* A's audio stops the moment Play is tapped; the mini bar shows B's title and cover
+      right away; the full player opens once B has loaded, at B's own position, playing B's audio
+      (or paused, if play/pause was tapped an odd number of times while it loaded). A's saved
+      position is where it was left. Repeat with a chapter tap on B's detail screen instead of
+      Play: B starts at that chapter. The log shows `starting playback`, `resolved; loading` and
+      `playback ready` for B, plus `discarded …` lines for anything still in flight for A, and
+      never a `track loaded` line for A after B was started.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.
