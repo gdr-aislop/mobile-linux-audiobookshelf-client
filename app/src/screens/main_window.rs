@@ -418,35 +418,16 @@ pub fn build(
             crate::widgets::swap_content(&window, &player_screen.root);
         }
     });
-    // Opens the player now if a book is loaded, else once the one starting has loaded (or
-    // failed — a failed start is loaded too, with its error). Bounded to 16s: `start()`'s
-    // network resolve alone has a 15s timeout (`abs_api::Client::with_bearer_token`'s default).
-    // A second request while one is waiting doesn't open the screen twice.
+    // Opens the player for the book that is loaded or starting — the Player is built while a
+    // start is still resolving (it shows the loading state and picks the book up as it loads),
+    // rather than waiting for the load (a start over a slow connection used to never open it).
+    // Nothing loaded and nothing starting: there is nothing to show.
     let open_player: Rc<dyn Fn()> = Rc::new({
         let controller = mini_bar.controller.clone();
-        let waiting = Rc::new(std::cell::Cell::new(false));
         move || {
             if controller.current_download_context().is_some() {
                 open_player_now();
-                return;
             }
-            if waiting.replace(true) {
-                return;
-            }
-            let controller = controller.clone();
-            let open_player_now = open_player_now.clone();
-            let waiting = waiting.clone();
-            glib::spawn_future_local(async move {
-                for _ in 0..160 {
-                    if controller.current_download_context().is_some() {
-                        waiting.set(false);
-                        open_player_now();
-                        return;
-                    }
-                    glib::timeout_future(std::time::Duration::from_millis(100)).await;
-                }
-                waiting.set(false);
-            });
         }
     });
 

@@ -319,6 +319,7 @@ mod tests {
         (playback_a_hanging_push_does_not_delay_local_writes, crate::player::tests::run_a_hanging_push_does_not_delay_local_writes),
         (playback_a_speed_picked_while_paused_on_a_stream_is_applied_at_play, crate::player::tests::run_a_speed_picked_while_paused_on_a_stream_is_applied_at_play),
         (playback_a_retired_player_goes_silent_and_stays_that_way, crate::player::tests::run_a_retired_player_goes_silent_and_stays_that_way),
+        (playback_progress_actions_during_a_start_apply_once_loaded, crate::player::tests::run_progress_actions_during_a_start_apply_once_loaded),
         (player_screen_renders, crate::screens::player::tests::run),
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),

@@ -741,6 +741,22 @@ impl ProgressAction {
         let (position, is_finished) = target(self.duration_seconds.get());
         self.show(position, is_finished);
         if self.is_loaded_in_player() {
+            // Still starting: the player's own position is 0 and the controller applies the
+            // action once the book is loaded, so the Undo is built from what was saved.
+            if self.controller.snapshot().is_some_and(|s| s.is_loading) {
+                let action = self.clone();
+                glib::spawn_future_local(async move {
+                    let before = abs_storage::repo::progress::get(&action.pool, &action.account_id, &action.server_id, &action.item_id).await.ok().flatten();
+                    let (before_position, before_finished) = before.map(|p| (p.current_time_seconds, p.is_finished)).unwrap_or((0.0, false));
+                    if is_finished {
+                        action.controller.mark_as_finished();
+                    } else {
+                        action.controller.reset_progress();
+                    }
+                    action.toast_overlay.add_toast(action.undo_toast(done_title, before_position, before_finished));
+                });
+                return;
+            }
             let before = self.controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
             // Synchronous from the caller's point of view (the controller's own write runs on
             // its queue, same posture as its periodic progress tick) — safe to toast right away.

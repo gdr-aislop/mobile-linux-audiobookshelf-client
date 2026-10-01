@@ -186,6 +186,19 @@ struct PendingStart {
     wants_play: bool,
     /// The chapter to start at instead of the saved position, if one was tapped.
     start_chapter: Option<usize>,
+    /// What Item Detail's "Reset progress" / "Mark as finished" asked for while this book was
+    /// still starting. Applied once it is loaded (see `PlayerController::reset_progress`).
+    intent: Option<StartIntent>,
+    /// What the book is being started with — what a download button on a Player opened while it
+    /// loads needs.
+    session: abs_core::auth::Session,
+}
+
+/// A progress action asked for during a start; see [`PendingStart::intent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartIntent {
+    Reset,
+    MarkFinished,
 }
 
 /// A chapter, as needed by the chapters sheet — kept in-memory on `NowPlaying` rather than pushed
@@ -1573,7 +1586,8 @@ impl PlayerController {
     /// `reset_progress`, below) would actually affect the item it means, since neither of those
     /// checks the id itself.
     pub fn current_item_id(&self) -> Option<String> {
-        self.inner.borrow().now_playing.as_ref().map(|np| np.item_id.clone())
+        let inner = self.inner.borrow();
+        inner.now_playing.as_ref().map(|np| np.item_id.clone()).or_else(|| inner.pending_start.as_ref().map(|p| p.item_id.clone()))
     }
 
     /// The currently-playing item's chapters, if any — for the chapters sheet. Empty if nothing
@@ -1586,7 +1600,9 @@ impl PlayerController {
     /// button needs to call `DownloadManager::start_download`. `None` if nothing is playing.
     pub fn current_download_context(&self) -> Option<(abs_core::auth::Session, String, String)> {
         let inner = self.inner.borrow();
-        let now_playing = inner.now_playing.as_ref()?;
+        let Some(now_playing) = inner.now_playing.as_ref() else {
+            return inner.pending_start.as_ref().map(|p| (p.session.clone(), p.server_id.clone(), p.item_id.clone()));
+        };
         Some((now_playing.session.clone(), now_playing.server_id.clone(), now_playing.item_id.clone()))
     }
 
@@ -1635,6 +1651,11 @@ impl PlayerController {
     /// no-op if nothing is playing.
     pub fn mark_as_finished(&self) {
         let mut inner = self.inner.borrow_mut();
+        if let Some(pending) = &mut inner.pending_start {
+            tracing::info!(item_id = %pending.item_id, "mark as finished: will apply once loaded");
+            pending.intent = Some(StartIntent::MarkFinished);
+            return;
+        }
         let Some(duration_seconds) = inner.now_playing.as_ref().map(|np| np.duration_seconds) else { return };
         tracing::info!("marking the current book finished");
         inner.pause_backend_if_loaded();
@@ -1655,8 +1676,16 @@ impl PlayerController {
     /// as `mark_as_finished`, worth keeping as real functionality rather than a debug-only
     /// backdoor. A no-op if nothing is playing.
     pub fn reset_progress(&self) {
-        if self.inner.borrow().now_playing.is_none() {
-            return;
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(pending) = &mut inner.pending_start {
+                tracing::info!(item_id = %pending.item_id, "reset progress: will apply once loaded");
+                pending.intent = Some(StartIntent::Reset);
+                return;
+            }
+            if inner.now_playing.is_none() {
+                return;
+            }
         }
         // Book position 0 is track 0's start — which is a cross-track seek whenever a later file
         // is loaded, so this goes through `seek_to_seconds`'s mapping rather than the backend
@@ -1747,6 +1776,8 @@ impl PlayerController {
                 cover_path: None,
                 wants_play: true,
                 start_chapter,
+                intent: None,
+                session: session.clone(),
             });
             tracing::info!(item_id = %item.item_id, title = %item.title, ?previous, ?start_chapter, session = generation, "starting playback");
             inner.publish();
@@ -2028,7 +2059,9 @@ impl PlayerController {
 
             let mut inner = inner_rc.borrow_mut();
             // Play only if nothing paused it while it resolved: the user, an unplug, a call.
-            let wants_play = inner.pending_start.take().is_some_and(|p| p.wants_play);
+            let pending = inner.pending_start.take();
+            let wants_play = pending.as_ref().is_some_and(|p| p.wants_play);
+            let intent = pending.and_then(|p| p.intent);
             let is_playing = loaded && wants_play;
             if is_playing {
                 let _ = inner.backend.play();
@@ -2074,6 +2107,12 @@ impl PlayerController {
             drop(inner);
             if is_playing {
                 controller.ensure_ticking();
+            }
+            // Asked for during the start: the book is loaded now, so it is a plain action on it.
+            match intent {
+                Some(StartIntent::Reset) => controller.reset_progress(),
+                Some(StartIntent::MarkFinished) => controller.mark_as_finished(),
+                None => {}
             }
 
             // The cover download, spawned only now that it can't race `now_playing` into
@@ -6537,5 +6576,58 @@ pub(crate) mod tests {
         };
         pump_until(saved, Duration::from_secs(5));
         assert!(saved(), "the position at retirement is saved");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. While a book is still starting it is
+    /// already "the current item" (so Item Detail routes its Reset/Mark finished to the
+    /// controller, and a Player opened then has a download context), and such an action is applied
+    /// once the book is loaded instead of being lost or overwritten by the start.
+    pub(crate) fn run_progress_actions_during_a_start_apply_once_loaded(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20], &[], Some(Duration::from_millis(800))));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[20], &[], Some(Duration::from_millis(800))));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 12.0, false)).unwrap();
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-2", 12.0, false)).unwrap();
+        let (controller, _state) = scripted_controller(&pool);
+
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        assert!(controller.snapshot().is_some_and(|s| s.is_loading));
+        assert_eq!(controller.current_item_id().as_deref(), Some("item-1"), "a book that is starting is the current one");
+        let (_, server_id, item_id) = controller.current_download_context().expect("a context while starting");
+        assert_eq!((server_id.as_str(), item_id.as_str()), (server.id.as_str(), "item-1"));
+
+        controller.mark_as_finished();
+        assert!(controller.snapshot().is_some_and(|s| s.is_loading), "asking doesn't end the start");
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+        assert!(!controller.snapshot().unwrap().is_playing, "marked finished: not playing");
+        let finished = || {
+            runtime
+                .block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1"))
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.is_finished && (p.current_time_seconds - 20.0).abs() < 0.5)
+        };
+        pump_until(finished, Duration::from_secs(5));
+        assert!(finished(), "the finished mark reaches the saved progress (it was 12s, unfinished)");
+
+        // And a reset asked for during a start.
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-2", "Book Two"), 1.0);
+        assert!(controller.snapshot().is_some_and(|s| s.is_loading));
+        controller.reset_progress();
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+        let reset = || {
+            runtime
+                .block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-2"))
+                .ok()
+                .flatten()
+                .is_some_and(|p| !p.is_finished && p.current_time_seconds < 0.5)
+        };
+        pump_until(reset, Duration::from_secs(5));
+        assert!(reset(), "the reset reaches the saved progress");
+        controller.stop();
     }
 }

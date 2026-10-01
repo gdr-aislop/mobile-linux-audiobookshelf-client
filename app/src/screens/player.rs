@@ -291,12 +291,12 @@ pub fn build(
     // The download button + its scope popover — shared with Item Detail's own
     // (`widgets::download_scope_menu`; see its module doc for why this moved out of this file).
     // `current_download_context()` is read once, here, rather than inside a closure: a
-    // `PlayerScreen` is built fresh on every mini-bar tap, so there is always something already
-    // playing by the time this runs — unlike `chapter_ranges`/`current_chapter_index`/free space
+    // `PlayerScreen` is built fresh on every mini-bar tap, so there is always a book loaded or
+    // starting by the time this runs — unlike `chapter_ranges`/`current_chapter_index`/free space
     // below, which the widget itself re-asks on every popover open since those genuinely change
     // over a session's lifetime.
     let (download_session, download_server_id, download_item_id) =
-        controller.current_download_context().expect("a player screen is only ever built once something is playing");
+        controller.current_download_context().expect("a player screen is only ever built once a book is loaded or starting");
     // Visible progress for this item's own in-flight download (see `widgets::download_progress`'s
     // doc) — built before `download_menu` moves `download_item_id`, appended to `content` below
     // (its last child is `secondary_row`, so a plain `append` here lands right after it).
@@ -311,10 +311,12 @@ pub fn build(
             let controller = controller.clone();
             move || controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect()
         },
-        // Player only builds this once playback has already started, so its chapters (however
-        // many there are — zero for a chapterless book) are already known by the time this menu
-        // exists; unlike Item Detail, there's no network round trip still in flight to wait on.
-        || true,
+        // The Player can open while its book is still starting; its chapters (however many
+        // there are — zero for a chapterless book) are known once that is over.
+        {
+            let controller = controller.clone();
+            move || controller.snapshot().is_some_and(|s| !s.is_loading)
+        },
         {
             let controller = controller.clone();
             move || controller.current_chapter_index().unwrap_or(0)
