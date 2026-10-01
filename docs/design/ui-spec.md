@@ -262,6 +262,21 @@ Fractal) rather than copying Lissen's Material Design look.
   itself. Every start, load, seek, play and pause is logged, as is anything discarded because a
   newer start or load replaced it. *(Field report: the previous book used to stay loaded through
   the whole resolve, and a rewind in that window loaded its audio behind the new book's title.)*
+- **Starting the book that's already loaded** (Play, Resume or a chapter on its detail screen)
+  doesn't load it again: a chapter is a seek, and otherwise it just plays from where it is.
+- **Finished books.** Once a book reaches its end, or is marked finished, it stays finished
+  through any later pause, quit, book switch or reconnect. Play on it starts it over from the
+  beginning. An end of the stream on the last file that comes more than a minute (but less than
+  10% of the file) before its reported length pauses there without marking the book finished;
+  Play loads it again at that spot, and ending at the same spot again is the real end.
+- **Recovering from a lost stream.** A stream error while playing (a dropped connection, an
+  expired token) reloads the file once by itself at the same position; a second one within a
+  minute stops with the error banner. A stream that failed while paused, or that has been paused
+  for five minutes or more, is loaded afresh on Play rather than resumed. A seek that never lands
+  reloads the file once at the target; if that fails too, playback stops with an error and the
+  target stays the saved position.
+- **Pausing then seeking** (rewind, scrub, speed) keeps the pipeline paused while it re-buffers;
+  it is never mistaken for a pause that failed.
 
 ### System media integration
 Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,

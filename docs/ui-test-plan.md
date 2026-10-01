@@ -514,6 +514,36 @@ was and wasn't verified.
       `playback ready` for B, plus `discarded …` lines for anything still in flight for A, and
       never a `track loaded` line for A after B was started.
 
+- [ ] **MP-10 — Pause, then rewind on a stream.** Stream a book (not downloaded), pause, and
+      within a second tap skip-back two or three times; also change the speed while paused.
+      *Expected:* no "the audio pipeline never actually paused" banner; Play resumes at the new
+      position at once (no reload). The log may show `pause confirmation ended by a seek`.
+
+- [ ] **MP-11 — Scrubbing seeks once.** In the full player, drag the scrubber slowly across a
+      good part of the book (across a file boundary in a multi-file book), then drag it to the
+      far right.
+      *Expected:* the time labels follow the thumb while dragging and the thumb isn't pulled back;
+      the log shows one `scrub: seeking` and one `seek` line per drag, not dozens; the far-right
+      drag lands one second before the end and keeps playing — the book is not marked finished.
+
+- [ ] **MP-12 — Play on the loaded book.** With a book playing (or paused), open its detail
+      screen and tap Play/Resume; then tap one of its chapters.
+      *Expected:* no loading state, no gap; the log shows `already loaded; playing` and no
+      `starting playback`. The chapter tap jumps there without reloading.
+
+- [ ] **MP-13 — A finished book stays finished.** Use ⋯ → Mark as finished on a playing book,
+      then quit and reopen the app; separately, let a book play to its very end and then start
+      another one.
+      *Expected:* both stay finished (Home, the server's web UI). Play on the finished book starts
+      it from the beginning (log: `finished book restarted`).
+
+- [ ] **MP-14 — Losing the stream.** While streaming, turn off Wi-Fi/mobile data for ~30 s and
+      back on; separately, pause for more than five minutes (screen off) and press Play.
+      *Expected:* the first case logs `stream error; reloading at the same position` once and
+      playback continues without a tap (a second loss within a minute shows the banner); the
+      second logs `resuming with a fresh connection` and audio starts within a few seconds rather
+      than after a long silence.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

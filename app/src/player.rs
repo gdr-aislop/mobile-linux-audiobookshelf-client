@@ -114,6 +114,17 @@ const PAUSE_CONFIRM_ATTEMPTS: u32 = 10;
 /// `PlayerController::external_play_pause`. Observed on the Librem 5: the spurious one ~2ms
 /// after the pause, a deliberate one ~3s after.
 const SPURIOUS_UNPLUG_TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
+/// A stream error while playing reloads the file once by itself (a fresh URL, token and
+/// connection) — a dropped connection or an expired token is the common cause, and a reload is
+/// exactly what Retry would do. A second error within this window stops with the error instead.
+const AUTO_RECOVER_WINDOW: Duration = Duration::from_secs(60);
+/// After a pause this long, a streamed book resumes with a fresh load rather than asking the
+/// paused pipeline to continue: the phone may have slept or changed networks meanwhile, and the
+/// pipeline's old HTTP connection then only fails after its own retries and timeouts — a long
+/// stretch of silence while the player says it's playing.
+const STALE_CONNECTION_AFTER: Duration = Duration::from_secs(300);
+/// After an automatic reload, how long the stream may take to answer before that is logged.
+const STREAM_SLOW_TO_ANSWER_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct PlayRequest {
@@ -286,6 +297,14 @@ struct NowPlaying {
     /// there (see `Inner::observe_position`). A second failure then stops with an error instead
     /// of reloading forever. Reset by a landed seek and by any seek the listener asks for.
     seek_reload_used: bool,
+}
+
+/// See `Inner::judge_end_of_stream`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EndOfStreamVerdict {
+    RealEnd,
+    Unclear { within: f64, short_by: f64 },
+    Premature,
 }
 
 /// What `seek_to_seconds` decided to do once its synchronous, borrow-scoped decision-making is
@@ -619,6 +638,13 @@ struct Inner {
     on_position_adopted: Option<Rc<dyn Fn(f64, f64)>>,
     /// Bumped by every seek while paused; the delayed write only runs for the latest one.
     paused_seek_generation: u64,
+    /// When a stream error last reloaded the file by itself — see `AUTO_RECOVER_WINDOW`.
+    last_auto_recover_at: Option<Instant>,
+    /// `STALE_CONNECTION_AFTER`, shortened by tests.
+    stale_connection_after: Duration,
+    /// An end-of-stream found on the bus by `play()` (which drains what arrived while paused),
+    /// handed to the next tick, which is where end-of-stream is handled.
+    deferred_event: Option<abs_player::PlayerEvent>,
 }
 
 impl Inner {
@@ -751,42 +777,94 @@ impl Inner {
     /// stale pre-seek reading that just happens to be `Some`. Called once per tick — the only
     /// place besides an explicit seek that keeps this fallback from going stale during ordinary,
     /// uninterrupted playback, and the only place that ever clears `seek_target_pending`.
-    fn observe_position(&mut self) {
-        let Some(within) = self.backend.position().map(|d| d.as_secs_f64()) else { return };
-        if let Some(now_playing) = &mut self.now_playing {
-            if now_playing.seek_target_pending {
-                // A generous tolerance: burst-buffering and container framing mean a landed seek
-                // rarely reports the exact requested second, and the only failure mode of being
-                // too generous here is trusting a fresher position slightly sooner — never
-                // trusting a stale one, since a genuinely stale reading (the old, pre-seek
-                // position) is normally seconds away from a skip/seek's target, not fractions.
-                const SEEK_LANDED_TOLERANCE_SECONDS: f64 = 1.5;
-                if (within - now_playing.last_known_within_track).abs() > SEEK_LANDED_TOLERANCE_SECONDS {
-                    // The pipeline reports a real position, just not the requested one. Either the
-                    // seek is still on its way, or it was asked for before the pipeline could take
-                    // it and silently did nothing — which, left alone, plays on from wherever the
-                    // pipeline happens to be and later saves that over the listener's position.
-                    // Give an issued seek a moment, then ask again; after a few tries accept what
-                    // the pipeline reports, since that is what is actually being heard.
-                    let Some(issued_at) = now_playing.seek_issued_at else { return };
-                    if issued_at.elapsed() < SEEK_REISSUE_AFTER {
-                        return;
-                    }
-                    if now_playing.seek_retries < MAX_SEEK_REISSUES {
-                        now_playing.seek_retries += 1;
-                        now_playing.seek_issued_at = Some(Instant::now());
-                        let target = now_playing.last_known_within_track;
-                        tracing::info!(target, within, "a seek didn't land; asking again");
-                        let _ = self.backend.seek(Duration::from_secs_f64(target));
-                        return;
-                    }
-                    tracing::warn!(target = now_playing.last_known_within_track, within, "a seek never landed; following the pipeline's own position");
+    ///
+    /// A seek that still hasn't landed after its re-issues is never given up on by adopting the
+    /// pipeline's position — on a fresh load that is the start of the file, and the next progress
+    /// write would save (and push) it over the listener's real position. The file is loaded again
+    /// at the target instead, once: the returned `(item_id, load generation)` is for the caller to
+    /// hand to `spawn_load_track`. If that doesn't land either, playback stops with an error and
+    /// the target stays the position shown and saved.
+    fn observe_position(&mut self) -> Option<(String, u64)> {
+        // A generous tolerance: burst-buffering and container framing mean a landed seek rarely
+        // reports the exact requested second, and the only failure mode of being too generous
+        // here is trusting a fresher position slightly sooner — never trusting a stale one, since
+        // a genuinely stale reading (the old, pre-seek position) is normally seconds away from a
+        // skip/seek's target, not fractions.
+        const SEEK_LANDED_TOLERANCE_SECONDS: f64 = 1.5;
+        enum GiveUp {
+            Reload { track: usize, target: f64, item_id: String },
+            Stop { target: f64 },
+        }
+        let within = self.backend.position().map(|d| d.as_secs_f64())?;
+        let file_end = self.backend.duration().map(|d| d.as_secs_f64()).filter(|d| *d > 0.0);
+        let now_playing = self.now_playing.as_mut()?;
+        let mut give_up = None;
+        if now_playing.seek_target_pending {
+            let target = now_playing.last_known_within_track;
+            // A target past the file's real end (the server reported it longer than it is) lands
+            // at that end: the pipeline can't go further, and that's not a failed seek.
+            let clamped_at_end = file_end.is_some_and(|end| target > end && (within - end).abs() <= SEEK_LANDED_TOLERANCE_SECONDS);
+            // A freshly loaded file reports exactly its start until the seek lands, which for a
+            // target under the tolerance would otherwise read as landed — and pin the position
+            // back to the start of the file. Accurate seeks don't land on exactly zero instead.
+            let still_at_start = within == 0.0 && target > 0.25;
+            if ((within - target).abs() > SEEK_LANDED_TOLERANCE_SECONDS || still_at_start) && !clamped_at_end {
+                // The pipeline reports a real position, just not the requested one. Either the
+                // seek is still on its way, or it was asked for before the pipeline could take
+                // it and silently did nothing. Give an issued seek a moment, then ask again.
+                let issued_at = now_playing.seek_issued_at?;
+                if issued_at.elapsed() < SEEK_REISSUE_AFTER {
+                    return None;
                 }
+                if now_playing.seek_retries < MAX_SEEK_REISSUES {
+                    now_playing.seek_retries += 1;
+                    now_playing.seek_issued_at = Some(Instant::now());
+                    tracing::info!(target, within, "a seek didn't land; asking again");
+                    self.drop_stale_end_of_stream();
+                    let _ = self.backend.seek(Duration::from_secs_f64(target));
+                    return None;
+                }
+                give_up = Some(if now_playing.seek_reload_used {
+                    GiveUp::Stop { target }
+                } else {
+                    GiveUp::Reload { track: now_playing.current_track, target, item_id: now_playing.item_id.clone() }
+                });
+            } else {
                 now_playing.seek_target_pending = false;
                 now_playing.seek_issued_at = None;
                 now_playing.seek_retries = 0;
+                now_playing.seek_reload_used = false;
             }
-            now_playing.last_known_within_track = within;
+        }
+        match give_up {
+            None => {
+                now_playing.last_known_within_track = within;
+                None
+            }
+            Some(GiveUp::Reload { track, target, item_id }) => {
+                tracing::warn!(target, within, "a seek never landed; reloading the file at the target");
+                let generation = self.prepare_track_load(track, target)?;
+                if let Some(now_playing) = &mut self.now_playing {
+                    now_playing.seek_reload_used = true;
+                }
+                Some((item_id, generation))
+            }
+            Some(GiveUp::Stop { target }) => {
+                tracing::warn!(target, within, "a seek never landed, even after reloading the file; stopping");
+                self.reset_backend();
+                if let Some(now_playing) = &mut self.now_playing {
+                    // Still pending, at the target: that's what is shown, saved, and reloaded at.
+                    now_playing.is_playing = false;
+                    now_playing.needs_reload = true;
+                    now_playing.seek_issued_at = None;
+                    now_playing.last_error = Some(abs_player::PlaybackError {
+                        kind: abs_player::PlaybackErrorKind::Seek,
+                        message: format!("the audio never got to {target:.1}s into the file"),
+                        debug: None,
+                    });
+                }
+                None
+            }
         }
     }
 
@@ -869,31 +947,65 @@ impl Inner {
         });
     }
 
-    /// Whether an end-of-stream came well before the end of the track: a stream cut off mid-file
-    /// can end like a finished one, and treating it as finished would advance to the next file
-    /// (or mark the whole book finished) from the middle of this one. Only a large gap counts
-    /// (at least a minute and 10% of the track), since durations of some files are estimates. And
-    /// a second one at the same spot is accepted as the real end, so a wrong estimate can't trap
-    /// playback in a retry loop.
-    fn premature_end_of_stream(&mut self) -> bool {
+    /// Called right before a seek within the loaded file: an end-of-stream already waiting on the
+    /// bus was posted before the seek and is about the position being left, not the new one (a
+    /// rewind just before the end of a file used to be swallowed by it, moving on to the next
+    /// file or finishing the book). An error waiting there is kept for the tick.
+    fn drop_stale_end_of_stream(&mut self) {
+        if self.deferred_event.is_some() {
+            return;
+        }
+        while let Some(event) = self.backend.poll_event() {
+            match event {
+                abs_player::PlayerEvent::EndOfStream => tracing::info!("dropped an end-of-stream from before the seek"),
+                error @ abs_player::PlayerEvent::Error(_) => {
+                    self.deferred_event = Some(error);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// What an end-of-stream means, given how far before the end of the track it came. A stream
+    /// cut off mid-file can end like a finished one, and treating it as finished would advance to
+    /// the next file (or mark the whole book finished) from the middle of this one; but durations
+    /// of some files are estimates, so a small gap is the real end.
+    ///
+    /// - Within `PREMATURE_EOS_MIN_GAP_SECONDS` of the end: the real end.
+    /// - Further, but within 10% of the track: on any file but the last, the real end (moving on
+    ///   a little early beats stopping); on the last one, `Unclear` — stopping is better than
+    ///   finishing the book an hour early (10% of a 10-hour single file).
+    /// - Further still: `Premature`, handled as a lost connection.
+    ///
+    /// A second unclear or premature end at the same spot is accepted as the real end, so a
+    /// wrong estimate can't trap playback in a loop.
+    fn judge_end_of_stream(&mut self) -> EndOfStreamVerdict {
         let within = self.backend.position().map(|d| d.as_secs_f64());
         let backend_duration = self.backend.duration().map(|d| d.as_secs_f64()).filter(|d| *d > 0.0);
-        let Some(now_playing) = &mut self.now_playing else { return false };
+        let Some(now_playing) = &mut self.now_playing else { return EndOfStreamVerdict::RealEnd };
         let within = within.unwrap_or(now_playing.last_known_within_track);
         let server_duration = now_playing.tracks.get(now_playing.current_track).map(|t| t.duration_seconds).filter(|d| *d > 0.0);
-        let Some(duration) = server_duration.or(backend_duration) else { return false };
+        let Some(duration) = server_duration.or(backend_duration) else { return EndOfStreamVerdict::RealEnd };
+        let is_last_track = now_playing.current_track + 1 >= now_playing.tracks.len();
         let short_by = duration - within;
-        if short_by < PREMATURE_EOS_MIN_GAP_SECONDS.max(duration * 0.1) {
-            return false;
+        let verdict = if short_by < PREMATURE_EOS_MIN_GAP_SECONDS {
+            EndOfStreamVerdict::RealEnd
+        } else if short_by < duration * 0.1 {
+            if is_last_track { EndOfStreamVerdict::Unclear { within, short_by } } else { EndOfStreamVerdict::RealEnd }
+        } else {
+            EndOfStreamVerdict::Premature
+        };
+        if verdict == EndOfStreamVerdict::RealEnd {
+            return verdict;
         }
         let here = (now_playing.current_track, within);
         if now_playing.premature_eos_at.is_some_and(|(track, at)| track == here.0 && (at - within).abs() < 5.0) {
             tracing::warn!(within, duration, "the stream ended early at the same spot again; taking it as the real end");
             now_playing.premature_eos_at = None;
-            return false;
+            return EndOfStreamVerdict::RealEnd;
         }
         now_playing.premature_eos_at = Some(here);
-        true
+        verdict
     }
 
     /// At end-of-stream: if another track follows the current one, refines the track map against
@@ -1077,6 +1189,64 @@ impl Inner {
         });
     }
 
+    /// Before a paused pipeline is asked to play again: the tick doesn't run while paused, so
+    /// whatever the pipeline reported meanwhile is still on its bus. A stream error (burst
+    /// buffering keeps downloading while paused) means it can't resume — it's released and
+    /// marked for the reload `play()` then does, instead of erroring right after Play. An
+    /// end-of-stream is handed to the next tick, which handles it as usual. And a stream paused
+    /// for `stale_connection_after` is reloaded too, with a fresh connection (see
+    /// `STALE_CONNECTION_AFTER`).
+    fn prepare_to_resume(&mut self) {
+        // While playing, the tick is watching the bus itself.
+        if !self.backend_holds_track() || self.now_playing.as_ref().is_some_and(|np| np.is_playing) {
+            return;
+        }
+        // `poll_event` skips everything but an end-of-stream or an error, so one call finds either.
+        let failed = match self.backend.poll_event() {
+            Some(abs_player::PlayerEvent::Error(err)) => Some(err),
+            Some(abs_player::PlayerEvent::EndOfStream) => {
+                self.deferred_event = Some(abs_player::PlayerEvent::EndOfStream);
+                return;
+            }
+            None => None,
+        };
+        let Some(now_playing) = &self.now_playing else { return };
+        let stale = !now_playing.current_source_is_local && self.last_played_at.elapsed() >= self.stale_connection_after;
+        if failed.is_none() && !stale {
+            return;
+        }
+        let within = if now_playing.seek_target_pending {
+            now_playing.last_known_within_track
+        } else {
+            self.backend.position().map(|d| d.as_secs_f64()).unwrap_or(now_playing.last_known_within_track)
+        };
+        match &failed {
+            Some(err) => tracing::info!(kind = ?err.kind, within, "the stream failed while paused; reloading it to resume"),
+            None => tracing::info!(paused_for = ?self.last_played_at.elapsed(), within, "resuming with a fresh connection"),
+        }
+        self.reset_backend();
+        if let Some(now_playing) = &mut self.now_playing {
+            now_playing.needs_reload = true;
+            now_playing.last_known_within_track = within;
+        }
+    }
+
+    /// Logs once if the load `generation` (an automatic reload after a stream error) still has
+    /// no audio after `STREAM_SLOW_TO_ANSWER_AFTER` — the stream's own timeout reports the error
+    /// later, and meanwhile the player says it's playing.
+    fn log_if_the_stream_is_slow_to_answer(inner_rc: Rc<RefCell<Inner>>, generation: u64) {
+        let inner_rc = Rc::downgrade(&inner_rc);
+        glib::timeout_add_local_once(STREAM_SLOW_TO_ANSWER_AFTER, move || {
+            let Some(inner_rc) = inner_rc.upgrade() else { return };
+            let inner = inner_rc.borrow();
+            let waiting = inner.now_playing.as_ref().is_some_and(|np| np.loading_track == Some(generation))
+                || (inner.load_generation == generation && inner.backend.position().is_none());
+            if waiting {
+                tracing::warn!(waited = ?STREAM_SLOW_TO_ANSWER_AFTER, "still waiting for the stream after reloading it");
+            }
+        });
+    }
+
     /// Confirms a `pause()` call whose `backend.pause()` returned `Ok` actually landed — see
     /// `AudioBackend::pause`'s doc comment for why `Ok` alone doesn't mean that. Polls
     /// `backend.is_paused()` on the GTK main loop (never blocking it, unlike a real
@@ -1216,6 +1386,9 @@ impl PlayerController {
                 holding_writes_for_reconcile: None,
                 on_position_adopted: None,
                 paused_seek_generation: 0,
+                last_auto_recover_at: None,
+                stale_connection_after: STALE_CONNECTION_AFTER,
+                deferred_event: None,
             })),
             tick_source: Rc::new(RefCell::new(None)),
         }
@@ -1866,6 +2039,7 @@ impl PlayerController {
         }
         self.reconcile_before_resuming();
         let mut inner = self.inner.borrow_mut();
+        inner.prepare_to_resume();
         let position = inner.book_position();
         let Some(now_playing) = &mut inner.now_playing else { return };
         tracing::info!(item_id = %now_playing.item_id, position, "play");
@@ -2074,6 +2248,18 @@ impl PlayerController {
     #[cfg(test)]
     pub fn set_resume_reconcile_after(&self, after: Duration) {
         self.inner.borrow_mut().resume_reconcile_after = after;
+    }
+
+    #[cfg(test)]
+    pub fn set_stale_connection_after(&self, after: Duration) {
+        self.inner.borrow_mut().stale_connection_after = after;
+    }
+
+    /// As if a stream error had just been recovered from by itself: the next one stops with the
+    /// error, for tests of what the listener sees then.
+    #[cfg(test)]
+    pub fn use_up_auto_recovery(&self) {
+        self.inner.borrow_mut().last_auto_recover_at = Some(Instant::now());
     }
 
     pub fn pause(&self) {
@@ -2478,6 +2664,7 @@ impl PlayerController {
                     None
                 } else if now_playing.current_source_is_local {
                     now_playing.seek_issued_at = Some(Instant::now());
+                    inner.drop_stale_end_of_stream();
                     let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     None
                 } else {
@@ -2538,6 +2725,7 @@ impl PlayerController {
                         if let Some(now_playing) = &mut inner.now_playing {
                             now_playing.seek_issued_at = Some(Instant::now());
                         }
+                        inner.drop_stale_end_of_stream();
                         let _ = inner.backend.seek(Duration::from_secs_f64(within));
                     }
                 });
@@ -2565,6 +2753,9 @@ impl PlayerController {
         // A rate change is a seek to the pipeline: a pause confirmation in flight must not read
         // the preroll it causes as a pause that never landed.
         inner.seek_count += 1;
+        if holds_track {
+            inner.drop_stale_end_of_stream();
+        }
         let accepted = !holds_track || inner.backend.set_speed(speed, Duration::from_secs_f64(within)).is_ok();
         if accepted {
             if let Some(now_playing) = &mut inner.now_playing {
@@ -2634,11 +2825,43 @@ impl PlayerController {
             return false;
         }
 
-        inner.observe_position();
+        if let Some((item_id, generation)) = inner.observe_position() {
+            Inner::spawn_load_track(self.inner.clone(), item_id, generation);
+        }
 
-        if let Some(event) = inner.backend.poll_event() {
+        let event = match inner.deferred_event.take() {
+            Some(event) => Some(event),
+            None => inner.backend.poll_event(),
+        };
+        if let Some(event) = event {
+            let verdict = match event {
+                abs_player::PlayerEvent::EndOfStream => inner.judge_end_of_stream(),
+                abs_player::PlayerEvent::Error(_) => EndOfStreamVerdict::RealEnd,
+            };
+            if let EndOfStreamVerdict::Unclear { within, short_by } = verdict {
+                // Possibly the end, possibly a stream cut short near it: stop without marking the
+                // book finished. Play reloads here — more audio if there is some, or the same end
+                // again, which then counts as the real one.
+                tracing::warn!(within, short_by, "the last file ended before its reported length; pausing without marking the book finished");
+                inner.reset_backend();
+                if let Some(now_playing) = &mut inner.now_playing {
+                    now_playing.is_playing = false;
+                    now_playing.needs_reload = true;
+                    now_playing.last_known_within_track = within;
+                    now_playing.seek_target_pending = false;
+                }
+                inner.paused_by_unplug = false;
+                inner.paused_by_call = false;
+                inner.write_progress();
+                inner.publish();
+                // Only a wall-clock sleep timer still needs the tick while paused.
+                return matches!(
+                    inner.now_playing.as_ref().map(|n| n.sleep_timer),
+                    Some(SleepTimerState::Armed(SleepTimerDeadline::WallClock(_)))
+                );
+            }
             let event = match event {
-                abs_player::PlayerEvent::EndOfStream if inner.premature_end_of_stream() => {
+                abs_player::PlayerEvent::EndOfStream if verdict == EndOfStreamVerdict::Premature => {
                     tracing::warn!("the stream ended well before the end of the track; treating it as a lost connection");
                     abs_player::PlayerEvent::Error(abs_player::PlaybackError {
                         kind: abs_player::PlaybackErrorKind::Network,
@@ -2763,11 +2986,23 @@ impl PlayerController {
                             {
                                 return;
                             }
-                            if has_local {
-                                tracing::info!(item_id = %recovery.item_id, track = recovery.track_index, "the stream failed but the file is downloaded now; switching to it");
+                            // Once per `AUTO_RECOVER_WINDOW`, a failed stream is simply loaded
+                            // again — a fresh URL, token and connection, which is all a dropped
+                            // connection or an expired token needs, and all Retry would do.
+                            let auto_reload = !has_local && inner.last_auto_recover_at.is_none_or(|at| at.elapsed() >= AUTO_RECOVER_WINDOW);
+                            if has_local || auto_reload {
+                                if has_local {
+                                    tracing::info!(item_id = %recovery.item_id, track = recovery.track_index, "the stream failed but the file is downloaded now; switching to it");
+                                } else {
+                                    tracing::info!(item_id = %recovery.item_id, track = recovery.track_index, within = recovery.within, kind = ?recovery.err.kind, "stream error; reloading at the same position");
+                                    inner.last_auto_recover_at = Some(Instant::now());
+                                }
                                 if let Some(generation) = inner.prepare_track_load(recovery.track_index, recovery.within) {
                                     drop(inner);
-                                    Inner::spawn_load_track(inner_rc, recovery.item_id, generation);
+                                    Inner::spawn_load_track(inner_rc.clone(), recovery.item_id, generation);
+                                    if auto_reload {
+                                        Inner::log_if_the_stream_is_slow_to_answer(inner_rc, generation);
+                                    }
                                 }
                             } else {
                                 if let Some(now_playing) = &mut inner.now_playing {
@@ -3562,8 +3797,16 @@ pub(crate) mod tests {
             1.0,
         );
         // The flush is a synchronous call inside `start()`, but the DB write/server sync it
-        // spawns still needs a pump to land.
-        pump_until(|| false, Duration::from_millis(300));
+        // spawns still needs a pump to land — waited for, not timed: a fixed 300 ms was sometimes
+        // too short for the push.
+        let pushed = || {
+            runtime
+                .block_on(mock_server.received_requests())
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/me/progress/item-1")
+        };
+        pump_until(pushed, Duration::from_secs(5));
 
         let progress = runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap();
         let progress = progress.expect("switching items should flush the outgoing item's progress locally");
@@ -4366,6 +4609,8 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(10));
 
         // Inject a bus error, as if the network died mid-stream.
+        // The automatic reload is covered by its own test; this one is about what follows it.
+        controller.use_up_auto_recovery();
         state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::Error(abs_player::PlaybackError {
             kind: abs_player::PlaybackErrorKind::Network,
             message: "simulated network failure".to_string(),
@@ -4587,6 +4832,8 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 2.5), Duration::from_secs(10));
 
         // The stream dies: the backend is released and reports no position from here on.
+        // The automatic reload is covered by its own test; this one is about what follows it.
+        controller.use_up_auto_recovery();
         state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::Error(abs_player::PlaybackError {
             kind: abs_player::PlaybackErrorKind::Network,
             message: "simulated network failure".to_string(),
@@ -4830,6 +5077,8 @@ pub(crate) mod tests {
         state.borrow_mut().position = Some(Duration::from_secs(100));
         pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 99.5), Duration::from_secs(5));
 
+        // The automatic reload is covered by its own test; this one is about what follows it.
+        controller.use_up_auto_recovery();
         state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
         pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(5));
         let snapshot = controller.snapshot().unwrap();
@@ -5405,6 +5654,8 @@ pub(crate) mod tests {
         let loaded_second = || state.borrow().load_calls.iter().any(|uri| uri.contains("/file/2"));
         pump_until(loaded_second, Duration::from_secs(5));
         assert!(loaded_second());
+        // The automatic reload is covered by its own test; this one is about what follows it.
+        controller.use_up_auto_recovery();
         state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::Error(abs_player::PlaybackError {
             kind: abs_player::PlaybackErrorKind::Network,
             message: "simulated network failure".to_string(),
@@ -5727,6 +5978,215 @@ pub(crate) mod tests {
         assert!((snapshot.position_seconds - 99.0).abs() < 0.5, "a seek to the end stops short of it, got {}", snapshot.position_seconds);
         pump_until(|| false, Duration::from_millis(600));
         assert!(controller.snapshot().unwrap().is_playing, "the book plays on rather than finishing");
+        controller.stop();
+    }
+
+
+    fn network_error() -> abs_player::PlayerEvent {
+        abs_player::PlayerEvent::Error(abs_player::PlaybackError {
+            kind: abs_player::PlaybackErrorKind::Network,
+            message: "simulated network failure".to_string(),
+            debug: None,
+        })
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A stream error while playing — a
+    /// dropped connection, an expired token — used to stop with an error until the listener
+    /// tapped Retry, which only reloads the file. It now reloads once by itself, at the same
+    /// position, and keeps playing; a second error soon after stops with the error as before.
+    pub(crate) fn run_a_stream_error_reloads_once_by_itself(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(30));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 29.5), Duration::from_secs(5));
+        let loads = state.borrow().load_calls.len();
+
+        state.borrow_mut().pending_event = Some(network_error());
+        pump_until(|| state.borrow().load_calls.len() > loads && state.borrow().seek_calls.last() == Some(&Duration::from_secs(30)), Duration::from_secs(5));
+        pump_until(|| false, Duration::from_millis(300));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "reloaded once");
+        assert!(snapshot.last_error.is_none() && snapshot.is_playing, "still playing, no error to tap through");
+        assert!((snapshot.position_seconds - 30.0).abs() < 0.5, "at the same position, got {}", snapshot.position_seconds);
+
+        state.borrow_mut().pending_event = Some(network_error());
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(5));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_some() && !snapshot.is_playing, "a second error soon after stops with the error");
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "and doesn't reload again");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The tick doesn't run while paused,
+    /// so a stream error from then (burst buffering keeps downloading) used to surface only
+    /// right after Play — "play, then it stops". Play now finds it and resumes with a reload. And
+    /// after a long pause a stream resumes with a fresh connection rather than the paused one,
+    /// which may have died while the phone slept.
+    pub(crate) fn run_resuming_a_stream_reloads_when_its_connection_is_gone(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(30));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 29.5), Duration::from_secs(5));
+        controller.pause();
+        // Let the tick notice the pause and stop, so nothing polls the bus any more.
+        pump_until(|| false, Duration::from_millis(600));
+
+        // An error arrived while paused.
+        state.borrow_mut().pending_event = Some(network_error());
+        let loads = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| state.borrow().load_calls.len() > loads && state.borrow().seek_calls.last() == Some(&Duration::from_secs(30)), Duration::from_secs(5));
+        pump_until(|| false, Duration::from_millis(300));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "play reloads instead of resuming a failed stream");
+        assert!(snapshot.last_error.is_none() && snapshot.is_playing);
+        assert!((snapshot.position_seconds - 30.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+
+        // A long pause: the stream is loaded afresh.
+        controller.pause();
+        pump_until(|| false, Duration::from_millis(600));
+        controller.set_stale_connection_after(Duration::from_millis(100));
+        let loads = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| state.borrow().load_calls.len() > loads, Duration::from_secs(5));
+        pump_until(|| false, Duration::from_millis(300));
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "a long-paused stream resumes with a fresh load");
+        assert!((controller.snapshot().unwrap().position_seconds - 30.0).abs() < 0.5);
+
+        // A short pause just resumes.
+        controller.set_stale_connection_after(STALE_CONNECTION_AFTER);
+        controller.pause();
+        let loads = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| false, Duration::from_millis(300));
+        assert_eq!(state.borrow().load_calls.len(), loads, "a short pause resumes the same pipeline");
+        controller.stop();
+    }
+
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A resume seek that never landed was
+    /// given up on by following the pipeline's own position — the start of the file — which the
+    /// next write saved and pushed over the listener's real position. The file is now loaded again
+    /// at the target once; if that fails too, playback stops with an error and the target stays
+    /// the saved position. A target past the file's real end lands at that end, though.
+    pub(crate) fn run_a_seek_that_never_lands_reloads_once_then_stops(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60], &[], None));
+        runtime.block_on(mock_item(&mock_server, "item-2", &[60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "Book Two"));
+        runtime.block_on(abs_storage::repo::progress::set(&pool, &account.id, &server.id, "item-1", 15.0, false)).unwrap();
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let saved = |item_id: &str| runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, item_id)).unwrap().unwrap();
+
+        state.borrow_mut().seeks_to_ignore = u32::MAX;
+        controller.start(session.clone(), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.last_error.is_some()), Duration::from_secs(30));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.last_error.as_ref().map(|e| e.kind), Some(abs_player::PlaybackErrorKind::Seek));
+        assert!(!snapshot.is_playing);
+        assert_eq!(state.borrow().load_calls.len(), 2, "loaded once more at the target, then stopped: {:?}", state.borrow().load_calls);
+        assert!((snapshot.position_seconds - 15.0).abs() < 0.5, "the target is still the position, got {}", snapshot.position_seconds);
+        controller.pause();
+        pump_until(|| false, Duration::from_millis(300));
+        assert!((saved("item-1").current_time_seconds - 15.0).abs() < 0.5, "never saved anywhere else, got {}", saved("item-1").current_time_seconds);
+
+        // The scripted file is really 20 s long: a seek to 50 s stops at its end, and that counts.
+        state.borrow_mut().seeks_to_ignore = 0;
+        controller.start(session.clone(), request("item-2", "Book Two"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().seeks_to_ignore = u32::MAX;
+        state.borrow_mut().position = Some(Duration::from_secs(20));
+        let loads = state.borrow().load_calls.len();
+        controller.seek_to_seconds(50.0);
+        pump_until(|| false, SEEK_REISSUE_AFTER * u32::from(MAX_SEEK_REISSUES + 2));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_none() && snapshot.is_playing, "{:?}", snapshot.last_error);
+        assert_eq!(state.borrow().load_calls.len(), loads, "no reload for a seek clamped at the file's end");
+        assert!((snapshot.position_seconds - 20.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+        controller.stop();
+    }
+
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. An end-of-stream on the last file
+    /// was taken as the end of the book anywhere within 10% of that file — the last hour of a
+    /// 10-hour single-file book, from a truncated download or a stream cut short. It now pauses
+    /// there without marking the book finished; Play loads it again at that spot, and ending at
+    /// the same spot again is the real end.
+    pub(crate) fn run_an_early_end_of_the_last_file_does_not_finish_the_book(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[2000], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        let saved = || runtime.block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1")).unwrap().unwrap();
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+
+        // 100 s short of a 2000 s file: more than a minute, less than 10%.
+        state.borrow_mut().position = Some(Duration::from_secs(1900));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 1899.5), Duration::from_secs(5));
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_playing), Duration::from_secs(5));
+        pump_until(|| false, Duration::from_millis(300));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_none(), "{:?}", snapshot.last_error);
+        assert!((snapshot.position_seconds - 1900.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+        assert!(!saved().is_finished, "not finished on an unclear end");
+        assert!((saved().current_time_seconds - 1900.0).abs() < 0.5, "got {}", saved().current_time_seconds);
+
+        let loads = state.borrow().load_calls.len();
+        controller.play();
+        pump_until(|| state.borrow().seek_calls.last() == Some(&Duration::from_secs(1900)), Duration::from_secs(5));
+        assert_eq!(state.borrow().load_calls.len(), loads + 1, "play loads it again at that spot");
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(5));
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        pump_until(|| saved().is_finished, Duration::from_secs(5));
+        assert!(saved().is_finished, "the same end again is the real end");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. An end-of-stream already waiting on
+    /// the bus when the listener rewinds is about the position they left: it used to be judged
+    /// against the new one and swallow the rewind — moving on to the next file, or finishing the
+    /// book.
+    pub(crate) fn run_an_end_of_stream_from_before_a_seek_is_dropped(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[60, 60], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(59));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 58.5), Duration::from_secs(5));
+        let loads = state.borrow().load_calls.len();
+
+        // The file ends, and before the next tick sees it, the listener skips back.
+        state.borrow_mut().pending_event = Some(abs_player::PlayerEvent::EndOfStream);
+        controller.skip(-30.0);
+        pump_until(|| false, Duration::from_millis(800));
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(state.borrow().load_calls.len(), loads, "still in the first file");
+        assert!(snapshot.is_playing);
+        assert!((snapshot.position_seconds - 29.0).abs() < 0.5, "got {}", snapshot.position_seconds);
         controller.stop();
     }
 }
