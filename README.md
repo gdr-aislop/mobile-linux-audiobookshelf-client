@@ -1,27 +1,47 @@
 # mobile-linux-audiobookshelf-client
 
-GNOME-native client for an Audiobookshelf media server, designed for mobile Linux
-(Phosh on the Librem 5, also usable on desktop). Built with Rust, GTK4 and libadwaita.
+An [Audiobookshelf](https://audiobookshelf.org/) client for Librem 5 / Phosh.
+Offline-first, fast Rust native code, installable on PureOS Crimson as a deb.
+For other Linux phones, Appimage and Flatpak builds are available.
 
-## Packaging
+(TODO: SCREENSHOT 1 GOES HERE)
+![Home Screen](docs/images/shot6.png) ![Player](docs/images/shot3.png)
 
-Three artifact types are built for every `v*` tag by
-[.github/workflows/release.yml](.github/workflows/release.yml), for both
-`x86_64` and `aarch64`:
+## Features
 
-- **`.deb`** — targets PureOS Crimson (Librem 5) and Ubuntu 24.04; expects the
-  distro's GTK4/libadwaita/GStreamer packages.
-- **`.AppImage`** — bundles GTK4, libadwaita, GStreamer plugins and the Adwaita
-  icon theme; runs on any glibc distro without installing dependencies.
-- **Flatpak** — built against `org.gnome.Platform`, published both as a
-  downloadable `.flatpak` bundle attached to the release and as a live,
-  signed remote hosted on GitHub Pages (see below).
-- **`.deb`** is, likewise, also published as a live, signed APT repository
-  on the same GitHub Pages site, alongside the downloadable file attached
-  to the release.
+*Offline-First* - first-class support for downloading audiobooks to local
+storage, syncing progress after listening offline. Has both manually enabled
+offline mode and network loss detection.
 
-The `.deb` and `.AppImage` are built inside a Debian bookworm container so
-they link against the library baseline of the target distros.
+*Phone, not Gnome* - a mobile app, not a responsive desktop program. Pause
+on call, handle headphones unplugging, battery efficiency, playback
+notification. Tested on a real, slow phone.
+
+*Comfortable* - has playback speed, sleep timer, fast forward/rewind, search
+and filtering.
+
+*Free Software* - GPLv3 licensed, only makes network calls to your Audiobookshelf
+server
+
+### AI disclosure
+
+The app has been developed using LLMs. 
+
+Prompts by [GDR!](https://github.com/gjedeer/)
+
+## Screenshots
+
+![Library Screen](docs/images/shot7.png)
+
+![Book Details](docs/images/shot4.png)
+
+![Download](docs/images/shot5.png)
+
+![Settings](docs/images/shot2.png)
+
+![Light mode](docs/images/shot1.png)
+
+## Installing
 
 ### Installing the Flatpak
 
