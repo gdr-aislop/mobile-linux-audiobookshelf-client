@@ -728,7 +728,7 @@ Needs a real GNOME/phosh session.
       unplug but the app didn't act on it — the "ignored:" reason says which; seeing neither
       means the audio server itself never reported the unplug (see HW-6c, and run with
       `RUST_LOG=debug` for the per-scan sink detail behind it). Check the rotating log file
-      under `~/.local/state/io.github.gdr-aislop.abs-app/logs/abs-app.<date>`
+      under `~/.local/state/io.github.gdr_aislop.abs-app/logs/abs-app.<date>`
       (`abs_storage::AppPaths::logs_dir()`) for a run where stderr wasn't captured. Two more
       things worth checking if "paused for headphone unplug" appears but audio never actually
       stops: a `mpris` "MPRIS command received" line shortly after it means something external

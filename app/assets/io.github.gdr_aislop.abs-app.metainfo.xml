@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- AppStream metadata, bundled into the AppImage by scripts/build-appimage.sh -->
 <component type="desktop-application">
-  <id>io.github.gdr-aislop.abs-app</id>
+  <id>io.github.gdr_aislop.abs-app</id>
 
   <name>Audiobookshelf</name>
   <summary>Client for an Audiobookshelf server, designed for mobile Linux</summary>
 
-  <metadata_license>GPL-3.0-or-later</metadata_license>
+  <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
   <description>
@@ -21,7 +21,7 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">abs-app.desktop</launchable>
+  <launchable type="desktop-id">io.github.gdr_aislop.abs-app.desktop</launchable>
 
   <url type="homepage">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client</url>
   <url type="bugtracker">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues</url>

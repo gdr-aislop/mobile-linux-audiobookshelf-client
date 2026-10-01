@@ -1,5 +1,5 @@
 {
-    "app-id": "io.github.gdr-aislop.abs-app",
+    "app-id": "io.github.gdr_aislop.abs-app",
     "runtime": "org.gnome.Platform",
     "runtime-version": "47",
     "sdk": "org.gnome.Sdk",
@@ -59,9 +59,9 @@
             "build-commands": [
                 "cargo --offline build --release -p abs-app",
                 "install -Dm755 target/release/abs-app /app/bin/abs-app",
-                "install -Dm644 app/assets/abs-app.desktop /app/share/applications/abs-app.desktop",
-                "install -Dm644 app/assets/abs-app.svg /app/share/icons/hicolor/scalable/apps/abs-app.svg",
-                "install -Dm644 app/assets/io.github.gdr-aislop.abs-app.metainfo.xml /app/share/metainfo/io.github.gdr-aislop.abs-app.metainfo.xml",
+                "install -Dm644 app/assets/io.github.gdr_aislop.abs-app.desktop /app/share/applications/io.github.gdr_aislop.abs-app.desktop",
+                "install -Dm644 app/assets/io.github.gdr_aislop.abs-app.svg /app/share/icons/hicolor/scalable/apps/io.github.gdr_aislop.abs-app.svg",
+                "install -Dm644 app/assets/io.github.gdr_aislop.abs-app.metainfo.xml /app/share/metainfo/io.github.gdr_aislop.abs-app.metainfo.xml",
                 "install -Dm644 LICENSE /app/share/doc/abs-app/LICENSE"
             ],
             "sources": [

@@ -37,7 +37,7 @@
 set -euo pipefail
 
 APP_NAME="abs-app"
-APP_ID="io.github.gdr-aislop.abs-app"
+APP_ID="io.github.gdr_aislop.abs-app"
 GH_OWNER="gdr-aislop"
 GH_REPO="mobile-linux-audiobookshelf-client"
 LINUXDEPLOY_VERSION="1-alpha-20251107-1" # pinned for reproducible builds
@@ -176,8 +176,8 @@ install -Dm755 "$BIN" "$APPDIR/usr/bin/$APP_NAME"
 if command -v strip >/dev/null 2>&1; then
     strip "$APPDIR/usr/bin/$APP_NAME"
 fi
-install -Dm644 "app/assets/$APP_NAME.desktop" "$APPDIR/usr/share/applications/$APP_NAME.desktop"
-install -Dm644 "app/assets/$APP_NAME.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_NAME.svg"
+install -Dm644 "app/assets/$APP_ID.desktop" "$APPDIR/usr/share/applications/$APP_ID.desktop"
+install -Dm644 "app/assets/$APP_ID.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 install -Dm644 "app/assets/$APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
 install -Dm644 LICENSE "$APPDIR/usr/share/doc/$APP_NAME/LICENSE"
 
@@ -302,8 +302,8 @@ export LDAI_UPDATE_INFORMATION="gh-releases-zsync|$GH_OWNER|$GH_REPO|latest|$APP
     "$LINUXDEPLOY_BIN" \
         --appdir="$APPDIR" \
         --executable="$APPDIR/usr/bin/$APP_NAME" \
-        --desktop-file="$APPDIR/usr/share/applications/$APP_NAME.desktop" \
-        --icon-file="$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_NAME.svg" \
+        --desktop-file="$APPDIR/usr/share/applications/$APP_ID.desktop" \
+        --icon-file="$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
         "${DEPLOY_ARGS[@]}" \
         --output=appimage
 )

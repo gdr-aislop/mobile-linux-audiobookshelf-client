@@ -30,8 +30,8 @@ every new tagged release automatically:
 
 ```sh
 flatpak remote-add --user --if-not-exists abs-app \
-  https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/io.github.gdr-aislop.abs-app.flatpakrepo
-flatpak install --user abs-app io.github.gdr-aislop.abs-app
+  https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/io.github.gdr_aislop.abs-app.flatpakrepo
+flatpak install --user abs-app io.github.gdr_aislop.abs-app
 ```
 
 Alternatively, download the `.flatpak` file from a
@@ -107,7 +107,7 @@ mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfi
 
 The app never phones home; everything below stays on the user's device. If
 someone reports a crash, ask for whatever exists under
-`~/.local/state/io.github.gdr-aislop.abs-app/`:
+`~/.local/state/io.github.gdr_aislop.abs-app/`:
 
 - `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without
