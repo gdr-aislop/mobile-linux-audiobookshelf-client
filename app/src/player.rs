@@ -278,6 +278,14 @@ struct NowPlaying {
     /// moves `last_known_within_track` (the load seeks there once ready), play/pause only change
     /// `is_playing` (the load applies it), and a speed change only changes `speed`.
     loading_track: Option<u64>,
+    /// The book has been finished: it reached its end, or was marked finished. Every progress
+    /// write then records it finished (at its full duration) rather than unfinished at wherever
+    /// the pipeline stopped, and the next play starts it over. Cleared by any seek.
+    ended: bool,
+    /// The seek target never landed after its re-issues and the file was reloaded once to get
+    /// there (see `Inner::observe_position`). A second failure then stops with an error instead
+    /// of reloading forever. Reset by a landed seek and by any seek the listener asks for.
+    seek_reload_used: bool,
 }
 
 /// What `seek_to_seconds` decided to do once its synchronous, borrow-scoped decision-making is
@@ -293,10 +301,19 @@ enum SeekPlan {
     MaybeLocalNow { item_id: String, server_id: String, track_index: usize, ino: Option<String>, load_generation: u64 },
 }
 
-/// A seek target clamped into the book. A book whose duration came back unknown (0) is only
-/// clamped below — clamping to its "end" would send every seek to 0.
+/// How far before the end of the book a seek may land at most. Seeking to the very end (a
+/// scrubber dragged all the way right, a long skip forward) used to reach end-of-stream at once
+/// and mark the book finished; a book is finished by listening to its end, or by the explicit
+/// "Mark as finished".
+const SEEK_END_MARGIN_SECONDS: f64 = 1.0;
+
+/// A seek target clamped into the book, short of its very end by `SEEK_END_MARGIN_SECONDS`. A
+/// book whose duration came back unknown (0) is only clamped below — clamping to its "end" would
+/// send every seek to 0.
 fn clamp_to_book(seconds: f64, duration_seconds: f64) -> f64 {
-    if duration_seconds > 0.0 {
+    if duration_seconds > SEEK_END_MARGIN_SECONDS {
+        seconds.clamp(0.0, duration_seconds - SEEK_END_MARGIN_SECONDS)
+    } else if duration_seconds > 0.0 {
         seconds.clamp(0.0, duration_seconds)
     } else {
         seconds.max(0.0)
@@ -1068,8 +1085,11 @@ impl Inner {
     /// speaker).
     ///
     /// `generation` is the load generation the pause was asked of: a load or reset since leaves
-    /// the pipeline not paused for reasons of its own, which is not this pause failing.
-    fn spawn_pause_confirmation(inner_rc: Rc<RefCell<Inner>>, generation: u64) {
+    /// the pipeline not paused for reasons of its own, which is not this pause failing. Likewise
+    /// `seek_count`: a seek or speed change since (pause, then rewind) makes the pipeline preroll
+    /// again, which on a stream takes as long as the new range request — and if that seek met a
+    /// pause still in flight, the pipeline only settles once the stream answers.
+    fn spawn_pause_confirmation(inner_rc: Rc<RefCell<Inner>>, generation: u64, seek_count: u64) {
         glib::spawn_future_local(async move {
             for attempt in 0..PAUSE_CONFIRM_ATTEMPTS {
                 glib::timeout_future(PAUSE_CONFIRM_INTERVAL).await;
@@ -1077,6 +1097,10 @@ impl Inner {
                 let still_pending = {
                     let inner = inner_rc.borrow();
                     if inner.load_generation != generation {
+                        return;
+                    }
+                    if inner.seek_count != seek_count {
+                        tracing::info!("pause confirmation ended by a seek");
                         return;
                     }
                     let Some(now_playing) = &inner.now_playing else { return };
@@ -1483,6 +1507,8 @@ impl PlayerController {
                     retry_request: Some(retry_request.clone()),
                     premature_eos_at: None,
                     loading_track: None,
+                    ended: false,
+                    seek_reload_used: false,
                 }
             };
             let fail_start = {
@@ -1715,6 +1741,8 @@ impl PlayerController {
                 // A load failure leaves nothing loaded, so the first Retry reloads.
                 needs_reload: !loaded,
                 loading_track: None,
+                ended: false,
+                seek_reload_used: false,
             });
             inner.last_progress_write = Instant::now();
             inner.last_played_at = Instant::now();
@@ -2023,7 +2051,7 @@ impl PlayerController {
                     // `Ok` here only means GStreamer accepted the request, not that the pipeline
                     // has actually reached `Paused` — see `AudioBackend::pause`'s doc comment.
                     // Confirms it did, or recovers if it never does.
-                    Inner::spawn_pause_confirmation(self.inner.clone(), inner.load_generation);
+                    Inner::spawn_pause_confirmation(self.inner.clone(), inner.load_generation, inner.seek_count);
                 }
                 Err(err) => {
                     tracing::warn!(%err, "backend.pause() failed; resetting the pipeline and marking it for reload");
@@ -2474,6 +2502,9 @@ impl PlayerController {
             inner.backend.position().map(|d| d.as_secs_f64()).unwrap_or(now_playing.last_known_within_track)
         };
         tracing::info!(item_id = %now_playing.item_id, speed, "speed");
+        // A rate change is a seek to the pipeline: a pause confirmation in flight must not read
+        // the preroll it causes as a pause that never landed.
+        inner.seek_count += 1;
         let accepted = !holds_track || inner.backend.set_speed(speed, Duration::from_secs_f64(within)).is_ok();
         if accepted {
             if let Some(now_playing) = &mut inner.now_playing {
@@ -5467,6 +5498,88 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading && s.is_playing), Duration::from_secs(10));
         assert_eq!(state.borrow().load_calls.len(), loads + 1, "one start, one load");
         assert!((controller.snapshot().unwrap().position_seconds - 20.0).abs() < 0.5, "got {}", controller.snapshot().unwrap().position_seconds);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Pause, then rewind: the seek makes
+    /// the pipeline preroll again, which on a stream lasts as long as the new range request. The
+    /// pause confirmation used to read that as a pause that never landed — "the audio pipeline
+    /// never actually paused" — and release the pipeline.
+    pub(crate) fn run_a_seek_right_after_a_pause_is_not_a_stuck_pause(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[20], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(15));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 14.5), Duration::from_secs(5));
+        let resets = state.borrow().reset_calls;
+
+        controller.pause();
+        controller.skip(-10.0);
+        // The re-preroll after that seek never finishes within the confirmation window.
+        state.borrow_mut().stuck_paused = true;
+        pump_until(|| false, PAUSE_CONFIRM_INTERVAL * (PAUSE_CONFIRM_ATTEMPTS + 2));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(snapshot.last_error.is_none(), "a seek after a pause is not a stuck pause: {:?}", snapshot.last_error);
+        assert_eq!(state.borrow().reset_calls, resets, "the paused pipeline is kept");
+        assert!((snapshot.position_seconds - 5.0).abs() < 0.5, "got {}", snapshot.position_seconds);
+
+        // A speed change is a seek to the pipeline, too.
+        state.borrow_mut().stuck_paused = false;
+        controller.play();
+        controller.pause();
+        controller.set_speed(1.5);
+        state.borrow_mut().stuck_paused = true;
+        pump_until(|| false, PAUSE_CONFIRM_INTERVAL * (PAUSE_CONFIRM_ATTEMPTS + 2));
+        assert!(controller.snapshot().unwrap().last_error.is_none());
+        assert_eq!(state.borrow().reset_calls, resets);
+        controller.stop();
+    }
+
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Dragging the full player's scrubber
+    /// used to seek at every value it passed through — on a stream, a new range request each
+    /// time. Only the value it settles on is sought now, once; and dragging it all the way right
+    /// stops short of the end instead of finishing the book.
+    pub(crate) fn run_a_scrubber_drag_seeks_once(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[100], &[], None));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Book One"));
+        let (controller, state) = scripted_controller(&pool);
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Book One"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        let download_manager = crate::downloads::DownloadManager::new(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            Box::new(abs_player::network_watch::UnknownNetworkMonitor),
+            false,
+        );
+        let screen = crate::screens::player::build(pool.clone(), controller.clone(), download_manager, || {}, || {});
+        let hooks = screen.test_hooks();
+        let seeks = state.borrow().seek_calls.len();
+
+        for fraction in [0.1, 0.15, 0.2, 0.25, 0.3] {
+            hooks.scrubber.set_value(fraction);
+        }
+        assert_eq!(hooks.elapsed_label.label(), "0:30", "the time follows the knob while it moves");
+        pump_until(|| false, Duration::from_millis(600));
+        let sought: Vec<Duration> = state.borrow().seek_calls[seeks..].to_vec();
+        assert_eq!(sought.len(), 1, "one seek per drag: {sought:?}");
+        assert!((sought[0].as_secs_f64() - 30.0).abs() < 0.01, "to where the knob settled: {sought:?}");
+        assert!((hooks.scrubber.value() - 0.3).abs() < 0.02, "the knob stays where it was left, got {}", hooks.scrubber.value());
+
+        hooks.scrubber.set_value(1.0);
+        pump_until(|| false, Duration::from_millis(600));
+        let snapshot = controller.snapshot().unwrap();
+        assert!((snapshot.position_seconds - 99.0).abs() < 0.5, "a seek to the end stops short of it, got {}", snapshot.position_seconds);
+        pump_until(|| false, Duration::from_millis(600));
+        assert!(controller.snapshot().unwrap().is_playing, "the book plays on rather than finishing");
         controller.stop();
     }
 }

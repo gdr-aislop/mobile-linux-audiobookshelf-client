@@ -306,6 +306,8 @@ mod tests {
         (playback_a_load_after_a_pause_is_not_a_stuck_pause, crate::player::tests::run_a_load_after_a_pause_is_not_a_stuck_pause),
         (playback_resuming_adopts_newer_progress_already_pulled_locally, crate::player::tests::run_resuming_adopts_newer_progress_already_pulled_locally),
         (playback_starting_at_a_chapter, crate::player::tests::run_starting_at_a_chapter),
+        (playback_a_seek_right_after_a_pause_is_not_a_stuck_pause, crate::player::tests::run_a_seek_right_after_a_pause_is_not_a_stuck_pause),
+        (playback_a_scrubber_drag_seeks_once, crate::player::tests::run_a_scrubber_drag_seeks_once),
         (player_screen_renders, crate::screens::player::tests::run),
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),

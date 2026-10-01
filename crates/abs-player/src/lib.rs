@@ -124,9 +124,9 @@ pub trait AudioBackend {
     ///
     /// [`is_paused`]: AudioBackend::is_paused
     fn pause(&mut self) -> Result<()>;
-    /// Whether the pipeline has actually reached, and settled in, `Paused` right now — `false`
-    /// both while a `pause()` is still asynchronously in flight and if it landed somewhere else
-    /// entirely. Reads GStreamer's last-known state instantly and never blocks (unlike this
+    /// Whether the pipeline has actually reached `Paused` right now — `false` while a `pause()`
+    /// is still asynchronously in flight and if it landed somewhere else entirely. A paused
+    /// pipeline that is prerolling again after a seek counts as paused: nothing renders. Reads GStreamer's last-known state instantly and never blocks (unlike this
     /// crate's own tests' `wait_for_state_change`, which blocks on purpose — appropriate for a
     /// test, not for a call a caller might make from the GTK main thread).
     fn is_paused(&self) -> bool;
@@ -280,11 +280,13 @@ impl AudioBackend for GstBackend {
     }
 
     fn is_paused(&self) -> bool {
-        // `pending_state()` is `VoidPending` exactly when no transition is in flight — checking
-        // it alongside `current_state()` is what tells "reached Paused" apart from "requested
-        // Paused, still Async". Both are plain non-blocking reads of GStreamer's last-known
-        // state (`ElementExt`, already used by this file's own tests).
-        self.pipeline.current_state() == gst::State::Paused && self.pipeline.pending_state() == gst::State::VoidPending
+        // `current_state() == Paused` means the pipeline committed Paused: the clock is stopped
+        // and nothing renders until it commits Playing. A flushing seek (or a rate change) on a
+        // paused pipeline leaves it there with `pending == Paused` while it prerolls again — on
+        // a stream, for as long as the new HTTP range request takes — and that is still paused.
+        // What isn't: a pipeline still at `Playing` (a pause in flight or stuck in `Async`), or
+        // one already on its way back to `Playing`. Both reads are non-blocking.
+        self.pipeline.current_state() == gst::State::Paused && self.pipeline.pending_state() != gst::State::Playing
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
@@ -306,8 +308,15 @@ impl AudioBackend for GstBackend {
     fn set_speed(&mut self, speed: f64, position: Duration) -> Result<()> {
         // GStreamer has no standalone "set rate" call — a rate change is expressed as a seek with
         // a new rate, to the position the caller knows is right (see the trait's doc comment).
+        // The rate is only kept if that seek was accepted: every later seek reuses
+        // `current_speed`, which would otherwise quietly apply a rate the caller was told failed.
+        let previous = self.current_speed;
         self.current_speed = speed;
-        self.seek(position)
+        let result = self.seek(position);
+        if result.is_err() {
+            self.current_speed = previous;
+        }
+        result
     }
 
     fn position(&self) -> Option<Duration> {
@@ -527,6 +536,29 @@ mod tests {
 
         wait_for_state_change(&player);
         assert!(player.is_paused(), "settled in Paused — must report paused");
+    }
+
+    /// A seek while paused makes the pipeline preroll again (GStreamer's "lost state": current
+    /// and pending both `Paused`). Nothing renders meanwhile, so it is still paused — reporting
+    /// otherwise made the app's pause confirmation tear down a perfectly paused pipeline after
+    /// pause → rewind on a slow stream.
+    #[test]
+    fn a_seek_while_paused_is_still_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut player = backend();
+        player.load(&silent_wav_uri(&tmp, 5)).unwrap();
+        player.play().unwrap();
+        wait_for_state_change(&player);
+        player.pause().unwrap();
+        wait_for_state_change(&player);
+        assert!(player.is_paused());
+
+        player.seek(Duration::from_secs(2)).unwrap();
+        assert!(player.is_paused(), "re-prerolling after a seek is still paused");
+        player.set_speed(1.5, Duration::from_secs(1)).unwrap();
+        assert!(player.is_paused(), "re-prerolling after a rate change is still paused");
+        wait_for_state_change(&player);
+        assert!(player.is_paused());
     }
 
     #[test]
