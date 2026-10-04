@@ -207,6 +207,7 @@ mod tests {
         (library_downloaded_badges_follow_downloads_in_this_session, crate::screens::library::tests::run_downloaded_badges_follow_downloads_in_this_session),
         (home_downloaded_badges_follow_downloads_in_this_session, crate::screens::home::tests::run_downloaded_badges_follow_downloads_in_this_session),
         (home_offline_mode_makes_no_requests, crate::screens::home::tests::run_offline_mode_makes_no_requests),
+        (home_missing_covers_are_asked_again_only_by_a_manual_sync, crate::screens::home::tests::run_missing_covers_are_asked_again_only_by_a_manual_sync),
         (playback_offline_mode_plays_and_saves_locally_then_catches_up, crate::player::tests::run_offline_mode_plays_and_saves_locally_then_catches_up),
         (playback_offline_mode_does_not_stream, crate::player::tests::run_offline_mode_does_not_stream),
         (downloads_engine_offline_mode_starts_no_download, crate::downloads::tests::run_offline_mode_starts_no_download),

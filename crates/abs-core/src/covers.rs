@@ -28,9 +28,29 @@ const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// with dozens of simultaneous image requests.
 const COVER_FETCH_CONCURRENCY: usize = 6;
 
+/// How long the answer "the server has no cover for this item" (a 404) is trusted before asking
+/// again. Items without covers are common, and every sync used to ask for each of them again
+/// (and log a warning per item). A manual sync asks regardless — see
+/// [`fetch_and_cache_covers`]'s `recheck_missing`.
+pub const NO_COVER_RECHECK_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What happened to one item's cover — what a batch summarizes in its one log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverOutcome {
+    /// Already on disk; no request.
+    Cached,
+    Fetched,
+    /// The server answered 404; remembered.
+    NoCover,
+    /// The server said 404 recently; not asked again.
+    KnownMissing,
+    Failed,
+}
+
 /// Returns the local path to the item's cached cover, fetching and writing it first if it isn't
 /// already cached. Returns `None` on any failure (offline, 404, disk error, ...) — callers treat
-/// "no cover" as a normal outcome, not something to surface to the user.
+/// "no cover" as a normal outcome, not something to surface to the user. An item the server
+/// recently said has no cover isn't asked about again (see [`NO_COVER_RECHECK_AFTER`]).
 ///
 /// The single-item entry point, for callers fetching exactly one cover (the player). Screen
 /// bursts should use [`fetch_and_cache_covers`], which reuses one client across the batch.
@@ -43,15 +63,17 @@ pub async fn fetch_and_cache_cover(
     item_id: &str,
 ) -> Option<PathBuf> {
     let api = connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT).ok()?;
-    fetch_and_cache_cover_with(&api, paths, pool, server_id, item_id).await
+    fetch_and_cache_cover_with(&api, paths, pool, server_id, item_id, Some(NO_COVER_RECHECK_AFTER)).await.0
 }
 
 /// Fetches covers for a whole batch of items over one shared HTTP client — one mint, one
 /// connection pool, so h2 multiplexing and keep-alive pooling actually get a chance instead
 /// of every cover paying a full DNS+TCP+TLS handshake before its first byte. Items already
-/// cached issue no HTTP at all; a failure on one item (404, offline, disk error) is logged
-/// and never aborts its siblings. Best-effort throughout: no result is returned, callers
-/// re-read local storage to pick up whatever landed.
+/// cached issue no HTTP at all, nor do items the server recently said have no cover — unless
+/// `recheck_missing` (a manual sync: the user asked to refresh, so a cover added on the server
+/// since shows up). A failure on one item (offline, disk error) is logged and never aborts its
+/// siblings. Best-effort throughout: no result is returned, callers re-read local storage to
+/// pick up whatever landed. Logs one summary line instead of one per item.
 pub async fn fetch_and_cache_covers(
     paths: &AppPaths,
     pool: &SqlitePool,
@@ -59,6 +81,22 @@ pub async fn fetch_and_cache_covers(
     access_token: &str,
     server_id: &str,
     item_ids: Vec<String>,
+    recheck_missing: bool,
+) {
+    let recheck_after = if recheck_missing { None } else { Some(NO_COVER_RECHECK_AFTER) };
+    fetch_and_cache_covers_with_recheck(paths, pool, connection, access_token, server_id, item_ids, recheck_after).await;
+}
+
+/// [`fetch_and_cache_covers`] with the "no cover" memory's lifetime as a parameter (`None`:
+/// ignore it) — so tests can expire it.
+async fn fetch_and_cache_covers_with_recheck(
+    paths: &AppPaths,
+    pool: &SqlitePool,
+    connection: &crate::connection::ConnectionTarget,
+    access_token: &str,
+    server_id: &str,
+    item_ids: Vec<String>,
+    recheck_after: Option<Duration>,
 ) {
     let api = match connection.api_client_with_timeout(access_token, COVER_FETCH_TIMEOUT) {
         Ok(api) => api,
@@ -68,28 +106,45 @@ pub async fn fetch_and_cache_covers(
         }
     };
 
-    futures::stream::iter(item_ids.into_iter().map(|item_id| {
+    let outcomes: Vec<CoverOutcome> = futures::stream::iter(item_ids.into_iter().map(|item_id| {
         // Cheap `Client` clone (Arc'd internals) — every future shares the same pool.
         let api = api.clone();
-        async move { fetch_and_cache_cover_with(&api, paths, pool, server_id, &item_id).await; }
+        async move { fetch_and_cache_cover_with(&api, paths, pool, server_id, &item_id, recheck_after).await.1 }
     }))
     .buffer_unordered(COVER_FETCH_CONCURRENCY)
-    .collect::<()>()
+    .collect()
     .await;
+    let count = |wanted: CoverOutcome| outcomes.iter().filter(|o| **o == wanted).count();
+    let (fetched, no_cover, known_missing, failed) =
+        (count(CoverOutcome::Fetched), count(CoverOutcome::NoCover), count(CoverOutcome::KnownMissing), count(CoverOutcome::Failed));
+    if fetched + no_cover + failed > 0 {
+        tracing::info!(fetched, without_cover = no_cover, known_without_cover = known_missing, failed, "covers fetched; items without a cover aren't asked about again for a day");
+    }
 }
 
 /// The per-item work behind both entry points — everything after client minting, so a batch
 /// runs it concurrently over clones of one shared client. The cache check comes first: the
-/// common case on repeat visits (cover already on disk) never touches the client at all.
+/// common case on repeat visits (cover already on disk) never touches the client at all. Then
+/// the "no cover" memory: with `recheck_after`, an item the server said had no cover less than
+/// that long ago isn't asked about again.
 async fn fetch_and_cache_cover_with(
     api: &abs_api::Client,
     paths: &AppPaths,
     pool: &SqlitePool,
     server_id: &str,
     item_id: &str,
-) -> Option<PathBuf> {
+    recheck_after: Option<Duration>,
+) -> (Option<PathBuf>, CoverOutcome) {
     if let Some(cached) = cached_cover_path(pool, server_id, item_id).await {
-        return Some(cached);
+        return (Some(cached), CoverOutcome::Cached);
+    }
+    let marker = paths.missing_cover_marker_path(server_id, item_id);
+    if let Some(recheck_after) = recheck_after {
+        let age = tokio::fs::metadata(&marker).await.ok().and_then(|m| m.modified().ok()).and_then(|at| at.elapsed().ok());
+        if age.is_some_and(|age| age < recheck_after) {
+            tracing::debug!(item_id, "the server had no cover for this item recently; not asking again yet");
+            return (None, CoverOutcome::KnownMissing);
+        }
     }
 
     let cover = match api.get_item_cover(item_id).await {
@@ -103,16 +158,28 @@ async fn fetch_and_cache_cover_with(
             // "valid enough to cache" and "decodable for display" can't drift apart.
             if let Err(err) = image::load_from_memory(&cover.bytes) {
                 tracing::warn!(item_id, content_type = %cover.content_type, %err, "server returned a non-image cover body; ignoring it");
-                return None;
+                return (None, CoverOutcome::Failed);
             }
             cover
+        }
+        Err(abs_api::LibraryItemsError::NotFound(_)) => {
+            // An item without a cover: remembered (an empty marker file; its modification time
+            // is when the server last said so), so the next syncs don't ask again.
+            if let Some(dir) = marker.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            if let Err(err) = tokio::fs::write(&marker, b"").await {
+                tracing::debug!(%err, item_id, "couldn't remember that this item has no cover");
+            }
+            tracing::debug!(item_id, "the server has no cover for this item; asking again in a day");
+            return (None, CoverOutcome::NoCover);
         }
         Err(err) => {
             // `details` classifies the failure (timeout / tls / connect / ...) and walks the
             // full source chain — reqwest's Display alone is just "error sending request for
             // url (...)", identical for a timeout, a DNS failure and a certificate error.
             tracing::warn!(details = err.details(), item_id, "couldn't fetch cover art");
-            return None;
+            return (None, CoverOutcome::Failed);
         }
     };
 
@@ -120,17 +187,19 @@ async fn fetch_and_cache_cover_with(
     let dir = paths.covers_dir().join(server_id);
     if let Err(err) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(%err, item_id, "couldn't create the covers cache directory");
-        return None;
+        return (None, CoverOutcome::Failed);
     }
     let path = paths.cover_cache_path(server_id, item_id, extension);
     if let Err(err) = tokio::fs::write(&path, &cover.bytes).await {
         tracing::warn!(%err, item_id, "couldn't write the cached cover image");
-        return None;
+        return (None, CoverOutcome::Failed);
     }
     if let Err(err) = abs_storage::repo::items::set_cover_cache_path(pool, server_id, item_id, Some(&path.to_string_lossy())).await {
         tracing::warn!(%err, item_id, "couldn't record the cached cover path");
     }
-    Some(path)
+    // It has one now.
+    let _ = tokio::fs::remove_file(&marker).await;
+    (Some(path), CoverOutcome::Fetched)
 }
 
 /// The item's locally cached cover path, if one is recorded **and** the file it points to still
@@ -340,7 +409,7 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_items(&["item-1", "item-2"]).await;
 
-        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()], false).await;
 
         for (item_id, _content_type, body) in [("item-1", "image/png", PNG_1X1), ("item-2", "image/webp", WEBP_1X1)] {
             let item = abs_storage::repo::items::get(&pool, &server_id, item_id).await.unwrap();
@@ -364,7 +433,7 @@ mod tests {
         let (_tmp, paths) = test_paths();
         let (pool, server_id) = pool_with_synced_items(&["item-1", "item-2"]).await;
 
-        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()], false).await;
 
         let failed = abs_storage::repo::items::get(&pool, &server_id, "item-1").await.unwrap();
         assert!(failed.cover_cache_path.is_none(), "a failed item must not record a cover path");
@@ -393,9 +462,71 @@ mod tests {
         // uncached item-2 may reach the wire (1 pre-cache request + 1 batch request; a batch
         // that ignored the cache would make 3).
         fetch_and_cache_cover(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1").await.unwrap();
-        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()]).await;
+        fetch_and_cache_covers(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, vec!["item-1".into(), "item-2".into()], false).await;
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "the batch must serve the cached item from disk, not HTTP");
+    }
+
+    fn missing(paths: &AppPaths, server_id: &str, item_id: &str) -> bool {
+        paths.missing_cover_marker_path(server_id, item_id).exists()
+    }
+
+    fn cover_requests(requests: &[wiremock::Request]) -> usize {
+        requests.iter().filter(|r| r.url.path().ends_with("/cover")).count()
+    }
+
+    #[tokio::test]
+    async fn a_missing_cover_is_remembered_and_not_asked_for_again() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
+        let connection = ConnectionTarget::direct(&mock_server.uri());
+
+        assert!(fetch_and_cache_cover(&paths, &pool, &connection, "token", &server_id, "item-1").await.is_none());
+        assert!(missing(&paths, &server_id, "item-1"), "the 404 is remembered");
+        assert!(fetch_and_cache_cover(&paths, &pool, &connection, "token", &server_id, "item-1").await.is_none());
+        fetch_and_cache_covers(&paths, &pool, &connection, "token", &server_id, vec!["item-1".into()], false).await;
+        assert_eq!(cover_requests(&mock_server.received_requests().await.unwrap()), 1, "asked once, then remembered");
+
+        // A manual sync asks again regardless.
+        fetch_and_cache_covers(&paths, &pool, &connection, "token", &server_id, vec!["item-1".into()], true).await;
+        assert_eq!(cover_requests(&mock_server.received_requests().await.unwrap()), 2, "a manual sync re-asks");
+    }
+
+    #[tokio::test]
+    async fn an_expired_missing_cover_is_asked_for_again_and_forgotten_once_found() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).up_to_n_times(1).mount(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1.to_vec()))
+            .mount(&mock_server)
+            .await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
+        let connection = ConnectionTarget::direct(&mock_server.uri());
+
+        fetch_and_cache_covers_with_recheck(&paths, &pool, &connection, "token", &server_id, vec!["item-1".into()], Some(NO_COVER_RECHECK_AFTER)).await;
+        assert!(missing(&paths, &server_id, "item-1"));
+        // The memory has run out (a zero lifetime): asked again, and the cover now exists.
+        fetch_and_cache_covers_with_recheck(&paths, &pool, &connection, "token", &server_id, vec!["item-1".into()], Some(Duration::ZERO)).await;
+        assert!(cached_cover_path(&pool, &server_id, "item-1").await.is_some(), "the cover added since is cached");
+        assert!(!missing(&paths, &server_id, "item-1"), "and the no-cover memory is dropped");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_not_remembered() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(500)).mount(&mock_server).await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_items(&["item-1"]).await;
+        let connection = ConnectionTarget::direct(&mock_server.uri());
+
+        fetch_and_cache_cover(&paths, &pool, &connection, "token", &server_id, "item-1").await;
+        assert!(!missing(&paths, &server_id, "item-1"), "only a 404 means there is no cover");
+        fetch_and_cache_cover(&paths, &pool, &connection, "token", &server_id, "item-1").await;
+        assert_eq!(cover_requests(&mock_server.received_requests().await.unwrap()), 2, "a failure is retried next time");
     }
 }

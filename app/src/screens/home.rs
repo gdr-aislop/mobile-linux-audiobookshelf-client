@@ -756,6 +756,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         // only the artwork, never the initial render. The whole batch shares one HTTP client
         // (one pooled connection), and per item it no-ops once a cover is already cached on
         // disk, so this is cheap on every subsequent visit.
+        // A manual sync also re-asks for covers the server recently said it doesn't have.
+        let recheck_missing_covers = manual.is_some();
         let spawned_covers = data_after_sync.as_ref().filter(|data| !data.libraries.is_empty()).map(|data| {
             let item_ids: Vec<String> = data
                 .recent_items
@@ -776,7 +778,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged, never surfaced.
                     if let Some(connection) = session.connection_target().await.ok().as_ref() {
-                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids).await;
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids, recheck_missing_covers).await;
                     }
 
                     load(&pool, &server_id, &account_id).await.ok()
@@ -1737,5 +1739,54 @@ pub(crate) mod tests {
         pump_until(|| false, Duration::from_millis(300));
         let requests = runtime.block_on(mock_server.received_requests()).unwrap();
         assert!(requests.is_empty(), "offline mode: no request may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A cover the server doesn't have (404)
+    /// isn't asked for again by the next automatic sync, but "Sync now" asks again.
+    pub(crate) fn run_missing_covers_are_asked_again_only_by_a_manual_sync(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [item_json("item-1", "Project Hail Mary")] })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let cover_requests = || {
+            runtime.block_on(mock_server.received_requests()).unwrap().iter().filter(|r| r.url.path() == "/api/items/item-1/cover").count()
+        };
+        let build_home = || {
+            let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+            let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+            build(pool.clone(), paths.clone(), server.clone(), account.clone(), session, offline_mode, |_| {}, || {}, |_| {})
+        };
+
+        let first = build_home();
+        pump_until(|| cover_requests() == 1, Duration::from_secs(10));
+        assert_eq!(cover_requests(), 1, "the first sync asks for the cover");
+        pump_until(|| false, Duration::from_millis(500));
+
+        // Another automatic sync (a new shell) doesn't ask again.
+        let second = build_home();
+        let hooks = second.test_hooks();
+        pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(10));
+        pump_until(|| false, Duration::from_secs(1));
+        assert_eq!(cover_requests(), 1, "a cover the server just said it doesn't have isn't asked for again");
+
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| cover_requests() == 2, Duration::from_secs(10));
+        assert_eq!(cover_requests(), 2, "Sync now asks again");
+        drop(first);
     }
 }

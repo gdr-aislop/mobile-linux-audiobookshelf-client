@@ -1170,6 +1170,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         // as home.rs's identically-named cycle; the batch shares one HTTP client (one pooled
         // connection) across all of it.
         if !item_ids_after_sync.is_empty() {
+            // A manual sync also re-asks for covers the server recently said it doesn't have.
+            let recheck_missing_covers = manual.is_some();
             let spawned_covers = tokio::spawn({
                 let pool = pool.clone();
                 let paths = paths.clone();
@@ -1180,7 +1182,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged (above), never surfaced.
                     if let Some(connection) = session.connection_target().await.ok().as_ref() {
-                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids_after_sync).await;
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids_after_sync, recheck_missing_covers).await;
                     }
                 }
             });
