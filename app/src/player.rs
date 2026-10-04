@@ -57,10 +57,45 @@ async fn resolve_playable_url(
     ino: &str,
     session: &abs_core::auth::Session,
 ) -> (String, bool) {
-    if let Some(path) = abs_core::download_tracks::local_track_path(pool, server_id, item_id, ino).await {
-        return (gio::File::for_path(&path).uri().to_string(), true);
+    match abs_core::download_tracks::track_source(pool, server_id, item_id, ino).await {
+        abs_core::download_tracks::TrackSource::Local(path) => return (gio::File::for_path(&path).uri().to_string(), true),
+        // Never downloaded is the ordinary streaming case; anything else means a download exists
+        // that couldn't be used, which is worth knowing when a "downloaded" book streams.
+        abs_core::download_tracks::TrackSource::Streamed(abs_core::download_tracks::StreamReason::NotDownloaded) => {}
+        abs_core::download_tracks::TrackSource::Streamed(reason) => {
+            tracing::warn!(item_id, ino, %reason, "streaming a track that has a download, which can't be used");
+        }
     }
     (connection.track_url(item_id, ino, &session.access_token().await), false)
+}
+
+/// For a start: the cached track list and chapters, if the track playback would start in is
+/// downloaded and verified on disk — i.e. the book can start without the server. `None` when
+/// there is no cached metadata or the start track would have to be streamed.
+async fn start_target_from_files(
+    pool: &SqlitePool,
+    session: &abs_core::auth::Session,
+    item_id: &str,
+    start_chapter: Option<usize>,
+    connection: &abs_core::connection::ConnectionTarget,
+    access_token: &str,
+) -> Option<abs_core::streaming::StreamTarget> {
+    let target = abs_core::streaming::offline_stream_target(pool, session.server_id(), item_id, connection, access_token).await.ok()?;
+    let chapter_start = start_chapter.and_then(|index| target.chapters.get(index)).map(|c| c.start_seconds.max(0.0));
+    let saved = abs_storage::repo::progress::get(pool, session.account_id(), session.server_id(), item_id).await.ok().flatten();
+    let resume_at = match chapter_start {
+        Some(at) => Some(at).filter(|at| *at > 0.0),
+        None => saved.and_then(|p| resume_position(p.current_time_seconds, p.is_finished, target.duration_seconds)),
+    };
+    let (start_track, _) = locate_track(&target.tracks, resume_at.unwrap_or(0.0));
+    let ino = &target.tracks.get(start_track)?.ino;
+    match abs_core::download_tracks::track_source(pool, session.server_id(), item_id, ino).await {
+        abs_core::download_tracks::TrackSource::Local(_) => Some(target),
+        abs_core::download_tracks::TrackSource::Streamed(reason) => {
+            tracing::info!(item_id, track = start_track, %reason, "the track to start in isn't on the device; the server is needed to start");
+            None
+        }
+    }
 }
 
 /// The app is the composition root between `abs-core` (which resolves a server's connection
@@ -119,6 +154,11 @@ const SPURIOUS_UNPLUG_TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
 /// seek is attempted anyway (and then trusted only once `observe_position` sees it land): 15 s,
 /// matching the HTTP timeout. 5 s gave up on slow mobile connections that were still connecting.
 const PREROLL_WAIT_ATTEMPTS: u32 = 150;
+
+/// How long a start waits for the server when the book can start from the files on the device
+/// (the cached track list is there and the track to start in is downloaded). A dead connection
+/// used to cost the full HTTP timeout (15 s) before the downloaded files were used.
+const LOCAL_START_SERVER_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a headphone replug has to hold before it resumes playback: a jack that bounces
 /// (plugged, unplugged, plugged again within a few hundred ms) is not one reconnection. The
@@ -715,6 +755,9 @@ struct Inner {
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
     /// same shape as `pause_on_unplug`/`resume_on_replug` above.
     burst_buffering: bool,
+    /// The app-wide "offline mode" switch (Home/Library's toggle), as told by the shell: starting
+    /// a book whose files are on the device then doesn't contact the server at all.
+    offline_mode: bool,
     /// Told how every server progress push ended. Without it a sync failure only reached the
     /// log, and a user could listen for hours with nothing synced and no idea.
     on_progress_sync: Option<ProgressSyncListener>,
@@ -1506,6 +1549,7 @@ impl PlayerController {
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
+                offline_mode: false,
                 on_progress_sync: None,
                 progress_writer: ProgressWriter::default(),
                 last_played_at: Instant::now(),
@@ -1947,10 +1991,44 @@ impl PlayerController {
             // from locally cached state instead (below). Reconciling progress is a nice-to-have
             // that must never add its own delay on top — run both concurrently rather than one
             // after another, so a slow or unreachable server is only ever felt once, not twice.
-            let (target_result, reconcile_result) = tokio::join!(
-                abs_core::streaming::resolve_stream_target(&connection, &access_token, &item.item_id),
-                abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item.item_id),
-            );
+            //
+            // When the track to start in is already on the device, the server isn't worth waiting
+            // for: with offline mode on it isn't asked at all, otherwise only for
+            // `LOCAL_START_SERVER_WAIT` (a reachable server answers well within that, and then
+            // still provides fresh metadata and progress from other devices).
+            let offline_mode = inner_rc.borrow().offline_mode;
+            let start_chapter_asked = inner_rc.borrow().pending_start.as_ref().and_then(|p| p.start_chapter);
+            let mut files_only =
+                start_target_from_files(&pool, &session, &item.item_id, start_chapter_asked, &connection, &access_token).await;
+            if superseded(&inner_rc.borrow()) {
+                return;
+            }
+            let answer = {
+                let server_calls = async {
+                tokio::join!(
+                    abs_core::streaming::resolve_stream_target(&connection, &access_token, &item.item_id),
+                    abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item.item_id),
+                )
+            };
+            match (&files_only, offline_mode) {
+                (Some(_), true) => {
+                    tracing::info!(item_id = %item.item_id, "offline mode is on and the book is on the device; starting from the downloaded files without contacting the server");
+                    None
+                }
+                (Some(_), false) => match tokio::time::timeout(LOCAL_START_SERVER_WAIT, server_calls).await {
+                    Ok(answer) => Some(answer),
+                    Err(_) => {
+                        tracing::info!(item_id = %item.item_id, wait_ms = LOCAL_START_SERVER_WAIT.as_millis() as u64, "the server is slow or unreachable; starting from the downloaded files");
+                        None
+                    }
+                },
+                (None, _) => Some(server_calls.await),
+                }
+            };
+            let (target_result, reconcile_result) = match answer {
+                Some(answer) => answer,
+                None => (Ok(files_only.take().expect("answer is None only when the files can start the book")), Ok(())),
+            };
             if superseded(&inner_rc.borrow()) {
                 return;
             }
@@ -2022,6 +2100,17 @@ impl PlayerController {
 
             let (start_url, start_is_local) =
                 resolve_playable_url(&pool, &connection, session.server_id(), &item.item_id, &target.tracks[start_track].ino, &session).await;
+            let downloaded_tracks =
+                abs_core::download_tracks::complete_inos_for_item(&pool, session.server_id(), &item.item_id).await.map(|inos| inos.len()).unwrap_or(0);
+            tracing::info!(
+                item_id = %item.item_id,
+                tracks = target.tracks.len(),
+                downloaded_tracks,
+                offline_mode,
+                start_track,
+                start_track_local = start_is_local,
+                "track sources"
+            );
             tracing::info!(
                 item_id = %item.item_id,
                 resume_at = resume_at.unwrap_or(0.0),
@@ -2613,6 +2702,15 @@ impl PlayerController {
     /// The shell uses it to toast a sync failure once per failure episode.
     pub fn set_on_progress_sync(&self, listener: impl Fn(ProgressSyncOutcome) + 'static) {
         self.inner.borrow_mut().on_progress_sync = Some(Rc::new(listener));
+    }
+
+    /// Tells the controller whether the app's offline mode is on (see `Inner::offline_mode`).
+    pub fn set_offline_mode(&self, enabled: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.offline_mode != enabled {
+            tracing::info!(offline_mode = enabled, "playback: offline mode {}", if enabled { "on" } else { "off" });
+        }
+        inner.offline_mode = enabled;
     }
 
     pub fn set_burst_buffering(&self, enabled: bool) {
@@ -6808,6 +6906,91 @@ pub(crate) mod tests {
         assert!(!controller.snapshot().unwrap().is_playing, "not before the plug has held");
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(5));
         assert!(controller.snapshot().unwrap().is_playing, "a replug that holds resumes");
+        controller.stop();
+    }
+
+    /// A server that accepts the connection and then never answers — the "Wi-Fi connected but
+    /// dead" case — for the start-from-the-files scenarios below.
+    async fn mock_hanging_server(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60))).mount(mock_server).await;
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book whose files are on the device
+    /// starts from them after a few seconds even if the server never answers — it used to wait for
+    /// the full HTTP timeout (15 s) first.
+    pub(crate) fn run_a_downloaded_book_starts_without_waiting_for_a_dead_server(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_hanging_server(&mock_server));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0), ("2", 2.0, 3.0)]));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "2", &silent_wav_bytes(2)));
+
+        let (controller, state) = scripted_controller(&pool);
+        let started = Instant::now();
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Offline Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        let waited = started.elapsed();
+        assert!(controller.snapshot().is_some_and(|s| s.is_playing && s.last_error.is_none()), "it plays");
+        assert!(waited < LOCAL_START_SERVER_WAIT + Duration::from_secs(2), "started after {waited:?}; the dead server must not be waited for in full");
+        assert!(waited >= LOCAL_START_SERVER_WAIT - Duration::from_millis(500), "a server that might still answer is given its short chance: {waited:?}");
+        assert!(state.borrow().load_calls.iter().all(|uri| uri.starts_with("file://")), "only the downloaded files are loaded: {:?}", state.borrow().load_calls);
+        controller.stop();
+    }
+
+    /// With offline mode on, the same start doesn't contact the server at all.
+    pub(crate) fn run_offline_mode_starts_a_downloaded_book_without_contacting_the_server(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_hanging_server(&mock_server));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0)]));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+
+        let (controller, _state) = scripted_controller(&pool);
+        controller.set_offline_mode(true);
+        let started = Instant::now();
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Offline Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        assert!(controller.snapshot().is_some_and(|s| s.is_playing));
+        assert!(started.elapsed() < Duration::from_secs(2), "started after {:?}", started.elapsed());
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(
+            !requests.iter().any(|r| r.url.path().starts_with("/api/items/")),
+            "offline mode: no item request before playing: {:?}",
+            requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        );
+        controller.stop();
+    }
+
+    /// A book whose *start* track isn't on the device still waits for the server as before (it
+    /// needs it), then falls back to the cached tracks.
+    pub(crate) fn run_a_book_whose_start_track_is_not_downloaded_still_waits_for_the_server(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item(&mock_server, "item-1", &[3, 2], &[], Some(Duration::from_secs(5))));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0), ("2", 2.0, 3.0)]));
+        // Only the second file is on the device; the book starts in the first.
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "2", &silent_wav_bytes(2)));
+
+        let (controller, _state) = scripted_controller(&pool);
+        let started = Instant::now();
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Partial Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(15));
+        assert!(started.elapsed() >= Duration::from_secs(4), "it waited for the server it needs: {:?}", started.elapsed());
+        assert!(controller.snapshot().is_some_and(|s| s.is_playing));
         controller.stop();
     }
 }

@@ -69,6 +69,17 @@ fn classify_gst_error(err: &gst::glib::Error) -> PlaybackErrorKind {
     PlaybackErrorKind::Other
 }
 
+/// [`classify_gst_error`] plus what the bus message's debug string adds: a generic stream failure
+/// ("Internal data stream error", `StreamError::Failed`) that comes from the HTTP source is a
+/// dropped or dead connection, not an unclassifiable fault.
+fn classify_bus_error(err: &gst::glib::Error, debug: Option<&str>) -> PlaybackErrorKind {
+    let kind = classify_gst_error(err);
+    if kind == PlaybackErrorKind::Other && debug.is_some_and(|d| d.contains("GstSoupHTTPSrc") || d.contains("GstCurlHttpSrc")) {
+        return PlaybackErrorKind::Network;
+    }
+    kind
+}
+
 /// Replaces the value of every `token=` query parameter in `text` with `REDACTED` — stream URLs
 /// authenticate with `?token=<access token>`, and GStreamer quotes the URL in its error messages.
 pub fn redact_tokens(text: &str) -> String {
@@ -348,7 +359,7 @@ impl AudioBackend for GstBackend {
                 gst::MessageView::Eos(_) => return Some(PlayerEvent::EndOfStream),
                 gst::MessageView::Error(e) => {
                     let error = e.error();
-                    let kind = classify_gst_error(&error);
+                    let kind = classify_bus_error(&error, e.debug().as_deref());
                     // An HTTP source's messages quote the stream URL, which carries the access
                     // token as a query parameter — and these strings reach the log and the error
                     // banner's details.
@@ -717,6 +728,15 @@ mod tests {
     fn classifies_not_authorized_as_not_authorized() {
         let err = glib::Error::new(gst::ResourceError::NotAuthorized, "401");
         assert_eq!(classify_gst_error(&err), PlaybackErrorKind::NotAuthorized);
+    }
+
+    #[test]
+    fn a_generic_failure_from_the_http_source_is_a_network_error() {
+        let err = glib::Error::new(gst::StreamError::Failed, "Internal data stream error.");
+        let debug = "../libs/gst/base/gstbasesrc.c(3132): gst_base_src_loop (): /GstPlayBin:playbin0/GstURIDecodeBin:uridecodebin0/GstSoupHTTPSrc:source:\nstreaming stopped, reason error (-5)";
+        assert_eq!(classify_bus_error(&err, Some(debug)), PlaybackErrorKind::Network);
+        assert_eq!(classify_bus_error(&err, Some("/GstPlayBin:playbin0/GstFileSrc:source: streaming stopped")), PlaybackErrorKind::Other, "a local file's failure is not a network one");
+        assert_eq!(classify_bus_error(&err, None), PlaybackErrorKind::Other);
     }
 
     #[test]

@@ -570,6 +570,23 @@ was and wasn't verified.
       *Expected:* playback stays paused until the plug has held for a moment; a firm replug
       resumes it.
 
+- [ ] **MP-20 — Downloaded book on a dead connection.** Download a whole book, then connect to a
+      Wi-Fi network that has no internet (or block the server) and press Play.
+      *Expected:* it starts within ~3 s from the downloaded files (log: `the server is slow or
+      unreachable; starting from the downloaded files`, then `track sources … start_track_local=true`),
+      with no stream error. With offline mode switched on it starts at once and the log says
+      `offline mode is on and the book is on the device; starting from the downloaded files`.
+
+- [ ] **MP-21 — Partly downloaded book.** Download only some chapters, resume in a chapter that
+      isn't downloaded, with the connection dead.
+      *Expected:* the log names why the start track is streamed (`not downloaded`, `download not
+      finished`, `downloaded file is missing`, …); the failure reads "Lost the connection while
+      playing" rather than "Playback stopped unexpectedly".
+
+- [ ] **MP-22 — Offline mode is logged.** Toggle offline mode on Home or Library.
+      *Expected:* the log shows `offline mode turned on|off` and `playback: offline mode on|off`;
+      the setting is also logged at startup (`loaded the offline mode setting`).
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

@@ -280,6 +280,12 @@ Fractal) rather than copying Lissen's Material Design look.
 - **A speed picked while paused on a stream** is shown at once and applied when playback resumes
   — changing the rate is a network seek nobody can hear. Speeds outside the picker's range (or
   not numbers) are brought into range or ignored.
+- **A book whose files are on the device starts from them.** Downloaded tracks are always
+  preferred over the stream, online or not. If the track to start in is downloaded, the start
+  waits at most ~3 s for the server (which, if it answers, still supplies fresh metadata and
+  progress from other devices) — and not at all while offline mode is on. If that track isn't
+  downloaded the server is needed and is waited for as before. The log says how many tracks are
+  on the device and, for a streamed track that has a download, why it can't be used.
 - **Starting a book opens the full player at once**, in a loading state (controls greyed out),
   instead of waiting for the load; the book that is starting counts as the current one, so
   Mark as finished / Reset progress chosen meanwhile are applied once it has loaded.

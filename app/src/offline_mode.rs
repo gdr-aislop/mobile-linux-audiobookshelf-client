@@ -56,6 +56,7 @@ impl OfflineModeState {
         let inner_rc = state.inner.clone();
         glib::spawn_future_local(async move {
             if let Ok(value) = abs_core::settings::load_offline_mode(&pool).await {
+                tracing::info!(offline_mode = value, "loaded the offline mode setting");
                 inner_rc.borrow_mut().value = value;
                 // See `set()`'s comment: `publish()` must run with no active borrow.
                 inner_rc.borrow().publish();
@@ -83,6 +84,7 @@ impl OfflineModeState {
             inner.value = value;
             (inner.pool.clone(), inner.on_persist_error.clone())
         };
+        tracing::info!(offline_mode = value, "offline mode {}", if value { "turned on" } else { "turned off" });
         // `publish()` must run with no active borrow — listener callbacks call `.get()` (and
         // `apply()`/`render_from_current_data()` do too, transitively), which needs its own
         // immutable borrow, and a listener invoked while this method still held `borrow_mut()`

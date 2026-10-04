@@ -358,6 +358,11 @@ pub fn build(
     // setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this must be a single
     // shared instance rather than each screen loading its own copy.
     let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+    // The player starts a downloaded book without waiting on the server while this is on.
+    offline_mode.add_listener({
+        let controller = mini_bar.controller.clone();
+        move |on| controller.set_offline_mode(on)
+    });
 
     let stack = adw::ViewStack::new();
 

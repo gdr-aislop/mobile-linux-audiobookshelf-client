@@ -168,30 +168,95 @@ pub async fn chapter_offline_markers_for_item(pool: &SqlitePool, server_id: &str
     Ok(chapter_offline_markers(&tracks, &chapters, &complete))
 }
 
+/// Why a track is streamed rather than played from disk — the reason `local_track_path` used to
+/// swallow. Logged at playback start so "why did it stream a book I downloaded?" is answerable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamReason {
+    /// No download was ever started for this track.
+    NotDownloaded,
+    /// A download row exists but hasn't finished (pending or in progress).
+    InProgress,
+    /// The download ended in failure.
+    Failed,
+    /// Marked complete, but the file is gone from disk.
+    FileMissing,
+    /// Marked complete, but the file's size isn't what was recorded.
+    SizeMismatch { expected: u64, actual: u64 },
+    /// The download table couldn't be read.
+    LookupFailed(String),
+}
+
+impl std::fmt::Display for StreamReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamReason::NotDownloaded => write!(f, "not downloaded"),
+            StreamReason::InProgress => write!(f, "download not finished"),
+            StreamReason::Failed => write!(f, "download failed"),
+            StreamReason::FileMissing => write!(f, "downloaded file is missing"),
+            StreamReason::SizeMismatch { expected, actual } => write!(f, "downloaded file is {actual} bytes, expected {expected}"),
+            StreamReason::LookupFailed(err) => write!(f, "couldn't read the downloads table: {err}"),
+        }
+    }
+}
+
+/// Where a track plays from: a verified local file, or the stream (and why).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackSource {
+    Local(PathBuf),
+    Streamed(StreamReason),
+}
+
 /// A `Complete` row is only trustworthy if its file still exists on disk with the size recorded at
 /// download time — a size mismatch (or a missing file, e.g. deleted externally) means the row is
 /// stale, and callers must treat it the same as "not downloaded" rather than crash or play/report a
 /// corrupt file. Shared by `download_track`'s own idempotency check (skip a re-download) and
-/// `local_track_path` below (prefer a local file over streaming) — one definition of "trustworthy",
+/// `track_source` below (prefer a local file over streaming) — one definition of "trustworthy",
 /// not two copies that could quietly drift apart.
 async fn verified_complete_path(row: &DownloadTrack) -> Option<PathBuf> {
-    if row.status != DownloadStatus::Complete {
-        return None;
+    match verify_row(row).await {
+        TrackSource::Local(path) => Some(path),
+        TrackSource::Streamed(_) => None,
     }
-    let metadata = tokio::fs::metadata(&row.file_path).await.ok()?;
-    let size_matches = row.expected_size_bytes.map(|expected| expected as u64 == metadata.len()).unwrap_or(true);
-    size_matches.then(|| PathBuf::from(&row.file_path))
 }
 
-/// The on-disk path for a track, if — and only if — it's verifiably safe to play from: a `Complete`
-/// row whose file still matches its recorded size. `None` covers every other case (never downloaded,
-/// still in progress, failed, or a stale/corrupted row) uniformly, so callers (playback, preferring
-/// a local file over streaming) never have to distinguish "why not" — they just fall back to
-/// streaming. Never fails the caller: a DB read error is treated the same as "not downloaded",
-/// matching this module's existing best-effort posture (`covers`, `item_offline_availability`).
+async fn verify_row(row: &DownloadTrack) -> TrackSource {
+    match row.status {
+        DownloadStatus::Complete => {}
+        DownloadStatus::Pending | DownloadStatus::Downloading => return TrackSource::Streamed(StreamReason::InProgress),
+        DownloadStatus::Failed => return TrackSource::Streamed(StreamReason::Failed),
+    }
+    let Ok(metadata) = tokio::fs::metadata(&row.file_path).await else {
+        return TrackSource::Streamed(StreamReason::FileMissing);
+    };
+    match row.expected_size_bytes {
+        Some(expected) if expected as u64 != metadata.len() => {
+            TrackSource::Streamed(StreamReason::SizeMismatch { expected: expected as u64, actual: metadata.len() })
+        }
+        _ => TrackSource::Local(PathBuf::from(&row.file_path)),
+    }
+}
+
+/// Where this track plays from — the on-disk path if, and only if, it's verifiably safe to play
+/// from (a `Complete` row whose file still matches its recorded size), otherwise the stream and
+/// the reason. Never fails the caller: a DB read error is a `Streamed(LookupFailed)`, logged.
+pub async fn track_source(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str) -> TrackSource {
+    match abs_storage::repo::download_tracks::get(pool, server_id, item_id, ino).await {
+        Ok(Some(row)) => verify_row(&row).await,
+        Ok(None) => TrackSource::Streamed(StreamReason::NotDownloaded),
+        Err(err) => {
+            tracing::warn!(%err, item_id, ino, "couldn't read the downloads table; streaming this track");
+            TrackSource::Streamed(StreamReason::LookupFailed(err.to_string()))
+        }
+    }
+}
+
+/// The on-disk path for a track, if — and only if, see [`track_source`]. `None` covers every other
+/// case uniformly, for callers that only need "is there a local file".
 pub async fn local_track_path(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str) -> Option<PathBuf> {
-    let row = abs_storage::repo::download_tracks::get(pool, server_id, item_id, ino).await.ok()??;
-    verified_complete_path(&row).await
+    match track_source(pool, server_id, item_id, ino).await {
+        TrackSource::Local(path) => Some(path),
+        TrackSource::Streamed(_) => None,
+    }
 }
 
 /// Which of an item's tracks are fully downloaded — what `chapter_offline_markers` needs to turn
@@ -633,6 +698,34 @@ mod tests {
 
         abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 10).await.unwrap();
         assert_eq!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap(), BTreeSet::from(["a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn track_source_says_why_a_track_is_streamed() {
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["a"]).await;
+        let source = || track_source(&pool, &server_id, "item-1", "a");
+        assert_eq!(source().await, TrackSource::Streamed(StreamReason::NotDownloaded));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.mp3");
+        tokio::fs::write(&file_path, b"hello").await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "a", file_path.to_str().unwrap()).await.unwrap();
+        assert_eq!(source().await, TrackSource::Streamed(StreamReason::InProgress));
+
+        abs_storage::repo::download_tracks::mark_failed(&pool, &server_id, "item-1", "a", "boom").await.unwrap();
+        assert_eq!(source().await, TrackSource::Streamed(StreamReason::Failed));
+
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 999).await.unwrap();
+        assert_eq!(source().await, TrackSource::Streamed(StreamReason::SizeMismatch { expected: 999, actual: 5 }));
+
+        abs_storage::repo::download_tracks::mark_complete(&pool, &server_id, "item-1", "a", 5).await.unwrap();
+        assert_eq!(source().await, TrackSource::Local(file_path.clone()));
+
+        tokio::fs::remove_file(&file_path).await.unwrap();
+        assert_eq!(source().await, TrackSource::Streamed(StreamReason::FileMissing));
+
+        pool.close().await;
+        assert!(matches!(source().await, TrackSource::Streamed(StreamReason::LookupFailed(_))), "a DB error is a reason, not a silent None");
     }
 
     #[tokio::test]
