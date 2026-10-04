@@ -83,6 +83,18 @@ pub struct LibraryScreen {
 }
 
 impl LibraryScreen {
+    /// Re-renders the list when low memory mode changes, so the covers already shown turn into
+    /// placeholders (or come back).
+    pub(crate) fn follow_low_memory_mode(&self, low_memory_mode: &crate::low_memory_mode::LowMemoryModeState) {
+        let widgets = self.widgets.clone();
+        low_memory_mode.add_listener(move |_| {
+            // The books are the same, so the "nothing changed" check would skip the rebuild; the
+            // new cards are what drop the old covers.
+            *widgets.rendered_signature.borrow_mut() = None;
+            request_render(&widgets);
+        });
+    }
+
     /// Keeps the cards' downloaded badges (and the offline-mode view) current as downloads finish
     /// or are cleared — see `crate::downloads::follow_downloaded_items`. An unchanged list isn't
     /// rebuilt (the render compares what it would show with what is shown).
@@ -1419,6 +1431,13 @@ fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk
     glib::idle_add_local_once(move || {
         widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
         widgets.list_box.set_visible(mode == LibraryViewMode::List);
+        // The container no longer shown keeps nothing: its whole tree (a widget per book, with
+        // the textures it showed) used to stay alive behind the visible one.
+        match mode {
+            LibraryViewMode::Grid => clear_list_box(&widgets.list_box),
+            LibraryViewMode::List => clear_flow_box(&widgets.flow_box),
+        }
+        *widgets.rendered_signature.borrow_mut() = None;
         render_from_current_data(&widgets);
         set_busy(&widgets, false);
     });
@@ -3835,5 +3854,74 @@ pub(crate) mod tests {
         download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-2".to_string(), state: crate::downloads::ItemDownloadState::Idle });
         pump_until(|| hooks.flow_box.child_at_index(0).is_none(), Duration::from_secs(5));
         assert!(hooks.flow_box.child_at_index(0).is_none(), "a cleared download leaves offline mode's list");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Switching between grid and list leaves
+    /// nothing behind in the container no longer shown (it used to keep its whole widget tree), and
+    /// low memory mode turns the covers on the grid into placeholders and back.
+    pub(crate) fn run_low_memory_mode_and_view_switches_release_what_is_not_shown(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+            bytes
+        };
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1/cover"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(png))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+        low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        screen.follow_low_memory_mode(&low_memory_mode);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(hooks.list_box.row_at_index(0).is_none(), "the list is emptied while the grid is shown");
+        let cover_showing = || {
+            hooks
+                .flow_box
+                .child_at_index(0)
+                .and_then(|child| child.child())
+                .and_then(|card| crate::widgets::item_card::tests::cover_picture_of(&card))
+                .is_some_and(|picture| picture.is_visible())
+        };
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "the grid shows the cover");
+
+        low_memory_mode.set(true);
+        pump_until(|| !cover_showing(), Duration::from_secs(5));
+        assert!(!cover_showing(), "low memory mode: a placeholder");
+        low_memory_mode.set(false);
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "and the cover is back");
+
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(hooks.flow_box.child_at_index(0).is_none(), "the grid is emptied while the list is shown");
     }
 }

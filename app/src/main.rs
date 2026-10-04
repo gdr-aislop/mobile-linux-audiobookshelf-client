@@ -2,6 +2,7 @@ mod application;
 mod crash_reporting;
 mod downloads;
 mod error_reporting;
+mod low_memory_mode;
 mod offline_mode;
 mod perf;
 mod player;
@@ -94,6 +95,22 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
     let pool = abs_storage::connect_and_migrate(&paths.db_path())
         .await
         .expect("open and migrate the local database");
+
+    // Low memory mode decides how the database itself is opened (fewer connections, a small page
+    // cache), so it is read first, with the default pool, and the pool reopened if it is on. The
+    // cover widgets get the flag before any window exists.
+    let low_memory_mode = abs_core::settings::load_low_memory_mode(&pool).await.unwrap_or(false);
+    tracing::info!(low_memory_mode, "loaded the low memory mode setting");
+    let pool = if low_memory_mode {
+        pool.close().await;
+        tracing::info!("low memory mode: opening the database with fewer connections and a small page cache");
+        abs_storage::connect_and_migrate_with(&paths.db_path(), abs_storage::DbProfile::LowMemory)
+            .await
+            .expect("open the local database in low memory mode")
+    } else {
+        pool
+    };
+    widgets::cover_image::set_low_memory_mode(low_memory_mode);
 
     let playback_settings = abs_core::settings::load_playback_settings(&pool)
         .await
@@ -204,9 +221,11 @@ mod tests {
         (library_search_and_sort_apply_in_list_mode_too, crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too),
         (library_view_mode_is_remembered_across_screen_rebuilds, crate::screens::library::tests::run_view_mode_is_remembered_across_screen_rebuilds),
         (library_a_big_library_renders_in_slices_and_skips_identical_renders, crate::screens::library::tests::run_a_big_library_renders_in_slices_and_skips_identical_renders),
+        (library_low_memory_mode_and_view_switches_release_what_is_not_shown, crate::screens::library::tests::run_low_memory_mode_and_view_switches_release_what_is_not_shown),
         (library_downloaded_badges_follow_downloads_in_this_session, crate::screens::library::tests::run_downloaded_badges_follow_downloads_in_this_session),
         (home_downloaded_badges_follow_downloads_in_this_session, crate::screens::home::tests::run_downloaded_badges_follow_downloads_in_this_session),
         (home_offline_mode_makes_no_requests, crate::screens::home::tests::run_offline_mode_makes_no_requests),
+        (home_low_memory_mode_hides_the_covers_on_the_shelves, crate::screens::home::tests::run_low_memory_mode_hides_the_covers_on_the_shelves),
         (home_missing_covers_are_asked_again_only_by_a_manual_sync, crate::screens::home::tests::run_missing_covers_are_asked_again_only_by_a_manual_sync),
         (playback_offline_mode_plays_and_saves_locally_then_catches_up, crate::player::tests::run_offline_mode_plays_and_saves_locally_then_catches_up),
         (playback_offline_mode_does_not_stream, crate::player::tests::run_offline_mode_does_not_stream),
@@ -261,6 +280,7 @@ mod tests {
         (main_window_mini_bar_open_player_swaps_to_the_full_player_screen, crate::screens::main_window::tests::run_mini_bar_open_player_swaps_to_the_full_player_screen),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
+        (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
         (settings_servers_menu_actions_rebuild_the_shell, crate::screens::settings::tests::run_servers_menu_actions_rebuild_the_shell),
         (settings_add_server_row_opens_welcome_and_cancels_back, crate::screens::settings::tests::run_add_server_row_opens_welcome_and_cancels_back),
@@ -362,6 +382,8 @@ mod tests {
         (cover_image_rendering, crate::widgets::cover_image::tests::run),
         (cover_image_decodes_at_the_requested_size_not_the_source_size, crate::widgets::cover_image::tests::run_decodes_at_the_requested_size_not_the_source_size),
         (cover_image_cache_hit_avoids_re_reading_disk, crate::widgets::cover_image::tests::run_cache_hit_avoids_re_reading_disk),
+        (cover_image_low_memory_mode_turns_covers_off_and_back_on, crate::widgets::cover_image::tests::run_low_memory_mode_turns_covers_off_and_back_on),
+        (low_memory_mode_state_notifies_and_persists, crate::low_memory_mode::tests::run_low_memory_mode_state_notifies_and_persists),
         (cover_image_a_stale_decode_does_not_clobber_a_newer_path, crate::widgets::cover_image::tests::run_a_stale_decode_does_not_clobber_a_newer_path),
         (cover_image_lru_eviction_keeps_recently_accessed_entries, crate::widgets::cover_image::tests::run_lru_eviction_keeps_recently_accessed_entries),
         (debouncer_fires_again_after_a_previous_debounce_already_fired, crate::widgets::tests::run_fires_again_after_a_previous_debounce_already_fired),

@@ -9,6 +9,6 @@ pub mod models;
 pub mod paths;
 pub mod repo;
 
-pub use db::connect_and_migrate;
+pub use db::{connect_and_migrate, connect_and_migrate_with, DbProfile};
 pub use error::{Result, StorageError};
 pub use paths::AppPaths;

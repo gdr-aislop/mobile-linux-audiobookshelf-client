@@ -363,6 +363,10 @@ pub fn build(
     // setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this must be a single
     // shared instance rather than each screen loading its own copy.
     let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+    // "Low memory mode": the covers follow it (no decoding, a small texture cache) and so do the
+    // lists that show them (Home, Library — hooked up where they are built, below).
+    let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+    low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
     // Offline mode cuts every server call made through the session (see
     // `abs_core::auth::Session::set_offline`); switching it off catches up on what was kept
     // locally meanwhile — this book's progress and any other book's unpushed progress.
@@ -401,6 +405,10 @@ pub fn build(
     offline_mode.set_on_persist_error({
         let root = root.clone();
         move |err| crate::error_reporting::report_background_error(&root, "Saving offline mode", err)
+    });
+    low_memory_mode.set_on_persist_error({
+        let root = root.clone();
+        move |err| crate::error_reporting::report_background_error(&root, "Saving low memory mode", err)
     });
 
     // Opens the full player by swapping the window's content — there's no
@@ -735,6 +743,8 @@ pub fn build(
     // Both shelves' badges follow downloads finishing or being cleared in this session.
     home_screen.follow_downloads(&download_manager);
     library_screen.follow_downloads(&download_manager);
+    home_screen.follow_low_memory_mode(&low_memory_mode);
+    library_screen.follow_low_memory_mode(&low_memory_mode);
     stack.add_titled_with_icon(&home_screen.root, Some("home"), "Home", "go-home-symbolic");
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
@@ -776,6 +786,7 @@ pub fn build(
         mini_bar.controller.clone(),
         download_manager.clone(),
         playback_settings,
+        low_memory_mode.clone(),
         theme,
         paths,
         servers_with_accounts,

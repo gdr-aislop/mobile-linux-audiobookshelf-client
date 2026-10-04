@@ -404,6 +404,15 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   `AdwStyleManager` immediately and at startup), the **About** row, and the **Account** and
   **Servers** groups (below) are real too. The one remaining stub: Playback's
   sleep-timer-default row.
+- **Low memory mode** (Playback group, next to "Buffer streams in bursts"): one switch for a
+  phone short on RAM. It hides covers everywhere (Home, Library, Item detail, Player, mini bar,
+  Downloads show their placeholders — nothing is decoded), shrinks the cover texture cache from
+  24 MiB to 4 MiB, and opens the database with 3 connections and a small page cache instead of 5
+  and the default (the database part applies on the next launch; the rest applies at once).
+  Burst buffering is **not** changed by it — it stays the user's own choice — but while both are
+  on, the burst row adds a line saying it uses up to 64 MB of buffer and suggesting turning it off.
+  (Independently of the mode, switching Library between grid and list now empties the container
+  that is no longer shown.)
 - **Account** group: one row showing the *active* server/account — username as title,
   `host · active` as subtitle — with a chevron; tapping it pushes the active server's
   **Connection** page. The mockup's second row ("Switch or manage servers") is deliberately

@@ -609,6 +609,16 @@ was and wasn't verified.
       download say offline mode is on; the undownloaded book says it isn't downloaded. Turning it
       off logs `offline mode off: catching up with the server` and the position reaches the server.
 
+- [ ] **MP-26 — Low memory mode.** Settings → Playback → Low memory mode on, then look at Home,
+      Library (grid and list), Item Detail, the full player and the mini bar; scroll the Library;
+      with burst buffering on, read the burst row. Relaunch the app. Compare `ps -o rss` with the
+      mode on and off after scrolling the whole Library.
+      *Expected:* every cover is a placeholder at once (nothing else on the cards changes); the
+      burst row adds a "Uses up to 64 MB of buffer…" line while both are on (and loses it when
+      either goes off); the log shows `low memory mode: opening the database with fewer
+      connections…` on the relaunch; turning the mode off brings the covers back; the memory used
+      is clearly lower with it on.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

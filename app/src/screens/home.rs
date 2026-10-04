@@ -39,6 +39,21 @@ pub struct HomeScreen {
 }
 
 impl HomeScreen {
+    /// Re-renders the shelves when low memory mode changes, so the covers already shown turn into
+    /// placeholders (or come back).
+    pub(crate) fn follow_low_memory_mode(&self, low_memory_mode: &crate::low_memory_mode::LowMemoryModeState) {
+        let widgets = self.widgets.clone();
+        low_memory_mode.add_listener(move |_| {
+            let widgets = widgets.clone();
+            glib::idle_add_local_once(move || {
+                let cached = widgets.last_data.borrow().clone();
+                if let Some(data) = cached {
+                    apply(&data, &widgets);
+                }
+            });
+        });
+    }
+
     /// Keeps the shelves' downloaded badges (and the offline-mode view) current as downloads
     /// finish or are cleared — see `crate::downloads::follow_downloaded_items`.
     pub(crate) fn follow_downloads(&self, download_manager: &crate::downloads::DownloadManager) {
@@ -1788,5 +1803,63 @@ pub(crate) mod tests {
         pump_until(|| cover_requests() == 2, Duration::from_secs(10));
         assert_eq!(cover_requests(), 2, "Sync now asks again");
         drop(first);
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Low memory mode turns the covers on
+    /// the shelves into placeholders (and back), leaving everything else on the cards alone.
+    pub(crate) fn run_low_memory_mode_hides_the_covers_on_the_shelves(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [item_json("item-1", "Project Hail Mary")] })))
+                .mount(&mock_server),
+        );
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+            bytes
+        };
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1/cover"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(png))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+        low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, |_| {});
+        screen.follow_low_memory_mode(&low_memory_mode);
+        let hooks = screen.test_hooks();
+        let cover_showing = || {
+            hooks
+                .recent_row
+                .first_child()
+                .and_then(|card| crate::widgets::item_card::tests::cover_picture_of(&card))
+                .is_some_and(|picture| picture.is_visible())
+        };
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "the cover shows normally");
+
+        low_memory_mode.set(true);
+        pump_until(|| !cover_showing(), Duration::from_secs(5));
+        assert!(!cover_showing(), "low memory mode: a placeholder instead of the cover");
+        assert_eq!(count_children(&hooks.recent_row), 1, "the card itself stays");
+
+        low_memory_mode.set(false);
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "and the cover comes back");
     }
 }
