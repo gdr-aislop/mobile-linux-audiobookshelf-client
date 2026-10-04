@@ -33,7 +33,7 @@ pub async fn connect_and_migrate(path: &Path) -> Result<SqlitePool> {
         .busy_timeout(Duration::from_secs(15));
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(MAX_CONNECTIONS)
         // Explicit rather than sqlx's undocumented-at-this-call-site 30s default: kept just
         // under it so a pool-exhaustion failure surfaces a little before that default would,
         // while still comfortably outlasting normal sync-vs-UI-action contention.
@@ -43,12 +43,56 @@ pub async fn connect_and_migrate(path: &Path) -> Result<SqlitePool> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    spawn_saturation_probe(pool.clone());
+
     Ok(pool)
+}
+
+const MAX_CONNECTIONS: u32 = 5;
+const SATURATION_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether every connection the pool may have is open and checked out — anything asking for one
+/// now waits. (A slow `acquire` with this *not* holding points elsewhere, e.g. at a blocked
+/// caller; see `app/src/perf.rs`.)
+fn is_saturated(size: u32, idle: usize, max: u32) -> bool {
+    size >= max && idle == 0
+}
+
+/// Samples the pool once a second from a Tokio worker — independent of the GTK main loop that
+/// polls most queries — and warns when it has been saturated for two samples in a row, once per
+/// episode. Stops when the pool is closed.
+fn spawn_saturation_probe(pool: SqlitePool) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+    runtime.spawn(async move {
+        let mut saturated_samples = 0_u32;
+        loop {
+            tokio::time::sleep(SATURATION_PROBE_INTERVAL).await;
+            if pool.is_closed() {
+                return;
+            }
+            if is_saturated(pool.size(), pool.num_idle(), MAX_CONNECTIONS) {
+                saturated_samples += 1;
+                if saturated_samples == 2 {
+                    tracing::warn!(connections = pool.size(), "the database pool is saturated: every connection has been busy for over a second");
+                }
+            } else {
+                saturated_samples = 0;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturated_means_every_connection_open_and_none_idle() {
+        assert!(is_saturated(5, 0, 5));
+        assert!(!is_saturated(5, 1, 5), "one idle connection is not saturation");
+        assert!(!is_saturated(3, 0, 5), "the pool can still open more");
+        assert!(!is_saturated(0, 0, 5));
+    }
 
     #[tokio::test]
     async fn connect_and_migrate_creates_the_database_file() {

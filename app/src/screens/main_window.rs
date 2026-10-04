@@ -234,6 +234,7 @@ pub fn build(
     servers_with_accounts: Vec<(Server, Vec<Account>)>,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
+    let _slow = crate::perf::SlowJob::new("main window build");
     let mini_bar = player::build_mini_bar(pool.clone(), paths.clone(), player::real_backend());
 
     // MPRIS registration is best-effort — no session bus (a bare console, a locked-down sandbox)

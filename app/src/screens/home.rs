@@ -840,6 +840,7 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
 /// children first, so this is a full re-render rather than an incremental diff (fine at this
 /// scale: a handful of shelf cards and library rows, not a large list needing virtualization).
 fn apply(data: &HomeData, widgets: &HomeWidgets) {
+    let _slow = crate::perf::SlowJob::new("home render");
     *widgets.last_data.borrow_mut() = Some(data.clone());
 
     // The empty state's *mode* is owned by the sync-cycle state machine, but its hiding happens

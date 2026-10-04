@@ -587,6 +587,14 @@ was and wasn't verified.
       *Expected:* the log shows `offline mode turned on|off` and `playback: offline mode on|off`;
       the setting is also logged at startup (`loaded the offline mode setting`).
 
+- [ ] **MP-23 — The UI stays responsive with a big library.** With a library of a few hundred
+      books, open the Library tab, type in search, change the sort, and toggle offline mode.
+      *Expected:* the list fills in over a moment instead of freezing the app; scrolling and taps
+      stay responsive meanwhile; a render that changes nothing doesn't reset the scroll position.
+      The log has no `sqlx::pool::acquire` slow warnings; if the main loop is ever held up it says
+      `the main loop was blocked` (with how long) and names the job (`a UI job held up the main
+      loop … library render`), and `the database pool is saturated` if the pool itself ever is.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

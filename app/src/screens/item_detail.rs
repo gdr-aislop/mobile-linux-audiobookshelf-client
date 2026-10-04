@@ -105,6 +105,7 @@ pub fn build(
     on_open_series: impl Fn(String) + 'static,
     on_open_downloads: impl Fn() + 'static,
 ) -> ItemDetailScreen {
+    let _slow = crate::perf::SlowJob::new("item detail build");
     let on_play: Rc<dyn Fn(String, Option<usize>)> = Rc::new(on_play);
     let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);

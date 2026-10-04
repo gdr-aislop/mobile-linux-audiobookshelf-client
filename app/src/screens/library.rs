@@ -259,6 +259,12 @@ struct LibraryWidgets {
     genre_chip_box: gtk4::Box,
     /// This render's cards/rows and their (maybe not yet decoded) covers — see [`PendingCover`].
     pending_covers: Rc<std::cell::RefCell<Vec<PendingCover>>>,
+    /// Bumped by every render that rebuilds the list; a slice still building an older one sees the
+    /// change and stops (`append_remaining_entries`).
+    render_generation: Rc<Cell<u64>>,
+    /// What the fully built list on screen was built from (`render_signature`); `None` while a
+    /// render is still in progress or nothing has been rendered.
+    rendered_signature: Rc<std::cell::RefCell<Option<String>>>,
     /// Shown for the one main-loop tick between any filter/search/sort/view-mode change and the
     /// rebuild it triggers — see [`request_render`]/[`set_busy`].
     busy_spinner: gtk4::Spinner,
@@ -550,6 +556,8 @@ pub fn build(
         progress_banner: progress_banner.clone(),
         genre_chip_box: genre_chip_box.clone(),
         pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
+        render_generation: Rc::new(Cell::new(0)),
+        rendered_signature: Rc::new(std::cell::RefCell::new(None)),
         busy_spinner: busy_spinner.clone(),
         busy_scrim: busy_scrim.clone(),
     };
@@ -1375,6 +1383,7 @@ fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk
 }
 
 fn render_from_current_data(widgets: &LibraryWidgets) {
+    let _slow = crate::perf::SlowJob::new("library render");
     let query = abs_core::search::normalize_for_search(&widgets.search_entry.text());
     let sort = widgets.sort.get();
     let data = widgets.data.borrow();
@@ -1452,40 +1461,48 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // posture already used everywhere else in this file, just gated per mode so switching modes
     // (or searching/sorting while a mode is hidden) doesn't do wasted work on the other one.
     // Every card/row's cover decode is *deferred* (`build_deferred`/`library_list_row_deferred`):
-    // building the widget itself is cheap (no I/O), so that still happens for everything matching
+    // building the widget itself needs no I/O, so that still happens for everything matching
     // the filter, but only covers within (or near) the visible viewport actually start decoding —
     // see `decode_covers_in_viewport`, scheduled once right after this function returns.
-    let mut pending = Vec::new();
-    match widgets.view_mode.get() {
-        LibraryViewMode::Grid => {
-            clear_flow_box(&widgets.flow_box);
-            for (key, bucket) in &groups {
-                if grouping != Grouping::None {
-                    widgets.flow_box.insert(&grid_group_header(key.label()), -1);
-                }
-                for item in bucket {
-                    let subtitle = item_subtitle(item);
-                    let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id));
-                    widgets.flow_box.insert(&built.widget, -1);
-                    pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
-                }
-            }
+    //
+    // Building a few hundred cards is seconds of main-loop time on a phone, during which nothing
+    // else runs — including every database future. So only the first `FIRST_RENDER_BATCH` entries
+    // are built here; the rest follow in idle slices (`append_remaining_entries`), and a newer
+    // render abandons an older one still in progress.
+    let mut entries: Vec<RenderEntry> = Vec::new();
+    for (key, bucket) in &groups {
+        if grouping != Grouping::None {
+            entries.push(RenderEntry::Header(key.label().to_string()));
         }
-        LibraryViewMode::List => {
-            clear_list_box(&widgets.list_box);
-            for (key, bucket) in &groups {
-                if grouping != Grouping::None {
-                    widgets.list_box.append(&list_group_header(key.label()));
-                }
-                for item in bucket {
-                    let built = library_list_row_deferred(item, &widgets.on_open);
-                    widgets.list_box.append(&built.row);
-                    pending.push(PendingCover { widget: built.row.upcast(), cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
-                }
-            }
+        for item in bucket {
+            entries.push(RenderEntry::Item { item: Box::new((*item).clone()), downloaded: data.downloaded.contains(&item.id) });
         }
     }
-    *widgets.pending_covers.borrow_mut() = pending;
+    let mode = widgets.view_mode.get();
+    let signature = render_signature(mode, &entries);
+    if widgets.rendered_signature.borrow().as_deref() == Some(signature.as_str()) {
+        // Exactly what is on screen already (a sync that changed nothing, a toggle with nothing to
+        // filter, a search whose results didn't change): rebuilding it would only cost time and
+        // lose the scroll position.
+        tracing::debug!(books = entries.len(), "library render skipped: nothing changed");
+    } else {
+        *widgets.rendered_signature.borrow_mut() = None;
+        let generation = widgets.render_generation.get() + 1;
+        widgets.render_generation.set(generation);
+        match mode {
+            LibraryViewMode::Grid => clear_flow_box(&widgets.flow_box),
+            LibraryViewMode::List => clear_list_box(&widgets.list_box),
+        }
+        widgets.pending_covers.borrow_mut().clear();
+        let entries = Rc::new(entries);
+        let built = FIRST_RENDER_BATCH.min(entries.len());
+        append_entries(widgets, mode, &entries[..built]);
+        if built == entries.len() {
+            *widgets.rendered_signature.borrow_mut() = Some(signature);
+        } else {
+            append_remaining_entries(widgets.clone(), mode, entries, built, generation, signature);
+        }
+    }
 
     // Deferred past this function returning — the cards above were only just inserted, and
     // `compute_bounds` (inside `decode_covers_in_viewport`) needs a completed layout/allocation
@@ -1508,6 +1525,87 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     } else if !data.items.is_empty() {
         widgets.status_page.set_title("No items yet");
     }
+}
+
+/// How many cards/rows a render builds before yielding to the main loop, and how many each
+/// following idle slice builds. A few dozen widgets is a frame or two even on a phone.
+const FIRST_RENDER_BATCH: usize = 40;
+const RENDER_SLICE: usize = 40;
+
+/// One thing a render puts on screen, owned so the later slices don't depend on `widgets.data`
+/// still holding the same items.
+#[derive(Clone)]
+enum RenderEntry {
+    Header(String),
+    Item { item: Box<Item>, downloaded: bool },
+}
+
+/// Identifies what a render would show — the view mode and every input the card/row builders and
+/// the group headers read — so an identical one can be skipped.
+fn render_signature(mode: LibraryViewMode, entries: &[RenderEntry]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (mode == LibraryViewMode::Grid).hash(&mut hasher);
+    for entry in entries {
+        match entry {
+            RenderEntry::Header(label) => ("header", label).hash(&mut hasher),
+            RenderEntry::Item { item, downloaded } => ("item", format!("{item:?}"), downloaded).hash(&mut hasher),
+        }
+    }
+    format!("{}:{:x}", entries.len(), hasher.finish())
+}
+
+/// Builds and inserts the widgets for `entries` into the active container, and tracks their
+/// covers for `decode_covers_in_viewport`.
+fn append_entries(widgets: &LibraryWidgets, mode: LibraryViewMode, entries: &[RenderEntry]) {
+    let mut pending = widgets.pending_covers.borrow_mut();
+    for entry in entries {
+        match (mode, entry) {
+            (LibraryViewMode::Grid, RenderEntry::Header(label)) => {
+                widgets.flow_box.insert(&grid_group_header(label), -1);
+            }
+            (LibraryViewMode::List, RenderEntry::Header(label)) => {
+                widgets.list_box.append(&list_group_header(label));
+            }
+            (LibraryViewMode::Grid, RenderEntry::Item { item, downloaded }) => {
+                let subtitle = item_subtitle(item);
+                let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, *downloaded);
+                widgets.flow_box.insert(&built.widget, -1);
+                pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
+            }
+            (LibraryViewMode::List, RenderEntry::Item { item, .. }) => {
+                let built = library_list_row_deferred(item, &widgets.on_open);
+                widgets.list_box.append(&built.row);
+                pending.push(PendingCover { widget: built.row.upcast(), cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
+            }
+        }
+    }
+}
+
+/// Builds `entries[from..]` in idle slices. Stops (leaving the partly built list for the render
+/// that replaced this one to clear) as soon as `widgets.render_generation` has moved on; on
+/// finishing, records `signature` as what is on screen and decodes the covers in view.
+fn append_remaining_entries(widgets: LibraryWidgets, mode: LibraryViewMode, entries: Rc<Vec<RenderEntry>>, from: usize, generation: u64, signature: String) {
+    let next = Cell::new(from);
+    glib::idle_add_local(move || {
+        if widgets.render_generation.get() != generation {
+            tracing::debug!("a library render was replaced before it finished");
+            return glib::ControlFlow::Break;
+        }
+        let _slow = crate::perf::SlowJob::new("library render slice");
+        let start = next.get();
+        let end = (start + RENDER_SLICE).min(entries.len());
+        append_entries(&widgets, mode, &entries[start..end]);
+        next.set(end);
+        if end < entries.len() {
+            return glib::ControlFlow::Continue;
+        }
+        *widgets.rendered_signature.borrow_mut() = Some(signature.clone());
+        tracing::debug!(books = entries.len(), "library render finished");
+        let widgets = widgets.clone();
+        glib::idle_add_local_once(move || decode_covers_in_viewport(&widgets));
+        glib::ControlFlow::Break
+    });
 }
 
 /// Decodes the cover for every currently-tracked card/row (`widgets.pending_covers`) that's
@@ -3568,5 +3666,62 @@ pub(crate) mod tests {
             crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the pull's completion toast must appear too"
         );
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A big library is built in slices so the
+    /// main loop is never held for the whole of it, a newer render abandons an older one still
+    /// being built, and a render that would show exactly what is already there builds nothing.
+    pub(crate) fn run_a_big_library_renders_in_slices_and_skips_identical_renders(runtime: &tokio::runtime::Runtime) {
+        const BOOKS: usize = 130;
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let results: Vec<_> = (0..BOOKS).map(|i| item_json(&format!("item-{i:03}"), &format!("Book {i:03}"), "An Author", 1_700_000_000_000 + i as i64, 3600.0)).collect();
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+        let rows = || {
+            let mut count = 0;
+            while hooks.list_box.row_at_index(count).is_some() {
+                count += 1;
+            }
+            count as usize
+        };
+
+        pump_until(|| rows() == BOOKS, Duration::from_secs(20));
+        assert_eq!(rows(), BOOKS, "every book ends up on screen");
+
+        // Applying the view that is already shown builds nothing: the very same rows stay.
+        screen.apply_view(SortKey::DateAdded, false);
+        pump_until(|| false, Duration::from_millis(500));
+        pump_until(|| rows() == BOOKS, Duration::from_secs(20));
+        let first_row = hooks.list_box.row_at_index(0).unwrap();
+        screen.apply_view(SortKey::DateAdded, false);
+        pump_until(|| false, Duration::from_millis(300));
+        assert_eq!(rows(), BOOKS);
+        assert_eq!(hooks.list_box.row_at_index(0).as_ref(), Some(&first_row), "an identical render must not rebuild the list");
+
+        // A filter typed straight after another render began wins: nothing of the abandoned
+        // build is left behind.
+        screen.apply_view(SortKey::Title, false);
+        hooks.search_entry.set_text("book 129");
+        pump_until(|| rows() == 1, Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(rows(), 1, "only the match remains");
     }
 }

@@ -88,6 +88,7 @@ pub fn build_application(state: AppState) -> adw::Application {
 
     app.connect_activate(move |app| {
         build_window(app, &state);
+        crate::perf::start_main_loop_watchdog();
     });
 
     quit_cleanly_on_termination_signals(&app);
