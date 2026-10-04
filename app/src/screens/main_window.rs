@@ -332,6 +332,10 @@ pub fn build(
             let pool = pool.clone();
             let session = session.clone();
             watcher.start(Box::new(move || {
+                // Offline mode ignores the network coming back; switching it off catches up.
+                if session.is_offline() {
+                    return;
+                }
                 controller.sync_pending_progress();
                 push_unconfirmed_progress(pool.clone(), session.clone());
             }));
@@ -359,10 +363,26 @@ pub fn build(
     // setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this must be a single
     // shared instance rather than each screen loading its own copy.
     let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
-    // The player starts a downloaded book without waiting on the server while this is on.
+    // Offline mode cuts every server call made through the session (see
+    // `abs_core::auth::Session::set_offline`); switching it off catches up on what was kept
+    // locally meanwhile — this book's progress and any other book's unpushed progress.
     offline_mode.add_listener({
         let controller = mini_bar.controller.clone();
-        move |on| controller.set_offline_mode(on)
+        let session = session.clone();
+        let pool = pool.clone();
+        move |on| {
+            if session.is_offline() == on {
+                return;
+            }
+            session.set_offline(on);
+            if on {
+                tracing::info!("offline mode on: network disabled");
+            } else {
+                tracing::info!("offline mode off: catching up with the server");
+                controller.sync_pending_progress();
+                push_unconfirmed_progress(pool.clone(), session.clone());
+            }
+        }
     });
 
     let stack = adw::ViewStack::new();

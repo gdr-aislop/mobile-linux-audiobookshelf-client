@@ -56,7 +56,6 @@ impl OfflineModeState {
         let inner_rc = state.inner.clone();
         glib::spawn_future_local(async move {
             if let Ok(value) = abs_core::settings::load_offline_mode(&pool).await {
-                tracing::info!(offline_mode = value, "loaded the offline mode setting");
                 inner_rc.borrow_mut().value = value;
                 // See `set()`'s comment: `publish()` must run with no active borrow.
                 inner_rc.borrow().publish();

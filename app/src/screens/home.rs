@@ -524,7 +524,10 @@ pub fn build(
     // same logic must run whether *this* screen's own toggle fired or Library's did.
     let offline_toggle_handler = offline_toggle.connect_toggled({
         let offline_mode = widgets.offline_mode.clone();
-        move |toggle| offline_mode.set(toggle.is_active())
+        move |toggle| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
+            offline_mode.set(toggle.is_active());
+        }
     });
 
     widgets.offline_mode.add_listener({
@@ -545,14 +548,21 @@ pub fn build(
                 offline_toggle.unblock_signal(&offline_toggle_handler);
             }
             offline_banner.set_reveal_child(active);
-            // Rendered synchronously, before any DB work — the refetch's pool acquire must not
+            // Rendered on the next idle, before any DB work — the refetch's pool acquire must not
             // gate the visible filter change (a contended pool has stalled it for tens of seconds
-            // on-device). The in-memory snapshot is immediate-and-slightly-stale; the spawned
-            // refetch below re-renders with fresh data when it lands.
-            let cached = widgets.last_data.borrow().clone();
-            if let Some(data) = cached {
-                apply(&data, &widgets);
-            }
+            // on-device). Not inside this handler: GTK only redraws the toggle after the handler
+            // returns, and rebuilding the shelves first made the toggle seem not to react. The
+            // in-memory snapshot is immediate-and-slightly-stale; the spawned refetch below
+            // re-renders with fresh data when it lands.
+            glib::idle_add_local_once({
+                let widgets = widgets.clone();
+                move || {
+                    let cached = widgets.last_data.borrow().clone();
+                    if let Some(data) = cached {
+                        apply(&data, &widgets);
+                    }
+                }
+            });
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -640,6 +650,23 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         }
     }
 
+    // Offline mode: nothing may reach the server — show what's stored locally and stop there.
+    // No sync claim is taken, so Library (which does the same) never waits on one.
+    if ctx.session.is_offline() {
+        tracing::info!("offline mode: Home shows what's stored on the device; not syncing");
+        let (pool, server_id, account_id) = (ctx.pool.clone(), ctx.server.id.clone(), ctx.account.id.clone());
+        glib::spawn_future_local(async move {
+            match load(&pool, &server_id, &account_id).await {
+                Ok(data) if !data.libraries.is_empty() => apply(&data, &widgets),
+                _ => widgets.empty_state.show_empty(),
+            }
+        });
+        if let Some(manual) = manual {
+            manual.finish_offline();
+        }
+        return;
+    }
+
     // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Library
     // does the exact same thing for the same account, since both screens are built eagerly. Only
     // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
@@ -685,7 +712,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
-                        return (Err(err), None);
+                        let data = Some(load(&pool, &server_id, &account_id).await);
+                        return (Err(err), data);
                     }
                 };
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
@@ -709,6 +737,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         let (sync_result, data_after_sync) = spawned_sync
             .await
             .expect("the Home sync task must not panic");
+        // Offline mode switched on mid-sync cut it short; that's not a failure to show.
+        let sync_result = sync_result.or_else(|err| if matches!(err, CoreError::Offline) { Ok(()) } else { Err(err) });
         let local_read_error = data_after_sync.as_ref().and_then(|data| data.as_ref().err()).map(|err| {
             tracing::warn!(%err, "couldn't read the synced library back from local storage");
             err.to_string()
@@ -1169,18 +1199,23 @@ pub(crate) mod tests {
 
         // Same immediacy contract as `library.rs`'s offline scenario: the first toggle-on waits
         // for the handler's background refetch (the download above landed after this screen's
-        // load, so the in-memory set is stale), but every later toggle below re-renders
-        // synchronously inside the handler — no pump, no contended-pool wait.
+        // load, so the in-memory set is stale), but every later toggle below re-renders on the
+        // next idle — no contended-pool wait, and not inside the toggle handler.
         hooks.offline_toggle.set_active(true);
         pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
+        // The toggle handler itself only flips cheap state, so the button redraws at once; the
+        // shelves follow on the very next idle, from the in-memory set (no database wait).
         hooks.offline_toggle.set_active(false);
-        assert_eq!(count_children(&hooks.recent_row), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child());
+        assert_eq!(count_children(&hooks.recent_row), 1, "the shelves aren't rebuilt inside the toggle handler");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(count_children(&hooks.recent_row), 2, "toggling offline mode off re-renders on the next idle");
 
         hooks.offline_toggle.set_active(true);
-        assert_eq!(count_children(&hooks.recent_row), 1, "toggling offline mode on must filter synchronously from the in-memory downloaded set");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(count_children(&hooks.recent_row), 1, "toggling offline mode on filters on the next idle from the in-memory downloaded set");
     }
 
     pub(crate) fn run_shows_empty_state_when_the_server_has_no_libraries(runtime: &tokio::runtime::Runtime) {
@@ -1672,5 +1707,35 @@ pub(crate) mod tests {
         download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-1".to_string(), state: crate::downloads::ItemDownloadState::Idle });
         pump_until(|| badges() == 0, Duration::from_secs(5));
         assert_eq!(badges(), 0, "a cleared download loses its badge");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, Home shows what's
+    /// stored on the device and nothing reaches the server — not even a manual "Sync now", which
+    /// says why instead.
+    pub(crate) fn run_offline_mode_makes_no_requests(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+        pump_until(|| false, Duration::from_millis(800));
+
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Offline mode is on — turn it off to sync"), Duration::from_secs(5));
+        assert!(crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Offline mode is on — turn it off to sync"));
+        pump_until(|| false, Duration::from_millis(300));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.is_empty(), "offline mode: no request may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
     }
 }

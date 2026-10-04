@@ -750,6 +750,7 @@ pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> (&'static
         AudioOutput => ("Couldn't reach this device's audio output.", Some("Retry")),
         Network => ("Lost the connection while playing — check your connection and try again.", Some("Retry")),
         Seek => ("Couldn't get to that position in the audio — try again, or try another position.", Some("Retry")),
+        Offline => ("This part of the book isn't downloaded — turn off offline mode to stream it.", None),
         Unavailable => ("Playback isn't available on this device — no audio engine could be started.", None),
         Other => ("Playback stopped unexpectedly.", Some("Retry")),
     }

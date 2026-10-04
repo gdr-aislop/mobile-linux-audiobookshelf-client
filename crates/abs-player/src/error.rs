@@ -58,6 +58,9 @@ pub enum PlaybackErrorKind {
     /// The pipeline never got to a requested position — it kept playing from somewhere else
     /// even after the file was loaded again. Raised by the app, not by GStreamer.
     Seek,
+    /// The app's offline mode is on and this part of the book isn't downloaded, so it can't be
+    /// streamed. Raised by the app, not by GStreamer.
+    Offline,
     /// No working audio engine at all — GStreamer itself failed to initialize or build a
     /// pipeline. Distinct from every case above: those mean *this file* won't play; this means
     /// *nothing* will, until the device itself is fixed.

@@ -147,6 +147,8 @@ Fractal) rather than copying Lissen's Material Design look.
   downloaded fully or partially — the same downloaded-item definition used everywhere else in this
   spec (see Item detail). This is state shared with the equivalent toggle on Library browse, not a
   per-screen setting.
+  **Offline mode also cuts all network use** (see "Offline-first playback"). The toggle reacts at
+  once; the shelves re-filter right after.
 - **Sync now**: a header-bar menu item (in the same `⋯` overflow as any other page-level actions)
   that forces an immediate resync of library contents and playback progress with the server,
   rather than waiting on whatever background sync interval is configured. Self-hosted servers on
@@ -513,6 +515,14 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   cached track metadata: a fully-downloaded book plays end-to-end with no server contact, a
   partially-downloaded one plays from the resume position and stops cleanly at the first
   missing chapter, and a book never synced on this device (no cached metadata) can't start.
+- **Offline mode means no network at all.** While it is on nothing reaches the server: no library
+  sync, progress reconcile or cover fetch (Home and Library show what's stored; "Sync now" says
+  offline mode is on), no progress push (positions are kept on the device), no token refresh, no
+  chapter fetch in Item detail, no download ("turn it off to download"), and no streaming — a part
+  of a book that isn't downloaded stops with "This part of the book isn't downloaded — turn off
+  offline mode to stream it." Switching it off pushes the kept progress. A file already streaming
+  when it is switched on plays to its end (its connection is already open). The login and
+  add-server screens aren't affected.
 
 ## 6. Keyboard shortcuts
 

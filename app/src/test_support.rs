@@ -79,3 +79,10 @@ pub fn find_button_with_label(root: &gtk4::Widget, label: &str) -> Option<gtk4::
     }
     None
 }
+
+/// Runs whatever the main loop has ready right now (idle callbacks included) without waiting
+/// for anything else to arrive — "it happens on the next idle, not after some async work".
+pub(crate) fn run_pending_main_loop_work() {
+    let context = gtk4::glib::MainContext::default();
+    while context.iteration(false) {}
+}

@@ -662,6 +662,9 @@ impl ProgressWriter {
         };
         let api = match session.api_client().await {
             Ok(api) => api,
+            // Kept locally (the row stays marked for pushing) until offline mode is switched off,
+            // which pushes it — not a sync failure to tell anyone about.
+            Err(abs_core::CoreError::Offline) => return,
             Err(err) => {
                 tracing::warn!(%err, "couldn't build an API client for this server; progress stays local");
                 report(outcome_of(&err));
@@ -755,9 +758,6 @@ struct Inner {
     /// `#[cfg(test)]` getter reads to confirm Settings' switch actually reached the controller,
     /// same shape as `pause_on_unplug`/`resume_on_replug` above.
     burst_buffering: bool,
-    /// The app-wide "offline mode" switch (Home/Library's toggle), as told by the shell: starting
-    /// a book whose files are on the device then doesn't contact the server at all.
-    offline_mode: bool,
     /// Told how every server progress push ended. Without it a sync failure only reached the
     /// log, and a user could listen for hours with nothing synced and no idea.
     on_progress_sync: Option<ProgressSyncListener>,
@@ -1246,7 +1246,9 @@ impl Inner {
             // The connection is asked at load time — a mid-book settings change (local address,
             // headers, TLS) is honored by the next track. Failure means the server row is gone
             // (session removed underneath us); stop cleanly like a load failure.
-            let connection = match session.connection_target().await {
+            let offline_mode = session.is_offline();
+            let connection = if offline_mode { session.local_connection_target().await } else { session.connection_target().await };
+            let connection = match connection {
                 Ok(connection) => connection,
                 Err(err) => {
                     let mut inner = inner_rc.borrow_mut();
@@ -1262,6 +1264,23 @@ impl Inner {
             // baked in at resolve time — by the time a multi-file book advances (possibly hours
             // later) that one can be expired.
             let (url, is_local) = resolve_playable_url(&pool, &connection, &server_id, &item_id, &ino, &session).await;
+            // Offline mode: a part of the book that isn't on the device can't be played; stop
+            // there, paused, so Play once offline mode is off streams it.
+            if offline_mode && !is_local {
+                let mut inner = inner_rc.borrow_mut();
+                if current(&inner) {
+                    tracing::info!(%item_id, track = track_index, "offline mode is on and this file isn't downloaded; stopping here");
+                    fail(
+                        &mut inner,
+                        abs_player::PlaybackError {
+                            kind: abs_player::PlaybackErrorKind::Offline,
+                            message: "this part of the book isn't downloaded".to_string(),
+                            debug: None,
+                        },
+                    );
+                }
+                return;
+            }
 
             let needs_seek_readiness = {
                 let mut inner = inner_rc.borrow_mut();
@@ -1549,7 +1568,6 @@ impl PlayerController {
                 // Matches `PlaybackSettings::default().burst_buffering` — overridden right after
                 // construction the same way as the fields above, via `set_burst_buffering`.
                 burst_buffering: true,
-                offline_mode: false,
                 on_progress_sync: None,
                 progress_writer: ProgressWriter::default(),
                 last_played_at: Instant::now(),
@@ -1974,8 +1992,12 @@ impl PlayerController {
             // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
             // connection (settings + resolved base URL) is asked the same way: a settings
             // change is honored by the very next playback without any rebuild.
+            // Offline mode: the stored settings only (no reachability probe), and nothing below
+            // reaches the server.
+            let offline_mode = session.is_offline();
             let access_token = session.access_token().await;
-            let connection = match session.connection_target().await {
+            let connection = if offline_mode { session.local_connection_target().await } else { session.connection_target().await };
+            let connection = match connection {
                 Ok(connection) => connection,
                 Err(err) => {
                     tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
@@ -1996,7 +2018,6 @@ impl PlayerController {
             // for: with offline mode on it isn't asked at all, otherwise only for
             // `LOCAL_START_SERVER_WAIT` (a reachable server answers well within that, and then
             // still provides fresh metadata and progress from other devices).
-            let offline_mode = inner_rc.borrow().offline_mode;
             let start_chapter_asked = inner_rc.borrow().pending_start.as_ref().and_then(|p| p.start_chapter);
             let mut files_only =
                 start_target_from_files(&pool, &session, &item.item_id, start_chapter_asked, &connection, &access_token).await;
@@ -2022,7 +2043,15 @@ impl PlayerController {
                         None
                     }
                 },
-                (None, _) => Some(server_calls.await),
+                (None, false) => Some(server_calls.await),
+                (None, true) => {
+                    tracing::info!(item_id = %item.item_id, "offline mode is on and the track to start in isn't downloaded; not starting");
+                    fail_start(failed_now_playing(
+                        abs_player::PlaybackErrorKind::Offline,
+                        "the part of the book to start in isn't downloaded".to_string(),
+                    ));
+                    return;
+                }
                 }
             };
             let (target_result, reconcile_result) = match answer {
@@ -2258,8 +2287,8 @@ impl PlayerController {
             // The cover download, spawned only now that it can't race `now_playing` into
             // existence, and never gating the first note. It only ever *replaces* the cached
             // cover the snapshot was seeded with: a failure changes nothing, and the same path
-            // again (a cache hit) isn't republished.
-            {
+            // again (a cache hit) isn't republished. Not fetched at all in offline mode.
+            if !offline_mode {
                 let inner_rc = inner_rc.clone();
                 let pool = pool.clone();
                 let paths = paths.clone();
@@ -2430,6 +2459,9 @@ impl PlayerController {
             let generation = inner.session_generation;
             let seek_count = inner.seek_count;
             let Some(now_playing) = &inner.now_playing else { return };
+            if now_playing.session.is_offline() {
+                return;
+            }
             if now_playing.is_playing || now_playing.tracks.is_empty() || !due || inner.holding_writes_for_reconcile.is_some() {
                 return;
             }
@@ -2643,6 +2675,9 @@ impl PlayerController {
         }) else {
             return;
         };
+        if session.is_offline() {
+            return;
+        }
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let before = abs_storage::repo::progress::get(&pool, &account_id, &server_id, &item_id).await.ok().flatten();
@@ -2702,15 +2737,6 @@ impl PlayerController {
     /// The shell uses it to toast a sync failure once per failure episode.
     pub fn set_on_progress_sync(&self, listener: impl Fn(ProgressSyncOutcome) + 'static) {
         self.inner.borrow_mut().on_progress_sync = Some(Rc::new(listener));
-    }
-
-    /// Tells the controller whether the app's offline mode is on (see `Inner::offline_mode`).
-    pub fn set_offline_mode(&self, enabled: bool) {
-        let mut inner = self.inner.borrow_mut();
-        if inner.offline_mode != enabled {
-            tracing::info!(offline_mode = enabled, "playback: offline mode {}", if enabled { "on" } else { "off" });
-        }
-        inner.offline_mode = enabled;
     }
 
     pub fn set_burst_buffering(&self, enabled: bool) {
@@ -6957,9 +6983,10 @@ pub(crate) mod tests {
         runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
 
         let (controller, _state) = scripted_controller(&pool);
-        controller.set_offline_mode(true);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
         let started = Instant::now();
-        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Offline Book"), 1.0);
+        controller.start(session, request("item-1", "Offline Book"), 1.0);
         pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
         assert!(controller.snapshot().is_some_and(|s| s.is_playing));
         assert!(started.elapsed() < Duration::from_secs(2), "started after {:?}", started.elapsed());
@@ -6991,6 +7018,76 @@ pub(crate) mod tests {
         pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(15));
         assert!(started.elapsed() >= Duration::from_secs(4), "it waited for the server it needs: {:?}", started.elapsed());
         assert!(controller.snapshot().is_some_and(|s| s.is_playing));
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, a downloaded book
+    /// plays and pauses without a single request reaching the server, its progress is kept locally,
+    /// and it's pushed once offline mode is off again.
+    pub(crate) fn run_offline_mode_plays_and_saves_locally_then_catches_up(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("PATCH")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(200)).mount(&mock_server),
+        );
+        runtime.block_on(Mock::given(method("GET")).and(path("/api/me/progress/item-1")).respond_with(ResponseTemplate::new(404)).mount(&mock_server));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 30.0, 0.0)]));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(30)));
+
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
+        controller.start(session.clone(), request("item-1", "Offline Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(10));
+        state.borrow_mut().position = Some(Duration::from_secs(7));
+        pump_until(|| controller.snapshot().is_some_and(|s| s.position_seconds >= 6.5), Duration::from_secs(5));
+        controller.pause();
+        let saved = || {
+            runtime
+                .block_on(abs_storage::repo::progress::get(&pool, &account.id, &server.id, "item-1"))
+                .ok()
+                .flatten()
+                .is_some_and(|p| (p.current_time_seconds - 7.0).abs() < 0.5 && p.needs_push)
+        };
+        pump_until(saved, Duration::from_secs(5));
+        assert!(saved(), "the position is kept locally, marked for pushing");
+        pump_until(|| false, Duration::from_millis(300));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.is_empty(), "offline mode: nothing may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
+
+        // Offline mode off: what the shell does on that switch.
+        session.set_offline(false);
+        controller.sync_pending_progress();
+        pump_until(|| !progress_patches(runtime, &mock_server, "item-1").is_empty(), Duration::from_secs(5));
+        let pushed = progress_patches(runtime, &mock_server, "item-1");
+        assert!((pushed.last().unwrap()["currentTime"].as_f64().unwrap() - 7.0).abs() < 0.5, "the kept position is pushed: {pushed:?}");
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, a book whose
+    /// start isn't downloaded doesn't start (and says why) instead of reaching for the server.
+    pub(crate) fn run_offline_mode_does_not_stream(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 20));
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 20.0, 0.0)]));
+
+        let (controller, state) = scripted_controller(&pool);
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
+        controller.start(session, request("item-1", "Streamed Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+        let snapshot = controller.snapshot().unwrap();
+        assert!(!snapshot.is_playing);
+        assert_eq!(snapshot.last_error.as_ref().map(|e| e.kind), Some(abs_player::PlaybackErrorKind::Offline));
+        assert!(state.borrow().load_calls.is_empty(), "nothing is streamed");
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.is_empty(), "offline mode: nothing may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
         controller.stop();
     }
 }

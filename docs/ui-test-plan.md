@@ -601,6 +601,14 @@ was and wasn't verified.
       it once cleared — no restart, sync or offline-mode toggle needed. With offline mode on, the
       book appears in (and leaves) the filtered lists the same way.
 
+- [ ] **MP-25 — Offline mode uses no network.** Turn offline mode on, then: open Home and Library
+      (and "Sync now"), open an Item Detail, play and pause a downloaded book, try a download, try
+      a book that isn't downloaded. Then turn it off.
+      *Expected:* the toggle shows pressed immediately; the log has no network errors or timeouts
+      while it's on (`offline mode on: network disabled`, `… not syncing`); "Sync now" and the
+      download say offline mode is on; the undownloaded book says it isn't downloaded. Turning it
+      off logs `offline mode off: catching up with the server` and the position reaches the server.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

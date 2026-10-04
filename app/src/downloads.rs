@@ -241,6 +241,13 @@ impl DownloadManager {
     /// metadata first if it isn't already cached locally (e.g. this item has never been played), so
     /// downloading never requires having played the item first.
     pub fn start_download(&self, session: Session, item_id: String, scope: DownloadScope, current_chapter_index: usize) {
+        // Offline mode: nothing may reach the server. The download buttons already say so; this
+        // is the backstop for any other caller.
+        if session.is_offline() {
+            tracing::info!(item_id, "offline mode is on; not starting a download");
+            self.inner.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed("offline mode is on".to_string()) });
+            return;
+        }
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
@@ -939,5 +946,29 @@ pub(crate) mod tests {
             events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(_), .. } if item_id == "item-2")),
             "a download started after wifi_only was set true, on a metered connection, must be blocked"
         );
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, a download isn't
+    /// started (and says why) instead of reaching for the server.
+    pub(crate) fn run_offline_mode_starts_no_download(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (session, _server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        session.set_offline(true);
+        let manager = DownloadManager::new(pool, crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        let states: Rc<RefCell<Vec<ItemDownloadState>>> = Rc::new(RefCell::new(Vec::new()));
+        manager.add_listener({
+            let states = states.clone();
+            move |event| {
+                if let DownloadEvent::ItemStateChanged { state, .. } = event {
+                    states.borrow_mut().push(state.clone());
+                }
+            }
+        });
+        manager.start_download(session, "item-1".to_string(), DownloadScope::EntireBook, 0);
+        crate::test_support::pump_until(|| !states.borrow().is_empty(), std::time::Duration::from_secs(5));
+        assert!(matches!(states.borrow().first(), Some(ItemDownloadState::Failed(reason)) if reason.contains("offline")), "{:?}", states.borrow());
+        crate::test_support::pump_until(|| false, std::time::Duration::from_millis(300));
+        assert!(runtime.block_on(mock_server.received_requests()).unwrap().is_empty(), "offline mode: nothing may reach the server");
     }
 }

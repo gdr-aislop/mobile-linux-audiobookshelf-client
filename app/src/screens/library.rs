@@ -675,7 +675,10 @@ pub fn build(
     // whether *this* screen's own toggle fired or Home's did.
     let offline_toggle_handler = offline_toggle.connect_toggled({
         let offline_mode = widgets.offline_mode.clone();
-        move |toggle| offline_mode.set(toggle.is_active())
+        move |toggle| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
+            offline_mode.set(toggle.is_active());
+        }
     });
 
     // The view-options popover's "Downloaded only" switch is the exact same shared state as
@@ -684,6 +687,7 @@ pub fn build(
     let downloaded_only_switch_handler = downloaded_only_switch.connect_state_set({
         let offline_mode = widgets.offline_mode.clone();
         move |_, active| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
             offline_mode.set(active);
             glib::signal::Propagation::Proceed
         }
@@ -715,13 +719,14 @@ pub fn build(
             }
             offline_banner.set_reveal_child(active);
             update_view_options_indicator(&widgets);
-            // Rendered synchronously, before any DB work: the visible filter change must not be
-            // gated behind the refetch's pool acquire — on a contended pool (sync/cover/progress
-            // cycles all fighting over the 5 connections) that await has been observed stalling
-            // for tens of seconds, leaving the grid unfiltered the whole time. The in-memory
+            // Rendered on the next idle (with the busy scrim meanwhile), before any DB work: the
+            // visible filter change must not be gated behind the refetch's pool acquire — on a
+            // contended pool that await has been observed stalling for tens of seconds. Not
+            // inside this handler: GTK only redraws the toggle after the handler returns, and
+            // rebuilding the list first made the toggle seem not to react. The in-memory
             // `downloaded` set is whatever the last full load saw, which is immediate-and-slightly-
             // stale; the spawned refetch below re-renders with fresh data when it lands.
-            render_from_current_data(&widgets);
+            request_render(&widgets);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -1058,6 +1063,16 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         }
     }
 
+    // Offline mode: nothing may reach the server — show what's stored locally and stop there.
+    if ctx.session.is_offline() {
+        tracing::info!("offline mode: Library shows what's stored on the device; not syncing");
+        glib::spawn_future_local(render_from_cache(ctx.pool.clone(), ctx.server_id.clone(), ctx.account_id.clone(), widgets.clone()));
+        if let Some(manual) = manual {
+            manual.finish_offline();
+        }
+        return;
+    }
+
     // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Home
     // does the exact same thing for the same account, since both screens are built eagerly. Only
     // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
@@ -1105,6 +1120,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
             }
         });
         let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
+        // Offline mode switched on mid-sync cut it short; that's not a failure to show.
+        let sync_result = sync_result.or_else(|err| if matches!(err, abs_core::CoreError::Offline) { Ok(()) } else { Err(err) });
         let manual_ok = sync_result.is_ok();
 
         let data_after_sync = load(&pool, &server_id, &account_id).await;
@@ -2109,18 +2126,23 @@ pub(crate) mod tests {
         // only a view-mode round-trip forced an immediate re-render). The first toggle-on still
         // waits for the refetch here, because the download above was inserted after this
         // screen's load — the in-memory set is stale and the synchronous render legitimately
-        // shows nothing — but every later toggle below round-trips with no pump at all: the
-        // list re-renders inside the handler, from the by-then-warm in-memory set.
+        // shows nothing — but every later toggle below needs only the next idle: the list
+        // re-renders from the by-then-warm in-memory set.
         hooks.offline_toggle.set_active(true);
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Project Hail Mary".to_string()], Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
+        // The toggle handler itself only flips cheap state, so the button redraws at once; the
+        // list follows on the very next idle, from the in-memory set (no database wait).
         hooks.offline_toggle.set_active(false);
-        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child(), "the banner should hide once offline mode is off");
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 1, "the list isn't rebuilt inside the toggle handler");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "toggling offline mode off re-renders on the next idle");
 
         hooks.offline_toggle.set_active(true);
-        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Project Hail Mary".to_string()], "toggling offline mode on must filter synchronously from the in-memory downloaded set");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Project Hail Mary".to_string()], "toggling offline mode on filters on the next idle from the in-memory downloaded set");
     }
 
     pub(crate) fn run_sort_changes_order(runtime: &tokio::runtime::Runtime) {
