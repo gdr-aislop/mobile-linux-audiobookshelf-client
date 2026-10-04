@@ -161,7 +161,7 @@ pub(crate) mod tests {
             .expect("card's second child is the title label")
     }
 
-    fn downloaded_badge_of(widget: &gtk4::Widget) -> gtk4::Image {
+    pub(crate) fn downloaded_badge_of(widget: &gtk4::Widget) -> gtk4::Image {
         let button = widget.clone().downcast::<gtk4::Button>().expect("item_card::build returns a GtkButton");
         let card_box = button.child().and_then(|w| w.downcast::<gtk4::Box>().ok()).expect("button wraps the card box");
         let cover_overlay = card_box.first_child().and_then(|w| w.downcast::<gtk4::Overlay>().ok()).expect("card's first child is the cover overlay");

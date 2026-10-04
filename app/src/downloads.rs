@@ -153,6 +153,13 @@ impl DownloadManager {
     /// Registers a permanent event listener, notified for the manager's whole lifetime — same
     /// "no corresponding unregister" shape as `PlayerController::add_listener` (nothing needs to
     /// stop listening once registered).
+    /// Delivers `event` to the listeners as if a download had produced it — for screen tests that
+    /// need a state change without running a download.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: DownloadEvent) {
+        self.inner.borrow().publish(event);
+    }
+
     pub fn add_listener(&self, listener: impl Fn(&DownloadEvent) + 'static) {
         self.add_scoped_listener(move |event| {
             listener(event);
@@ -518,6 +525,61 @@ impl DownloadManager {
             }
         });
     }
+}
+
+/// Keeps a screen's "which books are downloaded" set current while it's open: whenever an item's
+/// download finishes, stops, fails or is cleared, the set is read again
+/// (`abs_core::download_tracks::downloaded_item_ids`, the same query the screens load with) and,
+/// if it changed, handed to `on_changed`. Before, Home's and Library's badges only learned of a
+/// download at the next sync, offline-mode toggle or restart.
+///
+/// `alive` is the screen's root: once it's gone the listener drops itself. Reads never overlap — a
+/// change arriving during one is picked up by one more read right after.
+pub(crate) fn follow_downloaded_items(
+    download_manager: &DownloadManager,
+    pool: SqlitePool,
+    server_id: String,
+    alive: glib::WeakRef<gtk4::Widget>,
+    on_changed: impl Fn(HashSet<String>) + 'static,
+) {
+    struct Follow {
+        pool: SqlitePool,
+        server_id: String,
+        reading: Cell<bool>,
+        again: Cell<bool>,
+        on_changed: Box<dyn Fn(HashSet<String>)>,
+    }
+    fn refresh(follow: Rc<Follow>) {
+        if follow.reading.replace(true) {
+            follow.again.set(true);
+            return;
+        }
+        glib::spawn_future_local(async move {
+            loop {
+                follow.again.set(false);
+                match abs_core::download_tracks::downloaded_item_ids(&follow.pool, &follow.server_id).await {
+                    Ok(ids) => (follow.on_changed)(ids.into_iter().collect()),
+                    Err(err) => tracing::warn!(%err, "couldn't re-read which books are downloaded; badges may be stale until the next sync"),
+                }
+                if !follow.again.get() {
+                    break;
+                }
+            }
+            follow.reading.set(false);
+        });
+    }
+    let follow = Rc::new(Follow { pool, server_id, reading: Cell::new(false), again: Cell::new(false), on_changed: Box::new(on_changed) });
+    download_manager.add_scoped_listener(move |event| {
+        if alive.upgrade().is_none() {
+            return false;
+        }
+        if let DownloadEvent::ItemStateChanged { state, .. } = event {
+            if !matches!(state, ItemDownloadState::Downloading) {
+                refresh(follow.clone());
+            }
+        }
+        true
+    });
 }
 
 #[cfg(test)]

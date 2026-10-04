@@ -595,6 +595,12 @@ was and wasn't verified.
       `the main loop was blocked` (with how long) and names the job (`a UI job held up the main
       loop … library render`), and `the database pool is saturated` if the pool itself ever is.
 
+- [ ] **MP-24 — Downloaded badges follow downloads.** Download a book (or a chapter of it) from
+      its detail screen, then go back to Home and Library; afterwards clear it from Downloads.
+      *Expected:* its cards gain the downloaded badge as soon as the download finishes, and lose
+      it once cleared — no restart, sync or offline-mode toggle needed. With offline mode on, the
+      book appears in (and leaves) the filtered lists the same way.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

@@ -204,6 +204,8 @@ mod tests {
         (library_search_and_sort_apply_in_list_mode_too, crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too),
         (library_view_mode_is_remembered_across_screen_rebuilds, crate::screens::library::tests::run_view_mode_is_remembered_across_screen_rebuilds),
         (library_a_big_library_renders_in_slices_and_skips_identical_renders, crate::screens::library::tests::run_a_big_library_renders_in_slices_and_skips_identical_renders),
+        (library_downloaded_badges_follow_downloads_in_this_session, crate::screens::library::tests::run_downloaded_badges_follow_downloads_in_this_session),
+        (home_downloaded_badges_follow_downloads_in_this_session, crate::screens::home::tests::run_downloaded_badges_follow_downloads_in_this_session),
         (library_search_is_debounced, crate::screens::library::tests::run_search_is_debounced),
         (library_deferred_decode_only_covers_items_near_the_viewport, crate::screens::library::tests::run_deferred_decode_only_covers_items_near_the_viewport),
         (library_hide_finished_switch_filters_finished_items, crate::screens::library::tests::run_hide_finished_switch_filters_finished_items),

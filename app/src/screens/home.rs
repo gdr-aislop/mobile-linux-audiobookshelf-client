@@ -30,8 +30,33 @@ pub(crate) enum Shelf {
 
 pub struct HomeScreen {
     pub root: gtk4::Widget,
+    /// What `follow_downloads` needs to re-render the shelves' downloaded badges.
+    widgets: HomeWidgets,
+    pool: SqlitePool,
+    server_id: String,
     #[cfg(test)]
     hooks: TestHooks,
+}
+
+impl HomeScreen {
+    /// Keeps the shelves' downloaded badges (and the offline-mode view) current as downloads
+    /// finish or are cleared — see `crate::downloads::follow_downloaded_items`.
+    pub(crate) fn follow_downloads(&self, download_manager: &crate::downloads::DownloadManager) {
+        let widgets = self.widgets.clone();
+        crate::downloads::follow_downloaded_items(download_manager, self.pool.clone(), self.server_id.clone(), self.root.downgrade(), move |downloaded| {
+            let data = {
+                let mut last = widgets.last_data.borrow_mut();
+                let Some(data) = last.as_mut() else { return };
+                if data.downloaded == downloaded {
+                    return;
+                }
+                tracing::debug!(downloaded = downloaded.len(), "downloaded books changed; refreshing Home's badges");
+                data.downloaded = downloaded;
+                data.clone()
+            };
+            apply(&data, &widgets);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +586,9 @@ pub fn build(
 
     HomeScreen {
         root: toast_overlay.clone().upcast(),
+        widgets: widgets.clone(),
+        pool: pool.clone(),
+        server_id: server.id.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             empty_state,
@@ -1587,5 +1615,62 @@ pub(crate) mod tests {
             "the live demo server has at least one library, so the empty state should clear"
         );
         assert!(hooks.libraries_list.row_at_index(0).is_some());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book downloaded (or cleared) while
+    /// the app runs gets (or loses) its badge on Home's shelves right away — it used to wait for
+    /// the next sync, offline-mode toggle or restart.
+    pub(crate) fn run_downloaded_badges_follow_downloads_in_this_session(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode, |_| {}, || {}, |_| {});
+        let download_manager =
+            crate::downloads::DownloadManager::new(pool.clone(), crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        screen.follow_downloads(&download_manager);
+        let hooks = screen.test_hooks();
+        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
+        let badges = || {
+            let mut shown = 0;
+            let mut child = hooks.recent_row.first_child();
+            while let Some(card) = child {
+                if crate::widgets::item_card::tests::downloaded_badge_of(&card).is_visible() {
+                    shown += 1;
+                }
+                child = card.next_sibling();
+            }
+            shown
+        };
+        assert_eq!(badges(), 0);
+
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-1".to_string(), state: crate::downloads::ItemDownloadState::Complete });
+        pump_until(|| badges() == 1, Duration::from_secs(5));
+        assert_eq!(badges(), 1, "the finished download shows its badge without a sync");
+
+        runtime.block_on(abs_storage::repo::download_tracks::remove_for_item(&pool, &server.id, "item-1")).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-1".to_string(), state: crate::downloads::ItemDownloadState::Idle });
+        pump_until(|| badges() == 0, Duration::from_secs(5));
+        assert_eq!(badges(), 0, "a cleared download loses its badge");
     }
 }

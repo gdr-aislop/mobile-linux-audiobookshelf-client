@@ -75,11 +75,32 @@ pub struct LibraryScreen {
     /// posture as every other widget field: `LibraryWidgets` is cheap-clone, and the async
     /// pipeline already holds its own clone.
     widgets: LibraryWidgets,
+    /// What `follow_downloads` needs to re-read which books are downloaded.
+    pool: SqlitePool,
+    server_id: String,
     #[cfg(test)]
     hooks: TestHooks,
 }
 
 impl LibraryScreen {
+    /// Keeps the cards' downloaded badges (and the offline-mode view) current as downloads finish
+    /// or are cleared — see `crate::downloads::follow_downloaded_items`. An unchanged list isn't
+    /// rebuilt (the render compares what it would show with what is shown).
+    pub(crate) fn follow_downloads(&self, download_manager: &crate::downloads::DownloadManager) {
+        let widgets = self.widgets.clone();
+        crate::downloads::follow_downloaded_items(download_manager, self.pool.clone(), self.server_id.clone(), self.root.downgrade(), move |downloaded| {
+            {
+                let mut data = widgets.data.borrow_mut();
+                if data.downloaded == downloaded {
+                    return;
+                }
+                tracing::debug!(downloaded = downloaded.len(), "downloaded books changed; refreshing Library's badges");
+                data.downloaded = downloaded;
+            }
+            render_from_current_data(&widgets);
+        });
+    }
+
     /// Navigation-with-intent entry point (docs/design/ui-spec.md, Home tap-through): Home's
     /// shelf headers switch to this screen pre-sorted — and, for Continue Listening,
     /// pre-filtered to in-progress books — without persisting anything, exactly like a manual
@@ -965,6 +986,8 @@ pub fn build(
         root: toast_overlay.clone().upcast(),
         search_entry: search_entry.clone(),
         widgets: widgets.clone(),
+        pool: pool.clone(),
+        server_id: server.id.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             status_page,
@@ -3723,5 +3746,70 @@ pub(crate) mod tests {
         pump_until(|| rows() == 1, Duration::from_secs(10));
         pump_until(|| false, Duration::from_millis(500));
         assert_eq!(rows(), 1, "only the match remains");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The Library's badges follow downloads
+    /// finishing and being cleared in this session, and offline mode's list gains the book.
+    pub(crate) fn run_downloaded_badges_follow_downloads_in_this_session(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Dune", "Frank Herbert", 1_600_000_000_000, 7200.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let download_manager =
+            crate::downloads::DownloadManager::new(pool.clone(), crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        screen.follow_downloads(&download_manager);
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        let badges = || {
+            let mut shown = 0;
+            let mut index = 0;
+            while let Some(child) = hooks.flow_box.child_at_index(index) {
+                if child.child().is_some_and(|card| crate::widgets::item_card::tests::downloaded_badge_of(&card).is_visible()) {
+                    shown += 1;
+                }
+                index += 1;
+            }
+            shown
+        };
+        assert_eq!(badges(), 0);
+
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-2", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 7200.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-2", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-2", "1", 10)).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-2".to_string(), state: crate::downloads::ItemDownloadState::Complete });
+        pump_until(|| badges() == 1, Duration::from_secs(5));
+        assert_eq!(badges(), 1, "the finished download shows its badge without a sync");
+
+        offline_mode.set(true);
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Dune".to_string()], Duration::from_secs(5));
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Dune".to_string()], "offline mode shows the newly downloaded book");
+
+        runtime.block_on(abs_storage::repo::download_tracks::remove_for_item(&pool, &server.id, "item-2")).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-2".to_string(), state: crate::downloads::ItemDownloadState::Idle });
+        pump_until(|| hooks.flow_box.child_at_index(0).is_none(), Duration::from_secs(5));
+        assert!(hooks.flow_box.child_at_index(0).is_none(), "a cleared download leaves offline mode's list");
     }
 }

@@ -701,23 +701,21 @@ pub fn build(
         }
     };
 
-    stack.add_titled_with_icon(
-        &screens::home::build(
-            pool.clone(),
-            paths.clone(),
-            server.clone(),
-            account.clone(),
-            session.clone(),
-            offline_mode.clone(),
-            on_open.clone(),
-            on_relogin,
-            on_open_shelf,
-        )
-        .root,
-        Some("home"),
-        "Home",
-        "go-home-symbolic",
+    let home_screen = screens::home::build(
+        pool.clone(),
+        paths.clone(),
+        server.clone(),
+        account.clone(),
+        session.clone(),
+        offline_mode.clone(),
+        on_open.clone(),
+        on_relogin,
+        on_open_shelf,
     );
+    // Both shelves' badges follow downloads finishing or being cleared in this session.
+    home_screen.follow_downloads(&download_manager);
+    library_screen.follow_downloads(&download_manager);
+    stack.add_titled_with_icon(&home_screen.root, Some("home"), "Home", "go-home-symbolic");
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
