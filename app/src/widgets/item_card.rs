@@ -161,7 +161,29 @@ pub(crate) mod tests {
             .expect("card's second child is the title label")
     }
 
-    fn downloaded_badge_of(widget: &gtk4::Widget) -> gtk4::Image {
+    /// The card's cover `GtkPicture` (visible once a cover has decoded into it).
+    pub(crate) fn cover_picture_of(widget: &gtk4::Widget) -> Option<gtk4::Picture> {
+        let button = widget.clone().downcast::<gtk4::Button>().ok()?;
+        let card_box = button.child()?.downcast::<gtk4::Box>().ok()?;
+        let cover_overlay = card_box.first_child()?.downcast::<gtk4::Overlay>().ok()?;
+        // The cover widget is an overlay (placeholder + picture); look through it for the picture.
+        fn find(widget: &gtk4::Widget) -> Option<gtk4::Picture> {
+            if let Ok(picture) = widget.clone().downcast::<gtk4::Picture>() {
+                return Some(picture);
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(found) = find(&current) {
+                    return Some(found);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        find(cover_overlay.upcast_ref())
+    }
+
+    pub(crate) fn downloaded_badge_of(widget: &gtk4::Widget) -> gtk4::Image {
         let button = widget.clone().downcast::<gtk4::Button>().expect("item_card::build returns a GtkButton");
         let card_box = button.child().and_then(|w| w.downcast::<gtk4::Box>().ok()).expect("button wraps the card box");
         let cover_overlay = card_box.first_child().and_then(|w| w.downcast::<gtk4::Overlay>().ok()).expect("card's first child is the cover overlay");

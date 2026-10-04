@@ -514,6 +514,111 @@ was and wasn't verified.
       `playback ready` for B, plus `discarded …` lines for anything still in flight for A, and
       never a `track loaded` line for A after B was started.
 
+- [ ] **MP-10 — Pause, then rewind on a stream.** Stream a book (not downloaded), pause, and
+      within a second tap skip-back two or three times; also change the speed while paused.
+      *Expected:* no "the audio pipeline never actually paused" banner; Play resumes at the new
+      position at once (no reload). The log may show `pause confirmation ended by a seek`.
+
+- [ ] **MP-11 — Scrubbing seeks once.** In the full player, drag the scrubber slowly across a
+      good part of the book (across a file boundary in a multi-file book), then drag it to the
+      far right.
+      *Expected:* the time labels follow the thumb while dragging and the thumb isn't pulled back;
+      the log shows one `scrub: seeking` and one `seek` line per drag, not dozens; the far-right
+      drag lands one second before the end and keeps playing — the book is not marked finished.
+
+- [ ] **MP-12 — Play on the loaded book.** With a book playing (or paused), open its detail
+      screen and tap Play/Resume; then tap one of its chapters.
+      *Expected:* no loading state, no gap; the log shows `already loaded; playing` and no
+      `starting playback`. The chapter tap jumps there without reloading.
+
+- [ ] **MP-13 — A finished book stays finished.** Use ⋯ → Mark as finished on a playing book,
+      then quit and reopen the app; separately, let a book play to its very end and then start
+      another one.
+      *Expected:* both stay finished (Home, the server's web UI). Play on the finished book starts
+      it from the beginning (log: `finished book restarted`).
+
+- [ ] **MP-14 — Losing the stream.** While streaming, turn off Wi-Fi/mobile data for ~30 s and
+      back on; separately, pause for more than five minutes (screen off) and press Play.
+      *Expected:* the first case logs `stream error; reloading at the same position` once and
+      playback continues without a tap (a second loss within a minute shows the banner); the
+      second logs `resuming with a fresh connection` and audio starts within a few seconds rather
+      than after a long silence.
+
+- [ ] **MP-15 — Speed picked while paused.** Stream a book, pause, pick another speed in the
+      full player, wait, then press Play.
+      *Expected:* the speed label changes at once; no network activity or stall while paused; the
+      audio resumes at the new speed (the log shows one `speed` line, applied at Play).
+
+- [ ] **MP-16 — Quit and signals keep the position.** Play for a minute, then quit with Ctrl+Q;
+      separately, play and send `kill <pid>` (SIGTERM) or press Ctrl+C in the launching terminal.
+      *Expected:* the log shows `asked to terminate; quitting` for the signals; the next launch
+      resumes within a few seconds of where each stopped, and Home shows the same position.
+
+- [ ] **MP-17 — Switching accounts retires the old player.** Play a book, then sign in as another
+      account (or sign out). Press a media key or use the lock-screen card.
+      *Expected:* the old book stops (its position saved, log: `retired the previous player`);
+      the media controls no longer start or move it, and the new shell has nothing playing.
+
+- [ ] **MP-18 — Opening the player while a book loads.** On a slow connection, tap Play on a book
+      detail screen.
+      *Expected:* the full player opens at once, showing the title and cover with the controls
+      greyed out; once the book has loaded they enable and (if you tapped Play) audio starts. Mark
+      as finished / Reset progress chosen while it loads take effect once loaded.
+
+- [ ] **MP-19 — Headphone jack bounce.** With "Resume when headphones reconnect" on, unplug the
+      headphones (playback pauses), then wiggle the plug so it connects and disconnects quickly.
+      *Expected:* playback stays paused until the plug has held for a moment; a firm replug
+      resumes it.
+
+- [ ] **MP-20 — Downloaded book on a dead connection.** Download a whole book, then connect to a
+      Wi-Fi network that has no internet (or block the server) and press Play.
+      *Expected:* it starts within ~3 s from the downloaded files (log: `the server is slow or
+      unreachable; starting from the downloaded files`, then `track sources … start_track_local=true`),
+      with no stream error. With offline mode switched on it starts at once and the log says
+      `offline mode is on and the book is on the device; starting from the downloaded files`.
+
+- [ ] **MP-21 — Partly downloaded book.** Download only some chapters, resume in a chapter that
+      isn't downloaded, with the connection dead.
+      *Expected:* the log names why the start track is streamed (`not downloaded`, `download not
+      finished`, `downloaded file is missing`, …); the failure reads "Lost the connection while
+      playing" rather than "Playback stopped unexpectedly".
+
+- [ ] **MP-22 — Offline mode is logged.** Toggle offline mode on Home or Library.
+      *Expected:* the log shows `offline mode turned on|off` and `playback: offline mode on|off`;
+      the setting is also logged at startup (`loaded the offline mode setting`).
+
+- [ ] **MP-23 — The UI stays responsive with a big library.** With a library of a few hundred
+      books, open the Library tab, type in search, change the sort, and toggle offline mode.
+      *Expected:* the list fills in over a moment instead of freezing the app; scrolling and taps
+      stay responsive meanwhile; a render that changes nothing doesn't reset the scroll position.
+      The log has no `sqlx::pool::acquire` slow warnings; if the main loop is ever held up it says
+      `the main loop was blocked` (with how long) and names the job (`a UI job held up the main
+      loop … library render`), and `the database pool is saturated` if the pool itself ever is.
+
+- [ ] **MP-24 — Downloaded badges follow downloads.** Download a book (or a chapter of it) from
+      its detail screen, then go back to Home and Library; afterwards clear it from Downloads.
+      *Expected:* its cards gain the downloaded badge as soon as the download finishes, and lose
+      it once cleared — no restart, sync or offline-mode toggle needed. With offline mode on, the
+      book appears in (and leaves) the filtered lists the same way.
+
+- [ ] **MP-25 — Offline mode uses no network.** Turn offline mode on, then: open Home and Library
+      (and "Sync now"), open an Item Detail, play and pause a downloaded book, try a download, try
+      a book that isn't downloaded. Then turn it off.
+      *Expected:* the toggle shows pressed immediately; the log has no network errors or timeouts
+      while it's on (`offline mode on: network disabled`, `… not syncing`); "Sync now" and the
+      download say offline mode is on; the undownloaded book says it isn't downloaded. Turning it
+      off logs `offline mode off: catching up with the server` and the position reaches the server.
+
+- [ ] **MP-26 — Low memory mode.** Settings → Playback → Low memory mode on, then look at Home,
+      Library (grid and list), Item Detail, the full player and the mini bar; scroll the Library;
+      with burst buffering on, read the burst row. Relaunch the app. Compare `ps -o rss` with the
+      mode on and off after scrolling the whole Library.
+      *Expected:* every cover is a placeholder at once (nothing else on the cards changes); the
+      burst row adds a "Uses up to 64 MB of buffer…" line while both are on (and loses it when
+      either goes off); the log shows `low memory mode: opening the database with fewer
+      connections…` on the relaunch; turning the mode off brings the covers back; the memory used
+      is clearly lower with it on.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

@@ -71,6 +71,7 @@ mod keys {
     pub const IN_PROGRESS_ONLY: &str = "library.in_progress_only";
     pub const VIEW_MODE: &str = "library.view_mode";
     pub const OFFLINE_MODE: &str = "browse.offline_mode";
+    pub const LOW_MEMORY_MODE: &str = "app.low_memory_mode";
 }
 
 /// Parse a stored value, falling back to `default` (and logging) on a missing key or a value
@@ -320,6 +321,17 @@ pub async fn save_library_view_mode(pool: &SqlitePool, mode: LibraryViewMode) ->
 /// equivalent toggle on Library browse, not a per-screen setting". Storage-only for now (the
 /// toggle UI itself is a later pass); persisting it here means the UI work just has to read/write
 /// this instead of also inventing where the shared state lives.
+/// "Low memory mode": no covers, smaller caches. A standalone key rather than a field of
+/// [`PlaybackSettings`] — it is shared live state (see the app's `LowMemoryModeState`) and is
+/// read before the rest of the settings (it decides how the database itself is opened).
+pub async fn load_low_memory_mode(pool: &SqlitePool) -> Result<bool> {
+    parse_or_default(pool, keys::LOW_MEMORY_MODE, false).await
+}
+
+pub async fn save_low_memory_mode(pool: &SqlitePool, enabled: bool) -> Result<()> {
+    kv::set(pool, keys::LOW_MEMORY_MODE, &enabled.to_string()).await
+}
+
 pub async fn load_offline_mode(pool: &SqlitePool) -> Result<bool> {
     parse_or_default(pool, keys::OFFLINE_MODE, false).await
 }
@@ -489,5 +501,15 @@ mod tests {
         assert!(load_offline_mode(&pool).await.unwrap());
         save_offline_mode(&pool, false).await.unwrap();
         assert!(!load_offline_mode(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn low_memory_mode_defaults_to_off_and_round_trips() {
+        let pool = pool().await;
+        assert!(!load_low_memory_mode(&pool).await.unwrap());
+        save_low_memory_mode(&pool, true).await.unwrap();
+        assert!(load_low_memory_mode(&pool).await.unwrap());
+        save_low_memory_mode(&pool, false).await.unwrap();
+        assert!(!load_low_memory_mode(&pool).await.unwrap());
     }
 }

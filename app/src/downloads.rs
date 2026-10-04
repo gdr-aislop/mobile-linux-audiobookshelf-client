@@ -80,7 +80,8 @@ pub enum DownloadEvent {
     },
 }
 
-type EventListener = Box<dyn Fn(&DownloadEvent)>;
+/// Returns whether to keep listening: `false` (its screen is gone) drops the listener.
+type EventListener = Box<dyn Fn(&DownloadEvent) -> bool>;
 
 /// Bookkeeping for one item's in-flight download batch: how many tracks were queued, how each one
 /// finished so far, and every in-flight track's cooperative cancel flag so `cancel_item` can stop
@@ -110,7 +111,9 @@ struct Inner {
     network_monitor: Box<dyn NetworkMonitor>,
     wifi_only: bool,
     semaphore: Rc<tokio::sync::Semaphore>,
-    listeners: Vec<EventListener>,
+    listeners: RefCell<Vec<EventListener>>,
+    /// Listeners registered from inside a publish; added once it is over.
+    listeners_added_meanwhile: RefCell<Vec<EventListener>>,
     /// Keyed by `(server_id, item_id)` rather than just `item_id` — the same item id is only ever
     /// meaningful within one server, but nothing stops two different servers from happening to
     /// reuse the same id, and this manager is shared for the app's whole lifetime, potentially
@@ -120,9 +123,9 @@ struct Inner {
 
 impl Inner {
     fn publish(&self, event: DownloadEvent) {
-        for listener in &self.listeners {
-            listener(&event);
-        }
+        self.listeners.borrow_mut().retain(|listener| listener(&event));
+        let mut added = self.listeners_added_meanwhile.borrow_mut();
+        self.listeners.borrow_mut().append(&mut added);
     }
 }
 
@@ -140,7 +143,8 @@ impl DownloadManager {
                 network_monitor,
                 wifi_only,
                 semaphore: Rc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
-                listeners: Vec::new(),
+                listeners: RefCell::new(Vec::new()),
+                listeners_added_meanwhile: RefCell::new(Vec::new()),
                 batches: HashMap::new(),
             })),
         }
@@ -149,8 +153,37 @@ impl DownloadManager {
     /// Registers a permanent event listener, notified for the manager's whole lifetime — same
     /// "no corresponding unregister" shape as `PlayerController::add_listener` (nothing needs to
     /// stop listening once registered).
+    /// Delivers `event` to the listeners as if a download had produced it — for screen tests that
+    /// need a state change without running a download.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: DownloadEvent) {
+        self.inner.borrow().publish(event);
+    }
+
     pub fn add_listener(&self, listener: impl Fn(&DownloadEvent) + 'static) {
-        self.inner.borrow_mut().listeners.push(Box::new(listener));
+        self.add_scoped_listener(move |event| {
+            listener(event);
+            true
+        });
+    }
+
+    /// Like `add_listener`, for a listener tied to a screen that comes and goes (Item Detail and
+    /// the Player are built afresh per visit): it returns `false` once that screen is gone and is
+    /// then dropped, instead of staying registered — and keeping the screen's widgets alive — for
+    /// the manager's whole lifetime.
+    pub fn add_scoped_listener(&self, listener: impl Fn(&DownloadEvent) -> bool + 'static) {
+        let inner = self.inner.borrow();
+        let listener = Box::new(listener);
+        let added_now = match inner.listeners.try_borrow_mut() {
+            Ok(mut listeners) => {
+                listeners.push(listener);
+                None
+            }
+            Err(_) => Some(listener),
+        };
+        if let Some(listener) = added_now {
+            inner.listeners_added_meanwhile.borrow_mut().push(listener);
+        }
     }
 
     /// This item's in-flight batch's progress as `(finished tracks, total tracks)`. `finished`
@@ -208,6 +241,13 @@ impl DownloadManager {
     /// metadata first if it isn't already cached locally (e.g. this item has never been played), so
     /// downloading never requires having played the item first.
     pub fn start_download(&self, session: Session, item_id: String, scope: DownloadScope, current_chapter_index: usize) {
+        // Offline mode: nothing may reach the server. The download buttons already say so; this
+        // is the backstop for any other caller.
+        if session.is_offline() {
+            tracing::info!(item_id, "offline mode is on; not starting a download");
+            self.inner.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed("offline mode is on".to_string()) });
+            return;
+        }
         let inner_rc = self.inner.clone();
         glib::spawn_future_local(async move {
             let pool = inner_rc.borrow().pool.clone();
@@ -492,6 +532,61 @@ impl DownloadManager {
             }
         });
     }
+}
+
+/// Keeps a screen's "which books are downloaded" set current while it's open: whenever an item's
+/// download finishes, stops, fails or is cleared, the set is read again
+/// (`abs_core::download_tracks::downloaded_item_ids`, the same query the screens load with) and,
+/// if it changed, handed to `on_changed`. Before, Home's and Library's badges only learned of a
+/// download at the next sync, offline-mode toggle or restart.
+///
+/// `alive` is the screen's root: once it's gone the listener drops itself. Reads never overlap — a
+/// change arriving during one is picked up by one more read right after.
+pub(crate) fn follow_downloaded_items(
+    download_manager: &DownloadManager,
+    pool: SqlitePool,
+    server_id: String,
+    alive: glib::WeakRef<gtk4::Widget>,
+    on_changed: impl Fn(HashSet<String>) + 'static,
+) {
+    struct Follow {
+        pool: SqlitePool,
+        server_id: String,
+        reading: Cell<bool>,
+        again: Cell<bool>,
+        on_changed: Box<dyn Fn(HashSet<String>)>,
+    }
+    fn refresh(follow: Rc<Follow>) {
+        if follow.reading.replace(true) {
+            follow.again.set(true);
+            return;
+        }
+        glib::spawn_future_local(async move {
+            loop {
+                follow.again.set(false);
+                match abs_core::download_tracks::downloaded_item_ids(&follow.pool, &follow.server_id).await {
+                    Ok(ids) => (follow.on_changed)(ids.into_iter().collect()),
+                    Err(err) => tracing::warn!(%err, "couldn't re-read which books are downloaded; badges may be stale until the next sync"),
+                }
+                if !follow.again.get() {
+                    break;
+                }
+            }
+            follow.reading.set(false);
+        });
+    }
+    let follow = Rc::new(Follow { pool, server_id, reading: Cell::new(false), again: Cell::new(false), on_changed: Box::new(on_changed) });
+    download_manager.add_scoped_listener(move |event| {
+        if alive.upgrade().is_none() {
+            return false;
+        }
+        if let DownloadEvent::ItemStateChanged { state, .. } = event {
+            if !matches!(state, ItemDownloadState::Downloading) {
+                refresh(follow.clone());
+            }
+        }
+        true
+    });
 }
 
 #[cfg(test)]
@@ -851,5 +946,29 @@ pub(crate) mod tests {
             events.borrow().iter().any(|e| matches!(e, DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(_), .. } if item_id == "item-2")),
             "a download started after wifi_only was set true, on a metered connection, must be blocked"
         );
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, a download isn't
+    /// started (and says why) instead of reaching for the server.
+    pub(crate) fn run_offline_mode_starts_no_download(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (session, _server) = runtime.block_on(session_for(&pool, &mock_server.uri()));
+        session.set_offline(true);
+        let manager = DownloadManager::new(pool, crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        let states: Rc<RefCell<Vec<ItemDownloadState>>> = Rc::new(RefCell::new(Vec::new()));
+        manager.add_listener({
+            let states = states.clone();
+            move |event| {
+                if let DownloadEvent::ItemStateChanged { state, .. } = event {
+                    states.borrow_mut().push(state.clone());
+                }
+            }
+        });
+        manager.start_download(session, "item-1".to_string(), DownloadScope::EntireBook, 0);
+        crate::test_support::pump_until(|| !states.borrow().is_empty(), std::time::Duration::from_secs(5));
+        assert!(matches!(states.borrow().first(), Some(ItemDownloadState::Failed(reason)) if reason.contains("offline")), "{:?}", states.borrow());
+        crate::test_support::pump_until(|| false, std::time::Duration::from_millis(300));
+        assert!(runtime.block_on(mock_server.received_requests()).unwrap().is_empty(), "offline mode: nothing may reach the server");
     }
 }

@@ -541,6 +541,10 @@ pub enum LibraryItemsError {
     Unauthorized(u16),
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
+    /// The server answered 404: what was asked for doesn't exist there — for a cover, an item
+    /// that simply has none. Told apart so a caller can remember that instead of asking again.
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl LibraryItemsError {
@@ -757,6 +761,9 @@ impl Client {
 
         if is_auth_status(response.status()) {
             return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(LibraryItemsError::NotFound(format!("GET /api/items/{item_id}/cover returned HTTP {}", response.status())));
         }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
@@ -1735,11 +1742,21 @@ mod tests {
     #[tokio::test]
     async fn get_item_cover_propagates_server_errors() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
 
         let client = Client::new(&server.uri());
         let err = client.get_item_cover("item-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_cover_tells_a_missing_cover_apart() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+
+        let client = Client::new(&server.uri());
+        let err = client.get_item_cover("item-1").await.unwrap_err();
+        assert!(matches!(err, LibraryItemsError::NotFound(_)), "{err:?}");
     }
 
     #[tokio::test]

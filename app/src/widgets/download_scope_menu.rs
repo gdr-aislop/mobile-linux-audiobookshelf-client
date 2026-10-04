@@ -215,14 +215,16 @@ pub fn build(
     // per screen-open (Player, on every mini-bar tap) or per item (Item Detail), so its own item
     // id never actually changes across the instance's lifetime — matching `DownloadEvent` itself,
     // which carries no server id to disambiguate further.
-    download_manager.add_listener({
-        let widget = widget.clone();
+    download_manager.add_scoped_listener({
+        // Weak: the screen this button lives on comes and goes, and the manager outlives it.
+        let widget = widget.downgrade();
         let item_id = item_id.clone();
-        let toast_overlay = toast_overlay.clone();
+        let toast_overlay = toast_overlay.downgrade();
         move |event| {
-            let DownloadEvent::ItemStateChanged { item_id: event_item_id, state } = event else { return };
+            let (Some(widget), Some(toast_overlay)) = (widget.upgrade(), toast_overlay.upgrade()) else { return false };
+            let DownloadEvent::ItemStateChanged { item_id: event_item_id, state } = event else { return true };
             if *event_item_id != item_id {
-                return;
+                return true;
             }
             widget.set_icon_name(match state {
                 ItemDownloadState::Downloading => "content-loading-symbolic",
@@ -238,6 +240,7 @@ pub fn build(
             if let ItemDownloadState::Failed(reason) = state {
                 toast_overlay.add_toast(adw::Toast::new(&format!("Download failed — {reason}")));
             }
+            true
         }
     });
 
@@ -249,6 +252,9 @@ pub fn build(
         popover_box,
     }
 }
+
+/// What a download asked for while offline mode is on gets instead of a download.
+pub(crate) const OFFLINE_DOWNLOAD_TOAST: &str = "Offline mode is on — turn it off to download";
 
 /// Estimated bytes a scope would fetch, or `None` when no honest estimate exists: sizes not
 /// cached yet, or nothing to fetch (a disabled row shouldn't advertise "≈0 B"). No chapters at
@@ -372,6 +378,11 @@ fn populate_download_popover_rows(
             let toast_overlay = toast_overlay.clone();
             let on_open_downloads = on_open_downloads.clone();
             move |_| {
+                if session.is_offline() {
+                    popover.popdown();
+                    toast_overlay.add_toast(adw::Toast::new(OFFLINE_DOWNLOAD_TOAST));
+                    return;
+                }
                 if blocked {
                     toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
                     return;
@@ -512,6 +523,11 @@ fn populate_download_popover_rows(
             let next_blocked = next_blocked.clone();
             let on_open_downloads = on_open_downloads.clone();
             move |_| {
+                if session.is_offline() {
+                    popover.popdown();
+                    toast_overlay.add_toast(adw::Toast::new(OFFLINE_DOWNLOAD_TOAST));
+                    return;
+                }
                 if next_blocked.get() {
                     toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
                     return;

@@ -30,8 +30,48 @@ pub(crate) enum Shelf {
 
 pub struct HomeScreen {
     pub root: gtk4::Widget,
+    /// What `follow_downloads` needs to re-render the shelves' downloaded badges.
+    widgets: HomeWidgets,
+    pool: SqlitePool,
+    server_id: String,
     #[cfg(test)]
     hooks: TestHooks,
+}
+
+impl HomeScreen {
+    /// Re-renders the shelves when low memory mode changes, so the covers already shown turn into
+    /// placeholders (or come back).
+    pub(crate) fn follow_low_memory_mode(&self, low_memory_mode: &crate::low_memory_mode::LowMemoryModeState) {
+        let widgets = self.widgets.clone();
+        low_memory_mode.add_listener(move |_| {
+            let widgets = widgets.clone();
+            glib::idle_add_local_once(move || {
+                let cached = widgets.last_data.borrow().clone();
+                if let Some(data) = cached {
+                    apply(&data, &widgets);
+                }
+            });
+        });
+    }
+
+    /// Keeps the shelves' downloaded badges (and the offline-mode view) current as downloads
+    /// finish or are cleared — see `crate::downloads::follow_downloaded_items`.
+    pub(crate) fn follow_downloads(&self, download_manager: &crate::downloads::DownloadManager) {
+        let widgets = self.widgets.clone();
+        crate::downloads::follow_downloaded_items(download_manager, self.pool.clone(), self.server_id.clone(), self.root.downgrade(), move |downloaded| {
+            let data = {
+                let mut last = widgets.last_data.borrow_mut();
+                let Some(data) = last.as_mut() else { return };
+                if data.downloaded == downloaded {
+                    return;
+                }
+                tracing::debug!(downloaded = downloaded.len(), "downloaded books changed; refreshing Home's badges");
+                data.downloaded = downloaded;
+                data.clone()
+            };
+            apply(&data, &widgets);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -499,7 +539,10 @@ pub fn build(
     // same logic must run whether *this* screen's own toggle fired or Library's did.
     let offline_toggle_handler = offline_toggle.connect_toggled({
         let offline_mode = widgets.offline_mode.clone();
-        move |toggle| offline_mode.set(toggle.is_active())
+        move |toggle| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
+            offline_mode.set(toggle.is_active());
+        }
     });
 
     widgets.offline_mode.add_listener({
@@ -520,14 +563,21 @@ pub fn build(
                 offline_toggle.unblock_signal(&offline_toggle_handler);
             }
             offline_banner.set_reveal_child(active);
-            // Rendered synchronously, before any DB work — the refetch's pool acquire must not
+            // Rendered on the next idle, before any DB work — the refetch's pool acquire must not
             // gate the visible filter change (a contended pool has stalled it for tens of seconds
-            // on-device). The in-memory snapshot is immediate-and-slightly-stale; the spawned
-            // refetch below re-renders with fresh data when it lands.
-            let cached = widgets.last_data.borrow().clone();
-            if let Some(data) = cached {
-                apply(&data, &widgets);
-            }
+            // on-device). Not inside this handler: GTK only redraws the toggle after the handler
+            // returns, and rebuilding the shelves first made the toggle seem not to react. The
+            // in-memory snapshot is immediate-and-slightly-stale; the spawned refetch below
+            // re-renders with fresh data when it lands.
+            glib::idle_add_local_once({
+                let widgets = widgets.clone();
+                move || {
+                    let cached = widgets.last_data.borrow().clone();
+                    if let Some(data) = cached {
+                        apply(&data, &widgets);
+                    }
+                }
+            });
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -561,6 +611,9 @@ pub fn build(
 
     HomeScreen {
         root: toast_overlay.clone().upcast(),
+        widgets: widgets.clone(),
+        pool: pool.clone(),
+        server_id: server.id.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             empty_state,
@@ -612,6 +665,23 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         }
     }
 
+    // Offline mode: nothing may reach the server — show what's stored locally and stop there.
+    // No sync claim is taken, so Library (which does the same) never waits on one.
+    if ctx.session.is_offline() {
+        tracing::info!("offline mode: Home shows what's stored on the device; not syncing");
+        let (pool, server_id, account_id) = (ctx.pool.clone(), ctx.server.id.clone(), ctx.account.id.clone());
+        glib::spawn_future_local(async move {
+            match load(&pool, &server_id, &account_id).await {
+                Ok(data) if !data.libraries.is_empty() => apply(&data, &widgets),
+                _ => widgets.empty_state.show_empty(),
+            }
+        });
+        if let Some(manual) = manual {
+            manual.finish_offline();
+        }
+        return;
+    }
+
     // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Library
     // does the exact same thing for the same account, since both screens are built eagerly. Only
     // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
@@ -657,7 +727,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
-                        return (Err(err), None);
+                        let data = Some(load(&pool, &server_id, &account_id).await);
+                        return (Err(err), data);
                     }
                 };
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
@@ -669,7 +740,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                 // timeout — a failure here (offline, slow connection) is logged and never
                 // surfaced as this screen's sync banner, which is about library/item sync,
                 // not this.
-                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id).await
+                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id, crate::sync_coordinator::loaded_item(&server_id, &account_id).as_deref()).await
                 {
                     tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
                 }
@@ -681,6 +752,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         let (sync_result, data_after_sync) = spawned_sync
             .await
             .expect("the Home sync task must not panic");
+        // Offline mode switched on mid-sync cut it short; that's not a failure to show.
+        let sync_result = sync_result.or_else(|err| if matches!(err, CoreError::Offline) { Ok(()) } else { Err(err) });
         let local_read_error = data_after_sync.as_ref().and_then(|data| data.as_ref().err()).map(|err| {
             tracing::warn!(%err, "couldn't read the synced library back from local storage");
             err.to_string()
@@ -698,6 +771,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         // only the artwork, never the initial render. The whole batch shares one HTTP client
         // (one pooled connection), and per item it no-ops once a cover is already cached on
         // disk, so this is cheap on every subsequent visit.
+        // A manual sync also re-asks for covers the server recently said it doesn't have.
+        let recheck_missing_covers = manual.is_some();
         let spawned_covers = data_after_sync.as_ref().filter(|data| !data.libraries.is_empty()).map(|data| {
             let item_ids: Vec<String> = data
                 .recent_items
@@ -718,7 +793,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged, never surfaced.
                     if let Some(connection) = session.connection_target().await.ok().as_ref() {
-                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids).await;
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids, recheck_missing_covers).await;
                     }
 
                     load(&pool, &server_id, &account_id).await.ok()
@@ -840,6 +915,7 @@ async fn load(pool: &SqlitePool, server_id: &str, account_id: &str) -> CoreResul
 /// children first, so this is a full re-render rather than an incremental diff (fine at this
 /// scale: a handful of shelf cards and library rows, not a large list needing virtualization).
 fn apply(data: &HomeData, widgets: &HomeWidgets) {
+    let _slow = crate::perf::SlowJob::new("home render");
     *widgets.last_data.borrow_mut() = Some(data.clone());
 
     // The empty state's *mode* is owned by the sync-cycle state machine, but its hiding happens
@@ -1140,18 +1216,23 @@ pub(crate) mod tests {
 
         // Same immediacy contract as `library.rs`'s offline scenario: the first toggle-on waits
         // for the handler's background refetch (the download above landed after this screen's
-        // load, so the in-memory set is stale), but every later toggle below re-renders
-        // synchronously inside the handler — no pump, no contended-pool wait.
+        // load, so the in-memory set is stale), but every later toggle below re-renders on the
+        // next idle — no contended-pool wait, and not inside the toggle handler.
         hooks.offline_toggle.set_active(true);
         pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
+        // The toggle handler itself only flips cheap state, so the button redraws at once; the
+        // shelves follow on the very next idle, from the in-memory set (no database wait).
         hooks.offline_toggle.set_active(false);
-        assert_eq!(count_children(&hooks.recent_row), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child());
+        assert_eq!(count_children(&hooks.recent_row), 1, "the shelves aren't rebuilt inside the toggle handler");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(count_children(&hooks.recent_row), 2, "toggling offline mode off re-renders on the next idle");
 
         hooks.offline_toggle.set_active(true);
-        assert_eq!(count_children(&hooks.recent_row), 1, "toggling offline mode on must filter synchronously from the in-memory downloaded set");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(count_children(&hooks.recent_row), 1, "toggling offline mode on filters on the next idle from the in-memory downloaded set");
     }
 
     pub(crate) fn run_shows_empty_state_when_the_server_has_no_libraries(runtime: &tokio::runtime::Runtime) {
@@ -1586,5 +1667,199 @@ pub(crate) mod tests {
             "the live demo server has at least one library, so the empty state should clear"
         );
         assert!(hooks.libraries_list.row_at_index(0).is_some());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book downloaded (or cleared) while
+    /// the app runs gets (or loses) its badge on Home's shelves right away — it used to wait for
+    /// the next sync, offline-mode toggle or restart.
+    pub(crate) fn run_downloaded_badges_follow_downloads_in_this_session(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary"), item_json("item-2", "Dune")]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode, |_| {}, || {}, |_| {});
+        let download_manager =
+            crate::downloads::DownloadManager::new(pool.clone(), crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        screen.follow_downloads(&download_manager);
+        let hooks = screen.test_hooks();
+        pump_until(|| count_children(&hooks.recent_row) == 2, Duration::from_secs(10));
+        let badges = || {
+            let mut shown = 0;
+            let mut child = hooks.recent_row.first_child();
+            while let Some(card) = child {
+                if crate::widgets::item_card::tests::downloaded_badge_of(&card).is_visible() {
+                    shown += 1;
+                }
+                child = card.next_sibling();
+            }
+            shown
+        };
+        assert_eq!(badges(), 0);
+
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-1", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 3600.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-1", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-1", "1", 10)).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-1".to_string(), state: crate::downloads::ItemDownloadState::Complete });
+        pump_until(|| badges() == 1, Duration::from_secs(5));
+        assert_eq!(badges(), 1, "the finished download shows its badge without a sync");
+
+        runtime.block_on(abs_storage::repo::download_tracks::remove_for_item(&pool, &server.id, "item-1")).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-1".to_string(), state: crate::downloads::ItemDownloadState::Idle });
+        pump_until(|| badges() == 0, Duration::from_secs(5));
+        assert_eq!(badges(), 0, "a cleared download loses its badge");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With offline mode on, Home shows what's
+    /// stored on the device and nothing reaches the server — not even a manual "Sync now", which
+    /// says why instead.
+    pub(crate) fn run_offline_mode_makes_no_requests(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, |_| {});
+        let hooks = screen.test_hooks();
+        pump_until(|| false, Duration::from_millis(800));
+
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Offline mode is on — turn it off to sync"), Duration::from_secs(5));
+        assert!(crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Offline mode is on — turn it off to sync"));
+        pump_until(|| false, Duration::from_millis(300));
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.is_empty(), "offline mode: no request may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A cover the server doesn't have (404)
+    /// isn't asked for again by the next automatic sync, but "Sync now" asks again.
+    pub(crate) fn run_missing_covers_are_asked_again_only_by_a_manual_sync(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [item_json("item-1", "Project Hail Mary")] })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(Mock::given(method("GET")).and(path("/api/items/item-1/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server));
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let cover_requests = || {
+            runtime.block_on(mock_server.received_requests()).unwrap().iter().filter(|r| r.url.path() == "/api/items/item-1/cover").count()
+        };
+        let build_home = || {
+            let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+            let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+            build(pool.clone(), paths.clone(), server.clone(), account.clone(), session, offline_mode, |_| {}, || {}, |_| {})
+        };
+
+        let first = build_home();
+        pump_until(|| cover_requests() == 1, Duration::from_secs(10));
+        assert_eq!(cover_requests(), 1, "the first sync asks for the cover");
+        pump_until(|| false, Duration::from_millis(500));
+
+        // Another automatic sync (a new shell) doesn't ask again.
+        let second = build_home();
+        let hooks = second.test_hooks();
+        pump_until(|| count_children(&hooks.recent_row) == 1, Duration::from_secs(10));
+        pump_until(|| false, Duration::from_secs(1));
+        assert_eq!(cover_requests(), 1, "a cover the server just said it doesn't have isn't asked for again");
+
+        hooks.sync_now_button.emit_clicked();
+        pump_until(|| cover_requests() == 2, Duration::from_secs(10));
+        assert_eq!(cover_requests(), 2, "Sync now asks again");
+        drop(first);
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Low memory mode turns the covers on
+    /// the shelves into placeholders (and back), leaving everything else on the cards alone.
+    pub(crate) fn run_low_memory_mode_hides_the_covers_on_the_shelves(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [item_json("item-1", "Project Hail Mary")] })))
+                .mount(&mock_server),
+        );
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+            bytes
+        };
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1/cover"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(png))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+        low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, |_| {});
+        screen.follow_low_memory_mode(&low_memory_mode);
+        let hooks = screen.test_hooks();
+        let cover_showing = || {
+            hooks
+                .recent_row
+                .first_child()
+                .and_then(|card| crate::widgets::item_card::tests::cover_picture_of(&card))
+                .is_some_and(|picture| picture.is_visible())
+        };
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "the cover shows normally");
+
+        low_memory_mode.set(true);
+        pump_until(|| !cover_showing(), Duration::from_secs(5));
+        assert!(!cover_showing(), "low memory mode: a placeholder instead of the cover");
+        assert_eq!(count_children(&hooks.recent_row), 1, "the card itself stays");
+
+        low_memory_mode.set(false);
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "and the cover comes back");
     }
 }

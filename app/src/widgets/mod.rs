@@ -128,6 +128,13 @@ impl ManualSync {
         let message = if ok { "Sync complete" } else { "Sync failed" };
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
+
+    /// Releases the slot without syncing: offline mode is on, so nothing may reach the server.
+    pub(crate) fn finish_offline(&self) {
+        self.in_flight.set(false);
+        self.indicator.hide();
+        self.toast_overlay.add_toast(adw::Toast::new("Offline mode is on — turn it off to sync"));
+    }
 }
 
 /// A cancel-and-reschedule debounce over a one-shot GLib timeout — call [`Self::schedule`] on

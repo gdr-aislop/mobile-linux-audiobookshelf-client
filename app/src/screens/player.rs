@@ -79,7 +79,15 @@ pub fn build(
 ) -> PlayerScreen {
     // Shared by the down-chevron header button and the Escape action below.
     let on_collapse = Rc::new(on_collapse);
-    let on_open_downloads: Rc<dyn Fn()> = Rc::new(on_open_downloads);
+    // Leaving for the Downloads tab is a way out of the Player like collapsing it: the screen's
+    // snapshot hook must not stay on the controller, updating widgets nobody sees.
+    let on_open_downloads: Rc<dyn Fn()> = Rc::new({
+        let controller = controller.clone();
+        move || {
+            controller.clear_full_update();
+            on_open_downloads();
+        }
+    });
     let header = adw::HeaderBar::new();
     let collapse_button = gtk4::Button::from_icon_name("go-down-symbolic");
     collapse_button.connect_clicked({
@@ -291,12 +299,12 @@ pub fn build(
     // The download button + its scope popover — shared with Item Detail's own
     // (`widgets::download_scope_menu`; see its module doc for why this moved out of this file).
     // `current_download_context()` is read once, here, rather than inside a closure: a
-    // `PlayerScreen` is built fresh on every mini-bar tap, so there is always something already
-    // playing by the time this runs — unlike `chapter_ranges`/`current_chapter_index`/free space
+    // `PlayerScreen` is built fresh on every mini-bar tap, so there is always a book loaded or
+    // starting by the time this runs — unlike `chapter_ranges`/`current_chapter_index`/free space
     // below, which the widget itself re-asks on every popover open since those genuinely change
     // over a session's lifetime.
     let (download_session, download_server_id, download_item_id) =
-        controller.current_download_context().expect("a player screen is only ever built once something is playing");
+        controller.current_download_context().expect("a player screen is only ever built once a book is loaded or starting");
     // Visible progress for this item's own in-flight download (see `widgets::download_progress`'s
     // doc) — built before `download_menu` moves `download_item_id`, appended to `content` below
     // (its last child is `secondary_row`, so a plain `append` here lands right after it).
@@ -311,10 +319,12 @@ pub fn build(
             let controller = controller.clone();
             move || controller.chapters().iter().map(|c| (c.start_seconds, c.end_seconds)).collect()
         },
-        // Player only builds this once playback has already started, so its chapters (however
-        // many there are — zero for a chapterless book) are already known by the time this menu
-        // exists; unlike Item Detail, there's no network round trip still in flight to wait on.
-        || true,
+        // The Player can open while its book is still starting; its chapters (however many
+        // there are — zero for a chapterless book) are known once that is over.
+        {
+            let controller = controller.clone();
+            move || controller.snapshot().is_some_and(|s| !s.is_loading)
+        },
         {
             let controller = controller.clone();
             move || controller.current_chapter_index().unwrap_or(0)
@@ -336,8 +346,10 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             move || {
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
-                controller.mark_as_finished();
-                toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
+                // Only a controller that acted has anything to undo.
+                if controller.mark_as_finished() {
+                    toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
+                }
             }
         },
         {
@@ -345,8 +357,9 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             move || {
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
-                controller.reset_progress();
-                toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
+                if controller.reset_progress() {
+                    toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
+                }
             }
         },
     );
@@ -481,14 +494,40 @@ pub fn build(
     // doesn't get immediately re-interpreted as the user dragging (which would fight the real
     // playback position every tick).
     let updating_from_snapshot = std::rc::Rc::new(std::cell::Cell::new(false));
+    // A drag moves the scale through dozens of values; seeking at each one meant a flushing seek
+    // (on a stream, a new range request, and across files a whole track load) per pixel. Only
+    // the value the knob settles on is sought, once it has been still for `SCRUB_SETTLE` —
+    // whatever moved it (a drag, a tap, a key, a scroll). Meanwhile the time labels follow the
+    // knob, and the snapshot doesn't move it back under the finger.
+    let pending_scrub: Rc<std::cell::RefCell<Option<glib::SourceId>>> = Rc::new(std::cell::RefCell::new(None));
     scrubber.connect_value_changed({
         let controller = controller.clone();
         let updating_from_snapshot = updating_from_snapshot.clone();
+        let pending_scrub = pending_scrub.clone();
+        let elapsed_label = elapsed_label.clone();
+        let remaining_label = remaining_label.clone();
         move |scale| {
             if updating_from_snapshot.get() {
                 return;
             }
-            controller.seek_fraction(scale.value());
+            let fraction = scale.value();
+            if let Some(duration) = controller.snapshot().map(|s| s.duration_seconds).filter(|d| *d > 0.0) {
+                set_time_labels(&elapsed_label, &remaining_label, fraction * duration, duration);
+            }
+            if let Some(source) = pending_scrub.borrow_mut().take() {
+                source.remove();
+            }
+            let source = glib::timeout_add_local_once(SCRUB_SETTLE, {
+                let controller = controller.clone();
+                let pending_scrub = pending_scrub.clone();
+                move || {
+                    // Fired: the source is gone, so nothing may `remove()` it any more.
+                    pending_scrub.borrow_mut().take();
+                    tracing::info!(fraction, "scrub: seeking");
+                    controller.seek_fraction(fraction);
+                }
+            });
+            *pending_scrub.borrow_mut() = Some(source);
         }
     });
 
@@ -501,6 +540,9 @@ pub fn build(
         let remaining_label = remaining_label.clone();
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
+        let skip_back = skip_back.clone();
+        let skip_forward = skip_forward.clone();
+        let speed_button = speed_button.clone();
         let cover = cover.clone();
         let error_banner = error_banner.clone();
         move |snapshot: &PlayerSnapshot| {
@@ -519,14 +561,20 @@ pub fn build(
             } else {
                 0.0
             };
-            updating_from_snapshot.set(true);
-            scrubber.set_value(fraction);
-            updating_from_snapshot.set(false);
-            // Nothing to seek in until the book has loaded.
+            // While the listener is still moving the knob, it and the time labels are theirs.
+            if pending_scrub.borrow().is_none() {
+                updating_from_snapshot.set(true);
+                scrubber.set_value(fraction);
+                updating_from_snapshot.set(false);
+                set_time_labels(&elapsed_label, &remaining_label, snapshot.position_seconds, snapshot.duration_seconds);
+            }
+            // Nothing to seek in, skip over, speed up or time until the book has loaded — each
+            // of these would be a no-op the controller swallows, which reads as a dead button.
             scrubber.set_sensitive(!snapshot.is_loading);
-
-            elapsed_label.set_label(&format_hms(snapshot.position_seconds));
-            remaining_label.set_label(&format!("-{}", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0))));
+            skip_back.set_sensitive(!snapshot.is_loading);
+            skip_forward.set_sensitive(!snapshot.is_loading);
+            speed_button.set_sensitive(!snapshot.is_loading);
+            sleep_timer_button.set_sensitive(!snapshot.is_loading);
 
             speed_label.set_label(&format_speed(snapshot.speed));
             if snapshot.sleep_timer_active {
@@ -701,9 +749,21 @@ pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> (&'static
         NotAuthorized => ("The server refused this request — try signing in again.", None),
         AudioOutput => ("Couldn't reach this device's audio output.", Some("Retry")),
         Network => ("Lost the connection while playing — check your connection and try again.", Some("Retry")),
+        Seek => ("Couldn't get to that position in the audio — try again, or try another position.", Some("Retry")),
+        Offline => ("This part of the book isn't downloaded — turn off offline mode to stream it.", None),
         Unavailable => ("Playback isn't available on this device — no audio engine could be started.", None),
         Other => ("Playback stopped unexpectedly.", Some("Retry")),
     }
+}
+
+/// How long the scrubber must rest on a value before it is sought — see the scrubber's
+/// `value-changed` handler.
+const SCRUB_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The elapsed and remaining labels for `position` of `duration`, both book-level seconds.
+fn set_time_labels(elapsed_label: &gtk4::Label, remaining_label: &gtk4::Label, position: f64, duration: f64) {
+    elapsed_label.set_label(&format_hms(position));
+    remaining_label.set_label(&format!("-{}", format_hms((duration - position).max(0.0))));
 }
 
 /// Below this, a downward drag is ignored; at or above it, a predominantly-downward drag

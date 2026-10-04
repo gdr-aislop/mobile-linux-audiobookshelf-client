@@ -75,11 +75,44 @@ pub struct LibraryScreen {
     /// posture as every other widget field: `LibraryWidgets` is cheap-clone, and the async
     /// pipeline already holds its own clone.
     widgets: LibraryWidgets,
+    /// What `follow_downloads` needs to re-read which books are downloaded.
+    pool: SqlitePool,
+    server_id: String,
     #[cfg(test)]
     hooks: TestHooks,
 }
 
 impl LibraryScreen {
+    /// Re-renders the list when low memory mode changes, so the covers already shown turn into
+    /// placeholders (or come back).
+    pub(crate) fn follow_low_memory_mode(&self, low_memory_mode: &crate::low_memory_mode::LowMemoryModeState) {
+        let widgets = self.widgets.clone();
+        low_memory_mode.add_listener(move |_| {
+            // The books are the same, so the "nothing changed" check would skip the rebuild; the
+            // new cards are what drop the old covers.
+            *widgets.rendered_signature.borrow_mut() = None;
+            request_render(&widgets);
+        });
+    }
+
+    /// Keeps the cards' downloaded badges (and the offline-mode view) current as downloads finish
+    /// or are cleared — see `crate::downloads::follow_downloaded_items`. An unchanged list isn't
+    /// rebuilt (the render compares what it would show with what is shown).
+    pub(crate) fn follow_downloads(&self, download_manager: &crate::downloads::DownloadManager) {
+        let widgets = self.widgets.clone();
+        crate::downloads::follow_downloaded_items(download_manager, self.pool.clone(), self.server_id.clone(), self.root.downgrade(), move |downloaded| {
+            {
+                let mut data = widgets.data.borrow_mut();
+                if data.downloaded == downloaded {
+                    return;
+                }
+                tracing::debug!(downloaded = downloaded.len(), "downloaded books changed; refreshing Library's badges");
+                data.downloaded = downloaded;
+            }
+            render_from_current_data(&widgets);
+        });
+    }
+
     /// Navigation-with-intent entry point (docs/design/ui-spec.md, Home tap-through): Home's
     /// shelf headers switch to this screen pre-sorted — and, for Continue Listening,
     /// pre-filtered to in-progress books — without persisting anything, exactly like a manual
@@ -259,6 +292,12 @@ struct LibraryWidgets {
     genre_chip_box: gtk4::Box,
     /// This render's cards/rows and their (maybe not yet decoded) covers — see [`PendingCover`].
     pending_covers: Rc<std::cell::RefCell<Vec<PendingCover>>>,
+    /// Bumped by every render that rebuilds the list; a slice still building an older one sees the
+    /// change and stops (`append_remaining_entries`).
+    render_generation: Rc<Cell<u64>>,
+    /// What the fully built list on screen was built from (`render_signature`); `None` while a
+    /// render is still in progress or nothing has been rendered.
+    rendered_signature: Rc<std::cell::RefCell<Option<String>>>,
     /// Shown for the one main-loop tick between any filter/search/sort/view-mode change and the
     /// rebuild it triggers — see [`request_render`]/[`set_busy`].
     busy_spinner: gtk4::Spinner,
@@ -550,6 +589,8 @@ pub fn build(
         progress_banner: progress_banner.clone(),
         genre_chip_box: genre_chip_box.clone(),
         pending_covers: Rc::new(std::cell::RefCell::new(Vec::new())),
+        render_generation: Rc::new(Cell::new(0)),
+        rendered_signature: Rc::new(std::cell::RefCell::new(None)),
         busy_spinner: busy_spinner.clone(),
         busy_scrim: busy_scrim.clone(),
     };
@@ -646,7 +687,10 @@ pub fn build(
     // whether *this* screen's own toggle fired or Home's did.
     let offline_toggle_handler = offline_toggle.connect_toggled({
         let offline_mode = widgets.offline_mode.clone();
-        move |toggle| offline_mode.set(toggle.is_active())
+        move |toggle| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
+            offline_mode.set(toggle.is_active());
+        }
     });
 
     // The view-options popover's "Downloaded only" switch is the exact same shared state as
@@ -655,6 +699,7 @@ pub fn build(
     let downloaded_only_switch_handler = downloaded_only_switch.connect_state_set({
         let offline_mode = widgets.offline_mode.clone();
         move |_, active| {
+            let _slow = crate::perf::SlowJob::new("offline mode toggle");
             offline_mode.set(active);
             glib::signal::Propagation::Proceed
         }
@@ -686,13 +731,14 @@ pub fn build(
             }
             offline_banner.set_reveal_child(active);
             update_view_options_indicator(&widgets);
-            // Rendered synchronously, before any DB work: the visible filter change must not be
-            // gated behind the refetch's pool acquire — on a contended pool (sync/cover/progress
-            // cycles all fighting over the 5 connections) that await has been observed stalling
-            // for tens of seconds, leaving the grid unfiltered the whole time. The in-memory
+            // Rendered on the next idle (with the busy scrim meanwhile), before any DB work: the
+            // visible filter change must not be gated behind the refetch's pool acquire — on a
+            // contended pool that await has been observed stalling for tens of seconds. Not
+            // inside this handler: GTK only redraws the toggle after the handler returns, and
+            // rebuilding the list first made the toggle seem not to react. The in-memory
             // `downloaded` set is whatever the last full load saw, which is immediate-and-slightly-
             // stale; the spawned refetch below re-renders with fresh data when it lands.
-            render_from_current_data(&widgets);
+            request_render(&widgets);
             glib::spawn_future_local({
                 let pool = pool.clone();
                 let widgets = widgets.clone();
@@ -957,6 +1003,8 @@ pub fn build(
         root: toast_overlay.clone().upcast(),
         search_entry: search_entry.clone(),
         widgets: widgets.clone(),
+        pool: pool.clone(),
+        server_id: server.id.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             status_page,
@@ -1027,6 +1075,16 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         }
     }
 
+    // Offline mode: nothing may reach the server — show what's stored locally and stop there.
+    if ctx.session.is_offline() {
+        tracing::info!("offline mode: Library shows what's stored on the device; not syncing");
+        glib::spawn_future_local(render_from_cache(ctx.pool.clone(), ctx.server_id.clone(), ctx.account_id.clone(), widgets.clone()));
+        if let Some(manual) = manual {
+            manual.finish_offline();
+        }
+        return;
+    }
+
     // An *automatic* cycle (no `manual`) is what `build()` fires once, immediately — and Home
     // does the exact same thing for the same account, since both screens are built eagerly. Only
     // one of them should actually hit the network; see `sync_coordinator`'s module doc. A manual
@@ -1065,7 +1123,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                 };
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
 
-                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id).await
+                if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id, crate::sync_coordinator::loaded_item(&server_id, &account_id).as_deref()).await
                 {
                     tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
                 }
@@ -1074,6 +1132,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
             }
         });
         let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
+        // Offline mode switched on mid-sync cut it short; that's not a failure to show.
+        let sync_result = sync_result.or_else(|err| if matches!(err, abs_core::CoreError::Offline) { Ok(()) } else { Err(err) });
         let manual_ok = sync_result.is_ok();
 
         let data_after_sync = load(&pool, &server_id, &account_id).await;
@@ -1122,6 +1182,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         // as home.rs's identically-named cycle; the batch shares one HTTP client (one pooled
         // connection) across all of it.
         if !item_ids_after_sync.is_empty() {
+            // A manual sync also re-asks for covers the server recently said it doesn't have.
+            let recheck_missing_covers = manual.is_some();
             let spawned_covers = tokio::spawn({
                 let pool = pool.clone();
                 let paths = paths.clone();
@@ -1132,7 +1194,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                     // Best-effort like the fetches themselves: a settings failure here just
                     // means no covers — logged (above), never surfaced.
                     if let Some(connection) = session.connection_target().await.ok().as_ref() {
-                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids_after_sync).await;
+                        abs_core::covers::fetch_and_cache_covers(&paths, &pool, connection, &access_token, &server_id, item_ids_after_sync, recheck_missing_covers).await;
                     }
                 }
             });
@@ -1369,12 +1431,20 @@ fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk
     glib::idle_add_local_once(move || {
         widgets.flow_box.set_visible(mode == LibraryViewMode::Grid);
         widgets.list_box.set_visible(mode == LibraryViewMode::List);
+        // The container no longer shown keeps nothing: its whole tree (a widget per book, with
+        // the textures it showed) used to stay alive behind the visible one.
+        match mode {
+            LibraryViewMode::Grid => clear_list_box(&widgets.list_box),
+            LibraryViewMode::List => clear_flow_box(&widgets.flow_box),
+        }
+        *widgets.rendered_signature.borrow_mut() = None;
         render_from_current_data(&widgets);
         set_busy(&widgets, false);
     });
 }
 
 fn render_from_current_data(widgets: &LibraryWidgets) {
+    let _slow = crate::perf::SlowJob::new("library render");
     let query = abs_core::search::normalize_for_search(&widgets.search_entry.text());
     let sort = widgets.sort.get();
     let data = widgets.data.borrow();
@@ -1452,40 +1522,48 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // posture already used everywhere else in this file, just gated per mode so switching modes
     // (or searching/sorting while a mode is hidden) doesn't do wasted work on the other one.
     // Every card/row's cover decode is *deferred* (`build_deferred`/`library_list_row_deferred`):
-    // building the widget itself is cheap (no I/O), so that still happens for everything matching
+    // building the widget itself needs no I/O, so that still happens for everything matching
     // the filter, but only covers within (or near) the visible viewport actually start decoding —
     // see `decode_covers_in_viewport`, scheduled once right after this function returns.
-    let mut pending = Vec::new();
-    match widgets.view_mode.get() {
-        LibraryViewMode::Grid => {
-            clear_flow_box(&widgets.flow_box);
-            for (key, bucket) in &groups {
-                if grouping != Grouping::None {
-                    widgets.flow_box.insert(&grid_group_header(key.label()), -1);
-                }
-                for item in bucket {
-                    let subtitle = item_subtitle(item);
-                    let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, data.downloaded.contains(&item.id));
-                    widgets.flow_box.insert(&built.widget, -1);
-                    pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
-                }
-            }
+    //
+    // Building a few hundred cards is seconds of main-loop time on a phone, during which nothing
+    // else runs — including every database future. So only the first `FIRST_RENDER_BATCH` entries
+    // are built here; the rest follow in idle slices (`append_remaining_entries`), and a newer
+    // render abandons an older one still in progress.
+    let mut entries: Vec<RenderEntry> = Vec::new();
+    for (key, bucket) in &groups {
+        if grouping != Grouping::None {
+            entries.push(RenderEntry::Header(key.label().to_string()));
         }
-        LibraryViewMode::List => {
-            clear_list_box(&widgets.list_box);
-            for (key, bucket) in &groups {
-                if grouping != Grouping::None {
-                    widgets.list_box.append(&list_group_header(key.label()));
-                }
-                for item in bucket {
-                    let built = library_list_row_deferred(item, &widgets.on_open);
-                    widgets.list_box.append(&built.row);
-                    pending.push(PendingCover { widget: built.row.upcast(), cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
-                }
-            }
+        for item in bucket {
+            entries.push(RenderEntry::Item { item: Box::new((*item).clone()), downloaded: data.downloaded.contains(&item.id) });
         }
     }
-    *widgets.pending_covers.borrow_mut() = pending;
+    let mode = widgets.view_mode.get();
+    let signature = render_signature(mode, &entries);
+    if widgets.rendered_signature.borrow().as_deref() == Some(signature.as_str()) {
+        // Exactly what is on screen already (a sync that changed nothing, a toggle with nothing to
+        // filter, a search whose results didn't change): rebuilding it would only cost time and
+        // lose the scroll position.
+        tracing::debug!(books = entries.len(), "library render skipped: nothing changed");
+    } else {
+        *widgets.rendered_signature.borrow_mut() = None;
+        let generation = widgets.render_generation.get() + 1;
+        widgets.render_generation.set(generation);
+        match mode {
+            LibraryViewMode::Grid => clear_flow_box(&widgets.flow_box),
+            LibraryViewMode::List => clear_list_box(&widgets.list_box),
+        }
+        widgets.pending_covers.borrow_mut().clear();
+        let entries = Rc::new(entries);
+        let built = FIRST_RENDER_BATCH.min(entries.len());
+        append_entries(widgets, mode, &entries[..built]);
+        if built == entries.len() {
+            *widgets.rendered_signature.borrow_mut() = Some(signature);
+        } else {
+            append_remaining_entries(widgets.clone(), mode, entries, built, generation, signature);
+        }
+    }
 
     // Deferred past this function returning — the cards above were only just inserted, and
     // `compute_bounds` (inside `decode_covers_in_viewport`) needs a completed layout/allocation
@@ -1508,6 +1586,87 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     } else if !data.items.is_empty() {
         widgets.status_page.set_title("No items yet");
     }
+}
+
+/// How many cards/rows a render builds before yielding to the main loop, and how many each
+/// following idle slice builds. A few dozen widgets is a frame or two even on a phone.
+const FIRST_RENDER_BATCH: usize = 40;
+const RENDER_SLICE: usize = 40;
+
+/// One thing a render puts on screen, owned so the later slices don't depend on `widgets.data`
+/// still holding the same items.
+#[derive(Clone)]
+enum RenderEntry {
+    Header(String),
+    Item { item: Box<Item>, downloaded: bool },
+}
+
+/// Identifies what a render would show — the view mode and every input the card/row builders and
+/// the group headers read — so an identical one can be skipped.
+fn render_signature(mode: LibraryViewMode, entries: &[RenderEntry]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (mode == LibraryViewMode::Grid).hash(&mut hasher);
+    for entry in entries {
+        match entry {
+            RenderEntry::Header(label) => ("header", label).hash(&mut hasher),
+            RenderEntry::Item { item, downloaded } => ("item", format!("{item:?}"), downloaded).hash(&mut hasher),
+        }
+    }
+    format!("{}:{:x}", entries.len(), hasher.finish())
+}
+
+/// Builds and inserts the widgets for `entries` into the active container, and tracks their
+/// covers for `decode_covers_in_viewport`.
+fn append_entries(widgets: &LibraryWidgets, mode: LibraryViewMode, entries: &[RenderEntry]) {
+    let mut pending = widgets.pending_covers.borrow_mut();
+    for entry in entries {
+        match (mode, entry) {
+            (LibraryViewMode::Grid, RenderEntry::Header(label)) => {
+                widgets.flow_box.insert(&grid_group_header(label), -1);
+            }
+            (LibraryViewMode::List, RenderEntry::Header(label)) => {
+                widgets.list_box.append(&list_group_header(label));
+            }
+            (LibraryViewMode::Grid, RenderEntry::Item { item, downloaded }) => {
+                let subtitle = item_subtitle(item);
+                let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, *downloaded);
+                widgets.flow_box.insert(&built.widget, -1);
+                pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
+            }
+            (LibraryViewMode::List, RenderEntry::Item { item, .. }) => {
+                let built = library_list_row_deferred(item, &widgets.on_open);
+                widgets.list_box.append(&built.row);
+                pending.push(PendingCover { widget: built.row.upcast(), cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
+            }
+        }
+    }
+}
+
+/// Builds `entries[from..]` in idle slices. Stops (leaving the partly built list for the render
+/// that replaced this one to clear) as soon as `widgets.render_generation` has moved on; on
+/// finishing, records `signature` as what is on screen and decodes the covers in view.
+fn append_remaining_entries(widgets: LibraryWidgets, mode: LibraryViewMode, entries: Rc<Vec<RenderEntry>>, from: usize, generation: u64, signature: String) {
+    let next = Cell::new(from);
+    glib::idle_add_local(move || {
+        if widgets.render_generation.get() != generation {
+            tracing::debug!("a library render was replaced before it finished");
+            return glib::ControlFlow::Break;
+        }
+        let _slow = crate::perf::SlowJob::new("library render slice");
+        let start = next.get();
+        let end = (start + RENDER_SLICE).min(entries.len());
+        append_entries(&widgets, mode, &entries[start..end]);
+        next.set(end);
+        if end < entries.len() {
+            return glib::ControlFlow::Continue;
+        }
+        *widgets.rendered_signature.borrow_mut() = Some(signature.clone());
+        tracing::debug!(books = entries.len(), "library render finished");
+        let widgets = widgets.clone();
+        glib::idle_add_local_once(move || decode_covers_in_viewport(&widgets));
+        glib::ControlFlow::Break
+    });
 }
 
 /// Decodes the cover for every currently-tracked card/row (`widgets.pending_covers`) that's
@@ -1988,18 +2147,23 @@ pub(crate) mod tests {
         // only a view-mode round-trip forced an immediate re-render). The first toggle-on still
         // waits for the refetch here, because the download above was inserted after this
         // screen's load — the in-memory set is stale and the synchronous render legitimately
-        // shows nothing — but every later toggle below round-trips with no pump at all: the
-        // list re-renders inside the handler, from the by-then-warm in-memory set.
+        // shows nothing — but every later toggle below needs only the next idle: the list
+        // re-renders from the by-then-warm in-memory set.
         hooks.offline_toggle.set_active(true);
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Project Hail Mary".to_string()], Duration::from_secs(5));
         assert!(hooks.offline_banner.reveals_child(), "the offline banner should show while the toggle is active");
 
+        // The toggle handler itself only flips cheap state, so the button redraws at once; the
+        // list follows on the very next idle, from the in-memory set (no database wait).
         hooks.offline_toggle.set_active(false);
-        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "toggling offline mode off must re-render synchronously, not after the handler's DB refetch");
         assert!(!hooks.offline_banner.reveals_child(), "the banner should hide once offline mode is off");
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 1, "the list isn't rebuilt inside the toggle handler");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(flow_box_titles(&hooks.flow_box).len(), 2, "toggling offline mode off re-renders on the next idle");
 
         hooks.offline_toggle.set_active(true);
-        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Project Hail Mary".to_string()], "toggling offline mode on must filter synchronously from the in-memory downloaded set");
+        crate::test_support::run_pending_main_loop_work();
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Project Hail Mary".to_string()], "toggling offline mode on filters on the next idle from the in-memory downloaded set");
     }
 
     pub(crate) fn run_sort_changes_order(runtime: &tokio::runtime::Runtime) {
@@ -3568,5 +3732,196 @@ pub(crate) mod tests {
             crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync complete"),
             "the pull's completion toast must appear too"
         );
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A big library is built in slices so the
+    /// main loop is never held for the whole of it, a newer render abandons an older one still
+    /// being built, and a render that would show exactly what is already there builds nothing.
+    pub(crate) fn run_a_big_library_renders_in_slices_and_skips_identical_renders(runtime: &tokio::runtime::Runtime) {
+        const BOOKS: usize = 130;
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let results: Vec<_> = (0..BOOKS).map(|i| item_json(&format!("item-{i:03}"), &format!("Book {i:03}"), "An Author", 1_700_000_000_000 + i as i64, 3600.0)).collect();
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        let hooks = screen.test_hooks();
+        let rows = || {
+            let mut count = 0;
+            while hooks.list_box.row_at_index(count).is_some() {
+                count += 1;
+            }
+            count as usize
+        };
+
+        pump_until(|| rows() == BOOKS, Duration::from_secs(20));
+        assert_eq!(rows(), BOOKS, "every book ends up on screen");
+
+        // Applying the view that is already shown builds nothing: the very same rows stay.
+        screen.apply_view(SortKey::DateAdded, false);
+        pump_until(|| false, Duration::from_millis(500));
+        pump_until(|| rows() == BOOKS, Duration::from_secs(20));
+        let first_row = hooks.list_box.row_at_index(0).unwrap();
+        screen.apply_view(SortKey::DateAdded, false);
+        pump_until(|| false, Duration::from_millis(300));
+        assert_eq!(rows(), BOOKS);
+        assert_eq!(hooks.list_box.row_at_index(0).as_ref(), Some(&first_row), "an identical render must not rebuild the list");
+
+        // A filter typed straight after another render began wins: nothing of the abandoned
+        // build is left behind.
+        screen.apply_view(SortKey::Title, false);
+        hooks.search_entry.set_text("book 129");
+        pump_until(|| rows() == 1, Duration::from_secs(10));
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(rows(), 1, "only the match remains");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The Library's badges follow downloads
+    /// finishing and being cleared in this session, and offline mode's list gains the book.
+    pub(crate) fn run_downloaded_badges_follow_downloads_in_this_session(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0),
+                        item_json("item-2", "Dune", "Frank Herbert", 1_600_000_000_000, 7200.0)
+                    ]
+                })))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let screen = build(pool.clone(), crate::test_support::test_paths(), server.clone(), account, session, offline_mode.clone(), |_| {}, || {}, || {});
+        let download_manager =
+            crate::downloads::DownloadManager::new(pool.clone(), crate::test_support::test_paths(), Box::new(abs_player::network_watch::UnknownNetworkMonitor), false);
+        screen.follow_downloads(&download_manager);
+        let hooks = screen.test_hooks();
+        pump_until(|| hooks.list_box.row_at_index(1).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(1).is_some(), Duration::from_secs(10));
+        let badges = || {
+            let mut shown = 0;
+            let mut index = 0;
+            while let Some(child) = hooks.flow_box.child_at_index(index) {
+                if child.child().is_some_and(|card| crate::widgets::item_card::tests::downloaded_badge_of(&card).is_visible()) {
+                    shown += 1;
+                }
+                index += 1;
+            }
+            shown
+        };
+        assert_eq!(badges(), 0);
+
+        runtime.block_on(abs_storage::repo::tracks::upsert_all(&pool, &server.id, "item-2", &[abs_storage::repo::tracks::NewTrack { ino: "1", duration_seconds: 7200.0, offset_seconds: 0.0, size_bytes: None }])).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::upsert_pending(&pool, &server.id, "item-2", "1", "/p/1.mp3")).unwrap();
+        runtime.block_on(abs_storage::repo::download_tracks::mark_complete(&pool, &server.id, "item-2", "1", 10)).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-2".to_string(), state: crate::downloads::ItemDownloadState::Complete });
+        pump_until(|| badges() == 1, Duration::from_secs(5));
+        assert_eq!(badges(), 1, "the finished download shows its badge without a sync");
+
+        offline_mode.set(true);
+        pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Dune".to_string()], Duration::from_secs(5));
+        assert_eq!(flow_box_titles(&hooks.flow_box), vec!["Dune".to_string()], "offline mode shows the newly downloaded book");
+
+        runtime.block_on(abs_storage::repo::download_tracks::remove_for_item(&pool, &server.id, "item-2")).unwrap();
+        download_manager.publish_for_test(crate::downloads::DownloadEvent::ItemStateChanged { item_id: "item-2".to_string(), state: crate::downloads::ItemDownloadState::Idle });
+        pump_until(|| hooks.flow_box.child_at_index(0).is_none(), Duration::from_secs(5));
+        assert!(hooks.flow_box.child_at_index(0).is_none(), "a cleared download leaves offline mode's list");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Switching between grid and list leaves
+    /// nothing behind in the container no longer shown (it used to keep its whole widget tree), and
+    /// low memory mode turns the covers on the grid into placeholders and back.
+    pub(crate) fn run_low_memory_mode_and_view_switches_release_what_is_not_shown(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [item_json("item-1", "Project Hail Mary", "Andy Weir", 1_700_000_000_000, 3600.0)]
+                })))
+                .mount(&mock_server),
+        );
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+            bytes
+        };
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/items/item-1/cover"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(png))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+        low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
+        let screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+        screen.follow_low_memory_mode(&low_memory_mode);
+        let hooks = screen.test_hooks();
+
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        hooks.view_toggle.set_active(false);
+        pump_until(|| hooks.flow_box.child_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(hooks.list_box.row_at_index(0).is_none(), "the list is emptied while the grid is shown");
+        let cover_showing = || {
+            hooks
+                .flow_box
+                .child_at_index(0)
+                .and_then(|child| child.child())
+                .and_then(|card| crate::widgets::item_card::tests::cover_picture_of(&card))
+                .is_some_and(|picture| picture.is_visible())
+        };
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "the grid shows the cover");
+
+        low_memory_mode.set(true);
+        pump_until(|| !cover_showing(), Duration::from_secs(5));
+        assert!(!cover_showing(), "low memory mode: a placeholder");
+        low_memory_mode.set(false);
+        pump_until(cover_showing, Duration::from_secs(10));
+        assert!(cover_showing(), "and the cover is back");
+
+        hooks.view_toggle.set_active(true);
+        pump_until(|| hooks.list_box.row_at_index(0).is_some(), Duration::from_secs(10));
+        assert!(hooks.flow_box.child_at_index(0).is_none(), "the grid is emptied while the list is shown");
     }
 }

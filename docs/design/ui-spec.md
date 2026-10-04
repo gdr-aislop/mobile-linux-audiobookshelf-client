@@ -147,6 +147,8 @@ Fractal) rather than copying Lissen's Material Design look.
   downloaded fully or partially — the same downloaded-item definition used everywhere else in this
   spec (see Item detail). This is state shared with the equivalent toggle on Library browse, not a
   per-screen setting.
+  **Offline mode also cuts all network use** (see "Offline-first playback"). The toggle reacts at
+  once; the shelves re-filter right after.
 - **Sync now**: a header-bar menu item (in the same `⋯` overflow as any other page-level actions)
   that forces an immediate resync of library contents and playback progress with the server,
   rather than waiting on whatever background sync interval is configured. Self-hosted servers on
@@ -262,6 +264,43 @@ Fractal) rather than copying Lissen's Material Design look.
   itself. Every start, load, seek, play and pause is logged, as is anything discarded because a
   newer start or load replaced it. *(Field report: the previous book used to stay loaded through
   the whole resolve, and a rewind in that window loaded its audio behind the new book's title.)*
+- **Starting the book that's already loaded** (Play, Resume or a chapter on its detail screen)
+  doesn't load it again: a chapter is a seek, and otherwise it just plays from where it is.
+- **Finished books.** Once a book reaches its end, or is marked finished, it stays finished
+  through any later pause, quit, book switch or reconnect. Play on it starts it over from the
+  beginning. An end of the stream on the last file that comes more than a minute (but less than
+  10% of the file) before its reported length pauses there without marking the book finished;
+  Play loads it again at that spot, and ending at the same spot again is the real end.
+- **Recovering from a lost stream.** A stream error while playing (a dropped connection, an
+  expired token) reloads the file once by itself at the same position; a second one within a
+  minute stops with the error banner. A stream that failed while paused, or that has been paused
+  for five minutes or more, is loaded afresh on Play rather than resumed. A seek that never lands
+  reloads the file once at the target; if that fails too, playback stops with an error and the
+  target stays the saved position.
+- **Pausing then seeking** (rewind, scrub, speed) keeps the pipeline paused while it re-buffers;
+  it is never mistaken for a pause that failed.
+- **A speed picked while paused on a stream** is shown at once and applied when playback resumes
+  — changing the rate is a network seek nobody can hear. Speeds outside the picker's range (or
+  not numbers) are brought into range or ignored.
+- **A book whose files are on the device starts from them.** Downloaded tracks are always
+  preferred over the stream, online or not. If the track to start in is downloaded, the start
+  waits at most ~3 s for the server (which, if it answers, still supplies fresh metadata and
+  progress from other devices) — and not at all while offline mode is on. If that track isn't
+  downloaded the server is needed and is waited for as before. The log says how many tracks are
+  on the device and, for a streamed track that has a download, why it can't be used.
+- **Starting a book opens the full player at once**, in a loading state (controls greyed out),
+  instead of waiting for the load; the book that is starting counts as the current one, so
+  Mark as finished / Reset progress chosen meanwhile are applied once it has loaded.
+- **The server's track timeline is the book's timeline.** A file that turns out longer or shorter
+  than the server said does not move the later files' offsets (progress is saved against them, and
+  other clients read it back the same way); the position shown stalls at a file's end rather than
+  running into the next file's part early.
+- **Quitting saves the position** however the app is asked to go: Ctrl+Q, closing the window,
+  SIGTERM or Ctrl+C. Home and Library sync leave the loaded book's progress to the player.
+- **A bouncing headphone jack** doesn't resume playback: a replug resumes only after it has held
+  for about 300 ms. An unplug still pauses at once.
+- **Replacing the shell** (account switch, sign-out) stops the old player, saves its position and
+  takes it off the system media controls.
 
 ### System media integration
 Lissen's Android build posts a persistent MediaStyle notification — cover art, transport controls,
@@ -365,6 +404,15 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   `AdwStyleManager` immediately and at startup), the **About** row, and the **Account** and
   **Servers** groups (below) are real too. The one remaining stub: Playback's
   sleep-timer-default row.
+- **Low memory mode** (Playback group, next to "Buffer streams in bursts"): one switch for a
+  phone short on RAM. It hides covers everywhere (Home, Library, Item detail, Player, mini bar,
+  Downloads show their placeholders — nothing is decoded), shrinks the cover texture cache from
+  24 MiB to 4 MiB, and opens the database with 3 connections and a small page cache instead of 5
+  and the default (the database part applies on the next launch; the rest applies at once).
+  Burst buffering is **not** changed by it — it stays the user's own choice — but while both are
+  on, the burst row adds a line saying it uses up to 64 MB of buffer and suggesting turning it off.
+  (Independently of the mode, switching Library between grid and list now empties the container
+  that is no longer shown.)
 - **Account** group: one row showing the *active* server/account — username as title,
   `host · active` as subtitle — with a chevron; tapping it pushes the active server's
   **Connection** page. The mockup's second row ("Switch or manage servers") is deliberately
@@ -476,6 +524,14 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   cached track metadata: a fully-downloaded book plays end-to-end with no server contact, a
   partially-downloaded one plays from the resume position and stops cleanly at the first
   missing chapter, and a book never synced on this device (no cached metadata) can't start.
+- **Offline mode means no network at all.** While it is on nothing reaches the server: no library
+  sync, progress reconcile or cover fetch (Home and Library show what's stored; "Sync now" says
+  offline mode is on), no progress push (positions are kept on the device), no token refresh, no
+  chapter fetch in Item detail, no download ("turn it off to download"), and no streaming — a part
+  of a book that isn't downloaded stops with "This part of the book isn't downloaded — turn off
+  offline mode to stream it." Switching it off pushes the kept progress. A file already streaming
+  when it is switched on plays to its end (its connection is already open). The login and
+  add-server screens aren't affected.
 
 ## 6. Keyboard shortcuts
 

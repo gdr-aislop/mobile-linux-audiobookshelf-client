@@ -56,6 +56,9 @@ const INTROSPECTION_XML: &str = r#"
       <arg direction="in" name="TrackId" type="o"/>
       <arg direction="in" name="Position" type="x"/>
     </method>
+    <signal name="Seeked">
+      <arg name="Position" type="x"/>
+    </signal>
     <property name="PlaybackStatus" type="s" access="read"/>
     <property name="Rate" type="d" access="read"/>
     <property name="Metadata" type="a{sv}" access="read"/>
@@ -175,6 +178,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
         .register_object(OBJECT_PATH, &player_info)
         .method_call({
             let commands = commands.clone();
+            let state = state.clone();
             move |_conn, sender, _path, _iface, method, params, invocation| {
                 // One chokepoint for every inbound Player-interface call (the desktop shell's
                 // media widget, media keys — including the spurious headset-button press a TRRS
@@ -183,7 +187,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
                 // sender is the caller's unique bus name; `busctl --user status <name>` maps it
                 // to a process.
                 tracing::info!(%method, sender = sender.unwrap_or("?"), "MPRIS command received");
-                match dispatch_player_method(method, &params, commands.as_ref()) {
+                match dispatch_player_method(method, &params, commands.as_ref(), &state.borrow()) {
                     Ok(reply) => invocation.return_value(reply.as_ref()),
                     Err(err) => invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", &err.to_string()),
                 }
@@ -199,7 +203,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
     // Owning the well-known name is best-effort: a failure here (e.g. the name is already taken
     // by another instance of this app) shouldn't tear down the object registrations above —
     // clients that already know the object path can still reach it directly.
-    let _owner_id = gio::bus_own_name_on_connection(
+    let owner_id = gio::bus_own_name_on_connection(
         &connection,
         &format!("org.mpris.MediaPlayer2.{app_name}"),
         gio::BusNameOwnerFlags::NONE,
@@ -207,14 +211,37 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
         |_conn, name| tracing::warn!(name, "couldn't own the MPRIS well-known bus name"),
     );
 
-    Ok(MprisHandle { connection, state, _media_player2_registration: media_player2_registration, _player_registration: player_registration })
+    Ok(MprisHandle {
+        connection,
+        state,
+        media_player2_registration: Some(media_player2_registration),
+        player_registration: Some(player_registration),
+        owner_id: Some(owner_id),
+    })
 }
 
+/// Dropping the handle takes the app off the bus again: both objects are unregistered and the
+/// well-known name released, so media keys and the lock-screen card stop reaching a player that
+/// has been replaced (an account switch builds a new one).
 pub struct MprisHandle {
     connection: gio::DBusConnection,
     state: Rc<RefCell<PlayerState>>,
-    _media_player2_registration: gio::RegistrationId,
-    _player_registration: gio::RegistrationId,
+    media_player2_registration: Option<gio::RegistrationId>,
+    player_registration: Option<gio::RegistrationId>,
+    owner_id: Option<gio::OwnerId>,
+}
+
+impl Drop for MprisHandle {
+    fn drop(&mut self) {
+        for registration in [self.media_player2_registration.take(), self.player_registration.take()].into_iter().flatten() {
+            if let Err(err) = self.connection.unregister_object(registration) {
+                tracing::warn!(%err, "couldn't unregister an MPRIS object");
+            }
+        }
+        if let Some(owner_id) = self.owner_id.take() {
+            gio::bus_unown_name(owner_id);
+        }
+    }
 }
 
 impl MprisHandle {
@@ -224,6 +251,15 @@ impl MprisHandle {
     pub fn update(&self, new_state: PlayerState) {
         let previous = self.state.borrow().clone();
         *self.state.borrow_mut() = new_state.clone();
+
+        // `Position` is never signalled by `PropertiesChanged` (below); clients learn of a jump
+        // — a seek, a chapter tap, a resume at the saved place — from `Seeked`. Playing moves it
+        // by well under `SEEKED_MIN_JUMP_MICROS` between updates, so a bigger step is a seek.
+        if position_jumped(&previous, &new_state) {
+            if let Err(err) = self.connection.emit_signal(None, OBJECT_PATH, PLAYER_IFACE, "Seeked", Some(&glib::Variant::tuple_from_iter([new_state.position_micros.to_variant()]))) {
+                tracing::warn!(%err, "couldn't emit MPRIS Seeked");
+            }
+        }
 
         if !player_state_changed(&previous, &new_state) {
             return;
@@ -246,6 +282,14 @@ impl MprisHandle {
             tracing::warn!(%err, "couldn't emit MPRIS PropertiesChanged");
         }
     }
+}
+
+/// Between two updates (one per 250 ms tick, at up to 3x) playback moves the position by at most
+/// about a second; a larger step is a seek.
+const SEEKED_MIN_JUMP_MICROS: i64 = 2_000_000;
+
+fn position_jumped(previous: &PlayerState, new: &PlayerState) -> bool {
+    (new.position_micros - previous.position_micros).abs() > SEEKED_MIN_JUMP_MICROS
 }
 
 /// Whether any MPRIS-relevant field changed. `position_micros` is deliberately excluded —
@@ -274,7 +318,9 @@ fn player_property(property: &str, state: &PlayerState) -> glib::Variant {
         "Position" => state.position_micros.to_variant(),
         "MinimumRate" => 0.8_f64.to_variant(),
         "MaximumRate" => 3.0_f64.to_variant(),
-        "CanGoNext" | "CanGoPrevious" | "CanPlay" | "CanPause" | "CanSeek" | "CanControl" => true.to_variant(),
+        // Nothing loaded: there is nothing to play, pause, skip or seek in.
+        "CanGoNext" | "CanGoPrevious" | "CanPlay" | "CanPause" | "CanSeek" => (state.status != PlaybackStatus::Stopped).to_variant(),
+        "CanControl" => true.to_variant(),
         _ => false.to_variant(),
     }
 }
@@ -297,7 +343,7 @@ fn metadata_variant(metadata: &TrackMetadata) -> glib::Variant {
 /// [`MprisCommands`] with no real D-Bus connection at all — the main fast-test surface for this
 /// module (a real bus round-trip can only be smoke-tested, gated on whatever D-Bus tooling exists
 /// in a given build/test environment).
-fn dispatch_player_method(method: &str, params: &glib::Variant, commands: &dyn MprisCommands) -> Result<Option<glib::Variant>, glib::Error> {
+fn dispatch_player_method(method: &str, params: &glib::Variant, commands: &dyn MprisCommands, state: &PlayerState) -> Result<Option<glib::Variant>, glib::Error> {
     match method {
         "PlayPause" => {
             commands.play_pause();
@@ -335,6 +381,15 @@ fn dispatch_player_method(method: &str, params: &glib::Variant, commands: &dyn M
                 .child_value(1)
                 .get()
                 .ok_or_else(|| glib::Error::new(gio::IOErrorEnum::InvalidArgument, "SetPosition expects an int64 position"))?;
+            // Per the MPRIS spec, a position outside the track — or for a track that isn't the
+            // current one, or with nothing loaded — is ignored rather than clamped: a client
+            // that computed it from stale metadata must not jump the book somewhere else.
+            let track_id = params.child_value(0).get::<glib::variant::ObjectPath>();
+            let is_current_track = track_id.is_some_and(|id| id.as_str() == TRACK_ID_PATH);
+            if state.status == PlaybackStatus::Stopped || !is_current_track || position < 0 || position > state.metadata.length_micros {
+                tracing::info!(position, length = state.metadata.length_micros, is_current_track, "ignored an MPRIS SetPosition outside the current track");
+                return Ok(None);
+            }
             commands.set_position(position);
             Ok(None)
         }
@@ -382,25 +437,35 @@ mod tests {
         }
     }
 
+    /// A loaded book 100 s long, paused.
+    fn loaded_state() -> PlayerState {
+        PlayerState {
+            status: PlaybackStatus::Paused,
+            metadata: TrackMetadata { title: "A Book".to_string(), artist: None, length_micros: 100_000_000, art_url: None },
+            position_micros: 0,
+            rate: 1.0,
+        }
+    }
+
     #[test]
     fn play_pause_calls_through() {
         let commands = FakeCommands::default();
-        dispatch_player_method("PlayPause", &().to_variant(), &commands).unwrap();
+        dispatch_player_method("PlayPause", &().to_variant(), &commands, &loaded_state()).unwrap();
         assert_eq!(commands.play_pause_calls.get(), 1);
     }
 
     #[test]
     fn stop_is_treated_as_pause() {
         let commands = FakeCommands::default();
-        dispatch_player_method("Stop", &().to_variant(), &commands).unwrap();
+        dispatch_player_method("Stop", &().to_variant(), &commands, &loaded_state()).unwrap();
         assert_eq!(commands.pause_calls.get(), 1);
     }
 
     #[test]
     fn next_and_previous_call_through_without_changing_tracks() {
         let commands = FakeCommands::default();
-        dispatch_player_method("Next", &().to_variant(), &commands).unwrap();
-        dispatch_player_method("Previous", &().to_variant(), &commands).unwrap();
+        dispatch_player_method("Next", &().to_variant(), &commands, &loaded_state()).unwrap();
+        dispatch_player_method("Previous", &().to_variant(), &commands, &loaded_state()).unwrap();
         assert_eq!(commands.next_calls.get(), 1);
         assert_eq!(commands.previous_calls.get(), 1);
     }
@@ -409,7 +474,7 @@ mod tests {
     fn seek_extracts_the_offset() {
         let commands = FakeCommands::default();
         let params = glib::Variant::tuple_from_iter([(-5_000_000_i64).to_variant()]);
-        dispatch_player_method("Seek", &params, &commands).unwrap();
+        dispatch_player_method("Seek", &params, &commands, &loaded_state()).unwrap();
         assert_eq!(commands.seek_offset.get(), Some(-5_000_000));
     }
 
@@ -420,14 +485,50 @@ mod tests {
             glib::variant::ObjectPath::try_from(TRACK_ID_PATH).unwrap().to_variant(),
             42_000_000_i64.to_variant(),
         ]);
-        dispatch_player_method("SetPosition", &params, &commands).unwrap();
+        dispatch_player_method("SetPosition", &params, &commands, &loaded_state()).unwrap();
         assert_eq!(commands.set_position.get(), Some(42_000_000));
+    }
+
+    #[test]
+    fn set_position_outside_the_track_or_for_another_track_is_ignored() {
+        let commands = FakeCommands::default();
+        let track = || glib::variant::ObjectPath::try_from(TRACK_ID_PATH).unwrap().to_variant();
+        for position in [-1_i64, 100_000_001, i64::MAX] {
+            let params = glib::Variant::tuple_from_iter([track(), position.to_variant()]);
+            dispatch_player_method("SetPosition", &params, &commands, &loaded_state()).unwrap();
+        }
+        let other_track = glib::variant::ObjectPath::try_from("/org/mpris/MediaPlayer2/Track/9").unwrap().to_variant();
+        dispatch_player_method("SetPosition", &glib::Variant::tuple_from_iter([other_track, 5_000_000_i64.to_variant()]), &commands, &loaded_state()).unwrap();
+        let params = glib::Variant::tuple_from_iter([track(), 5_000_000_i64.to_variant()]);
+        dispatch_player_method("SetPosition", &params, &commands, &PlayerState::default()).unwrap();
+        assert_eq!(commands.set_position.get(), None, "none of those may move the book");
+
+        dispatch_player_method("SetPosition", &glib::Variant::tuple_from_iter([track(), 100_000_000_i64.to_variant()]), &commands, &loaded_state()).unwrap();
+        assert_eq!(commands.set_position.get(), Some(100_000_000), "the very end is still inside the track");
+    }
+
+    #[test]
+    fn nothing_loaded_cannot_play_pause_or_seek() {
+        let idle = PlayerState::default();
+        for property in ["CanPlay", "CanPause", "CanSeek", "CanGoNext", "CanGoPrevious"] {
+            assert_eq!(player_property(property, &idle).get::<bool>(), Some(false), "{property} with nothing loaded");
+            assert_eq!(player_property(property, &loaded_state()).get::<bool>(), Some(true), "{property} with a book loaded");
+        }
+    }
+
+    #[test]
+    fn only_a_big_step_in_position_is_a_seek() {
+        let at = |micros: i64| PlayerState { position_micros: micros, ..loaded_state() };
+        assert!(!position_jumped(&at(10_000_000), &at(10_750_000)), "3x playback for a tick");
+        assert!(!position_jumped(&at(10_000_000), &at(10_000_000)));
+        assert!(position_jumped(&at(10_000_000), &at(40_000_000)), "a skip forward");
+        assert!(position_jumped(&at(40_000_000), &at(10_000_000)), "a rewind");
     }
 
     #[test]
     fn unknown_method_is_an_error_not_a_panic() {
         let commands = FakeCommands::default();
-        assert!(dispatch_player_method("SomethingUnsupported", &().to_variant(), &commands).is_err());
+        assert!(dispatch_player_method("SomethingUnsupported", &().to_variant(), &commands, &loaded_state()).is_err());
     }
 
     #[test]

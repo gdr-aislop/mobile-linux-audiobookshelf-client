@@ -1,17 +1,10 @@
-//! Shared, live-updating state behind the Home/Library "offline mode" toggle — per
-//! `docs/design/ui-spec.md`, "state shared with the equivalent toggle on Library browse, not a
-//! per-screen setting". Built once in `main_window.rs` and cloned into `screens::home::build`/
-//! `screens::library::build`, same shape as `crate::downloads::DownloadManager`/
-//! `crate::player::PlayerController`: an `Rc<RefCell<Inner>>` with a permanent
-//! `listeners: Vec<Box<dyn Fn(bool)>>`, notified synchronously on the GTK main loop whenever
-//! `set()` changes the value.
-//!
-//! Before this existed, each screen kept its own private `Rc<Cell<bool>>`, independently loaded
-//! once at build time and never told about the other screen's toggle — so both screens were built
-//! once, up front, and kept alive together for the app's whole run (see `main_window.rs`), and
-//! toggling one never reached the other until the next app launch. This type exists specifically
-//! to fix that: one value, one source of truth, every listener notified on every change regardless
-//! of which screen caused it.
+//! Shared, live-updating state behind Settings' "Low memory mode" switch — same shape as
+//! `crate::offline_mode::LowMemoryModeState`: one value, an `Rc<RefCell<Inner>>`, permanent
+//! listeners notified synchronously on the GTK main loop whenever `set()` changes it, persisted
+//! fire-and-forget. What reacts to it: the cover widgets (no covers, smaller texture cache — see
+//! `crate::widgets::cover_image::set_low_memory_mode`) and Home/Library (re-render so covers
+//! already shown go away). The database profile is chosen once at startup (`main.rs::setup`), so
+//! it follows a change on the next launch.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -40,12 +33,12 @@ impl Inner {
 }
 
 #[derive(Clone)]
-pub struct OfflineModeState {
+pub struct LowMemoryModeState {
     inner: Rc<RefCell<Inner>>,
 }
 
-impl OfflineModeState {
-    /// Starts at `false` and immediately kicks off one async `load_offline_mode` read, publishing
+impl LowMemoryModeState {
+    /// Starts at `false` and immediately kicks off one async `load_low_memory_mode` read, publishing
     /// the real persisted value once it lands. Callers must register their listeners
     /// synchronously, during their own `build()` (before yielding to the glib main loop) — this
     /// load is a local SQLite read with no `.await` point reached before the caller's own
@@ -55,7 +48,7 @@ impl OfflineModeState {
         let state = Self { inner: Rc::new(RefCell::new(Inner { pool: pool.clone(), value: false, listeners: Vec::new(), on_persist_error: None })) };
         let inner_rc = state.inner.clone();
         glib::spawn_future_local(async move {
-            if let Ok(value) = abs_core::settings::load_offline_mode(&pool).await {
+            if let Ok(value) = abs_core::settings::load_low_memory_mode(&pool).await {
                 inner_rc.borrow_mut().value = value;
                 // See `set()`'s comment: `publish()` must run with no active borrow.
                 inner_rc.borrow().publish();
@@ -83,17 +76,17 @@ impl OfflineModeState {
             inner.value = value;
             (inner.pool.clone(), inner.on_persist_error.clone())
         };
-        tracing::info!(offline_mode = value, "offline mode {}", if value { "turned on" } else { "turned off" });
+        tracing::info!(offline_mode = value, "low memory mode {}", if value { "turned on" } else { "turned off" });
         // `publish()` must run with no active borrow — listener callbacks call `.get()` (and
         // `apply()`/`render_from_current_data()` do too, transitively), which needs its own
         // immutable borrow, and a listener invoked while this method still held `borrow_mut()`
         // would panic with "already mutably borrowed".
         self.inner.borrow().publish();
         glib::spawn_future_local(async move {
-            if let Err(err) = abs_core::settings::save_offline_mode(&pool, value).await {
+            if let Err(err) = abs_core::settings::save_low_memory_mode(&pool, value).await {
                 match on_persist_error {
                     Some(on_persist_error) => on_persist_error(err),
-                    None => tracing::warn!(%err, "couldn't persist offline mode; it won't be remembered next launch"),
+                    None => tracing::warn!(%err, "couldn't persist low memory mode; it won't be remembered next launch"),
                 }
             }
         });
@@ -121,26 +114,29 @@ pub(crate) mod tests {
 
     use crate::test_support::pump_until;
 
-    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A toggle whose write fails still
-    /// takes effect in memory, and the failure reaches the persist-error hook instead of only
-    /// the log. Closing the pool makes the write fail for real.
-    pub(crate) fn run_failed_persist_is_reported(runtime: &tokio::runtime::Runtime) {
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Setting the mode notifies listeners
+    /// once per change, persists it, and a repeat is a no-op; a fresh state reads it back.
+    pub(crate) fn run_low_memory_mode_state_notifies_and_persists(runtime: &tokio::runtime::Runtime) {
         let pool = runtime.block_on(crate::test_support::pool());
-        let state = super::OfflineModeState::new(pool.clone());
-        // Let the initial load land first, so it can't race the closed pool below.
-        pump_until(|| false, Duration::from_millis(300));
-
-        let reported: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        state.set_on_persist_error({
-            let reported = reported.clone();
-            move |err| reported.borrow_mut().push(err.to_string())
+        let state = super::LowMemoryModeState::new(pool.clone());
+        pump_until(|| false, Duration::from_millis(200));
+        let seen: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        state.add_listener({
+            let seen = seen.clone();
+            move |on| seen.borrow_mut().push(on)
         });
+        assert!(!state.get());
 
-        runtime.block_on(pool.close());
         state.set(true);
-        assert!(state.get(), "the toggle takes effect in memory even though the write fails");
+        state.set(true);
+        assert!(state.get());
+        assert_eq!(*seen.borrow(), vec![true], "one notification per change");
+        let saved = || runtime.block_on(abs_core::settings::load_low_memory_mode(&pool)).unwrap();
+        pump_until(saved, Duration::from_secs(5));
+        assert!(saved(), "persisted");
 
-        pump_until(|| !reported.borrow().is_empty(), Duration::from_secs(5));
-        assert_eq!(reported.borrow().len(), 1, "exactly one failed write, reported once");
+        let reread = super::LowMemoryModeState::new(pool.clone());
+        pump_until(|| reread.get(), Duration::from_secs(5));
+        assert!(reread.get(), "a fresh state reads the stored value");
     }
 }

@@ -68,6 +68,9 @@ struct SessionInner {
     /// The last `abs_api::Client` minted for this session, plus the exact `(ConnectionTarget,
     /// access token)` it was minted for — see [`Session::api_client`].
     client_cache: tokio::sync::Mutex<Option<CachedClient>>,
+    /// The app's offline mode (see [`Session::set_offline`]): while set, nothing minted through
+    /// this session reaches the server.
+    offline: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,7 @@ impl Session {
                 }),
                 probe_cache: tokio::sync::Mutex::new(None),
                 client_cache: tokio::sync::Mutex::new(None),
+                offline: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -122,6 +126,26 @@ impl Session {
         &self.inner.server_id
     }
 
+    /// Turns the app's offline mode on or off for everything using this session (all clones share
+    /// it). While on, [`Session::connection_target`] refuses with [`CoreError::Offline`] — every
+    /// server call in the app resolves its connection there, so this is the one gate — and
+    /// [`Session::access_token`] doesn't refresh.
+    pub fn set_offline(&self, offline: bool) {
+        self.inner.offline.store(offline, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.inner.offline.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The connection settings as stored, resolved without any network (no local-address probe):
+    /// for building stream URLs and transport properties that won't be used to reach the server
+    /// while offline. Never refused by offline mode.
+    pub async fn local_connection_target(&self) -> crate::error::Result<crate::connection::ConnectionTarget> {
+        let server = abs_storage::repo::servers::get(&self.inner.pool, &self.inner.server_id).await?;
+        Ok(crate::connection::ConnectionTarget::resolve(&server, None))
+    }
+
     /// The connection every server-facing call for this session's server should go through.
     /// Fetched fresh from the database, so a settings change made on the Connection page is
     /// picked up by the next sync, download or playback without any rebuild — the same
@@ -129,6 +153,9 @@ impl Session {
     /// probe (when a local address is configured) runs through a short-lived per-session cache:
     /// concurrent callers share one probe, the way they share one token refresh.
     pub async fn connection_target(&self) -> crate::error::Result<crate::connection::ConnectionTarget> {
+        if self.is_offline() {
+            return Err(crate::error::CoreError::Offline);
+        }
         let server = abs_storage::repo::servers::get(&self.inner.pool, &self.inner.server_id).await?;
 
         let Some(local_address) = server
@@ -170,7 +197,8 @@ impl Session {
             None => true,
             Some(exp) => exp > chrono::Utc::now().timestamp() + FRESH_MARGIN_SECONDS,
         };
-        if fresh {
+        // Offline: the stored token is all there is; a refresh would be a server call.
+        if fresh || self.is_offline() {
             return tokens.access_token.clone();
         }
 
@@ -316,6 +344,25 @@ mod tests {
         assert_eq!(jwt_exp_seconds("plain-legacy-token"), None);
         assert_eq!(jwt_exp_seconds("a.b"), None, "payload that isn't JSON");
         assert_eq!(jwt_exp_seconds(""), None);
+    }
+
+    #[tokio::test]
+    async fn offline_mode_refuses_the_connection_and_never_refreshes() {
+        let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("refresh")).await;
+        let session = session_for(&pool, &account).await;
+
+        session.set_offline(true);
+        assert!(matches!(session.connection_target().await, Err(crate::error::CoreError::Offline)));
+        assert!(matches!(session.api_client().await, Err(crate::error::CoreError::Offline)));
+        assert_eq!(session.access_token().await, account.token, "the stored token, unrefreshed");
+        assert!(session.local_connection_target().await.is_ok(), "the stored settings are still readable");
+        assert!(session.clone().is_offline(), "clones share the switch");
+        assert!(mock_server.received_requests().await.unwrap().is_empty(), "nothing reached the server");
+
+        session.set_offline(false);
+        assert!(session.connection_target().await.is_ok());
     }
 
     #[tokio::test]

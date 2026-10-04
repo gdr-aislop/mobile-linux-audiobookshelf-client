@@ -115,6 +115,12 @@ impl AppPaths {
             .join(format!("{item_id}.{extension}"))
     }
 
+    /// Where the covers cache remembers that the server had no cover for an item (an empty file
+    /// whose modification time says when it last answered 404) — see `abs_core::covers`.
+    pub fn missing_cover_marker_path(&self, server_id: &str, item_id: &str) -> PathBuf {
+        self.covers_dir().join(server_id).join(format!("{item_id}.no-cover"))
+    }
+
     /// Every directory this `AppPaths` might write into — the single list `ensure_dirs` (async,
     /// called once `setup()` has a Tokio runtime) and `main.rs`'s early synchronous creation of
     /// just the logging/crash-dump dirs (needed before a runtime exists) both draw from, so the

@@ -88,9 +88,28 @@ pub fn build_application(state: AppState) -> adw::Application {
 
     app.connect_activate(move |app| {
         build_window(app, &state);
+        crate::perf::start_main_loop_watchdog();
     });
 
+    quit_cleanly_on_termination_signals(&app);
+
     app
+}
+
+/// SIGTERM (a service manager or `kill`) and SIGINT (Ctrl+C in a terminal) quit the way Ctrl+Q
+/// does, so the player's shutdown flush saves the listening position — they used to kill the
+/// process outright, losing up to the last few seconds of it.
+fn quit_cleanly_on_termination_signals(app: &adw::Application) {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    for signal in [SIGINT, SIGTERM] {
+        let app = app.clone();
+        glib::unix_signal_add_local(signal, move || {
+            tracing::info!(signal, "asked to terminate; quitting");
+            app.quit();
+            glib::ControlFlow::Break
+        });
+    }
 }
 
 fn build_window(app: &adw::Application, state: &AppState) {
@@ -278,6 +297,11 @@ async fn build_main_window(
         .expect("an active account's server must exist");
     let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
     let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+    // Before any screen is built: the first sync, cover fetch or progress push must already see
+    // offline mode if it is on (the shell's `OfflineModeState` only loads it asynchronously).
+    let offline_mode = abs_core::settings::load_offline_mode(&pool).await.unwrap_or(false);
+    session.set_offline(offline_mode);
+    tracing::info!(offline_mode, "loaded the offline mode setting");
     let servers_with_accounts = fetch_servers_with_accounts(&pool).await;
     screens::main_window::build(
         pool,

@@ -41,6 +41,9 @@ use crate::screens;
 /// call, and never a valid cookie itself) — reused here as the initial/cleared state rather than
 /// wrapping it in an `Option`, so a session manager that's unreachable at inhibit time is
 /// silently treated the same as "not currently playing" instead of a special case.
+/// A suspend inhibit that takes longer than this to be answered gets a warning in the log.
+const SLOW_SESSION_MANAGER_CALL: std::time::Duration = std::time::Duration::from_millis(100);
+
 struct SuspendInhibitGuard {
     app: Option<gtk4::Application>,
     window: adw::ApplicationWindow,
@@ -53,6 +56,9 @@ impl SuspendInhibitGuard {
     /// never on every unchanged snapshot in between.
     fn update(&self, is_playing: bool) {
         let Some(app) = &self.app else { return };
+        // Both calls are synchronous D-Bus round trips to the session manager, made on the main
+        // loop: a slow one is a frozen UI (and a late pause/play response), so say so.
+        let started = std::time::Instant::now();
         match (is_playing, self.cookie.get()) {
             (true, 0) => {
                 let cookie = app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::SUSPEND, Some("Playing an audiobook"));
@@ -62,7 +68,10 @@ impl SuspendInhibitGuard {
                 app.uninhibit(cookie);
                 self.cookie.set(0);
             }
-            _ => {}
+            _ => return,
+        }
+        if started.elapsed() > SLOW_SESSION_MANAGER_CALL {
+            tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64, is_playing, "the session manager was slow to answer the suspend inhibit; the UI waited for it");
         }
     }
 }
@@ -97,7 +106,15 @@ fn push_unconfirmed_progress(pool: sqlx::SqlitePool, session: abs_core::auth::Se
         };
         let access_token = session.access_token().await;
         if let Err(err) =
-            abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, session.account_id(), session.server_id()).await
+            abs_core::progress_sync::reconcile_all_progress(
+                &pool,
+                &connection,
+                &access_token,
+                session.account_id(),
+                session.server_id(),
+                crate::sync_coordinator::loaded_item(session.server_id(), session.account_id()).as_deref(),
+            )
+            .await
         {
             tracing::info!(%err, "couldn't push unconfirmed progress on reconnect; will retry on the next one");
         }
@@ -130,8 +147,18 @@ pub struct MainWindow {
     /// field itself is never read back (hence the allow), only retained.
     #[allow(dead_code)]
     pub download_manager: crate::downloads::DownloadManager,
+    /// Retired when this shell is dropped (replaced by the next account's, or by the login
+    /// screen) — see `PlayerController::retire`. Without it the old player kept playing, and kept
+    /// answering the media keys, behind the new shell.
+    controller: player::PlayerController,
     #[cfg(test)]
     hooks: TestHooks,
+}
+
+impl Drop for MainWindow {
+    fn drop(&mut self) {
+        self.controller.retire();
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +234,7 @@ pub fn build(
     servers_with_accounts: Vec<(Server, Vec<Account>)>,
     window: adw::ApplicationWindow,
 ) -> MainWindow {
+    let _slow = crate::perf::SlowJob::new("main window build");
     let mini_bar = player::build_mini_bar(pool.clone(), paths.clone(), player::real_backend());
 
     // MPRIS registration is best-effort — no session bus (a bare console, a locked-down sandbox)
@@ -304,6 +332,10 @@ pub fn build(
             let pool = pool.clone();
             let session = session.clone();
             watcher.start(Box::new(move || {
+                // Offline mode ignores the network coming back; switching it off catches up.
+                if session.is_offline() {
+                    return;
+                }
                 controller.sync_pending_progress();
                 push_unconfirmed_progress(pool.clone(), session.clone());
             }));
@@ -331,6 +363,31 @@ pub fn build(
     // setting") — see `crate::offline_mode::OfflineModeState`'s doc for why this must be a single
     // shared instance rather than each screen loading its own copy.
     let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+    // "Low memory mode": the covers follow it (no decoding, a small texture cache) and so do the
+    // lists that show them (Home, Library — hooked up where they are built, below).
+    let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+    low_memory_mode.add_listener(crate::widgets::cover_image::set_low_memory_mode);
+    // Offline mode cuts every server call made through the session (see
+    // `abs_core::auth::Session::set_offline`); switching it off catches up on what was kept
+    // locally meanwhile — this book's progress and any other book's unpushed progress.
+    offline_mode.add_listener({
+        let controller = mini_bar.controller.clone();
+        let session = session.clone();
+        let pool = pool.clone();
+        move |on| {
+            if session.is_offline() == on {
+                return;
+            }
+            session.set_offline(on);
+            if on {
+                tracing::info!("offline mode on: network disabled");
+            } else {
+                tracing::info!("offline mode off: catching up with the server");
+                controller.sync_pending_progress();
+                push_unconfirmed_progress(pool.clone(), session.clone());
+            }
+        }
+    });
 
     let stack = adw::ViewStack::new();
 
@@ -348,6 +405,10 @@ pub fn build(
     offline_mode.set_on_persist_error({
         let root = root.clone();
         move |err| crate::error_reporting::report_background_error(&root, "Saving offline mode", err)
+    });
+    low_memory_mode.set_on_persist_error({
+        let root = root.clone();
+        move |err| crate::error_reporting::report_background_error(&root, "Saving low memory mode", err)
     });
 
     // Opens the full player by swapping the window's content — there's no
@@ -400,35 +461,16 @@ pub fn build(
             crate::widgets::swap_content(&window, &player_screen.root);
         }
     });
-    // Opens the player now if a book is loaded, else once the one starting has loaded (or
-    // failed — a failed start is loaded too, with its error). Bounded to 16s: `start()`'s
-    // network resolve alone has a 15s timeout (`abs_api::Client::with_bearer_token`'s default).
-    // A second request while one is waiting doesn't open the screen twice.
+    // Opens the player for the book that is loaded or starting — the Player is built while a
+    // start is still resolving (it shows the loading state and picks the book up as it loads),
+    // rather than waiting for the load (a start over a slow connection used to never open it).
+    // Nothing loaded and nothing starting: there is nothing to show.
     let open_player: Rc<dyn Fn()> = Rc::new({
         let controller = mini_bar.controller.clone();
-        let waiting = Rc::new(std::cell::Cell::new(false));
         move || {
             if controller.current_download_context().is_some() {
                 open_player_now();
-                return;
             }
-            if waiting.replace(true) {
-                return;
-            }
-            let controller = controller.clone();
-            let open_player_now = open_player_now.clone();
-            let waiting = waiting.clone();
-            glib::spawn_future_local(async move {
-                for _ in 0..160 {
-                    if controller.current_download_context().is_some() {
-                        waiting.set(false);
-                        open_player_now();
-                        return;
-                    }
-                    glib::timeout_future(std::time::Duration::from_millis(100)).await;
-                }
-                waiting.set(false);
-            });
         }
     });
 
@@ -687,23 +729,23 @@ pub fn build(
         }
     };
 
-    stack.add_titled_with_icon(
-        &screens::home::build(
-            pool.clone(),
-            paths.clone(),
-            server.clone(),
-            account.clone(),
-            session.clone(),
-            offline_mode.clone(),
-            on_open.clone(),
-            on_relogin,
-            on_open_shelf,
-        )
-        .root,
-        Some("home"),
-        "Home",
-        "go-home-symbolic",
+    let home_screen = screens::home::build(
+        pool.clone(),
+        paths.clone(),
+        server.clone(),
+        account.clone(),
+        session.clone(),
+        offline_mode.clone(),
+        on_open.clone(),
+        on_relogin,
+        on_open_shelf,
     );
+    // Both shelves' badges follow downloads finishing or being cleared in this session.
+    home_screen.follow_downloads(&download_manager);
+    library_screen.follow_downloads(&download_manager);
+    home_screen.follow_low_memory_mode(&low_memory_mode);
+    library_screen.follow_low_memory_mode(&low_memory_mode);
+    stack.add_titled_with_icon(&home_screen.root, Some("home"), "Home", "go-home-symbolic");
     stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
@@ -744,6 +786,7 @@ pub fn build(
         mini_bar.controller.clone(),
         download_manager.clone(),
         playback_settings,
+        low_memory_mode.clone(),
         theme,
         paths,
         servers_with_accounts,
@@ -847,6 +890,7 @@ pub fn build(
         _route_watcher: route_watcher,
         _connectivity_watcher: connectivity_watcher,
         download_manager,
+        controller: mini_bar.controller.clone(),
         #[cfg(test)]
         hooks: TestHooks {
             stack,

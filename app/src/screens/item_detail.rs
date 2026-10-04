@@ -105,6 +105,7 @@ pub fn build(
     on_open_series: impl Fn(String) + 'static,
     on_open_downloads: impl Fn() + 'static,
 ) -> ItemDetailScreen {
+    let _slow = crate::perf::SlowJob::new("item detail build");
     let on_play: Rc<dyn Fn(String, Option<usize>)> = Rc::new(on_play);
     let on_open_series = Rc::new(on_open_series);
     let on_back = Rc::new(on_back);
@@ -313,7 +314,7 @@ pub fn build(
     // the glyphs stayed exactly as Pass 2 first found them until the screen was reopened. Refetch
     // is cheap (one indexed query over this item's chapter ranges), so this re-derives markers on
     // every event rather than trying to track "did a track just finish" precisely.
-    download_manager.add_listener({
+    download_manager.add_scoped_listener({
         let pool = pool.clone();
         let server_id = server.id.clone();
         let item_id = item_id.clone();
@@ -323,19 +324,24 @@ pub fn build(
         let progress_seconds_cell = progress_seconds_cell.clone();
         let on_play = on_play.clone();
         move |event| {
+            // This screen is built afresh per visit; once it is gone its list has no parent any
+            // more, and the listener goes with it.
+            if chapters_list.parent().is_none() {
+                return false;
+            }
             let event_item_id = match event {
                 crate::downloads::DownloadEvent::ItemStateChanged { item_id, .. } => item_id,
                 crate::downloads::DownloadEvent::TrackProgress { item_id, .. } => item_id,
             };
             if *event_item_id != item_id {
-                return;
+                return true;
             }
             let chapters = chapters_cell.clone();
             let chapter_ranges = chapter_ranges_cell.borrow().clone();
             if chapter_ranges.is_empty() {
                 // Pass 2 hasn't landed yet (or this item has no chapters at all) — nothing to
                 // refresh against.
-                return;
+                return true;
             }
             let pool = pool.clone();
             let server_id = server_id.clone();
@@ -347,6 +353,7 @@ pub fn build(
                 let markers = abs_core::download_tracks::chapter_offline_markers_for_item(&pool, &server_id, &item_id, &chapter_ranges).await.unwrap_or_default();
                 refresh_chapter_rows(&chapters_list, &chapters.borrow(), progress_seconds_cell.get(), &markers, &on_play, &item_id);
             });
+            true
         }
     });
 
@@ -741,6 +748,22 @@ impl ProgressAction {
         let (position, is_finished) = target(self.duration_seconds.get());
         self.show(position, is_finished);
         if self.is_loaded_in_player() {
+            // Still starting: the player's own position is 0 and the controller applies the
+            // action once the book is loaded, so the Undo is built from what was saved.
+            if self.controller.snapshot().is_some_and(|s| s.is_loading) {
+                let action = self.clone();
+                glib::spawn_future_local(async move {
+                    let before = abs_storage::repo::progress::get(&action.pool, &action.account_id, &action.server_id, &action.item_id).await.ok().flatten();
+                    let (before_position, before_finished) = before.map(|p| (p.current_time_seconds, p.is_finished)).unwrap_or((0.0, false));
+                    if is_finished {
+                        action.controller.mark_as_finished();
+                    } else {
+                        action.controller.reset_progress();
+                    }
+                    action.toast_overlay.add_toast(action.undo_toast(done_title, before_position, before_finished));
+                });
+                return;
+            }
             let before = self.controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
             // Synchronous from the caller's point of view (the controller's own write runs on
             // its queue, same posture as its periodic progress tick) — safe to toast right away.

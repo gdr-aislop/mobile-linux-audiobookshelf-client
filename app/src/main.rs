@@ -2,7 +2,9 @@ mod application;
 mod crash_reporting;
 mod downloads;
 mod error_reporting;
+mod low_memory_mode;
 mod offline_mode;
+mod perf;
 mod player;
 mod rich_text;
 mod screens;
@@ -93,6 +95,22 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
     let pool = abs_storage::connect_and_migrate(&paths.db_path())
         .await
         .expect("open and migrate the local database");
+
+    // Low memory mode decides how the database itself is opened (fewer connections, a small page
+    // cache), so it is read first, with the default pool, and the pool reopened if it is on. The
+    // cover widgets get the flag before any window exists.
+    let low_memory_mode = abs_core::settings::load_low_memory_mode(&pool).await.unwrap_or(false);
+    tracing::info!(low_memory_mode, "loaded the low memory mode setting");
+    let pool = if low_memory_mode {
+        pool.close().await;
+        tracing::info!("low memory mode: opening the database with fewer connections and a small page cache");
+        abs_storage::connect_and_migrate_with(&paths.db_path(), abs_storage::DbProfile::LowMemory)
+            .await
+            .expect("open the local database in low memory mode")
+    } else {
+        pool
+    };
+    widgets::cover_image::set_low_memory_mode(low_memory_mode);
 
     let playback_settings = abs_core::settings::load_playback_settings(&pool)
         .await
@@ -203,6 +221,16 @@ mod tests {
         (library_tapping_a_list_row_invokes_on_open, crate::screens::library::tests::run_tapping_a_list_row_invokes_on_open),
         (library_search_and_sort_apply_in_list_mode_too, crate::screens::library::tests::run_search_and_sort_apply_in_list_mode_too),
         (library_view_mode_is_remembered_across_screen_rebuilds, crate::screens::library::tests::run_view_mode_is_remembered_across_screen_rebuilds),
+        (library_a_big_library_renders_in_slices_and_skips_identical_renders, crate::screens::library::tests::run_a_big_library_renders_in_slices_and_skips_identical_renders),
+        (library_low_memory_mode_and_view_switches_release_what_is_not_shown, crate::screens::library::tests::run_low_memory_mode_and_view_switches_release_what_is_not_shown),
+        (library_downloaded_badges_follow_downloads_in_this_session, crate::screens::library::tests::run_downloaded_badges_follow_downloads_in_this_session),
+        (home_downloaded_badges_follow_downloads_in_this_session, crate::screens::home::tests::run_downloaded_badges_follow_downloads_in_this_session),
+        (home_offline_mode_makes_no_requests, crate::screens::home::tests::run_offline_mode_makes_no_requests),
+        (home_low_memory_mode_hides_the_covers_on_the_shelves, crate::screens::home::tests::run_low_memory_mode_hides_the_covers_on_the_shelves),
+        (home_missing_covers_are_asked_again_only_by_a_manual_sync, crate::screens::home::tests::run_missing_covers_are_asked_again_only_by_a_manual_sync),
+        (playback_offline_mode_plays_and_saves_locally_then_catches_up, crate::player::tests::run_offline_mode_plays_and_saves_locally_then_catches_up),
+        (playback_offline_mode_does_not_stream, crate::player::tests::run_offline_mode_does_not_stream),
+        (downloads_engine_offline_mode_starts_no_download, crate::downloads::tests::run_offline_mode_starts_no_download),
         (library_search_is_debounced, crate::screens::library::tests::run_search_is_debounced),
         (library_deferred_decode_only_covers_items_near_the_viewport, crate::screens::library::tests::run_deferred_decode_only_covers_items_near_the_viewport),
         (library_hide_finished_switch_filters_finished_items, crate::screens::library::tests::run_hide_finished_switch_filters_finished_items),
@@ -253,6 +281,7 @@ mod tests {
         (main_window_mini_bar_open_player_swaps_to_the_full_player_screen, crate::screens::main_window::tests::run_mini_bar_open_player_swaps_to_the_full_player_screen),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
+        (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
         (settings_servers_menu_actions_rebuild_the_shell, crate::screens::settings::tests::run_servers_menu_actions_rebuild_the_shell),
         (settings_add_server_row_opens_welcome_and_cancels_back, crate::screens::settings::tests::run_add_server_row_opens_welcome_and_cancels_back),
@@ -269,7 +298,8 @@ mod tests {
         (playback_untrustworthy_complete_row_falls_back_to_streaming, crate::player::tests::run_untrustworthy_complete_row_falls_back_to_streaming),
         (playback_multi_track_mixed_downloaded_and_streamed, crate::player::tests::run_multi_track_mixed_downloaded_and_streamed),
         (playback_start_resumes_from_existing_progress, crate::player::tests::run_start_resumes_from_existing_progress),
-        (playback_track_duration_correction_updates_the_book_total, crate::player::tests::run_track_duration_correction_updates_the_book_total),
+        (playback_track_duration_mismatch_leaves_the_server_timeline_alone, crate::player::tests::run_track_duration_mismatch_leaves_the_server_timeline_alone),
+        (playback_the_position_never_runs_past_its_file_in_the_server_timeline, crate::player::tests::run_the_position_never_runs_past_its_file_in_the_server_timeline),
         (playback_multi_track_advances_to_the_next_track, crate::player::tests::run_multi_track_advances_to_the_next_track),
         (playback_multi_track_final_track_marks_finished, crate::player::tests::run_multi_track_final_track_marks_finished),
         (playback_fully_downloaded_item_plays_offline, crate::player::tests::run_fully_downloaded_item_plays_offline),
@@ -307,6 +337,25 @@ mod tests {
         (playback_a_load_after_a_pause_is_not_a_stuck_pause, crate::player::tests::run_a_load_after_a_pause_is_not_a_stuck_pause),
         (playback_resuming_adopts_newer_progress_already_pulled_locally, crate::player::tests::run_resuming_adopts_newer_progress_already_pulled_locally),
         (playback_starting_at_a_chapter, crate::player::tests::run_starting_at_a_chapter),
+        (playback_a_seek_right_after_a_pause_is_not_a_stuck_pause, crate::player::tests::run_a_seek_right_after_a_pause_is_not_a_stuck_pause),
+        (playback_a_scrubber_drag_seeks_once, crate::player::tests::run_a_scrubber_drag_seeks_once),
+        (playback_starting_the_loaded_book_does_not_reload_it, crate::player::tests::run_starting_the_loaded_book_does_not_reload_it),
+        (playback_a_finished_book_stays_finished, crate::player::tests::run_a_finished_book_stays_finished),
+        (playback_a_stream_error_reloads_once_by_itself, crate::player::tests::run_a_stream_error_reloads_once_by_itself),
+        (playback_resuming_a_stream_reloads_when_its_connection_is_gone, crate::player::tests::run_resuming_a_stream_reloads_when_its_connection_is_gone),
+        (playback_a_seek_that_never_lands_reloads_once_then_stops, crate::player::tests::run_a_seek_that_never_lands_reloads_once_then_stops),
+        (playback_an_early_end_of_the_last_file_does_not_finish_the_book, crate::player::tests::run_an_early_end_of_the_last_file_does_not_finish_the_book),
+        (playback_an_end_of_stream_from_before_a_seek_is_dropped, crate::player::tests::run_an_end_of_stream_from_before_a_seek_is_dropped),
+        (playback_switching_books_during_a_resume_check_still_saves_the_outgoing_position, crate::player::tests::run_switching_books_during_a_resume_check_still_saves_the_outgoing_position),
+        (playback_a_hanging_push_does_not_delay_local_writes, crate::player::tests::run_a_hanging_push_does_not_delay_local_writes),
+        (playback_a_speed_picked_while_paused_on_a_stream_is_applied_at_play, crate::player::tests::run_a_speed_picked_while_paused_on_a_stream_is_applied_at_play),
+        (playback_a_retired_player_goes_silent_and_stays_that_way, crate::player::tests::run_a_retired_player_goes_silent_and_stays_that_way),
+        (playback_progress_actions_during_a_start_apply_once_loaded, crate::player::tests::run_progress_actions_during_a_start_apply_once_loaded),
+        (playback_listeners_of_discarded_screens_are_dropped, crate::player::tests::run_listeners_of_discarded_screens_are_dropped),
+        (playback_a_bouncing_headphone_jack_does_not_resume, crate::player::tests::run_a_bouncing_headphone_jack_does_not_resume),
+        (playback_a_downloaded_book_starts_without_waiting_for_a_dead_server, crate::player::tests::run_a_downloaded_book_starts_without_waiting_for_a_dead_server),
+        (playback_offline_mode_starts_a_downloaded_book_without_contacting_the_server, crate::player::tests::run_offline_mode_starts_a_downloaded_book_without_contacting_the_server),
+        (playback_a_book_whose_start_track_is_not_downloaded_still_waits_for_the_server, crate::player::tests::run_a_book_whose_start_track_is_not_downloaded_still_waits_for_the_server),
         (player_screen_renders, crate::screens::player::tests::run),
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),
@@ -334,6 +383,8 @@ mod tests {
         (cover_image_rendering, crate::widgets::cover_image::tests::run),
         (cover_image_decodes_at_the_requested_size_not_the_source_size, crate::widgets::cover_image::tests::run_decodes_at_the_requested_size_not_the_source_size),
         (cover_image_cache_hit_avoids_re_reading_disk, crate::widgets::cover_image::tests::run_cache_hit_avoids_re_reading_disk),
+        (cover_image_low_memory_mode_turns_covers_off_and_back_on, crate::widgets::cover_image::tests::run_low_memory_mode_turns_covers_off_and_back_on),
+        (low_memory_mode_state_notifies_and_persists, crate::low_memory_mode::tests::run_low_memory_mode_state_notifies_and_persists),
         (cover_image_a_stale_decode_does_not_clobber_a_newer_path, crate::widgets::cover_image::tests::run_a_stale_decode_does_not_clobber_a_newer_path),
         (cover_image_lru_eviction_keeps_recently_accessed_entries, crate::widgets::cover_image::tests::run_lru_eviction_keeps_recently_accessed_entries),
         (debouncer_fires_again_after_a_previous_debounce_already_fired, crate::widgets::tests::run_fires_again_after_a_previous_debounce_already_fired),

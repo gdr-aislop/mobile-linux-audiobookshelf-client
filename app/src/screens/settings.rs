@@ -45,6 +45,8 @@ pub struct SettingsHooks {
     pub wifi_only_switch: gtk4::Switch,
     pub wifi_only_row: adw::ActionRow,
     pub burst_buffering_switch: gtk4::Switch,
+    pub burst_buffering_row: adw::ActionRow,
+    pub low_memory_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
     pub account_row: adw::ActionRow,
@@ -68,6 +70,7 @@ pub fn build(
     controller: PlayerController,
     download_manager: DownloadManager,
     playback_settings: PlaybackSettings,
+    low_memory_mode: crate::low_memory_mode::LowMemoryModeState,
     theme: Theme,
     paths: AppPaths,
     servers_with_accounts: Vec<(Server, Vec<Account>)>,
@@ -446,13 +449,29 @@ pub fn build(
     burst_buffering_switch.set_valign(gtk4::Align::Center);
     burst_buffering_switch.set_state(playback_settings.burst_buffering);
     burst_buffering_switch.set_active(playback_settings.burst_buffering);
-    let burst_buffering_row = adw::ActionRow::builder()
-        .title("Buffer streams in bursts")
-        .subtitle("Downloads ahead at full speed so the radio can idle. Turn off on a slow or capped connection.")
-        .build();
+    let burst_buffering_row = adw::ActionRow::builder().title("Buffer streams in bursts").subtitle(BURST_BUFFERING_SUBTITLE).build();
     burst_buffering_row.add_suffix(&burst_buffering_switch);
     burst_buffering_row.set_activatable_widget(Some(&burst_buffering_switch));
     playback_group.add(&burst_buffering_row);
+
+    // "Low memory mode" lives next to it: the two interact (burst buffering buffers up to 64 MB),
+    // and the burst row says so while both are on. Burst buffering stays the user's own choice.
+    let low_memory_switch = gtk4::Switch::new();
+    low_memory_switch.set_valign(gtk4::Align::Center);
+    low_memory_switch.set_state(low_memory_mode.get());
+    low_memory_switch.set_active(low_memory_mode.get());
+    let low_memory_row = adw::ActionRow::builder()
+        .title("Low memory mode")
+        .subtitle("Hides covers and keeps less in memory. The database part applies on the next launch.")
+        .build();
+    low_memory_row.add_suffix(&low_memory_switch);
+    low_memory_row.set_activatable_widget(Some(&low_memory_switch));
+    playback_group.add(&low_memory_row);
+    let refresh_burst_hint = {
+        let burst_buffering_row = burst_buffering_row.clone();
+        move |burst_buffering: bool, low_memory: bool| burst_buffering_row.set_subtitle(&burst_buffering_subtitle(burst_buffering, low_memory))
+    };
+    refresh_burst_hint(burst_buffering_switch.is_active(), low_memory_switch.is_active());
 
     default_speed_row.connect_selected_notify({
         let settings = settings.clone();
@@ -515,10 +534,39 @@ pub fn build(
         let pool = pool.clone();
         let download_manager = download_manager.clone();
         let toast_overlay = toast_overlay.clone();
+        let low_memory_switch = low_memory_switch.clone();
+        let refresh_burst_hint = refresh_burst_hint.clone();
         move |_, state| {
+            refresh_burst_hint(state, low_memory_switch.is_active());
             settings.borrow_mut().burst_buffering = state;
             persist(&pool, &pending_save, &writer_running, &settings, &controller, &download_manager, &toast_overlay);
             glib::signal::Propagation::Proceed
+        }
+    });
+
+    let low_memory_handler = low_memory_switch.connect_state_set({
+        let low_memory_mode = low_memory_mode.clone();
+        let burst_buffering_switch = burst_buffering_switch.clone();
+        let refresh_burst_hint = refresh_burst_hint.clone();
+        move |_, state| {
+            refresh_burst_hint(burst_buffering_switch.is_active(), state);
+            low_memory_mode.set(state);
+            glib::signal::Propagation::Proceed
+        }
+    });
+    // The stored value lands a moment after the screen is built (and could change from
+    // elsewhere): the switch follows it without re-triggering its own handler.
+    low_memory_mode.add_listener({
+        let low_memory_switch = low_memory_switch.clone();
+        let burst_buffering_switch = burst_buffering_switch.clone();
+        move |on| {
+            if low_memory_switch.is_active() != on {
+                low_memory_switch.block_signal(&low_memory_handler);
+                low_memory_switch.set_active(on);
+                low_memory_switch.set_state(on);
+                low_memory_switch.unblock_signal(&low_memory_handler);
+            }
+            refresh_burst_hint(burst_buffering_switch.is_active(), on);
         }
     });
 
@@ -578,6 +626,8 @@ pub fn build(
             wifi_only_switch,
             wifi_only_row,
             burst_buffering_switch,
+            burst_buffering_row,
+            low_memory_switch,
             theme_row,
             about_row,
             account_row,
@@ -777,6 +827,19 @@ fn wifi_only_subtitle(can_detect_metered: bool) -> &'static str {
     }
 }
 
+const BURST_BUFFERING_SUBTITLE: &str = "Downloads ahead at full speed so the radio can idle. Turn off on a slow or capped connection.";
+const BURST_BUFFERING_LOW_MEMORY_HINT: &str = "Uses up to 64 MB of buffer; consider turning it off in low memory mode.";
+
+/// The burst-buffering row's subtitle: with low memory mode on as well, it adds a hint — the
+/// setting itself is left as the user has it.
+fn burst_buffering_subtitle(burst_buffering: bool, low_memory: bool) -> String {
+    if burst_buffering && low_memory {
+        format!("{BURST_BUFFERING_SUBTITLE}\n{BURST_BUFFERING_LOW_MEMORY_HINT}")
+    } else {
+        BURST_BUFFERING_SUBTITLE.to_string()
+    }
+}
+
 /// Fire-and-forget persistence on the shared Tokio runtime — same shape as every other GTK
 /// signal handler that touches the database (`PlayerController`'s progress writes, Welcome's
 /// Connect button): capture everything up front, spawn, report on failure through the toast
@@ -902,6 +965,7 @@ pub(crate) mod tests {
             controller.clone(),
             test_download_manager(pool.clone()),
             abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
@@ -951,6 +1015,7 @@ pub(crate) mod tests {
             controller.clone(),
             download_manager.clone(),
             abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
@@ -1040,6 +1105,7 @@ pub(crate) mod tests {
             controller.clone(),
             download_manager,
             abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
@@ -1102,6 +1168,7 @@ pub(crate) mod tests {
             controller,
             test_download_manager(pool.clone()),
             abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
@@ -1174,6 +1241,7 @@ pub(crate) mod tests {
                 controller,
                 test_download_manager(pool.clone()),
                 abs_core::settings::PlaybackSettings::default(),
+                crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
                 abs_core::settings::Theme::default(),
                 crate::test_support::test_paths(),
                 servers,
@@ -1235,6 +1303,7 @@ pub(crate) mod tests {
                 controller,
                 test_download_manager(pool.clone()),
                 abs_core::settings::PlaybackSettings::default(),
+                crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
                 abs_core::settings::Theme::default(),
                 paths,
                 servers,
@@ -1272,6 +1341,7 @@ pub(crate) mod tests {
             controller,
             test_download_manager(pool.clone()),
             abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
             abs_core::settings::Theme::default(),
             crate::test_support::test_paths(),
             servers,
@@ -1324,5 +1394,50 @@ pub(crate) mod tests {
             let account = abs_storage::repo::accounts::get(pool, &account_id).await.unwrap();
             (server, vec![account])
         })
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The Low memory mode switch defaults
+    /// off, reaches the shared state and is saved; while it and burst buffering are both on the
+    /// burst row says so (without changing the burst setting); and the switch follows the state.
+    pub(crate) fn run_low_memory_mode_switch_persists_and_hints_at_burst_buffering(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let low_memory_mode = crate::low_memory_mode::LowMemoryModeState::new(pool.clone());
+        let screen = build(
+            pool.clone(),
+            controller.clone(),
+            test_download_manager(pool.clone()),
+            abs_core::settings::PlaybackSettings::default(),
+            low_memory_mode.clone(),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            adw::ApplicationWindow::builder().build(),
+        );
+        let hooks = &screen.hooks;
+        let subtitle = || hooks.burst_buffering_row.subtitle().map(|s| s.to_string()).unwrap_or_default();
+
+        assert!(!hooks.low_memory_switch.state(), "low memory mode defaults to off");
+        assert!(!low_memory_mode.get());
+        assert!(!subtitle().contains("low memory mode"), "no hint while it is off");
+
+        let _: bool = hooks.low_memory_switch.emit_by_name("state-set", &[&true]);
+        assert!(low_memory_mode.get(), "the switch reaches the shared state");
+        assert!(subtitle().contains("consider turning it off in low memory mode"), "burst buffering is on too, so the row says so: {}", subtitle());
+        assert!(controller.burst_buffering(), "the hint doesn't change the burst-buffering setting");
+
+        let _: bool = hooks.burst_buffering_switch.emit_by_name("state-set", &[&false]);
+        assert!(!subtitle().contains("low memory mode"), "no hint once burst buffering is off");
+        let _: bool = hooks.burst_buffering_switch.emit_by_name("state-set", &[&true]);
+        assert!(subtitle().contains("low memory mode"));
+
+        pump_until(|| false, Duration::from_millis(500));
+        assert!(runtime.block_on(abs_core::settings::load_low_memory_mode(&pool)).unwrap(), "the switch is saved");
+
+        // Changed from elsewhere, the switch follows without re-triggering its own handler.
+        low_memory_mode.set(false);
+        assert!(!hooks.low_memory_switch.is_active());
+        assert!(!subtitle().contains("low memory mode"), "the hint goes with it");
     }
 }

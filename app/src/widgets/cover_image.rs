@@ -38,6 +38,10 @@ use adw::prelude::*;
 /// alone wouldn't give a real RAM ceiling.
 const TEXTURE_CACHE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
 
+/// The texture cache's budget in low memory mode — a few covers, enough for the mini bar and the
+/// player screen's big one.
+const LOW_MEMORY_TEXTURE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
 /// How many cover decodes run at once. Bounds background CPU/thermal load when a burst of newly-
 /// visible covers all become eligible to decode at once (e.g. a fast scroll) — the decode is
 /// already off the main thread and thus non-blocking either way; this just stops it from
@@ -51,6 +55,11 @@ thread_local! {
     // elsewhere in this crate for main-thread-only state. Only ever touched from the main
     // thread's own async continuations (see `set_path`), never from inside `spawn_blocking`.
     static TEXTURE_CACHE: RefCell<LruTextureCache> = RefCell::new(LruTextureCache::new(TEXTURE_CACHE_BUDGET_BYTES));
+    /// Low memory mode: covers aren't decoded at all (see [`set_low_memory_mode`]).
+    static LOW_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Every live `CoverImage`, weakly, so switching the mode can update the ones already on
+    /// screen. Pruned whenever it is walked and when it grows.
+    static LIVE_COVERS: RefCell<Vec<WeakCover>> = const { RefCell::new(Vec::new()) };
     static DECODE_SEMAPHORE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_COVER_DECODES));
 }
 
@@ -69,6 +78,17 @@ struct LruTextureCache {
 impl LruTextureCache {
     fn new(budget_bytes: usize) -> Self {
         Self { budget_bytes, used_bytes: 0, order: VecDeque::new(), entries: HashMap::new() }
+    }
+
+    /// Changes the budget and evicts (least recently used first) down to it.
+    fn set_budget(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        while self.used_bytes > self.budget_bytes {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(texture_bytes(&removed));
+            }
+        }
     }
 
     fn get(&mut self, key: &(PathBuf, i32)) -> Option<gtk4::gdk::Texture> {
@@ -114,6 +134,53 @@ fn texture_bytes(texture: &gtk4::gdk::Texture) -> usize {
 /// to at least 1 — GTK never reports less, but an unrealized widget's default shouldn't either.
 fn decode_pixels_for(size: i32, scale_factor: i32) -> i32 {
     size * scale_factor.max(1)
+}
+
+/// A `CoverImage` held weakly: `None` from [`WeakCover::upgrade`] once its widgets are gone.
+struct WeakCover {
+    overlay: glib::WeakRef<gtk4::Overlay>,
+    placeholder: glib::WeakRef<gtk4::Box>,
+    picture: glib::WeakRef<gtk4::Picture>,
+    last_path: std::rc::Weak<RefCell<Option<PathBuf>>>,
+    size: i32,
+}
+
+impl WeakCover {
+    fn upgrade(&self) -> Option<CoverImage> {
+        Some(CoverImage {
+            overlay: self.overlay.upgrade()?,
+            placeholder: self.placeholder.upgrade()?,
+            picture: self.picture.upgrade()?,
+            last_path: self.last_path.upgrade()?,
+            size: self.size,
+        })
+    }
+}
+
+/// Turns low memory mode on or off for every cover: on, nothing is decoded any more — each
+/// `CoverImage` shows its placeholder and the texture cache shrinks to
+/// [`LOW_MEMORY_TEXTURE_BUDGET_BYTES`] (textures a screen still holds are released when it
+/// rebuilds); off, covers decode again and the cache gets its full budget back.
+pub fn set_low_memory_mode(on: bool) {
+    if LOW_MEMORY.with(|flag| flag.replace(on)) == on {
+        return;
+    }
+    TEXTURE_CACHE.with(|cache| cache.borrow_mut().set_budget(if on { LOW_MEMORY_TEXTURE_BUDGET_BYTES } else { TEXTURE_CACHE_BUDGET_BYTES }));
+    // Re-run `set_path` for every cover on screen so the new mode applies to what is showing.
+    let covers: Vec<CoverImage> = LIVE_COVERS.with(|live| {
+        let mut live = live.borrow_mut();
+        let upgraded: Vec<CoverImage> = live.iter().filter_map(WeakCover::upgrade).collect();
+        live.retain(|weak| weak.picture.upgrade().is_some());
+        upgraded
+    });
+    for cover in covers {
+        let path = cover.last_path.borrow_mut().take();
+        cover.set_path(path.as_deref());
+    }
+}
+
+fn low_memory_mode() -> bool {
+    LOW_MEMORY.with(|flag| flag.get())
 }
 
 #[derive(Clone)]
@@ -173,7 +240,21 @@ impl CoverImage {
             .build();
         overlay.add_overlay(&picture);
 
-        Self { overlay, placeholder, picture, last_path: Rc::new(RefCell::new(None)), size }
+        let cover = Self { overlay, placeholder, picture, last_path: Rc::new(RefCell::new(None)), size };
+        LIVE_COVERS.with(|live| {
+            let mut live = live.borrow_mut();
+            if live.len() >= 256 {
+                live.retain(|weak| weak.picture.upgrade().is_some());
+            }
+            live.push(WeakCover {
+                overlay: cover.overlay.downgrade(),
+                placeholder: cover.placeholder.downgrade(),
+                picture: cover.picture.downgrade(),
+                last_path: Rc::downgrade(&cover.last_path),
+                size,
+            });
+        });
+        cover
     }
 
     pub fn widget(&self) -> &gtk4::Widget {
@@ -214,6 +295,11 @@ impl CoverImage {
             self.show_placeholder();
             return;
         };
+        // Low memory mode: no covers. The path is remembered (above) so leaving the mode shows it.
+        if low_memory_mode() {
+            self.show_placeholder();
+            return;
+        }
         let decode_pixels = self.decode_pixels();
         let key = (path.to_path_buf(), decode_pixels);
 
@@ -408,6 +494,32 @@ pub(crate) mod tests {
         pump_until(|| second.picture.is_visible(), Duration::from_secs(5));
         assert!(second.picture.is_visible(), "a cache hit must show the picture even though the file is gone");
         let _ = runtime;
+    }
+
+    /// Low memory mode: a cover showing when the mode goes on turns into its placeholder, new
+    /// covers aren't decoded, and leaving the mode brings them back.
+    pub(crate) fn run_low_memory_mode_turns_covers_off_and_back_on(_runtime: &tokio::runtime::Runtime) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cover.png");
+        write_1x1_png(&path);
+        let showing = CoverImage::new(64);
+        showing.set_path(Some(&path));
+        pump_until(|| showing.picture.is_visible(), Duration::from_secs(5));
+
+        set_low_memory_mode(true);
+        assert!(!showing.picture.is_visible(), "a cover on screen becomes its placeholder at once");
+        assert!(showing.placeholder.is_visible());
+        let other_path = tmp.path().join("other.png");
+        write_1x1_png(&other_path);
+        let new_cover = CoverImage::new(64);
+        new_cover.set_path(Some(&other_path));
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(!new_cover.picture.is_visible(), "nothing is decoded in low memory mode");
+        assert!(TEXTURE_CACHE.with(|cache| cache.borrow().used_bytes) <= LOW_MEMORY_TEXTURE_BUDGET_BYTES);
+
+        set_low_memory_mode(false);
+        pump_until(|| showing.picture.is_visible() && new_cover.picture.is_visible(), Duration::from_secs(5));
+        assert!(showing.picture.is_visible() && new_cover.picture.is_visible(), "covers come back when the mode goes off");
     }
 
     /// A late-landing decode for a path this widget has since moved on from must never clobber

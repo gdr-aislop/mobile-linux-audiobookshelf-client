@@ -69,6 +69,17 @@ fn classify_gst_error(err: &gst::glib::Error) -> PlaybackErrorKind {
     PlaybackErrorKind::Other
 }
 
+/// [`classify_gst_error`] plus what the bus message's debug string adds: a generic stream failure
+/// ("Internal data stream error", `StreamError::Failed`) that comes from the HTTP source is a
+/// dropped or dead connection, not an unclassifiable fault.
+fn classify_bus_error(err: &gst::glib::Error, debug: Option<&str>) -> PlaybackErrorKind {
+    let kind = classify_gst_error(err);
+    if kind == PlaybackErrorKind::Other && debug.is_some_and(|d| d.contains("GstSoupHTTPSrc") || d.contains("GstCurlHttpSrc")) {
+        return PlaybackErrorKind::Network;
+    }
+    kind
+}
+
 /// Replaces the value of every `token=` query parameter in `text` with `REDACTED` — stream URLs
 /// authenticate with `?token=<access token>`, and GStreamer quotes the URL in its error messages.
 pub fn redact_tokens(text: &str) -> String {
@@ -124,9 +135,9 @@ pub trait AudioBackend {
     ///
     /// [`is_paused`]: AudioBackend::is_paused
     fn pause(&mut self) -> Result<()>;
-    /// Whether the pipeline has actually reached, and settled in, `Paused` right now — `false`
-    /// both while a `pause()` is still asynchronously in flight and if it landed somewhere else
-    /// entirely. Reads GStreamer's last-known state instantly and never blocks (unlike this
+    /// Whether the pipeline has actually reached `Paused` right now — `false` while a `pause()`
+    /// is still asynchronously in flight and if it landed somewhere else entirely. A paused
+    /// pipeline that is prerolling again after a seek counts as paused: nothing renders. Reads GStreamer's last-known state instantly and never blocks (unlike this
     /// crate's own tests' `wait_for_state_change`, which blocks on purpose — appropriate for a
     /// test, not for a call a caller might make from the GTK main thread).
     fn is_paused(&self) -> bool;
@@ -280,11 +291,13 @@ impl AudioBackend for GstBackend {
     }
 
     fn is_paused(&self) -> bool {
-        // `pending_state()` is `VoidPending` exactly when no transition is in flight — checking
-        // it alongside `current_state()` is what tells "reached Paused" apart from "requested
-        // Paused, still Async". Both are plain non-blocking reads of GStreamer's last-known
-        // state (`ElementExt`, already used by this file's own tests).
-        self.pipeline.current_state() == gst::State::Paused && self.pipeline.pending_state() == gst::State::VoidPending
+        // `current_state() == Paused` means the pipeline committed Paused: the clock is stopped
+        // and nothing renders until it commits Playing. A flushing seek (or a rate change) on a
+        // paused pipeline leaves it there with `pending == Paused` while it prerolls again — on
+        // a stream, for as long as the new HTTP range request takes — and that is still paused.
+        // What isn't: a pipeline still at `Playing` (a pause in flight or stuck in `Async`), or
+        // one already on its way back to `Playing`. Both reads are non-blocking.
+        self.pipeline.current_state() == gst::State::Paused && self.pipeline.pending_state() != gst::State::Playing
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
@@ -306,8 +319,20 @@ impl AudioBackend for GstBackend {
     fn set_speed(&mut self, speed: f64, position: Duration) -> Result<()> {
         // GStreamer has no standalone "set rate" call — a rate change is expressed as a seek with
         // a new rate, to the position the caller knows is right (see the trait's doc comment).
+        // The rate is only kept if that seek was accepted: every later seek reuses
+        // `current_speed`, which would otherwise quietly apply a rate the caller was told failed.
+        // GStreamer rejects a rate of zero (and has no use for NaN or infinity); say so here
+        // rather than record a rate every later seek would then fail with.
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(PlayerError::SeekFailed);
+        }
+        let previous = self.current_speed;
         self.current_speed = speed;
-        self.seek(position)
+        let result = self.seek(position);
+        if result.is_err() {
+            self.current_speed = previous;
+        }
+        result
     }
 
     fn position(&self) -> Option<Duration> {
@@ -334,7 +359,7 @@ impl AudioBackend for GstBackend {
                 gst::MessageView::Eos(_) => return Some(PlayerEvent::EndOfStream),
                 gst::MessageView::Error(e) => {
                     let error = e.error();
-                    let kind = classify_gst_error(&error);
+                    let kind = classify_bus_error(&error, e.debug().as_deref());
                     // An HTTP source's messages quote the stream URL, which carries the access
                     // token as a query parameter — and these strings reach the log and the error
                     // banner's details.
@@ -529,6 +554,29 @@ mod tests {
         assert!(player.is_paused(), "settled in Paused — must report paused");
     }
 
+    /// A seek while paused makes the pipeline preroll again (GStreamer's "lost state": current
+    /// and pending both `Paused`). Nothing renders meanwhile, so it is still paused — reporting
+    /// otherwise made the app's pause confirmation tear down a perfectly paused pipeline after
+    /// pause → rewind on a slow stream.
+    #[test]
+    fn a_seek_while_paused_is_still_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut player = backend();
+        player.load(&silent_wav_uri(&tmp, 5)).unwrap();
+        player.play().unwrap();
+        wait_for_state_change(&player);
+        player.pause().unwrap();
+        wait_for_state_change(&player);
+        assert!(player.is_paused());
+
+        player.seek(Duration::from_secs(2)).unwrap();
+        assert!(player.is_paused(), "re-prerolling after a seek is still paused");
+        player.set_speed(1.5, Duration::from_secs(1)).unwrap();
+        assert!(player.is_paused(), "re-prerolling after a rate change is still paused");
+        wait_for_state_change(&player);
+        assert!(player.is_paused());
+    }
+
     #[test]
     fn duration_matches_the_generated_files_length() {
         let tmp = tempfile::tempdir().unwrap();
@@ -569,6 +617,20 @@ mod tests {
         // No `load()` call: playbin has no URI set, so a seek must error, not panic.
         let result = player.seek(Duration::from_secs(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_unusable_speed_is_refused_and_not_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut player = backend();
+        player.load(&silent_wav_uri(&tmp, 5)).unwrap();
+        player.pause().unwrap();
+        wait_for_state_change(&player);
+        for speed in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(player.set_speed(speed, Duration::from_secs(1)).is_err(), "{speed} should be refused");
+            assert_eq!(player.current_speed, 1.0);
+        }
+        assert!(player.seek(Duration::from_secs(1)).is_ok(), "later seeks must be unaffected");
     }
 
     #[test]
@@ -666,6 +728,15 @@ mod tests {
     fn classifies_not_authorized_as_not_authorized() {
         let err = glib::Error::new(gst::ResourceError::NotAuthorized, "401");
         assert_eq!(classify_gst_error(&err), PlaybackErrorKind::NotAuthorized);
+    }
+
+    #[test]
+    fn a_generic_failure_from_the_http_source_is_a_network_error() {
+        let err = glib::Error::new(gst::StreamError::Failed, "Internal data stream error.");
+        let debug = "../libs/gst/base/gstbasesrc.c(3132): gst_base_src_loop (): /GstPlayBin:playbin0/GstURIDecodeBin:uridecodebin0/GstSoupHTTPSrc:source:\nstreaming stopped, reason error (-5)";
+        assert_eq!(classify_bus_error(&err, Some(debug)), PlaybackErrorKind::Network);
+        assert_eq!(classify_bus_error(&err, Some("/GstPlayBin:playbin0/GstFileSrc:source: streaming stopped")), PlaybackErrorKind::Other, "a local file's failure is not a network one");
+        assert_eq!(classify_bus_error(&err, None), PlaybackErrorKind::Other);
     }
 
     #[test]

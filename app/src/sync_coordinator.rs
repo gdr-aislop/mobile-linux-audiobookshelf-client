@@ -80,6 +80,25 @@ pub(crate) fn mark_completed(server_id: &str, account_id: &str) {
     }
 }
 
+/// The item the player has loaded (or is starting) — `(server_id, account_id, item_id)`. Home's
+/// and Library's progress reconcile leave that item's row to the player (see
+/// `abs_core::progress_sync::reconcile_all_progress`'s `skip_item`). A real `Mutex`, not a
+/// `thread_local!`: the reconcile runs on a tokio worker, and asks at the moment it needs the
+/// answer rather than when its cycle was started, so a book started mid-sync is still protected.
+static LOADED_ITEM: std::sync::Mutex<Option<(String, String, String)>> = std::sync::Mutex::new(None);
+
+/// Called by the player whenever what it holds changes; `None` once nothing is loaded.
+pub(crate) fn set_loaded_item(loaded: Option<(&str, &str, &str)>) {
+    let loaded = loaded.map(|(server_id, account_id, item_id)| (server_id.to_string(), account_id.to_string(), item_id.to_string()));
+    *LOADED_ITEM.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded;
+}
+
+/// The player's loaded item for this server and account, if any.
+pub(crate) fn loaded_item(server_id: &str, account_id: &str) -> Option<String> {
+    let loaded = LOADED_ITEM.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    loaded.as_ref().filter(|(server, account, _)| server == server_id && account == account_id).map(|(_, _, item)| item.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +155,14 @@ mod tests {
         assert!(claim_startup_sync("server-5", "account-1"));
         mark_completed("server-5", "account-1");
         assert!(claim_startup_sync("server-5", "account-1"), "a relogin/account-switch reusing the same ids must sync again, not skip forever");
+    }
+
+    #[test]
+    fn the_loaded_item_is_reported_only_for_its_own_server_and_account() {
+        set_loaded_item(Some(("server-9", "account-9", "item-9")));
+        assert_eq!(loaded_item("server-9", "account-9").as_deref(), Some("item-9"));
+        assert_eq!(loaded_item("server-9", "account-other"), None);
+        set_loaded_item(None);
+        assert_eq!(loaded_item("server-9", "account-9"), None);
     }
 }
