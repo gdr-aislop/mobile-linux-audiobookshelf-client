@@ -506,9 +506,16 @@ Rules, each of which constrains future changes to this table:
 
 - **Typing always wins.** While any text entry has focus (Library search, the Welcome form, the
   Connection page's header editor), single-key bindings like `Space` and `b` must not fire —
-  they must type. GTK's shortcut resolution tries the focus widget before window/application
-  accelerators, which yields exactly this for free; the rule is stated so nobody later "fixes"
-  transport keys with a hand-rolled key controller that would break it.
+  they must type. GTK4 does **not** give this for free: application accelerators
+  (`set_accels_for_action`) run in the *capture* phase at the window, ahead of the focused
+  widget, so a bare-key accelerator swallows the keypress before a `GtkText` sees it (this is
+  how `b` once stopped typing in the Library search). Hence every modifier-less binding is
+  installed by `add_single_key_shortcuts` as a `GtkShortcutController` on the window with
+  global scope and the *bubble* phase, which only runs once the focused widget has declined the
+  key. Any new modifier-less binding goes there, never through `set_accels_for_action`;
+  accelerators with a modifier (`Ctrl+F`, `Alt+1`, …) stay as app accelerators. One deliberate
+  consequence: a focused button handles `Space` itself (activating) rather than toggling
+  playback, which is standard GTK behaviour.
 - **Arrows are deliberately not global.** Every other screen is grids and lists where arrow keys
   are keyboard focus navigation (an accessibility surface) — globalizing skip would redefine
   them out from under that. Hence skip is scoped to the full player, the one screen with nothing

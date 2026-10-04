@@ -307,11 +307,67 @@ pub(crate) async fn fetch_servers_with_accounts(pool: &SqlitePool) -> Vec<(abs_s
     result
 }
 
-/// The keyboard half of ui-spec §6: the accelerators (app-wide — they only fire when the matching
-/// action actually exists, so `player.*` accels are inert until the full player merges its action
-/// group, and `win.*` ones don't exist before login) and the `Ctrl+?` shortcuts overlay. The
-/// actions themselves live where their state is: `win.*` in `screens::main_window`, `player.*` on
-/// the full player screen.
+/// Accelerators registered app-wide through `set_accels_for_action`. Every one of them **must**
+/// carry a modifier: GTK4 runs application accelerators in the *capture* phase at the window,
+/// ahead of the focused widget, so a bare key here (`b`, `space`, ...) would be consumed before a
+/// focused text entry could type it. Modifier-less bindings live in `SINGLE_KEY_SHORTCUTS`.
+const APP_ACCELS: &[(&str, &[&str])] = &[
+    ("app.quit", &["<Control>q"]),
+    // GtkApplicationWindow also wires this action itself; stating the accel keeps the
+    // binding visible and independent of that internal default.
+    ("win.show-help-overlay", &["<Control>question"]),
+    ("win.switch-tab('home')", &["<Alt>1"]),
+    ("win.switch-tab('library')", &["<Alt>2"]),
+    ("win.switch-tab('downloads')", &["<Alt>3"]),
+    ("win.switch-tab('settings')", &["<Alt>4", "<Control>comma"]),
+    ("win.open-library-search", &["<Control>f"]),
+    // Dual bindings (with and without Ctrl) match Decibels, GNOME's own audio player and the
+    // closest analogue for these controls; the bare halves are in `SINGLE_KEY_SHORTCUTS`.
+    ("player.speed-up", &["<Control>plus"]),
+    ("player.speed-down", &["<Control>minus"]),
+    ("player.speed-reset", &["<Control>0"]),
+];
+
+/// Modifier-less `(trigger, action)` bindings, installed by `add_single_key_shortcuts`.
+const SINGLE_KEY_SHORTCUTS: &[(&str, &str)] = &[
+    ("space", "win.play-pause"),
+    ("b", "win.bookmark"),
+    ("Left", "player.skip-back"),
+    ("Right", "player.skip-forward"),
+    ("plus", "player.speed-up"),
+    ("minus", "player.speed-down"),
+    ("0", "player.speed-reset"),
+    ("c", "player.chapters"),
+    ("t", "player.sleep-timer"),
+    ("Escape", "player.collapse"),
+];
+
+/// Installs the modifier-less keyboard shortcuts on `widget` (the application window) so that
+/// "typing always wins" (ui-spec §6): the controller is in the *bubble* phase, so the focused
+/// widget — a `GtkText` inside the Library search, the login form, ... — gets first refusal on
+/// every key and the shortcut only fires if nothing focused wanted it. `Global` scope keeps it
+/// working wherever focus sits inside the window. Actions are referenced by name, so they resolve
+/// lazily: `win.*` ones don't exist before login and `player.*` ones are inert until the full
+/// player merges its action group.
+pub(crate) fn add_single_key_shortcuts(widget: &impl IsA<gtk4::Widget>) -> gtk4::ShortcutController {
+    let controller = gtk4::ShortcutController::new();
+    controller.set_scope(gtk4::ShortcutScope::Global);
+    controller.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+    for (trigger, action) in SINGLE_KEY_SHORTCUTS {
+        let trigger = gtk4::ShortcutTrigger::parse_string(trigger)
+            .unwrap_or_else(|| panic!("invalid shortcut trigger {trigger:?}"));
+        controller.add_shortcut(gtk4::Shortcut::new(Some(trigger), Some(gtk4::NamedAction::new(action))));
+    }
+    widget.add_controller(controller.clone());
+    controller
+}
+
+/// The keyboard half of ui-spec §6: the modifier accelerators (app-wide — they only fire when
+/// the matching action actually exists, so `player.*` accels are inert until the full player
+/// merges its action group, and `win.*` ones don't exist before login), the modifier-less
+/// shortcuts (see `add_single_key_shortcuts`) and the `Ctrl+?` shortcuts overlay. The actions
+/// themselves live where their state is: `win.*` in `screens::main_window`, `player.*` on the
+/// full player screen.
 fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow) {
     let quit_action = adw::gio::SimpleAction::new("quit", None);
     quit_action.connect_activate({
@@ -322,31 +378,10 @@ fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow)
 
     window.set_help_overlay(Some(&build_shortcuts_overlay()));
 
-    for (action, accels) in [
-        ("app.quit", vec!["<Control>q"]),
-        // GtkApplicationWindow also wires this action itself; stating the accel keeps the
-        // binding visible and independent of that internal default.
-        ("win.show-help-overlay", vec!["<Control>question"]),
-        ("win.switch-tab('home')", vec!["<Alt>1"]),
-        ("win.switch-tab('library')", vec!["<Alt>2"]),
-        ("win.switch-tab('downloads')", vec!["<Alt>3"]),
-        ("win.switch-tab('settings')", vec!["<Alt>4", "<Control>comma"]),
-        ("win.open-library-search", vec!["<Control>f"]),
-        ("win.play-pause", vec!["space"]),
-        ("win.bookmark", vec!["b"]),
-        ("player.skip-back", vec!["Left"]),
-        ("player.skip-forward", vec!["Right"]),
-        // Dual bindings (with and without Ctrl) match Decibels, GNOME's own audio player and
-        // the closest analogue for these controls.
-        ("player.speed-up", vec!["<Control>plus", "plus"]),
-        ("player.speed-down", vec!["<Control>minus", "minus"]),
-        ("player.speed-reset", vec!["<Control>0", "0"]),
-        ("player.chapters", vec!["c"]),
-        ("player.sleep-timer", vec!["t"]),
-        ("player.collapse", vec!["Escape"]),
-    ] {
-        app.set_accels_for_action(action, &accels);
+    for (action, accels) in APP_ACCELS {
+        app.set_accels_for_action(action, accels);
     }
+    add_single_key_shortcuts(window);
 }
 
 /// The `GtkShortcutsWindow` behind `Ctrl+?` — one item per row of ui-spec §6's table, grouped
@@ -506,8 +541,8 @@ fn build_shortcuts_overlay() -> gtk4::ShortcutsWindow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::version_line;
+pub(crate) mod tests {
+    use super::*;
 
     #[test]
     fn version_line_is_the_display_name_plus_a_dotted_version_plus_a_commit() {
@@ -526,5 +561,49 @@ mod tests {
             parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
             "version should be numeric and dotted, got: {version}"
         );
+    }
+
+    /// The capture-phase accelerator table must never carry a bare key: GTK4 runs those ahead of
+    /// the focused widget, which is exactly how `b` stopped typing in the Library search box.
+    #[test]
+    fn app_accels_all_carry_a_modifier() {
+        for (action, accels) in APP_ACCELS {
+            for accel in *accels {
+                assert!(
+                    accel.starts_with('<'),
+                    "{action}: accelerator {accel:?} has no modifier; bare keys belong in SINGLE_KEY_SHORTCUTS"
+                );
+            }
+        }
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The modifier-less shortcuts must sit
+    /// in a global-scope *bubble*-phase controller (so a focused text entry types first) and cover
+    /// exactly `SINGLE_KEY_SHORTCUTS`. Real key events can't be injected in a GTK4 test, so this
+    /// pins the configuration that produces the behavior.
+    pub(crate) fn run_single_key_shortcuts_defer_to_the_focused_widget(_runtime: &tokio::runtime::Runtime) {
+        let window = adw::ApplicationWindow::builder().build();
+        let controller = add_single_key_shortcuts(&window);
+
+        assert_eq!(controller.propagation_phase(), gtk4::PropagationPhase::Bubble);
+        assert_eq!(controller.scope(), gtk4::ShortcutScope::Global);
+
+        let model = controller.upcast_ref::<gtk4::gio::ListModel>();
+        assert_eq!(model.n_items() as usize, SINGLE_KEY_SHORTCUTS.len());
+        let mut found = Vec::new();
+        for i in 0..model.n_items() {
+            let shortcut = model.item(i).unwrap().downcast::<gtk4::Shortcut>().unwrap();
+            let trigger = shortcut.trigger().expect("every shortcut has a trigger").to_str().to_string();
+            let action = shortcut
+                .action()
+                .and_then(|a| a.downcast::<gtk4::NamedAction>().ok())
+                .expect("every shortcut targets a named action")
+                .action_name()
+                .to_string();
+            found.push((trigger, action));
+        }
+        let expected: Vec<(String, String)> =
+            SINGLE_KEY_SHORTCUTS.iter().map(|(t, a)| (t.to_string(), a.to_string())).collect();
+        assert_eq!(found, expected);
     }
 }

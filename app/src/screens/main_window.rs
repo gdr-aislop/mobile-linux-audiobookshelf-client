@@ -760,8 +760,10 @@ pub fn build(
     // Keyboard actions for the whole shell (ui-spec §6's global table; the accelerators
     // themselves are set app-wide in `application.rs`). Transport keys no-op when nothing is
     // loaded — every `PlayerController` method already does. Single-key bindings (`space`, `b`)
-    // rely on GTK's focus-first shortcut resolution: while a text entry has focus, the key types
-    // and the accelerator never fires, so no per-widget guards are wanted here.
+    // are installed by `application::add_single_key_shortcuts` as a bubble-phase controller, so
+    // a focused text entry types the key first and the action never fires: no per-widget guards
+    // are wanted here. (They must not be plain app accelerators — GTK4 runs those in the capture
+    // phase, ahead of the focused widget, which swallowed `b` in the Library search.)
     let play_pause_action = gtk4::gio::SimpleAction::new("play-pause", None);
     play_pause_action.connect_activate({
         let controller = mini_bar.controller.clone();
