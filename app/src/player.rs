@@ -3470,6 +3470,7 @@ pub struct MiniPlayerBar {
 #[cfg(test)]
 pub struct MiniPlayerHooks {
     pub bar: gtk4::Box,
+    pub card: gtk4::Box,
     pub cover_picture: gtk4::Picture,
     pub title_label: gtk4::Label,
     pub author_label: gtk4::Label,
@@ -3484,6 +3485,8 @@ pub struct MiniPlayerHooks {
 /// `PlayerController::add_listener`) is identical between the two.
 struct MiniBarWidgets {
     bar: gtk4::Box,
+    #[cfg(test)]
+    card: gtk4::Box,
     cover: CoverImage,
     title_label: gtk4::Label,
     author_label: gtk4::Label,
@@ -3493,9 +3496,33 @@ struct MiniBarWidgets {
     error_icon: gtk4::Image,
 }
 
+/// The mini bar's look, loaded once per process (same `Once`-guarded `CssProvider` idiom as
+/// `screens::library::ensure_busy_overlay_css`). The strip under the card copies libadwaita's own
+/// `actionbar` rule — the `AdwViewSwitcherBar` right below it is one — so bar and tab bar read as
+/// one bottom area, set off from the scrolling content by the same top line; named colors only,
+/// so dark and high-contrast follow by themselves.
+fn ensure_mini_bar_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(
+            "box.mini-player { background-color: @headerbar_bg_color; color: @headerbar_fg_color; \
+                               box-shadow: inset 0 1px @headerbar_shade_color; } \
+             box.mini-player:backdrop { background-color: @headerbar_backdrop_color; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("a display for the app's css"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
 /// From `docs/design/ui-spec.md`'s "Player — mini" section: cover placeholder, title/author,
-/// play/pause, a thin progress line — hidden until something has actually played.
+/// play/pause, a thin progress line — hidden until something has actually played. Drawn as a
+/// stock libadwaita `card` on a strip styled like the tab bar (see `ensure_mini_bar_css`).
 fn build_mini_bar_widgets() -> MiniBarWidgets {
+    ensure_mini_bar_css();
     let cover = CoverImage::new(40);
 
     let title_label = gtk4::Label::builder()
@@ -3522,19 +3549,48 @@ fn build_mini_bar_widgets() -> MiniBarWidgets {
     // mini bar's own established gesture) as the way to actually see why.
     let error_icon = gtk4::Image::builder().icon_name("dialog-warning-symbolic").tooltip_text("Playback error — tap for details").visible(false).build();
 
-    let content_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).margin_start(10).margin_end(10).margin_top(6).build();
+    let content_row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(10)
+        .margin_start(8)
+        .margin_end(4)
+        .margin_top(8)
+        .build();
     content_row.append(cover.widget());
     content_row.append(&text_box);
     content_row.append(&error_icon);
     content_row.append(&play_button);
 
-    let progress = gtk4::ProgressBar::builder().build();
+    // Inset from the card's rounded corners rather than running edge to edge.
+    let progress = gtk4::ProgressBar::builder().margin_start(10).margin_end(10).margin_top(8).margin_bottom(10).build();
 
-    let bar = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).css_classes(["toolbar"]).visible(false).build();
-    bar.append(&content_row);
-    bar.append(&progress);
+    // The margins leave room for the card's shadow, which would otherwise be clipped.
+    let card = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .css_classes(["card"])
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    card.append(&content_row);
+    card.append(&progress);
 
-    MiniBarWidgets { bar, cover, title_label, author_label, play_icon, play_button, progress, error_icon }
+    let bar = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).css_classes(["mini-player"]).visible(false).build();
+    bar.append(&card);
+
+    MiniBarWidgets {
+        bar,
+        #[cfg(test)]
+        card,
+        cover,
+        title_label,
+        author_label,
+        play_icon,
+        play_button,
+        progress,
+        error_icon,
+    }
 }
 
 /// The closure that applies a snapshot to `widgets` — shared between `build_mini_bar` (registered
@@ -3587,6 +3643,7 @@ fn mini_bar_from_widgets(widgets: MiniBarWidgets, controller: PlayerController) 
         #[cfg(test)]
         hooks: MiniPlayerHooks {
             bar: widgets.bar,
+            card: widgets.card,
             cover_picture: widgets.cover.picture().clone(),
             title_label: widgets.title_label,
             author_label: widgets.author_label,

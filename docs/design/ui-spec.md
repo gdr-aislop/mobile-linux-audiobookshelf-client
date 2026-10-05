@@ -245,7 +245,14 @@ Fractal) rather than copying Lissen's Material Design look.
 
 ### Player — mini
 - Fixed bar: 40–48px cover thumbnail, title + author (single line, ellipsized), play/pause icon
-  button, thin progress line along the bottom edge of the bar.
+  button, thin progress line under them.
+- **Set apart from the content.** The bar is a libadwaita `card` (rounded, card background, the
+  stock card shadow) inset 6px on every side, sitting on a strip styled exactly like the tab bar
+  below it (`actionbar`'s header-bar colour with its top shade line). Bar and tab bar read as one
+  bottom area, separated from whatever scrolls above by that line, and the card stands on it —
+  so list rows never look like they run on into the bar. Named colours only, so dark and
+  high-contrast follow. *(Field report: on the phone the old flat `toolbar` bar had the page's
+  own background and blended into Home and Library.)*
 - Swipe-up gesture or tap opens the full player. **Not yet validated**: the swipe-up gesture's
   hit-zone needs to be confirmed against phosh's own edge-swipe gesture zones on real Librem 5
   hardware before being treated as final, since a bottom-edge swipe risks colliding with the

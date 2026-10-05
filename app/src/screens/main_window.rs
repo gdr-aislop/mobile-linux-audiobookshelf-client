@@ -1702,6 +1702,12 @@ pub(crate) mod tests {
         let content = app_window.content().expect("Item Detail should be showing");
         find_button_labeled(&content, "Play").expect("Item Detail's Play button").emit_clicked();
         pump_until(|| hooks.mini_bar.bar.is_visible(), std::time::Duration::from_secs(10));
+        // Set off from the content: a card (`card`) on a strip styled like the tab bar below it
+        // (`mini-player`), not the plain `toolbar` it used to be.
+        assert!(hooks.mini_bar.bar.has_css_class("mini-player"));
+        assert!(!hooks.mini_bar.bar.has_css_class("toolbar"));
+        assert!(hooks.mini_bar.card.has_css_class("card"));
+        assert!(hooks.mini_bar.card.is_ancestor(&hooks.mini_bar.bar) && hooks.mini_bar.progress.is_ancestor(&hooks.mini_bar.card));
 
         // This is the same closure both the tap and swipe-up gesture outcomes call — invoking it
         // directly is the seam this test exercises (see the doc comment above).
@@ -1973,5 +1979,154 @@ pub(crate) mod tests {
         let mut found = None;
         walk(root, icon_name, &mut found);
         found
+    }
+
+    /// Saves what `window` currently shows as a PNG — for the visual check of the mini bar's
+    /// look (see `run_mini_bar_screenshots`).
+    fn save_window_png(window: &adw::ApplicationWindow, path: &std::path::Path) {
+        let (width, height) = (window.width(), window.height());
+        let paintable = gtk4::WidgetPaintable::new(Some(window));
+        let snapshot = gtk4::Snapshot::new();
+        gtk4::gdk::prelude::PaintableExt::snapshot(&paintable, &snapshot, f64::from(width), f64::from(height));
+        let node = snapshot.to_node().expect("the window should have drawn something");
+        let renderer = window.renderer().expect("a realized window has a renderer");
+        let bounds = gtk4::graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+        renderer.render_texture(&node, Some(&bounds)).save_to_png(path).expect("the screenshot should save");
+    }
+
+    /// A solid-colour cover with a darker band, encoded as PNG — enough for covers to look like
+    /// covers in screenshots.
+    fn cover_png(rgb: [u8; 3]) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(300, 300, |_, y| {
+            if (200..240).contains(&y) {
+                image::Rgb(rgb.map(|c| c / 2))
+            } else {
+                image::Rgb(rgb)
+            }
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    /// Not a check: renders Home, Library and Item Detail with a book loaded in the mini bar, in
+    /// light and dark, into `$ABS_SCREENSHOT_DIR` (does nothing when that isn't set), so a
+    /// change to how the mini bar looks can be seen before it reaches a phone.
+    pub(crate) fn run_mini_bar_screenshots(runtime: &tokio::runtime::Runtime) {
+        let Some(dir) = std::env::var_os("ABS_SCREENSHOT_DIR").map(std::path::PathBuf::from) else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let books = [
+            ("item-1", "The Cuckoo's Egg", "Clifford Stoll", [230, 200, 40]),
+            ("item-2", "Project Hail Mary", "Andy Weir", [40, 90, 160]),
+            ("item-3", "The Left Hand of Darkness", "Ursula K. Le Guin", [120, 60, 140]),
+            ("item-4", "Piranesi", "Susanna Clarke", [60, 140, 120]),
+            ("item-5", "Surely You're Joking, Mr. Feynman!", "Richard Feynman", [200, 70, 50]),
+            ("item-6", "Hyperion", "Dan Simmons", [30, 40, 60]),
+            ("item-7", "Ghost in the Wires", "Kevin Mitnick", [20, 120, 140]),
+            ("item-8", "The Dispossessed", "Ursula K. Le Guin", [190, 130, 60]),
+            ("item-9", "Anathem", "Neal Stephenson", [90, 100, 110]),
+            ("item-10", "Walkaway", "Cory Doctorow", [240, 110, 30]),
+        ];
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let results: Vec<_> = books
+            .iter()
+            .enumerate()
+            .map(|(index, (id, title, author, _))| {
+                serde_json::json!({
+                    "id": id,
+                    "addedAt": 1_700_000_000_000i64 - index as i64 * 1000,
+                    "media": { "duration": 36000.0 + index as f64 * 1800.0, "metadata": { "title": title, "authorName": author } }
+                })
+            })
+            .collect();
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })))
+                .mount(&mock_server),
+        );
+        for (id, _, _, rgb) in &books {
+            runtime.block_on(
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path(format!("/api/items/{id}/cover")))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(cover_png(*rgb), "image/png"))
+                    .mount(&mock_server),
+            );
+        }
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 60));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().default_width(390).default_height(760).build();
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            server.clone(),
+            account.clone(),
+            session,
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+        app_window.set_content(Some(&window.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+
+        // A book in the mini bar, a little way in, paused (the play glyph, as on the phone).
+        window.controller.start(
+            abs_core::auth::Session::new(pool, &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "The Cuckoo's Egg".to_string(), author: Some("Clifford Stoll".to_string()) },
+            1.0,
+        );
+        pump_until(|| window.controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        pump_until(|| false, std::time::Duration::from_secs(4));
+        window.controller.toggle_play_pause();
+        // Covers decode off the main thread; give them time to land everywhere.
+        pump_until(|| false, std::time::Duration::from_secs(3));
+
+        let style = adw::StyleManager::default();
+        let shot = |name: &str| {
+            pump_until(|| false, std::time::Duration::from_millis(800));
+            save_window_png(&app_window, &dir.join(format!("{name}.png")));
+        };
+        for (scheme, theme) in [(adw::ColorScheme::ForceLight, "light"), (adw::ColorScheme::ForceDark, "dark")] {
+            style.set_color_scheme(scheme);
+            hooks.stack.set_visible_child_name("home");
+            shot(&format!("home-{theme}"));
+            hooks.stack.set_visible_child_name("library");
+            pump_until(|| false, std::time::Duration::from_secs(2));
+            shot(&format!("library-{theme}"));
+        }
+
+        hooks.stack.set_visible_child_name("home");
+        pump_until(|| false, std::time::Duration::from_millis(300));
+        find_card_button(&home_root).expect("a card").emit_clicked();
+        pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(5));
+        pump_until(|| false, std::time::Duration::from_secs(2));
+        for (scheme, theme) in [(adw::ColorScheme::ForceDark, "dark"), (adw::ColorScheme::ForceLight, "light")] {
+            style.set_color_scheme(scheme);
+            shot(&format!("item-detail-{theme}"));
+        }
     }
 }

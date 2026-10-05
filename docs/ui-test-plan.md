@@ -619,6 +619,13 @@ was and wasn't verified.
       connections…` on the relaunch; turning the mode off brings the covers back; the memory used
       is clearly lower with it on.
 
+- [ ] **MP-27 — The mini bar stands apart from the content.** With a book loaded, look at Home,
+      Library (scroll the list so rows run under the bar) and Item Detail, in the light and the
+      dark theme.
+      *Expected:* the bar is a rounded card with a soft shadow, inset from the screen edges, on a
+      strip the same colour as the tab bar; a line separates that strip from the scrolling
+      content; list rows never look like they continue into the bar.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

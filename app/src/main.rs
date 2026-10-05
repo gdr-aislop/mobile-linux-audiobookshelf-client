@@ -279,6 +279,7 @@ mod tests {
         (main_window_tapping_the_series_button_opens_library_filtered_to_that_series, crate::screens::main_window::tests::run_tapping_the_series_button_opens_library_filtered_to_that_series),
         (main_window_download_started_toast_view_action_opens_downloads, crate::screens::main_window::tests::run_download_started_toast_view_action_opens_downloads),
         (main_window_mini_bar_open_player_swaps_to_the_full_player_screen, crate::screens::main_window::tests::run_mini_bar_open_player_swaps_to_the_full_player_screen),
+        (main_window_mini_bar_screenshots, crate::screens::main_window::tests::run_mini_bar_screenshots),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
         (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),

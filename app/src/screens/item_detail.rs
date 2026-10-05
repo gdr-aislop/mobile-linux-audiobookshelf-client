@@ -1660,6 +1660,8 @@ pub(crate) mod tests {
         // The mini bar is primed immediately from `controller.snapshot()` at build time — no need
         // to wait for the next tick to see it reflect what's already playing.
         assert!(hooks.mini_bar.bar.is_visible(), "the mini bar should show once something is playing");
+        assert!(hooks.mini_bar.bar.has_css_class("mini-player"), "the bar sits on the tab-bar-styled strip");
+        assert!(hooks.mini_bar.card.has_css_class("card"), "the bar itself is drawn as a card");
         assert_eq!(hooks.mini_bar.title_label.label(), "Test Item");
 
         hooks.mini_bar.play_button.emit_clicked();
