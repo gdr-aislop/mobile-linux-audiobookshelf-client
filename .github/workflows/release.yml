@@ -263,11 +263,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GPG
+      # flatpak (for `flatpak build-update-repo`) as well as gpg: ubuntu-latest ships neither.
+      - name: Install flatpak and GPG
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gnupg
+          sudo apt-get install -y --no-install-recommends flatpak gnupg
 
       - name: Import the Flatpak signing key
         run: echo "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
