@@ -2009,15 +2009,16 @@ pub(crate) mod tests {
         bytes.into_inner()
     }
 
-    /// Not a check: renders Home, Library and Item Detail with a book loaded in the mini bar, in
-    /// light and dark, into `$ABS_SCREENSHOT_DIR` (does nothing when that isn't set), so a
-    /// change to how the mini bar looks can be seen before it reaches a phone.
+    /// Not a check: renders Home, Library, the full player, Home again after it, and Item Detail,
+    /// with a long-titled book loaded, in light and dark, at a phone's window size, into
+    /// `$ABS_SCREENSHOT_DIR` (does nothing when that isn't set) — so a change to how these screens
+    /// look or size can be seen before it reaches a phone.
     pub(crate) fn run_mini_bar_screenshots(runtime: &tokio::runtime::Runtime) {
         let Some(dir) = std::env::var_os("ABS_SCREENSHOT_DIR").map(std::path::PathBuf::from) else { return };
         std::fs::create_dir_all(&dir).unwrap();
 
         let books = [
-            ("item-1", "The Cuckoo's Egg", "Clifford Stoll", [230, 200, 40]),
+            ("item-1", "Krzysztof Kolumb. Odkrywca z wyspy Chios", "Jarosław Molenda", [230, 200, 40]),
             ("item-2", "Project Hail Mary", "Andy Weir", [40, 90, 160]),
             ("item-3", "The Left Hand of Darkness", "Ursula K. Le Guin", [120, 60, 140]),
             ("item-4", "Piranesi", "Susanna Clarke", [60, 140, 120]),
@@ -2071,7 +2072,8 @@ pub(crate) mod tests {
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
         let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
 
-        let app_window = adw::ApplicationWindow::builder().default_width(390).default_height(760).build();
+        // A Librem 5's usable window under phosh: 720 logical px, less the top and bottom bars.
+        let app_window = adw::ApplicationWindow::builder().default_width(360).default_height(648).build();
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
         let window = build(
@@ -2096,7 +2098,11 @@ pub(crate) mod tests {
         // A book in the mini bar, a little way in, paused (the play glyph, as on the phone).
         window.controller.start(
             abs_core::auth::Session::new(pool, &server, &account),
-            PlayRequest { item_id: "item-1".to_string(), title: "The Cuckoo's Egg".to_string(), author: Some("Clifford Stoll".to_string()) },
+            PlayRequest {
+                item_id: "item-1".to_string(),
+                title: "Krzysztof Kolumb. Odkrywca z wyspy Chios".to_string(),
+                author: Some("Jarosław Molenda".to_string()),
+            },
             1.0,
         );
         pump_until(|| window.controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
@@ -2119,6 +2125,18 @@ pub(crate) mod tests {
             shot(&format!("library-{theme}"));
         }
 
+        // The full player, then Home again: the window must not stay grown by the player.
+        for (scheme, theme) in [(adw::ColorScheme::ForceLight, "light"), (adw::ColorScheme::ForceDark, "dark")] {
+            style.set_color_scheme(scheme);
+            hooks.stack.set_visible_child_name("home");
+            (hooks.open_player)();
+            pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(5));
+            shot(&format!("player-{theme}"));
+            find_button_with_icon(&app_window.content().unwrap(), "go-down-symbolic").expect("collapse").emit_clicked();
+            pump_until(|| app_window.content().is_some_and(|c| c == window.root), std::time::Duration::from_secs(5));
+            shot(&format!("home-after-player-{theme}"));
+        }
+
         hooks.stack.set_visible_child_name("home");
         pump_until(|| false, std::time::Duration::from_millis(300));
         find_card_button(&home_root).expect("a card").emit_clicked();
@@ -2128,5 +2146,146 @@ pub(crate) mod tests {
             style.set_color_scheme(scheme);
             shot(&format!("item-detail-{theme}"));
         }
+    }
+
+    /// The usable height phosh leaves an app window on a Librem 5 (720 logical px, less the top
+    /// and bottom bars) is ~648 px; this keeps a margin for other shells and scales.
+    const PHONE_MAX_MIN_HEIGHT: i32 = 600;
+
+    /// Every screen `widgets::swap_content` can put in the window must be able to get as short as
+    /// a phone screen: the window grows to the largest minimum height any screen ever had and
+    /// never shrinks back, so one too-tall screen (e.g. the full player for a long title) leaves
+    /// Home's tab bar off the bottom of the screen for the rest of the session. Measured at a
+    /// phone's 360 px width, in the states that make each screen tallest.
+    pub(crate) fn run_every_screen_fits_a_phone(runtime: &tokio::runtime::Runtime) {
+        const LONG_TITLE: &str = "Krzysztof Kolumb. Odkrywca z wyspy Chios — powieść historyczna w trzech tomach, wydanie drugie";
+        const LONG_AUTHOR: &str = "Jarosław Molenda, Anna Kowalska-Nowakowska, Grzegorz Brzęczyszczykiewicz";
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        let results: Vec<_> = [("item-1", LONG_TITLE), ("item-2", LONG_TITLE), ("item-3", "Piranesi")]
+            .iter()
+            .map(|(id, title)| {
+                serde_json::json!({
+                    "id": id,
+                    "addedAt": 1_700_000_000_000i64,
+                    "media": { "duration": 36000.0, "metadata": { "title": title, "authorName": LONG_AUTHOR } }
+                })
+            })
+            .collect();
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })))
+                .mount(&mock_server),
+        );
+        // item-1's audio is gone from the server (an error banner on the player); item-2 and
+        // item-3 play.
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "media": { "audioFiles": [{ "ino": "1", "duration": 60.0 }] }
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/items/item-1/file/1"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .mount(&mock_server),
+        );
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-2", 60));
+        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-3", 60));
+
+        let pool = runtime.block_on(pool());
+        let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
+        let account_id = runtime.block_on(abs_storage::repo::accounts::add(&pool, &server_id, "jane", "token123", None)).unwrap();
+        runtime.block_on(abs_storage::repo::accounts::set_active(&pool, &account_id)).unwrap();
+        let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &server_id)).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account_id)).unwrap();
+
+        let app_window = adw::ApplicationWindow::builder().default_width(360).default_height(640).build();
+        let servers_with_accounts = vec![(server.clone(), vec![account.clone()])];
+        let window = build(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            server.clone(),
+            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            servers_with_accounts,
+            app_window.clone(),
+        );
+        let hooks = window.test_hooks();
+        app_window.set_content(Some(&window.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+        let home_root = hooks.stack.child_by_name("home").expect("home tab exists");
+        pump_until(|| find_card_button(&home_root).is_some(), std::time::Duration::from_secs(10));
+
+        let mut measured: Vec<(String, i32)> = Vec::new();
+        let mut measure = |name: &str, widget: &gtk4::Widget| {
+            pump_until(|| false, std::time::Duration::from_millis(500));
+            let (minimum, ..) = widget.measure(gtk4::Orientation::Vertical, 360);
+            eprintln!("min height at 360px: {minimum:>4}  {name}");
+            measured.push((name.to_string(), minimum));
+        };
+        let play = |item_id: &str, title: &str| {
+            window.controller.start(
+                abs_core::auth::Session::new(pool.clone(), &server, &account),
+                PlayRequest { item_id: item_id.to_string(), title: title.to_string(), author: Some(LONG_AUTHOR.to_string()) },
+                1.0,
+            );
+        };
+        let open_player_and_measure = |name: &str, measure: &mut dyn FnMut(&str, &gtk4::Widget)| {
+            (hooks.open_player)();
+            pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(10));
+            measure(name, &app_window.content().unwrap());
+            let collapse = find_button_with_icon(&app_window.content().unwrap(), "go-down-symbolic").expect("the player's collapse button");
+            collapse.emit_clicked();
+            pump_until(|| app_window.content().is_some_and(|c| c == window.root), std::time::Duration::from_secs(5));
+        };
+
+        // The shell, on every tab, with a long title in the mini bar.
+        play("item-2", LONG_TITLE);
+        pump_until(|| window.controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        for tab in ["home", "library", "downloads", "settings"] {
+            hooks.stack.set_visible_child_name(tab);
+            measure(&format!("shell, {tab} tab, mini bar shown"), &window.root);
+        }
+
+        // The full player: short title, long title, long title with an error banner.
+        open_player_and_measure("player, long title + author", &mut measure);
+        play("item-3", "Piranesi");
+        pump_until(|| window.controller.snapshot().is_some_and(|s| s.is_playing), std::time::Duration::from_secs(10));
+        open_player_and_measure("player, short title", &mut measure);
+        play("item-1", LONG_TITLE);
+        pump_until(|| window.controller.snapshot().is_some_and(|s| s.last_error.is_some()), std::time::Duration::from_secs(10));
+        open_player_and_measure("player, long title + error banner", &mut measure);
+
+        // Item Detail (long title and author), About, Welcome.
+        hooks.stack.set_visible_child_name("home");
+        pump_until(|| false, std::time::Duration::from_millis(300));
+        find_card_button(&home_root).expect("a card").emit_clicked();
+        pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(5));
+        measure("item detail", &app_window.content().unwrap());
+        app_window.set_content(Some(&window.root));
+        crate::screens::settings::push_about(&app_window);
+        pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(5));
+        measure("about", &app_window.content().unwrap());
+        let welcome = crate::screens::welcome::build(pool.clone(), crate::test_support::test_paths(), None, |_| {}, None);
+        app_window.set_content(Some(&welcome.root));
+        measure("welcome", &welcome.root);
+
+        let too_tall: Vec<_> = measured.iter().filter(|(_, minimum)| *minimum > PHONE_MAX_MIN_HEIGHT).collect();
+        assert!(too_tall.is_empty(), "screens that can't get as short as a phone screen ({PHONE_MAX_MIN_HEIGHT}px): {too_tall:?}");
     }
 }

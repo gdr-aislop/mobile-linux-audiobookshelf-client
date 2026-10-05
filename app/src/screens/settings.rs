@@ -669,7 +669,7 @@ fn push_connection(
 /// this app already avoids opening a second window for exactly this class of reason, and About
 /// was the one deliberate exception. It no longer is: see `docs/design/ui-spec.md`'s About
 /// section.
-fn push_about(window: &adw::ApplicationWindow) {
+pub(crate) fn push_about(window: &adw::ApplicationWindow) {
     let Some(shell_root) = window.content() else { return };
 
     let toast_overlay = adw::ToastOverlay::new();

@@ -505,6 +505,13 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - All list/grid views reflow item counts per row based on available width (`GtkGridView` with a
   minimum tile width, not a fixed column count) so the same layout scales from phone to desktop.
 - Touch targets sized per GNOME HIG (minimum 44×44px) throughout, since phosh is a touch shell.
+- **Every full-window screen scrolls vertically.** All screens share one window, and a GTK window
+  grows to the largest minimum height any screen shown in it ever had — then never shrinks back.
+  A screen that can't get shorter than the phone (~648 logical px under phosh on a Librem 5)
+  therefore leaves every later screen taller than the display, e.g. Home's tab bar under phosh's
+  bottom bar. *(Field report: the full player, unscrolled, measured 631px with a one-line title and
+  800px with a long title plus its error banner; after opening it, Home stayed too tall.)* A
+  scenario (`main_window_every_screen_fits_a_phone`) holds every screen to ≤ 600px at 360px wide.
 
 ## 5. State handling
 

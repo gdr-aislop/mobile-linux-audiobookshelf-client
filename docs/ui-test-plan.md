@@ -626,6 +626,13 @@ was and wasn't verified.
       strip the same colour as the tab bar; a line separates that strip from the scrolling
       content; list rows never look like they continue into the bar.
 
+- [ ] **MP-28 — The window stays the screen's height after the full player.** Open the full
+      player for the book with the longest title (and once while it shows a playback error, e.g.
+      with offline mode on for a not-downloaded book), collapse it, and go through Home, Library,
+      Downloads and Settings.
+      *Expected:* the tab bar stays fully visible above phosh's bottom bar every time; on a short
+      screen the player's content scrolls instead.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

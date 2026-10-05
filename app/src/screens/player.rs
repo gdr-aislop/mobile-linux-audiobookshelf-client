@@ -123,10 +123,9 @@ pub fn build(
     cover.widget().set_halign(gtk4::Align::Center);
     cover.widget().set_margin_top(14);
     // `max_width_chars(1)` caps each label's natural width regardless of `wrap` — this screen's
-    // main content sits in a plain `Box` with no `ScrolledWindow` anywhere in its layout (only
-    // the chapters popover scrolls), so an unclamped, fully server-controlled title/author
-    // string could otherwise force the whole window wider than the screen (see
-    // `widgets::banner`'s identical fix for the same reasoning).
+    // content scrolls only vertically (`hscrollbar_policy(Never)` below), so an unclamped, fully
+    // server-controlled title/author string could otherwise force the whole window wider than
+    // the screen (see `widgets::banner`'s identical fix for the same reasoning).
     let title_label = gtk4::Label::builder()
         .wrap(true)
         .max_width_chars(1)
@@ -268,10 +267,18 @@ pub fn build(
     content.append(&transport);
     content.append(&secondary_row);
 
+    // Scrolls vertically so the screen can get as short as a phone's: unscrolled, its minimum
+    // height (~630px with a one-line title, 800 with a long title and the error banner) is the
+    // window's minimum while it's shown, and the window never shrinks back afterwards — which
+    // left Home's tab bar under the bottom of the phone's screen. Where everything fits nothing
+    // scrolls, and the swipe-down below still collapses the screen.
+    let content_scroller =
+        gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&content).build();
+
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&header);
     root.append(error_banner.widget());
-    root.append(&content);
+    root.append(&content_scroller);
 
     // Swipe-down-to-collapse — the counterpart to the mini bar's own swipe-up-to-open gesture
     // (see `main_window`'s `mini_bar_gesture_should_open`). Added directly on `root`, the same

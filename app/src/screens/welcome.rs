@@ -420,8 +420,13 @@ pub fn build(
         banner: banner.clone(),
     };
 
+    // The whole screen scrolls, so it can get as short as the window does when the on-screen
+    // keyboard is up — unscrolled, its minimum height would be the window's while it's shown,
+    // and the window never shrinks back afterwards.
+    let scroller = gtk4::ScrolledWindow::builder().hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).child(&content).build();
+
     WelcomeScreen {
-        root: content.upcast(),
+        root: scroller.upcast(),
         #[cfg(test)]
         hooks,
     }
