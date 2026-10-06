@@ -167,7 +167,8 @@ Fractal) rather than copying Lissen's Material Design look.
   already awkward. Also a **"Sort & filter" `GtkMenuButton`** — one popover, two caption-labelled
   sections: **Sort** (Date added / Title / Author / Duration / **Last listened**) and **Filter**
   ("In progress only" check). While the filter is active the header button swaps to a funnel icon
-  (Nautilus-style active-filter hint), and an in-view banner ("Showing books in progress ·
+  (Nautilus-style active-filter hint; Adwaita has no funnel, so the app ships `funnel-symbolic`
+  itself, compiled into the binary — see `app/src/icons.rs`), and an in-view banner ("Showing books in progress ·
   **Show all**") is the ambient indicator plus one-tap clear — same placement/idiom as the offline
   banner. Also a trailing **view-options button**
   (three-line "adjustments" icon) that opens the view options sheet described below; these two stay

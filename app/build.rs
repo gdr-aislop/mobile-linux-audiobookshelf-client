@@ -10,6 +10,12 @@
 //! it for what's already a rarely-rebuilt, cheap-to-recompute version stamp — emitting nothing
 //! means cargo reruns this script on every build instead, which is exactly what keeps the hash
 //! honest.
+//!
+//! It also compiles `data/resources.gresource.xml` (the icons the system theme can't be relied on
+//! for, see `crate::icons`) into `$OUT_DIR/abs-app.gresource` with `glib-compile-resources`. Unlike
+//! the hash, that one is not optional: without it the build fails, rather than shipping a binary
+//! that shows "missing icon" placeholders. The tool comes with GLib's development files
+//! (`libglib2.0-dev-bin`, pulled in by `libgtk-4-dev`; the GNOME SDK has it too).
 
 use std::process::Command;
 
@@ -25,4 +31,17 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=ABS_APP_GIT_HASH={hash}");
+
+    compile_resources();
+}
+
+fn compile_resources() {
+    let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for build scripts");
+    let status = Command::new("glib-compile-resources")
+        .args(["--sourcedir", "data", "--target"])
+        .arg(std::path::Path::new(&out_dir).join("abs-app.gresource"))
+        .arg("data/resources.gresource.xml")
+        .status()
+        .unwrap_or_else(|err| panic!("could not run glib-compile-resources (install libglib2.0-dev-bin): {err}"));
+    assert!(status.success(), "glib-compile-resources failed on data/resources.gresource.xml ({status})");
 }

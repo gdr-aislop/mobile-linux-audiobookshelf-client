@@ -1994,6 +1994,29 @@ pub(crate) mod tests {
         renderer.render_texture(&node, Some(&bounds)).save_to_png(path).expect("the screenshot should save");
     }
 
+    /// The Library's "In progress only" switch, inside the view-options button's popover.
+    fn in_progress_only_switch(library_root: &gtk4::Widget) -> Option<gtk4::Switch> {
+        fn walk<T: IsA<gtk4::Widget>>(widget: &gtk4::Widget, found: &mut Vec<T>) {
+            if let Some(hit) = widget.downcast_ref::<T>() {
+                found.push(hit.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                walk(&c, found);
+                child = c.next_sibling();
+            }
+        }
+        let mut menu_buttons: Vec<gtk4::MenuButton> = Vec::new();
+        walk(library_root, &mut menu_buttons);
+        let popover = menu_buttons.iter().find(|b| b.tooltip_text().is_some_and(|t| t.contains("View options")))?.popover()?;
+        let mut rows: Vec<adw::ActionRow> = Vec::new();
+        walk(popover.upcast_ref(), &mut rows);
+        let row = rows.into_iter().find(|r| r.title() == "In progress only")?;
+        let mut switches: Vec<gtk4::Switch> = Vec::new();
+        walk(row.upcast_ref(), &mut switches);
+        switches.into_iter().next()
+    }
+
     /// A solid-colour cover with a darker band, encoded as PNG — enough for covers to look like
     /// covers in screenshots.
     fn cover_png(rgb: [u8; 3]) -> Vec<u8> {
@@ -2123,6 +2146,15 @@ pub(crate) mod tests {
             hooks.stack.set_visible_child_name("library");
             pump_until(|| false, std::time::Duration::from_secs(2));
             shot(&format!("library-{theme}"));
+        }
+
+        // The Library with a filter on: the view-options button shows its filter-active icon.
+        let library_root = hooks.stack.child_by_name("library").expect("library tab exists");
+        in_progress_only_switch(&library_root).expect("the view options' In progress only switch").set_active(true);
+        for (scheme, theme) in [(adw::ColorScheme::ForceLight, "light"), (adw::ColorScheme::ForceDark, "dark")] {
+            style.set_color_scheme(scheme);
+            hooks.stack.set_visible_child_name("library");
+            shot(&format!("library-filtered-{theme}"));
         }
 
         // The full player, then Home again: the window must not stay grown by the player.

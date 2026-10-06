@@ -124,6 +124,7 @@ fn build_window(app: &adw::Application, state: &AppState) {
         .default_height(760)
         .build();
 
+    crate::icons::register(&WidgetExt::display(&window));
     add_keyboard_support(app, &window);
 
     match &state.active_account {

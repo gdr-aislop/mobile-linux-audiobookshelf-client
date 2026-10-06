@@ -2,6 +2,7 @@ mod application;
 mod crash_reporting;
 mod downloads;
 mod error_reporting;
+mod icons;
 mod low_memory_mode;
 mod offline_mode;
 mod perf;
@@ -159,6 +160,7 @@ mod tests {
     /// `glib::spawn_future_local` futures panic with "requires a Tokio context").
     fn run_scenario(scenario: fn(&tokio::runtime::Runtime)) {
         gtk4::init().expect("gtk4::init for the scenario process");
+        crate::icons::register(&gtk4::gdk::Display::default().expect("gtk4::init opened a display"));
         abs_player::init().expect("gstreamer::init for the scenario process");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
@@ -188,6 +190,7 @@ mod tests {
     gtk_scenarios! {
         (application_single_key_shortcuts_defer_to_the_focused_widget, crate::application::tests::run_single_key_shortcuts_defer_to_the_focused_widget),
         (error_reporting_shows_one_toast, crate::error_reporting::tests::run_report_background_error_shows_one_toast),
+        (icons_every_icon_the_app_uses_is_in_the_theme, crate::icons::tests::run_every_icon_the_app_uses_is_in_the_theme),
         (welcome_connect, crate::screens::welcome::tests::run),
         (welcome_relogin_flow, crate::screens::welcome::tests::run_relogin_flow),
         (home_renders_synced_library_and_recently_added_item, crate::screens::home::tests::run_renders_synced_library_and_recently_added_item),

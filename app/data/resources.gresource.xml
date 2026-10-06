@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Compiled by build.rs into the binary; see `crate::icons`. -->
+<gresources>
+  <gresource prefix="/io/github/gdr_aislop/abs-app">
+    <file>icons/scalable/actions/funnel-symbolic.svg</file>
+  </gresource>
+</gresources>
