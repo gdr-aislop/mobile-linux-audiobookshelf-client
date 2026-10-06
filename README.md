@@ -98,7 +98,7 @@ through either repo (an `apt install` from the hosted repo above is already
 verified via its own signed `Release`/`InRelease`, with nothing extra to do):
 
 ```sh
-gpg --import abs-app.asc   # once, also attached to every release
+gpg --import abs-app-signing-key.asc   # once, also attached to every release
 gpg --verify abs-app_<version>_<arch>.deb.asc abs-app_<version>_<arch>.deb
 gpg --verify abs-app-<version>-<arch>.AppImage.asc abs-app-<version>-<arch>.AppImage
 ```
@@ -109,7 +109,7 @@ The signing key's fingerprint is:
 CC77 E444 A5CD 5384 0459  1237 08D0 546C 9455 D910
 ```
 
-Check it against `gpg --fingerprint` after importing `abs-app.asc`, since that
+Check it against `gpg --fingerprint` after importing `abs-app-signing-key.asc`, since that
 file is hosted alongside the binaries it verifies and shouldn't be the only
 source trusted for the key itself.
 

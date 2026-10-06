@@ -493,7 +493,7 @@ jobs:
           for f in *.deb *.AppImage; do
             gpg --batch --default-key "$SIGNING_GPG_KEY_ID" --detach-sign --armor -o "$f.asc" "$f"
           done
-          gpg --armor --export "$SIGNING_GPG_KEY_ID" > abs-app.asc
+          gpg --armor --export "$SIGNING_GPG_KEY_ID" > abs-app-signing-key.asc
         env:
           SIGNING_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
 
