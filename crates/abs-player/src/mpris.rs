@@ -187,7 +187,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
                 // sender is the caller's unique bus name; `busctl --user status <name>` maps it
                 // to a process.
                 tracing::info!(%method, sender = sender.unwrap_or("?"), "MPRIS command received");
-                match dispatch_player_method(method, &params, commands.as_ref(), &state.borrow()) {
+                match handle_player_call(method, &params, commands.as_ref(), &state) {
                     Ok(reply) => invocation.return_value(reply.as_ref()),
                     Err(err) => invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", &err.to_string()),
                 }
@@ -351,6 +351,16 @@ fn metadata_variant(metadata: &TrackMetadata) -> glib::Variant {
         dict.insert("mpris:artUrl", art_url.as_str());
     }
     dict.end()
+}
+
+/// The D-Bus method-call closure's body: runs one inbound Player call against the current state.
+/// It works on a copy, never holding `state` borrowed while the command runs: the player reports
+/// a pause or a seek back at once, through `MprisHandle::update`, which writes `state` — still
+/// inside this call. Holding the borrow made that a "RefCell already borrowed" panic, and since
+/// this runs in a GLib callback that can't unwind, a crash.
+fn handle_player_call(method: &str, params: &glib::Variant, commands: &dyn MprisCommands, state: &RefCell<PlayerState>) -> Result<Option<glib::Variant>, glib::Error> {
+    let current = state.borrow().clone();
+    dispatch_player_method(method, params, commands, &current)
 }
 
 /// Factored out of the D-Bus method-call closure so it's unit-testable against a fake
@@ -559,6 +569,64 @@ mod tests {
         assert_eq!(changed.lookup_value("PlaybackStatus", None).and_then(|value| value.str().map(str::to_string)), Some("Paused".to_string()));
     }
 
+    /// Commands that, like the real player, report the change straight back while they run:
+    /// the app's snapshot listener calls `MprisHandle::update`, which writes the shared state.
+    struct UpdatingCommands(Rc<RefCell<PlayerState>>);
+
+    impl UpdatingCommands {
+        fn report(&self) {
+            self.0.borrow_mut().status = PlaybackStatus::Playing;
+        }
+    }
+
+    impl MprisCommands for UpdatingCommands {
+        fn play_pause(&self) {
+            self.report();
+        }
+        fn play(&self) {
+            self.report();
+        }
+        fn pause(&self) {
+            self.report();
+        }
+        fn seek(&self, _offset_micros: i64) {
+            self.report();
+        }
+        fn set_position(&self, _position_micros: i64) {
+            self.report();
+        }
+        fn next(&self) {
+            self.report();
+        }
+        fn previous(&self) {
+            self.report();
+        }
+    }
+
+    /// Pausing from the phone's media widget crashed 0.9.2: the call held the state borrowed
+    /// while the pause ran, and the pause's own update then couldn't write it.
+    #[test]
+    fn a_command_may_update_the_state_while_it_runs() {
+        let state = Rc::new(RefCell::new(loaded_state()));
+        let commands = UpdatingCommands(state.clone());
+        let track = || glib::variant::ObjectPath::try_from(TRACK_ID_PATH).unwrap().to_variant();
+        let calls = [
+            ("PlayPause", ().to_variant()),
+            ("Play", ().to_variant()),
+            ("Pause", ().to_variant()),
+            ("Stop", ().to_variant()),
+            ("Next", ().to_variant()),
+            ("Previous", ().to_variant()),
+            ("Seek", glib::Variant::tuple_from_iter([5_000_000_i64.to_variant()])),
+            ("SetPosition", glib::Variant::tuple_from_iter([track(), 5_000_000_i64.to_variant()])),
+        ];
+        for (method, params) in calls {
+            *state.borrow_mut() = loaded_state();
+            handle_player_call(method, &params, &commands, &state).unwrap();
+            assert_eq!(state.borrow().status, PlaybackStatus::Playing, "{method} reported its change");
+        }
+    }
+
     #[test]
     fn only_a_big_step_in_position_is_a_seek() {
         let at = |micros: i64| PlayerState { position_micros: micros, ..loaded_state() };
@@ -661,6 +729,76 @@ mod tests {
 
                 handle.update(PlayerState { status: PlaybackStatus::Playing, ..loaded_state() });
                 spin_until("the client to see CanPlay turn on", &|| can_play() == Some(true));
+            })
+            .expect("the test's main context is free");
+    }
+
+    /// What crashed 0.9.2 on the phone: the media widget calls `PlayPause`, the player pauses and
+    /// reports it straight back through `update`, all inside the D-Bus call. Needs a real session
+    /// bus — run like the tests above.
+    #[test]
+    #[ignore]
+    fn a_client_can_pause_a_player_that_reports_back_at_once() {
+        struct ReportingCommands(Rc<RefCell<Option<MprisHandle>>>);
+        impl MprisCommands for ReportingCommands {
+            fn play_pause(&self) {
+                if let Some(handle) = self.0.borrow().as_ref() {
+                    handle.update(loaded_state());
+                }
+            }
+            fn play(&self) {}
+            fn pause(&self) {}
+            fn seek(&self, _offset_micros: i64) {}
+            fn set_position(&self, _position_micros: i64) {}
+            fn next(&self) {}
+            fn previous(&self) {}
+        }
+
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let slot = Rc::new(RefCell::new(None));
+                let handle = register("AbsPlayerPauseTest", Rc::new(ReportingCommands(slot.clone()))).expect("a session bus is reachable");
+                handle.update(PlayerState { status: PlaybackStatus::Playing, ..loaded_state() });
+                *slot.borrow_mut() = Some(handle);
+
+                let address = gio::dbus_address_get_for_bus_sync(gio::BusType::Session, gio::Cancellable::NONE).expect("a session bus address");
+                let client = gio::DBusConnection::for_address_sync(
+                    &address,
+                    gio::DBusConnectionFlags::AUTHENTICATION_CLIENT | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                    None,
+                    gio::Cancellable::NONE,
+                )
+                .expect("a second connection to the session bus");
+                let reply = Rc::new(RefCell::new(None));
+                client.call(
+                    Some("org.mpris.MediaPlayer2.AbsPlayerPauseTest"),
+                    OBJECT_PATH,
+                    PLAYER_IFACE,
+                    "PlayPause",
+                    None,
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    5_000,
+                    gio::Cancellable::NONE,
+                    {
+                        let reply = reply.clone();
+                        move |result| *reply.borrow_mut() = Some(result.map(|_| ()))
+                    },
+                );
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+                while reply.borrow().is_none() {
+                    assert!(std::time::Instant::now() < deadline, "timed out waiting for the PlayPause reply");
+                    if !context.iteration(false) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                reply.borrow_mut().take().unwrap().expect("PlayPause succeeds");
+                // Taken out of the slot, the handle is dropped here, which unregisters it — inside
+                // the slot it's held by its own commands and would outlive the test.
+                let handle = slot.borrow_mut().take().expect("the handle is still in the slot");
+                assert_eq!(handle.state.borrow().status, PlaybackStatus::Paused, "the pause was reported");
             })
             .expect("the test's main context is free");
     }
