@@ -38,6 +38,8 @@ pub struct TestHooks {
     pub title_label: gtk4::Label,
     pub author_label: gtk4::Label,
     pub play_button: gtk4::Button,
+    pub previous_chapter_button: gtk4::Button,
+    pub next_chapter_button: gtk4::Button,
     pub collapse_button: gtk4::Button,
     pub scrubber: gtk4::Scale,
     pub elapsed_label: gtk4::Label,
@@ -147,6 +149,13 @@ pub fn build(
     time_row.append(&elapsed_label);
     time_row.append(&remaining_label);
 
+    // Previous/next chapter sit at the outer ends of the row, the same buttons the system media
+    // card's ⏮/⏭ are (MPRIS `Previous`/`Next`), with the skip-N-seconds pair inside them.
+    let previous_chapter = gtk4::Button::builder()
+        .css_classes(["circular", "flat"])
+        .tooltip_text("Previous chapter")
+        .child(&gtk4::Image::from_icon_name("media-skip-backward-symbolic"))
+        .build();
     let skip_back = gtk4::Button::builder()
         .css_classes(["circular"])
         .child(&gtk4::Image::from_icon_name("media-seek-backward-symbolic"))
@@ -167,10 +176,22 @@ pub fn build(
         .css_classes(["circular"])
         .child(&gtk4::Image::from_icon_name("media-seek-forward-symbolic"))
         .build();
-    let transport = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(30).halign(gtk4::Align::Center).margin_top(26).build();
+    let next_chapter = gtk4::Button::builder()
+        .css_classes(["circular", "flat"])
+        .tooltip_text("Next chapter")
+        .child(&gtk4::Image::from_icon_name("media-skip-forward-symbolic"))
+        .build();
+    // Five buttons have to fit a 360px-wide phone between `content`'s 28px margins, hence the
+    // tighter spacing than the three-button row had.
+    let transport = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(18).halign(gtk4::Align::Center).margin_top(26).build();
+    transport.append(&previous_chapter);
     transport.append(&skip_back);
     transport.append(&play_button);
     transport.append(&skip_forward);
+    transport.append(&next_chapter);
+    for button in [&previous_chapter, &skip_back, &skip_forward, &next_chapter] {
+        button.set_valign(gtk4::Align::Center);
+    }
 
     // Secondary row: speed, sleep timer, chapters. `AdwBottomSheet`/popover-menu widgets from
     // libadwaita 1.4+ are unavailable at this crate's v1.2 ceiling, so every one of these is a
@@ -399,6 +420,18 @@ pub fn build(
         let controller = controller.clone();
         move |_| controller.skip(controller.skip_intervals().1)
     });
+    previous_chapter.connect_clicked({
+        let controller = controller.clone();
+        move |_| {
+            controller.previous_chapter();
+        }
+    });
+    next_chapter.connect_clicked({
+        let controller = controller.clone();
+        move |_| {
+            controller.next_chapter();
+        }
+    });
     play_button.connect_clicked({
         let controller = controller.clone();
         move |_| controller.toggle_play_pause()
@@ -549,6 +582,8 @@ pub fn build(
         let sleep_timer_button = sleep_timer_button.clone();
         let skip_back = skip_back.clone();
         let skip_forward = skip_forward.clone();
+        let previous_chapter = previous_chapter.clone();
+        let next_chapter = next_chapter.clone();
         let speed_button = speed_button.clone();
         let cover = cover.clone();
         let error_banner = error_banner.clone();
@@ -580,6 +615,12 @@ pub fn build(
             scrubber.set_sensitive(!snapshot.is_loading);
             skip_back.set_sensitive(!snapshot.is_loading);
             skip_forward.set_sensitive(!snapshot.is_loading);
+            // Kept while loading (chapters aren't known yet) so the row doesn't reflow when they
+            // turn up; only a loaded book without chapters drops them.
+            for button in [&previous_chapter, &next_chapter] {
+                button.set_visible(snapshot.is_loading || snapshot.has_chapters);
+                button.set_sensitive(!snapshot.is_loading);
+            }
             speed_button.set_sensitive(!snapshot.is_loading);
             sleep_timer_button.set_sensitive(!snapshot.is_loading);
 
@@ -617,6 +658,8 @@ pub fn build(
             title_label,
             author_label,
             play_button,
+            previous_chapter_button: previous_chapter,
+            next_chapter_button: next_chapter,
             collapse_button,
             scrubber,
             elapsed_label,
@@ -951,6 +994,95 @@ pub(crate) mod tests {
         );
 
         window.destroy();
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The transport row's ⏭ goes to the
+    /// next chapter's start and ⏮ (pressed right at a chapter's start) back to the previous one;
+    /// MPRIS `Next`/`Previous` (the system media card's ⏮/⏭) do the same.
+    pub(crate) fn run_chapter_buttons_jump_between_chapters(runtime: &tokio::runtime::Runtime) {
+        use abs_player::mpris::MprisCommands;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(
+            &mock_server,
+            "item-1",
+            10,
+            &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)],
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
+
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
+        let hooks = screen.test_hooks();
+        let position = || controller.snapshot().unwrap().position_seconds;
+        assert!(hooks.previous_chapter_button.is_visible() && hooks.next_chapter_button.is_visible(), "a chaptered book shows both chapter buttons");
+        assert!(hooks.next_chapter_button.is_sensitive(), "the chapter buttons work once the book has loaded");
+
+        hooks.next_chapter_button.emit_clicked();
+        pump_until(|| position() >= 4.0, Duration::from_secs(5));
+        assert!(position() >= 4.0, "next chapter should seek to Chapter One's start");
+
+        hooks.previous_chapter_button.emit_clicked();
+        pump_until(|| position() < 4.0, Duration::from_secs(5));
+        assert!(position() < 4.0, "previous chapter at Chapter One's start should go back to the Intro");
+
+        let mpris = crate::player::MprisBridge::new(controller.clone());
+        mpris.next();
+        pump_until(|| position() >= 4.0, Duration::from_secs(5));
+        assert!(position() >= 4.0, "MPRIS Next should go to the next chapter");
+        mpris.previous();
+        pump_until(|| position() < 4.0, Duration::from_secs(5));
+        assert!(position() < 4.0, "MPRIS Previous should go back a chapter");
+
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A book without chapters hides the
+    /// chapter buttons, and MPRIS `Next`/`Previous` fall back to the skip intervals so the
+    /// system media card's ⏮/⏭ still do something.
+    pub(crate) fn run_chapter_buttons_hide_for_a_book_without_chapters(runtime: &tokio::runtime::Runtime) {
+        use abs_player::mpris::MprisCommands;
+
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-1", 20, &[]));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.set_playback_config(1.0, 2.0, 5.0);
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Plain Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
+        controller.pause();
+
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
+        let hooks = screen.test_hooks();
+        assert!(!hooks.previous_chapter_button.is_visible() && !hooks.next_chapter_button.is_visible(), "a book without chapters hides the chapter buttons");
+
+        let position = || controller.snapshot().unwrap().position_seconds;
+        let before = position();
+        crate::player::MprisBridge::new(controller.clone()).next();
+        pump_until(|| position() >= before + 4.0, Duration::from_secs(5));
+        assert!(position() >= before + 4.0, "MPRIS Next without chapters should skip forward by the 5s interval, got {} from {before}", position());
+
         controller.stop();
     }
 

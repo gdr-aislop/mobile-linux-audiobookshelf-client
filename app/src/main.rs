@@ -365,6 +365,8 @@ mod tests {
         (player_screen_playback_error_shows_the_banner, crate::screens::player::tests::run_playback_error_shows_the_banner),
         (player_screen_keyboard_actions, crate::screens::player::tests::run_keyboard_actions),
         (player_screen_chapters_sheet_lists_and_seeks, crate::screens::player::tests::run_chapters_sheet_lists_and_seeks),
+        (player_screen_chapter_buttons_jump_between_chapters, crate::screens::player::tests::run_chapter_buttons_jump_between_chapters),
+        (player_screen_chapter_buttons_hide_for_a_book_without_chapters, crate::screens::player::tests::run_chapter_buttons_hide_for_a_book_without_chapters),
         (player_screen_download_button_starts_a_download_and_reflects_state, crate::screens::player::tests::run_download_button_starts_a_download_and_reflects_state),
         (player_screen_download_progress_strip_reveals_while_downloading, crate::screens::player::tests::run_download_progress_strip_reveals_while_downloading),
 

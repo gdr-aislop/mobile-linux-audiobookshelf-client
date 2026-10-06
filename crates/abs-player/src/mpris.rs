@@ -10,9 +10,10 @@
 //! is the only place that ties `MprisCommands` to a real `PlayerController`. That's the whole
 //! dependency-direction story: `app` depends on `abs-player`, never the reverse.
 //!
-//! `Next`/`Previous` are named per the MPRIS spec but are wired to skip-forward/back-N-seconds,
-//! never a literal track change — this app has no playlist concept, per
-//! `docs/design/ui-spec.md`'s explicit mapping.
+//! `Next`/`Previous` go to the next/previous chapter, never a literal track change (this app has
+//! no playlist concept) — the system media card already has its own seek buttons for skipping.
+//! A book without chapters falls back to skip-forward/back-N-seconds, per
+//! `docs/design/ui-spec.md`'s mapping. Which of the two happens is the caller's business.
 
 use std::cell::RefCell;
 use std::rc::Rc;

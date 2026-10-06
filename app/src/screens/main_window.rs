@@ -2086,7 +2086,8 @@ pub(crate) mod tests {
                     .mount(&mock_server),
             );
         }
-        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-1", 60));
+        // Chaptered, so the player's previous/next chapter buttons are in the shots.
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-1", 60, &[("Prologue", 0.0, 20.0), ("One", 20.0, 60.0)]));
 
         let pool = runtime.block_on(pool());
         let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
@@ -2233,8 +2234,9 @@ pub(crate) mod tests {
                 .respond_with(wiremock::ResponseTemplate::new(404))
                 .mount(&mock_server),
         );
-        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-2", 60));
-        runtime.block_on(crate::player::tests::mock_playable_item(&mock_server, "item-3", 60));
+        // Chaptered, so the player's transport row has all five buttons when its width is checked.
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-2", 60, &[("One", 0.0, 30.0), ("Two", 30.0, 60.0)]));
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(&mock_server, "item-3", 60, &[("One", 0.0, 30.0), ("Two", 30.0, 60.0)]));
 
         let pool = runtime.block_on(pool());
         let server_id = runtime.block_on(abs_storage::repo::servers::add(&pool, &mock_server.uri())).unwrap();
@@ -2281,6 +2283,10 @@ pub(crate) mod tests {
             (hooks.open_player)();
             pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(10));
             measure(name, &app_window.content().unwrap());
+            // Nothing scrolls sideways, so a row wider than the phone (the five-button transport
+            // row is the widest) would widen the whole window.
+            let (min_width, ..) = app_window.content().unwrap().measure(gtk4::Orientation::Horizontal, -1);
+            assert!(min_width <= 360, "{name}: the player needs {min_width}px of width, wider than a 360px phone");
             let collapse = find_button_with_icon(&app_window.content().unwrap(), "go-down-symbolic").expect("the player's collapse button");
             collapse.emit_clicked();
             pump_until(|| app_window.content().is_some_and(|c| c == window.root), std::time::Duration::from_secs(5));

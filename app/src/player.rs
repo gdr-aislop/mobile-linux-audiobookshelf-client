@@ -208,6 +208,9 @@ pub struct PlayerSnapshot {
     /// loaded (the user, an unplug or a call can pause it before then).
     pub is_loading: bool,
     pub will_play_when_loaded: bool,
+    /// Whether the loaded book has chapter data, so the previous/next chapter buttons have
+    /// anywhere to go. `false` while a start is still resolving.
+    pub has_chapters: bool,
 }
 
 impl PlayerSnapshot {
@@ -418,6 +421,36 @@ fn clamp_to_book(seconds: f64, duration_seconds: f64) -> f64 {
 /// The end of the chapter `position` falls in, if any.
 fn chapter_end_at(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
     chapters.iter().find(|c| c.start_seconds <= position && position < c.end_seconds).map(|c| c.end_seconds)
+}
+
+/// How far into a chapter "previous chapter" still means "back to the previous one" — past this
+/// it restarts the current chapter instead, the way a music player's previous button works.
+const PREVIOUS_CHAPTER_RESTART_SECONDS: f64 = 3.0;
+
+/// Index of the chapter `position` falls in, clamped to the last chapter past every range (the
+/// same rule as `PlayerController::current_chapter_index`). `None` without chapters.
+fn chapter_index_at(chapters: &[ChapterInfo], position: f64) -> Option<usize> {
+    if chapters.is_empty() {
+        return None;
+    }
+    chapters.iter().position(|c| c.start_seconds <= position && position < c.end_seconds).or(Some(chapters.len() - 1))
+}
+
+/// Where "next chapter" goes from `position`: the start of the chapter after the current one.
+/// `None` in the last chapter or without chapters.
+fn next_chapter_start(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
+    let current = chapter_index_at(chapters, position)?;
+    chapters.get(current + 1).map(|c| c.start_seconds.max(0.0))
+}
+
+/// Where "previous chapter" goes from `position`: the current chapter's start when more than
+/// `PREVIOUS_CHAPTER_RESTART_SECONDS` into it (or in the first chapter), otherwise the previous
+/// chapter's start. `None` without chapters.
+fn previous_chapter_start(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
+    let current = chapter_index_at(chapters, position)?;
+    let restart = position - chapters[current].start_seconds > PREVIOUS_CHAPTER_RESTART_SECONDS;
+    let target = if restart || current == 0 { current } else { current - 1 };
+    Some(chapters[target].start_seconds.max(0.0))
 }
 
 /// Returns whether to keep listening: a listener that returns `false` (its screen is gone) is
@@ -801,6 +834,7 @@ impl Inner {
                 last_error: None,
                 is_loading: true,
                 will_play_when_loaded: pending.wants_play,
+                has_chapters: false,
             });
         }
         let now_playing = self.now_playing.as_ref()?;
@@ -816,6 +850,7 @@ impl Inner {
             last_error: now_playing.last_error.clone(),
             is_loading: false,
             will_play_when_loaded: false,
+            has_chapters: !now_playing.chapters.is_empty(),
         })
     }
 
@@ -1709,6 +1744,11 @@ impl PlayerController {
         self.inner.borrow().now_playing.as_ref().map(|np| np.chapters.clone()).unwrap_or_default()
     }
 
+    /// Whether the loaded book has chapter data — cheaper than `chapters()` for a yes/no.
+    pub fn has_chapters(&self) -> bool {
+        self.inner.borrow().now_playing.as_ref().is_some_and(|np| !np.chapters.is_empty())
+    }
+
     /// `(session, server_id, item_id)` for whatever is currently loaded — the context a download
     /// button needs to call `DownloadManager::start_download`. `None` if nothing is playing.
     pub fn current_download_context(&self) -> Option<(abs_core::auth::Session, String, String)> {
@@ -1727,15 +1767,7 @@ impl PlayerController {
     pub fn current_chapter_index(&self) -> Option<usize> {
         let inner = self.inner.borrow();
         let now_playing = inner.now_playing.as_ref()?;
-        if now_playing.chapters.is_empty() {
-            return None;
-        }
-        let position = inner.book_position();
-        now_playing
-            .chapters
-            .iter()
-            .position(|c| c.start_seconds <= position && position < c.end_seconds)
-            .or(Some(now_playing.chapters.len() - 1))
+        chapter_index_at(&now_playing.chapters, inner.book_position())
     }
 
     /// Records a bookmark at the current position. Local-only, bypassing `abs-core` entirely —
@@ -2983,6 +3015,30 @@ impl PlayerController {
         self.seek_to_seconds(target);
     }
 
+    /// Seeks to the start of the next chapter. Returns `false` (and does nothing) when nothing is
+    /// loaded, the book has no chapters, or it's already in the last one.
+    pub fn next_chapter(&self) -> bool {
+        self.seek_to_chapter_start(next_chapter_start)
+    }
+
+    /// Seeks back to the start of the current chapter, or to the previous chapter's start when
+    /// just past the current one's — see `previous_chapter_start`. Returns `false` (and does
+    /// nothing) when nothing is loaded or the book has no chapters.
+    pub fn previous_chapter(&self) -> bool {
+        self.seek_to_chapter_start(previous_chapter_start)
+    }
+
+    fn seek_to_chapter_start(&self, pick: fn(&[ChapterInfo], f64) -> Option<f64>) -> bool {
+        let target = {
+            let inner = self.inner.borrow();
+            let Some(now_playing) = &inner.now_playing else { return false };
+            pick(&now_playing.chapters, inner.book_position())
+        };
+        let Some(target) = target else { return false };
+        self.seek_to_seconds(target);
+        true
+    }
+
     pub fn seek_fraction(&self, fraction: f64) {
         let Some(duration_seconds) = self.inner.borrow().now_playing.as_ref().map(|np| np.duration_seconds) else { return };
         if duration_seconds <= 0.0 {
@@ -3708,11 +3764,21 @@ impl abs_player::mpris::MprisCommands for MprisBridge {
     fn set_position(&self, position_micros: i64) {
         self.controller.seek_to_seconds(position_micros as f64 / 1_000_000.0);
     }
+    // The card's ⏮/⏭ change chapters; its own seek buttons already cover skipping. A book
+    // without chapters falls back to the skip intervals so the buttons still do something.
     fn next(&self) {
-        self.controller.skip(self.controller.skip_intervals().1);
+        if !self.controller.has_chapters() {
+            self.controller.skip(self.controller.skip_intervals().1);
+        } else {
+            self.controller.next_chapter();
+        }
     }
     fn previous(&self) {
-        self.controller.skip(-self.controller.skip_intervals().0);
+        if !self.controller.has_chapters() {
+            self.controller.skip(-self.controller.skip_intervals().0);
+        } else {
+            self.controller.previous_chapter();
+        }
     }
 }
 
@@ -7152,5 +7218,50 @@ pub(crate) mod tests {
         let requests = runtime.block_on(mock_server.received_requests()).unwrap();
         assert!(requests.is_empty(), "offline mode: nothing may reach the server, got {:?}", requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>());
         controller.stop();
+    }
+
+    fn three_chapters() -> Vec<ChapterInfo> {
+        [("One", 0.0, 100.0), ("Two", 100.0, 250.0), ("Three", 250.0, 400.0)]
+            .into_iter()
+            .map(|(title, start_seconds, end_seconds)| ChapterInfo { title: title.to_string(), start_seconds, end_seconds })
+            .collect()
+    }
+
+    #[test]
+    fn next_chapter_goes_to_the_following_chapters_start() {
+        assert_eq!(next_chapter_start(&three_chapters(), 0.0), Some(100.0));
+        assert_eq!(next_chapter_start(&three_chapters(), 120.0), Some(250.0));
+    }
+
+    #[test]
+    fn next_chapter_in_the_last_chapter_goes_nowhere() {
+        assert_eq!(next_chapter_start(&three_chapters(), 300.0), None);
+        // Past every range clamps to the last chapter, which has no next one either.
+        assert_eq!(next_chapter_start(&three_chapters(), 400.0), None);
+    }
+
+    #[test]
+    fn previous_chapter_well_into_a_chapter_restarts_it() {
+        assert_eq!(previous_chapter_start(&three_chapters(), 180.0), Some(100.0));
+        assert_eq!(previous_chapter_start(&three_chapters(), 100.0 + PREVIOUS_CHAPTER_RESTART_SECONDS + 0.5), Some(100.0));
+    }
+
+    #[test]
+    fn previous_chapter_at_a_chapters_start_goes_to_the_one_before() {
+        assert_eq!(previous_chapter_start(&three_chapters(), 101.0), Some(0.0));
+        assert_eq!(previous_chapter_start(&three_chapters(), 100.0 + PREVIOUS_CHAPTER_RESTART_SECONDS), Some(0.0));
+        assert_eq!(previous_chapter_start(&three_chapters(), 250.0), Some(100.0));
+    }
+
+    #[test]
+    fn previous_chapter_in_the_first_chapter_goes_to_its_start() {
+        assert_eq!(previous_chapter_start(&three_chapters(), 1.0), Some(0.0));
+        assert_eq!(previous_chapter_start(&three_chapters(), 50.0), Some(0.0));
+    }
+
+    #[test]
+    fn chapter_jumps_without_chapters_go_nowhere() {
+        assert_eq!(next_chapter_start(&[], 10.0), None);
+        assert_eq!(previous_chapter_start(&[], 10.0), None);
     }
 }

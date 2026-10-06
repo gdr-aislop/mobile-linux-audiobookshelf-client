@@ -324,9 +324,11 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - **Properties to keep current**, on every playback state change (play/pause/seek/position tick),
   not just at session start: `PlaybackStatus`, `Metadata` (`xesam:title`, `xesam:artist`,
   `mpris:artUrl` pointing at the cached cover file, `mpris:length`), `Position`, `Rate`.
-- **Methods**: `PlayPause`/`Play`/`Pause`, `Seek`, and `Next`/`Previous` mapped to this app's
-  skip-forward/back-N-seconds actions rather than a literal track change — matching what Lissen's
-  own notification buttons actually do.
+- **Methods**: `PlayPause`/`Play`/`Pause`, `Seek`, and `Next`/`Previous` mapped to the full
+  player's next/previous chapter buttons rather than a literal track change. Phosh's card draws
+  its own seek buttons (`Seek` −10 s / +30 s) between ⏮ and ⏭, so skipping is already covered
+  there. A book without chapters maps them to skip-forward/back-N-seconds instead, so ⏮/⏭ never
+  go dead.
 - A plain `GNotification` is deliberately **not** part of this design: the quick-settings/lock-screen
   media widget already gives always-on visibility and controls without user action, so a second,
   separately-dismissible notification would just duplicate it.
@@ -383,7 +385,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for
   "Sleep timer", "Playback speed", "Add bookmark").
 - Large cover art, title/author, `GtkScale`-based scrubber with elapsed/remaining time labels.
-- Transport row: skip-back-N-seconds, play/pause (large), skip-forward-N-seconds.
+- Transport row: previous chapter, skip-back-N-seconds, play/pause (large),
+  skip-forward-N-seconds, next chapter. Previous chapter restarts the current chapter when more
+  than 3 s into it, and otherwise goes to the one before. Next chapter does nothing in the last
+  chapter. A book without chapters hides both chapter buttons.
 - Secondary row: playback speed button (cycles/opens popover with 0.8×–3.0× options), sleep-timer
   button (opens popover: off / 15 / 30 / 45 min / end-of-chapter), chapters button (opens a sheet
   listing chapters, current one highlighted).
