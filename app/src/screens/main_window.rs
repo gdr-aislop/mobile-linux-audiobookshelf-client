@@ -746,7 +746,7 @@ pub fn build(
     home_screen.follow_low_memory_mode(&low_memory_mode);
     library_screen.follow_low_memory_mode(&low_memory_mode);
     stack.add_titled_with_icon(&home_screen.root, Some("home"), "Home", "go-home-symbolic");
-    stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", "system-file-manager-symbolic");
+    stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", crate::icons::LIBRARY);
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
     stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
 
@@ -792,7 +792,7 @@ pub fn build(
         servers_with_accounts,
         window.clone(),
     );
-    stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", "emblem-system-symbolic");
+    stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", crate::icons::SETTINGS);
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
 

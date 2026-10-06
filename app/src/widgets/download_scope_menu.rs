@@ -228,7 +228,7 @@ pub fn build(
             }
             widget.set_icon_name(match state {
                 ItemDownloadState::Downloading => "content-loading-symbolic",
-                ItemDownloadState::Complete => "emblem-ok-symbolic",
+                ItemDownloadState::Complete => "object-select-symbolic",
                 // A stopped download kept its completed chapters — the button returns to its
                 // "can start/continue a download" state, same as idle.
                 ItemDownloadState::Idle | ItemDownloadState::Stopped | ItemDownloadState::Failed(_) => "folder-download-symbolic",
@@ -753,7 +753,7 @@ pub(crate) mod tests {
             || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "2")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
             Duration::from_secs(10),
         );
-        pump_until(|| menu.widget.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
+        pump_until(|| menu.widget.icon_name().as_deref() == Some("object-select-symbolic"), Duration::from_secs(5));
         assert!(
             runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().is_none(),
             "chapter 1's track must not be fetched — the download is exactly the stepper's 1 chapter"

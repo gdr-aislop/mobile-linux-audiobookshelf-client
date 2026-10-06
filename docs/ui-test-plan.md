@@ -462,7 +462,7 @@ was and wasn't verified.
 
 - [ ] **ID-15 — Offline-availability marker.** With some chapters downloaded, inspect the
       chapter list.
-      *Expected:* each downloaded chapter row shows a small filled checkmark-in-circle glyph
+      *Expected:* each downloaded chapter row shows a small checkmark glyph
       trailing the duration; not-downloaded rows show **no** glyph; the "Chapters" section
       header carries a one-line legend ("● downloaded"); the active chapter additionally shows
       the playing-bars icon.

@@ -6,6 +6,14 @@
 //! Icons added here act as part of the hicolor fallback theme, so a theme that has its own version
 //! still wins.
 
+/// The Library: no stock Adwaita icon means "library" (the old `system-file-manager-symbolic` is a
+/// legacy icon newer Adwaita versions dropped, so the flatpak drew a full-colour one in its place).
+/// Named for this app so another theme's "library" icon can't stand in for it.
+pub const LIBRARY: &str = "abs-library-symbolic";
+/// Settings: a gear. Adwaita's `emblem-system-symbolic` gear is gone from its current set, and
+/// `preferences-system-symbolic` is a wrench and screwdriver.
+pub const SETTINGS: &str = "abs-settings-symbolic";
+
 /// Where `data/resources.gresource.xml` puts the icon directories.
 const ICONS_RESOURCE_PATH: &str = "/io/github/gdr_aislop/abs-app/icons";
 
@@ -23,11 +31,12 @@ pub fn register(display: &gtk4::gdk::Display) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// Every `"…-symbolic"` icon name in the app's source must resolve, from the system theme,
-    /// libadwaita's own icons or the ones bundled here; GTK draws a placeholder for any that
-    /// doesn't, and says nothing. (The test machine's theme can be newer than a user's, so an
-    /// icon from a recent Adwaita can still slip through; check new names against the oldest
-    /// Adwaita the packages target, Debian bookworm's.)
+    /// Every `"…-symbolic"` icon name in the app's source must be one every supported system has:
+    /// in `data/stock-icons.txt` (Adwaita's current icons, in both the oldest and newest version
+    /// we run on; see `scripts/update-stock-icons.sh`), bundled in `data/icons/`, or libadwaita's
+    /// own (`adw-…`). Otherwise GTK silently draws whatever it finds instead: a full-colour icon
+    /// from another set, or a "missing icon" placeholder. Checking the list rather than this
+    /// machine's theme matters: its Adwaita still had legacy icons users' systems don't.
     pub(crate) fn run_every_icon_the_app_uses_is_in_the_theme(_rt: &tokio::runtime::Runtime) {
         adw::init().expect("libadwaita registers its own icons on init");
         let display = gtk4::gdk::Display::default().expect("a display");
@@ -56,6 +65,20 @@ pub(crate) mod tests {
             }
         }
         assert!(names.contains("funnel-symbolic"), "the scan should find the icon names in the source");
+
+        let stock: std::collections::HashSet<&str> =
+            include_str!("../data/stock-icons.txt").lines().filter(|line| !line.starts_with('#')).collect();
+        let bundled: Vec<&str> = include_str!("../data/resources.gresource.xml")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("<file>icons/")?.strip_suffix(".svg</file>"))
+            .filter_map(|path| path.rsplit('/').next())
+            .collect();
+        assert!(bundled.contains(&"funnel-symbolic"), "the bundled icons should be read from the gresource manifest");
+        let unsupported: Vec<_> = names
+            .iter()
+            .filter(|name| !stock.contains(name.as_str()) && !bundled.contains(&name.as_str()) && !name.starts_with("adw-"))
+            .collect();
+        assert!(unsupported.is_empty(), "icons not in every supported Adwaita (legacy, dropped or never there): {unsupported:?}");
 
         let missing: Vec<_> = names.iter().filter(|name| !theme.has_icon(name)).collect();
         assert!(missing.is_empty(), "icons the theme doesn't have (GTK would draw a placeholder): {missing:?}");

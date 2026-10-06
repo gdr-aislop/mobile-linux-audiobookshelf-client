@@ -198,7 +198,7 @@ pub fn build(
     let sleep_timer_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     let sleep_timer_popover = gtk4::Popover::builder().child(&sleep_timer_popover_box).build();
     let sleep_timer_button = gtk4::MenuButton::builder()
-        .icon_name("preferences-system-time-symbolic")
+        .icon_name("weather-clear-night-symbolic")
         .tooltip_text("Sleep timer")
         .popover(&sleep_timer_popover)
         .build();
@@ -990,8 +990,8 @@ pub(crate) mod tests {
             || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
             Duration::from_secs(10),
         );
-        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
-        assert_eq!(hooks.download_button.icon_name().as_deref(), Some("emblem-ok-symbolic"), "the button should reflect Complete once the download finishes");
+        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("object-select-symbolic"), Duration::from_secs(5));
+        assert_eq!(hooks.download_button.icon_name().as_deref(), Some("object-select-symbolic"), "the button should reflect Complete once the download finishes");
 
         window.destroy();
         controller.stop();

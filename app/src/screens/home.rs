@@ -1017,7 +1017,7 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
 }
 
 fn library_row(library: &Library) -> adw::ActionRow {
-    let icon_name = if library.media_type == "podcast" { "audio-input-microphone-symbolic" } else { "system-file-manager-symbolic" };
+    let icon_name = if library.media_type == "podcast" { "audio-input-microphone-symbolic" } else { crate::icons::LIBRARY };
     let row = adw::ActionRow::builder().title(library.name.as_str()).subtitle(library.media_type.as_str()).build();
     row.add_prefix(&gtk4::Image::from_icon_name(icon_name));
     row

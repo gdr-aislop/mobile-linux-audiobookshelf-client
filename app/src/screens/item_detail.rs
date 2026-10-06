@@ -198,7 +198,7 @@ pub fn build(
     // below); a "downloaded" legend sits in the section header (ID-15) so the offline glyph's
     // meaning doesn't need to be inferred from a single unlabeled icon.
     let chapters_legend = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).margin_bottom(4).build();
-    chapters_legend.append(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).build());
+    chapters_legend.append(&gtk4::Image::builder().icon_name("object-select-symbolic").css_classes(["dim-label"]).build());
     chapters_legend.append(&gtk4::Label::builder().label("downloaded").css_classes(["caption", "dim-label"]).build());
     let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
     let chapters_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).margin_top(16).visible(false).build();
@@ -674,7 +674,7 @@ fn refresh_chapter_rows(
             row.add_css_class("heading");
         }
         if is_downloaded {
-            row.add_suffix(&gtk4::Image::builder().icon_name("emblem-ok-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+            row.add_suffix(&gtk4::Image::builder().icon_name("object-select-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
         }
         row.connect_activated({
             let on_play = on_play.clone();
@@ -1465,7 +1465,7 @@ pub(crate) mod tests {
             || runtime.block_on(abs_storage::repo::download_tracks::get(&pool, &server.id, "item-1", "1")).unwrap().map(|r| r.status == abs_storage::models::DownloadStatus::Complete).unwrap_or(false),
             Duration::from_secs(10),
         );
-        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("emblem-ok-symbolic"), Duration::from_secs(5));
+        pump_until(|| hooks.download_button.icon_name().as_deref() == Some("object-select-symbolic"), Duration::from_secs(5));
         window.destroy();
     }
 

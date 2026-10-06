@@ -238,7 +238,7 @@ Fractal) rather than copying Lissen's Material Design look.
 - `AdwExpanderRow` or plain text block for description (truncated with "more").
 - Chapter/episode list as `AdwActionRow`s, each showing chapter title + duration, tap to seek.
 - **Offline-availability marker**: each chapter row that has been downloaded shows a small
-  filled checkmark-in-circle glyph trailing the duration, distinct from the "currently playing"
+  checkmark glyph (`object-select-symbolic`) trailing the duration, distinct from the "currently playing"
   bars icon already used on the active chapter. Chapters not yet downloaded show no glyph at all —
   presence of the glyph is the signal, so the list isn't cluttered with a "not downloaded" icon on
   every other row. A one-line legend ("● downloaded") sits in the "Chapters" section header so the
@@ -513,6 +513,13 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   bottom bar. *(Field report: the full player, unscrolled, measured 631px with a one-line title and
   800px with a long title plus its error banner; after opening it, Home stayed too tall.)* A
   scenario (`main_window_every_screen_fits_a_phone`) holds every screen to ≤ 600px at 360px wide.
+- **Icons come from current Adwaita or the app itself.** Every symbolic icon name must be in
+  `app/data/stock-icons.txt` (Adwaita's icons, outside its legacy folder, in both bookworm's 43
+  and the newest version; `scripts/update-stock-icons.sh` regenerates it), bundled in
+  `app/data/icons/`, or libadwaita's own `adw-…`. A legacy or dropped name is drawn from whatever
+  the system has instead: a "missing icon" placeholder (the AppImage's filter funnel) or a
+  full-colour icon (the flatpak's Library tab). The bundled ones: the Library's books, the Settings
+  gear and the filter funnel. `icons_every_icon_the_app_uses_is_in_the_theme` checks this.
 
 ## 5. State handling
 
