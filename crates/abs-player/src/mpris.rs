@@ -265,17 +265,9 @@ impl MprisHandle {
             return;
         }
 
-        let changed = glib::VariantDict::new(None);
-        changed.insert("PlaybackStatus", new_state.status.as_str());
-        changed.insert("Metadata", metadata_variant(&new_state.metadata));
-        changed.insert("Rate", new_state.rate);
-        // `Position` is deliberately excluded from `PropertiesChanged` per the MPRIS spec itself
-        // ("Position ... may be changed without notification") — clients are expected to poll
-        // `Position` (or seek from `Seeked`), not treat it as a properties-changed field.
-
         let params = glib::Variant::tuple_from_iter([
             PLAYER_IFACE.to_variant(),
-            changed.end(),
+            changed_properties(&new_state),
             Vec::<String>::new().to_variant(),
         ]);
         if let Err(err) = self.connection.emit_signal(None, OBJECT_PATH, PROPERTIES_IFACE, "PropertiesChanged", Some(&params)) {
@@ -296,6 +288,28 @@ fn position_jumped(previous: &PlayerState, new: &PlayerState) -> bool {
 /// see the comment in `MprisHandle::update` on why `Position` never triggers a signal.
 fn player_state_changed(previous: &PlayerState, new: &PlayerState) -> bool {
     previous.status != new.status || previous.metadata != new.metadata || previous.rate != new.rate
+}
+
+/// Every Player property whose value can change, sent in full with each `PropertiesChanged`.
+/// A client (Phosh's media widget, GNOME Shell's) reads all properties once when the app appears
+/// on the bus — with nothing loaded, so the `Can*` ones are `false` — and from then on only
+/// learns new values from this signal; a property missing here stays at its first value in the
+/// client forever. The `Can*` values depend only on `status`, which `player_state_changed`
+/// compares, so they never change without a signal going out.
+///
+/// `Position` is deliberately left out, per the MPRIS spec itself ("Position ... may be changed
+/// without notification") — clients poll it, or learn of a jump from `Seeked`. `CanControl` and
+/// the rate bounds never change.
+const SIGNALLED_PROPERTIES: [&str; 8] = ["PlaybackStatus", "Metadata", "Rate", "CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek"];
+
+/// The `changed_properties` dict of a `PropertiesChanged` signal, built from the same getter
+/// clients' `Get`/`GetAll` calls use, so the two can never disagree.
+fn changed_properties(state: &PlayerState) -> glib::Variant {
+    let changed = glib::VariantDict::new(None);
+    for property in SIGNALLED_PROPERTIES {
+        changed.insert_value(property, &player_property(property, state));
+    }
+    changed.end()
 }
 
 fn media_player2_property(property: &str, app_name: &str) -> glib::Variant {
@@ -516,6 +530,35 @@ mod tests {
         }
     }
 
+    /// A Player property that differs between "nothing loaded" and "a book loaded" but isn't in
+    /// `PropertiesChanged` stays stale in every client: that's how the controls stayed greyed out
+    /// in the phone's media widget. Every property the interface declares is checked, so a new
+    /// one is covered without touching this test.
+    #[test]
+    fn every_property_that_can_change_is_signalled() {
+        let node_info = gio::DBusNodeInfo::for_xml(INTROSPECTION_XML).expect("valid introspection XML");
+        let player_info = node_info.lookup_interface(PLAYER_IFACE).expect("the Player interface");
+        let declared: Vec<&str> = INTROSPECTION_XML
+            .split("<property name=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|name| player_info.lookup_property(name).is_some())
+            .collect();
+        assert!(declared.contains(&"CanPlay"), "the scan found the Player properties: {declared:?}");
+
+        let (idle, loaded) = (PlayerState::default(), loaded_state());
+        for property in declared {
+            if property == "Position" || player_property(property, &idle) == player_property(property, &loaded) {
+                continue;
+            }
+            assert!(SIGNALLED_PROPERTIES.contains(&property), "{property} changes when a book loads but isn't in PropertiesChanged");
+        }
+
+        let changed = glib::VariantDict::new(Some(&changed_properties(&loaded)));
+        assert_eq!(changed.lookup_value("CanPlay", None).and_then(|value| value.get::<bool>()), Some(true));
+        assert_eq!(changed.lookup_value("PlaybackStatus", None).and_then(|value| value.str().map(str::to_string)), Some("Paused".to_string()));
+    }
+
     #[test]
     fn only_a_big_step_in_position_is_a_seek() {
         let at = |micros: i64| PlayerState { position_micros: micros, ..loaded_state() };
@@ -554,10 +597,11 @@ mod tests {
     /// Registers against a *real* session bus — only checkable when one is reachable, which this
     /// sandbox doesn't provide by default (`register`'s own graceful `Err` on a missing bus is
     /// what fast tests above exercise indirectly by never needing a bus at all). Run explicitly
-    /// via `dbus-run-session -- cargo test -p abs-player -- --ignored mpris::tests::register`
+    /// via `dbus-run-session -- cargo test -p abs-player -- --ignored --test-threads=1 mpris::tests`
     /// once `dbus-run-session` is confirmed present (checked during implementation: it is, in
     /// this build environment, though real hardware verification of the lock-screen card itself
-    /// still requires GNOME Shell/phosh).
+    /// still requires GNOME Shell/phosh). One thread: the live tests all export the same object
+    /// path on the process's one session-bus connection.
     #[test]
     #[ignore]
     fn register_succeeds_against_a_real_session_bus() {
@@ -569,6 +613,56 @@ mod tests {
             position_micros: 0,
             rate: 1.0,
         });
+    }
+
+    /// Does what a phone's media widget (Phosh, GNOME Shell) does: a `GDBusProxy` on the Player
+    /// interface, which keeps its own copy of every property and updates it only from
+    /// `PropertiesChanged`. The app registers with nothing loaded, so the widget first learns the
+    /// controls are off; when a book then plays, that copy must hear they're on again, or the
+    /// widget stays greyed out with every button a no-op. Needs a real session bus — run like the
+    /// test above.
+    #[test]
+    #[ignore]
+    fn a_client_sees_the_controls_enable_when_a_book_starts() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let spin_until = |what: &str, done: &dyn Fn() -> bool| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !done() {
+                        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                        if !context.iteration(false) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                };
+
+                let handle = register("AbsPlayerProxyTest", Rc::new(FakeCommands::default())).expect("a session bus is reachable");
+
+                // Its own connection, like a separate process: the proxy's calls must reach the
+                // object through the bus, not short-circuit on the registering connection.
+                let address = gio::dbus_address_get_for_bus_sync(gio::BusType::Session, gio::Cancellable::NONE).expect("a session bus address");
+                let client = gio::DBusConnection::for_address_sync(
+                    &address,
+                    gio::DBusConnectionFlags::AUTHENTICATION_CLIENT | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                    None,
+                    gio::Cancellable::NONE,
+                )
+                .expect("a second connection to the session bus");
+                let proxy = Rc::new(RefCell::new(None));
+                gio::DBusProxy::new(&client, gio::DBusProxyFlags::NONE, None, Some("org.mpris.MediaPlayer2.AbsPlayerProxyTest"), OBJECT_PATH, PLAYER_IFACE, gio::Cancellable::NONE, {
+                    let proxy = proxy.clone();
+                    move |result| *proxy.borrow_mut() = Some(result.expect("a proxy for the Player interface"))
+                });
+                let can_play = || proxy.borrow().as_ref().and_then(|proxy| proxy.cached_property("CanPlay")).and_then(|value| value.get::<bool>());
+
+                spin_until("the client to load the properties", &|| can_play().is_some());
+                assert_eq!(can_play(), Some(false), "nothing is loaded yet");
+
+                handle.update(PlayerState { status: PlaybackStatus::Playing, ..loaded_state() });
+                spin_until("the client to see CanPlay turn on", &|| can_play() == Some(true));
+            })
+            .expect("the test's main context is free");
     }
 
     #[test]
