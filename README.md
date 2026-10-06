@@ -31,18 +31,23 @@ Prompts by [GDR!](https://github.com/gjedeer/)
 ## Screenshots
 
 Library Screen
+
 ![Library Screen](docs/images/shot7.png)
 
 Book Details
+
 ![Book Details](docs/images/shot4.png)
 
 Chapter download options
+
 ![Download](docs/images/shot5.png)
 
 Settings
+
 ![Settings](docs/images/shot2.png)
 
 Settings, in the light theme
+
 ![Light mode](docs/images/shot1.png)
 
 ## Installing
