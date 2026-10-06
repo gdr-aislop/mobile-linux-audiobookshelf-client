@@ -37,6 +37,7 @@ pub struct PlayerScreen {
 pub struct TestHooks {
     pub title_label: gtk4::Label,
     pub author_label: gtk4::Label,
+    pub chapter_label: gtk4::Label,
     pub play_button: gtk4::Button,
     pub previous_chapter_button: gtk4::Button,
     pub next_chapter_button: gtk4::Button,
@@ -133,10 +134,21 @@ pub fn build(
         .max_width_chars(1)
         .justify(gtk4::Justification::Center)
         .css_classes(["title-2"])
-        .margin_top(22)
+        .margin_top(16)
         .build();
     let author_label =
         gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).build();
+    // The chapter playing, under the author (Lissen shows it in the author's place). One line,
+    // ellipsized, so it never adds more than a line of height on a phone; tapping it opens the
+    // chapters list, like the chapters button.
+    let chapter_label = gtk4::Label::builder()
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(["accent"])
+        .tooltip_text("Chapters")
+        .margin_top(6)
+        .visible(false)
+        .build();
 
     let scrubber = gtk4::Scale::builder().orientation(gtk4::Orientation::Horizontal).hexpand(true).build();
     scrubber.set_range(0.0, 1.0);
@@ -283,6 +295,7 @@ pub fn build(
     content.append(cover.widget());
     content.append(&title_label);
     content.append(&author_label);
+    content.append(&chapter_label);
     content.append(&scrubber);
     content.append(&time_row);
     content.append(&transport);
@@ -420,6 +433,12 @@ pub fn build(
         let controller = controller.clone();
         move |_| controller.skip(controller.skip_intervals().1)
     });
+    let chapter_label_click = gtk4::GestureClick::new();
+    chapter_label_click.connect_released({
+        let chapters_popover = chapters_popover.clone();
+        move |_, _, _, _| chapters_popover.popup()
+    });
+    chapter_label.add_controller(chapter_label_click);
     previous_chapter.connect_clicked({
         let controller = controller.clone();
         move |_| {
@@ -574,6 +593,7 @@ pub fn build(
     let update = {
         let title_label = title_label.clone();
         let author_label = author_label.clone();
+        let chapter_label = chapter_label.clone();
         let play_icon = play_icon.clone();
         let scrubber = scrubber.clone();
         let elapsed_label = elapsed_label.clone();
@@ -591,6 +611,17 @@ pub fn build(
             title_label.set_label(&snapshot.title);
             author_label.set_label(snapshot.author.as_deref().unwrap_or(""));
             author_label.set_visible(snapshot.author.is_some());
+            match &snapshot.chapter {
+                Some(chapter) => {
+                    let text = format!("{} · {} of {}", chapter.title, chapter.number, chapter.count);
+                    // `update` runs 4 times a second; only touch the label when the chapter changes.
+                    if chapter_label.label() != text {
+                        chapter_label.set_label(&text);
+                    }
+                    chapter_label.set_visible(true);
+                }
+                None => chapter_label.set_visible(false),
+            }
             cover.set_path(snapshot.cover_path.as_deref());
             play_icon.set_icon_name(Some(if snapshot.shows_pause_button() {
                 "media-playback-pause-symbolic"
@@ -657,6 +688,7 @@ pub fn build(
         hooks: TestHooks {
             title_label,
             author_label,
+            chapter_label,
             play_button,
             previous_chapter_button: previous_chapter,
             next_chapter_button: next_chapter,
@@ -1029,14 +1061,20 @@ pub(crate) mod tests {
         let position = || controller.snapshot().unwrap().position_seconds;
         assert!(hooks.previous_chapter_button.is_visible() && hooks.next_chapter_button.is_visible(), "a chaptered book shows both chapter buttons");
         assert!(hooks.next_chapter_button.is_sensitive(), "the chapter buttons work once the book has loaded");
+        assert!(hooks.chapter_label.is_visible(), "a chaptered book shows the chapter line");
+        assert_eq!(hooks.chapter_label.label(), "Intro · 1 of 2");
 
         hooks.next_chapter_button.emit_clicked();
         pump_until(|| position() >= 4.0, Duration::from_secs(5));
         assert!(position() >= 4.0, "next chapter should seek to Chapter One's start");
+        pump_until(|| hooks.chapter_label.label() == "Chapter One · 2 of 2", Duration::from_secs(2));
+        assert_eq!(hooks.chapter_label.label(), "Chapter One · 2 of 2", "the chapter line follows the position");
 
         hooks.previous_chapter_button.emit_clicked();
         pump_until(|| position() < 4.0, Duration::from_secs(5));
         assert!(position() < 4.0, "previous chapter at Chapter One's start should go back to the Intro");
+        pump_until(|| hooks.chapter_label.label() == "Intro · 1 of 2", Duration::from_secs(2));
+        assert_eq!(hooks.chapter_label.label(), "Intro · 1 of 2");
 
         let mpris = crate::player::MprisBridge::new(controller.clone());
         mpris.next();
@@ -1076,6 +1114,7 @@ pub(crate) mod tests {
         let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
         let hooks = screen.test_hooks();
         assert!(!hooks.previous_chapter_button.is_visible() && !hooks.next_chapter_button.is_visible(), "a book without chapters hides the chapter buttons");
+        assert!(!hooks.chapter_label.is_visible(), "a book without chapters has no chapter line");
 
         let position = || controller.snapshot().unwrap().position_seconds;
         let before = position();

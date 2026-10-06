@@ -384,7 +384,9 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 ### Player — full
 - `AdwNavigationPage` with a transparent/blurred header (down-chevron to collapse, `⋯` menu for
   "Sleep timer", "Playback speed", "Add bookmark").
-- Large cover art, title/author, `GtkScale`-based scrubber with elapsed/remaining time labels.
+- Large cover art, title, author, and the current chapter (`<title> · n of m`, one ellipsized
+  line; tapping it opens the chapters list), then a `GtkScale`-based scrubber with
+  elapsed/remaining time labels.
 - Transport row: previous chapter, skip-back-N-seconds, play/pause (large),
   skip-forward-N-seconds, next chapter. Previous chapter restarts the current chapter when more
   than 3 s into it, and otherwise goes to the one before. Next chapter does nothing in the last

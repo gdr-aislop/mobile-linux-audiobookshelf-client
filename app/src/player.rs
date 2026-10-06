@@ -211,6 +211,18 @@ pub struct PlayerSnapshot {
     /// Whether the loaded book has chapter data, so the previous/next chapter buttons have
     /// anywhere to go. `false` while a start is still resolving.
     pub has_chapters: bool,
+    /// The chapter the position falls in, for the full player's chapter line. `None` while a
+    /// start is still resolving or when the book has no chapters.
+    pub chapter: Option<CurrentChapter>,
+}
+
+/// Which chapter is playing, as the full player shows it: "<title> · <number> of <count>".
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurrentChapter {
+    pub title: String,
+    /// 1-based.
+    pub number: usize,
+    pub count: usize,
 }
 
 impl PlayerSnapshot {
@@ -835,13 +847,20 @@ impl Inner {
                 is_loading: true,
                 will_play_when_loaded: pending.wants_play,
                 has_chapters: false,
+                chapter: None,
             });
         }
         let now_playing = self.now_playing.as_ref()?;
+        let position = self.book_position();
+        let chapter = chapter_index_at(&now_playing.chapters, position).map(|index| CurrentChapter {
+            title: now_playing.chapters[index].title.clone(),
+            number: index + 1,
+            count: now_playing.chapters.len(),
+        });
         Some(PlayerSnapshot {
             title: now_playing.title.clone(),
             author: now_playing.author.clone(),
-            position_seconds: self.book_position(),
+            position_seconds: position,
             duration_seconds: now_playing.duration_seconds,
             is_playing: now_playing.is_playing,
             speed: now_playing.speed,
@@ -851,6 +870,7 @@ impl Inner {
             is_loading: false,
             will_play_when_loaded: false,
             has_chapters: !now_playing.chapters.is_empty(),
+            chapter,
         })
     }
 
