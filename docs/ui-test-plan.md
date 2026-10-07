@@ -520,11 +520,14 @@ was and wasn't verified.
       position at once (no reload). The log may show `pause confirmation ended by a seek`.
 
 - [ ] **MP-11 — Scrubbing seeks once.** In the full player, drag the scrubber slowly across a
-      good part of the book (across a file boundary in a multi-file book), then drag it to the
-      far right.
+      good part of the current chapter (the bar spans the chapter, not the book — for the
+      file-boundary case use a chapter that spans two files, or a multi-file book without
+      chapters), then drag it to the far right.
       *Expected:* the time labels follow the thumb while dragging and the thumb isn't pulled back;
-      the log shows one `scrub: seeking` and one `seek` line per drag, not dozens; the far-right
-      drag lands one second before the end and keeps playing — the book is not marked finished.
+      the log shows one `scrub: seeking` and one `seek` line per drag, not dozens. The far-right
+      drag lands at the next chapter's start in a mid-book chapter; in the last chapter (or a book
+      without chapters) it lands one second before the end and keeps playing — the book is not
+      marked finished.
 
 - [ ] **MP-12 — Play on the loaded book.** With a book playing (or paused), open its detail
       screen and tap Play/Resume; then tap one of its chapters.
@@ -641,11 +644,13 @@ was and wasn't verified.
 
 ## 8. Full player (FP) — ✅ implemented
 
-- [x] **FP-1 — Layout.** Open the full player.
+- [ ] **FP-1 — Layout.** Open the full player on a chaptered book.
       *Expected:* "Now Playing" header, down-chevron on the left, ⋯ menu on the right, large
-      cover, title, author, scrubber with elapsed (left) and remaining (right, "-0:00" style)
-      times, transport row (skip-back, big play/pause, skip-forward), secondary row (speed,
-      sleep timer, chapters).
+      cover, title, author, the chapter line (`<chapter title> · n of m`, accent colour), scrubber
+      with elapsed (left) and remaining (right, "-0:00" style) chapter times and a centred
+      "… left in book" label between them, transport row (⏮ previous chapter, skip-back, big
+      play/pause, skip-forward, ⏭ next chapter — skip-back/forward round, not stretched into tall
+      pills), secondary row (speed, sleep timer, chapters, download).
 
 - [x] **FP-2 — Play/pause.** Tap the big button repeatedly.
       *Expected:* audio toggles; icon alternates between pause and play states.
@@ -663,13 +668,17 @@ was and wasn't verified.
       needing to restart the app. Regression test for a Librem 5 field report where a second skip
       during a network stall both jumped backwards and left playback unrecoverable.
 
-- [x] **FP-4 — Scrubber drag.** Drag the scrubber to the middle of the book, release.
-      *Expected:* audio jumps to approximately that book position; elapsed/remaining update;
-      playback continues from there without stalling. Dragging while paused also works and
-      playback resumes from the target when played.
+- [ ] **FP-4 — Scrubber drag.** On a chaptered book, drag the scrubber to the middle of the bar,
+      release.
+      *Expected:* audio jumps to approximately the middle of the *current chapter* (the bar spans
+      the chapter, not the book); elapsed/remaining are chapter-relative and update, and "… left
+      in book" changes accordingly; playback continues from there without stalling. Dragging
+      while paused also works and playback resumes from the target when played.
 
 - [x] **FP-5 — Scrubber doesn't fight playback.** Don't touch anything for ~30 s.
-      *Expected:* the scrubber advances smoothly on its own; it never snaps back or jitters.
+      *Expected:* the scrubber advances smoothly on its own; it never snaps back or jitters. When
+      playback crosses into the next chapter, the knob starts again from the left and the times
+      switch to the new chapter.
 
 - [x] **FP-6 — Playback speed.** Tap the speed button (reads "1.0×"), pick 2.0×.
       *Expected:* audio audibly speeds up, the button now reads "2.0×". Available presets:
@@ -712,6 +721,31 @@ was and wasn't verified.
       *Expected:* returns to whatever tab was open before, mini bar still visible, audio still
       playing.
 
+- [ ] **FP-16 — Next chapter.** On a chaptered book, tap ⏭; then go to the last chapter and tap
+      ⏭ again.
+      *Expected:* the first tap jumps to the start of the next chapter, the chapter line reads
+      "n+1 of m" and the knob is at the left; in the last chapter ⏭ does nothing.
+
+- [ ] **FP-17 — Previous chapter.** Well into a chapter (more than 3 s), tap ⏮; then tap it again
+      straight away; then, in the first chapter, tap it once more.
+      *Expected:* the first tap goes back to the start of the current chapter; the second (within
+      3 s of that start) goes to the start of the previous chapter; in the first chapter ⏮ goes
+      to 0:00.
+
+- [ ] **FP-18 — Chapter line.** Watch the chapter line across a chapter boundary; open a book with
+      a very long chapter title; tap the chapter line.
+      *Expected:* the line follows playback into the next chapter; a long title stays on one line,
+      cut off with "…"; tapping the line opens the chapters popover (same as the chapters button).
+
+- [ ] **FP-19 — Book without chapters.** Play a book that has no chapter data.
+      *Expected:* no chapter line, no ⏮/⏭ buttons and no "… left in book" label; the scrubber and
+      its times span the whole book, as before chapters were tracked.
+
+- [ ] **FP-20 — Fits a phone.** On a 360-px-wide phone (e.g. Librem 5), open the player for a book
+      whose title wraps to two lines.
+      *Expected:* everything down to and including the secondary row (speed, sleep timer,
+      chapters, download) is on screen without scrolling; nothing scrolls sideways.
+
 ---
 
 ## 9. Multi-track playback (MU) — ✅ implemented
@@ -747,8 +781,9 @@ continuous book.
 - [ ] **MU-6 — Skip-back across a boundary.** Position ~5 s into file 2 and tap skip-back.
       *Expected:* playback lands near the end of file 1 at the correct book position.
 
-- [ ] **MU-7 — Scrub into a later file.** From early in file 1, drag the scrubber to ~60 % of
-      the book.
+- [ ] **MU-7 — Scrub into a later file.** From early in file 1, open the chapters popover, tap a
+      chapter that lives in a later file, then drag the scrubber within it. (For a multi-file book
+      without chapters, the bar spans the whole book: drag it to ~60 % instead.)
       *Expected:* the app loads the file containing 60 % and plays from the right spot. This may
       take a moment to load (spinner/silence acceptable), but must end up at the correct
       position and keep playing.
@@ -816,9 +851,11 @@ Needs a real GNOME/phosh session.
       *Expected:* the app's audio follows; the mini bar and full player stay in sync with the
       shell's state.
 
-- [ ] **SI-3 — Shell next/previous = skip.** Use next/previous on the shell's media card.
-      *Expected:* the position skips forward/back by the configured skip interval — it does
-      **not** jump to another book.
+- [ ] **SI-3 — Shell next/previous = chapters.** Use ⏭ / ⏮ on the shell's media card.
+      *Expected:* ⏭ goes to the next chapter's start; ⏮ restarts the current chapter, or goes back
+      a chapter when pressed within 3 s of its start (the same rules as FP-16/FP-17); the app's
+      chapter line follows. For a book without chapters they skip forward/back by the configured
+      skip intervals instead. They never jump to another book.
 
 - [ ] **SI-4 — MPRIS metadata updates.** Switch books; check the shell's media card.
       *Expected:* title/author/cover update to the new book immediately, without reopening
@@ -827,6 +864,17 @@ Needs a real GNOME/phosh session.
 - [ ] **SI-5 — No duplicate notification.** Check the notification tray while playing.
       *Expected:* the shell media widget is the only playback surface — the app must **not**
       additionally post its own playback notification.
+
+- [ ] **SI-6 — Card controls don't crash the app.** While playing, pause from the lock-screen card,
+      then play, ⏭ and ⏮ from it; also run `playerctl pause` / `playerctl play` and press a
+      headset's play/pause button.
+      *Expected:* each one acts and the app keeps running; the log shows no `RefCell already
+      borrowed` panic or abort. Regression test for 0.9.2, where pausing from the phone's media
+      widget crashed the app.
+
+- [ ] **SI-7 — Shell's own seek buttons.** On phosh's card, tap ↺10 and ↻30.
+      *Expected:* the position moves back 10 s / forward 30 s (phosh's own MPRIS `Seek` amounts,
+      independent of the app's Skip settings), and the app's scrubber follows.
 
 ---
 
