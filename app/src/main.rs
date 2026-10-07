@@ -207,6 +207,7 @@ mod tests {
         (home_pull_to_refresh_resyncs_and_toasts, crate::screens::home::tests::run_pull_to_refresh_resyncs_and_toasts),
         (home_sync_now_toasts_failure, crate::screens::home::tests::run_sync_now_toasts_failure),
         (library_renders_all_synced_items, crate::screens::library::tests::run_renders_all_synced_items),
+        (library_a_load_logs_each_step, crate::screens::library::tests::run_a_library_load_logs_each_step),
         (library_search_filters_by_title_and_author, crate::screens::library::tests::run_search_filters_by_title_and_author),
         (library_search_ignores_national_characters, crate::screens::library::tests::run_search_ignores_national_characters),
         (library_sort_changes_order, crate::screens::library::tests::run_sort_changes_order),

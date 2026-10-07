@@ -1104,11 +1104,16 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         glib::spawn_future_local(render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()));
         crate::sync_coordinator::on_completed(&ctx.server_id, &ctx.account_id, move |outcome| {
             glib::spawn_future_local(async move {
+                let mut steps = crate::perf::Steps::new("library load", "after Home's sync");
+                steps.step("read");
                 let loaded = load(&pool, &server_id, &account_id).await;
                 let local_read_error = loaded.as_ref().err().map(|err| err.to_string());
+                let items = loaded.as_ref().ok().map(|data| data.items.len());
+                steps.step("render");
                 if let Ok(data) = loaded {
                     apply(data, &widgets);
                 }
+                steps.finish(if local_read_error.is_none() { "ok" } else { "failed" }, items);
                 // How Home's sync went — told here too, so a failure never goes unmentioned
                 // on this tab just because the other one ran the sync.
                 if let Some(outcome) = outcome {
@@ -1121,8 +1126,17 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
 
     glib::spawn_future_local(async move {
         let SyncCtx { pool, paths, session, server_id, account_id } = ctx;
+        // One log line per load, step by step (`library load finished …`): what a slow library
+        // actually spent its time on, and how much of it the screen was frozen.
+        let mut steps = crate::perf::Steps::new("library load", if manual.is_some() { "manual" } else { "automatic" });
 
-        render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()).await;
+        steps.step("cached read");
+        let cached = load(&pool, &server_id, &account_id).await;
+        steps.step("cached render");
+        if let Ok(data) = cached {
+            apply(data, &widgets);
+        }
+        steps.close();
 
         let spawned_sync = tokio::spawn({
             let pool = pool.clone();
@@ -1138,24 +1152,30 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
-                        return Err(err);
+                        return (Err(err), std::time::Duration::ZERO, std::time::Duration::ZERO);
                     }
                 };
+                let started = std::time::Instant::now();
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
+                let sync_took = started.elapsed();
 
+                let started = std::time::Instant::now();
                 if let Err(err) = abs_core::progress_sync::reconcile_all_progress(&pool, &connection, &access_token, &account_id, &server_id, crate::sync_coordinator::loaded_item(&server_id, &account_id).as_deref()).await
                 {
                     tracing::warn!(%err, "couldn't reconcile progress with the server; showing local progress");
                 }
 
-                sync_result
+                (sync_result, sync_took, started.elapsed())
             }
         });
-        let sync_result = spawned_sync.await.expect("the Library sync task must not panic");
+        let (sync_result, sync_took, reconcile_took) = spawned_sync.await.expect("the Library sync task must not panic");
+        steps.record("sync", sync_took);
+        steps.record("reconcile", reconcile_took);
         // Offline mode switched on mid-sync cut it short; that's not a failure to show.
         let sync_result = sync_result.or_else(|err| if matches!(err, abs_core::CoreError::Offline) { Ok(()) } else { Err(err) });
         let manual_ok = sync_result.is_ok();
 
+        steps.step("reread");
         let data_after_sync = load(&pool, &server_id, &account_id).await;
         let local_read_error = data_after_sync.as_ref().err().map(|err| {
             tracing::warn!(%err, "couldn't read the synced library back from local storage");
@@ -1163,9 +1183,12 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         });
         let data_after_sync = data_after_sync.ok();
         let item_ids_after_sync: Vec<String> = data_after_sync.as_ref().map(|data| data.items.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
+        let items = data_after_sync.as_ref().map(|data| data.items.len());
+        steps.step("rerender");
         if let Some(data) = data_after_sync {
             apply(data, &widgets);
         }
+        steps.close();
 
         show_sync_result(&widgets, sync_result.as_ref().err(), local_read_error.as_deref());
 
@@ -1178,6 +1201,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         if !item_ids_after_sync.is_empty() {
             // A manual sync also re-asks for covers the server recently said it doesn't have.
             let recheck_missing_covers = manual.is_some();
+            steps.step("covers");
             let spawned_covers = tokio::spawn({
                 let pool = pool.clone();
                 let paths = paths.clone();
@@ -1194,10 +1218,12 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
             });
             spawned_covers.await.expect("the Library cover-fetch task must not panic");
 
+            steps.step("final read and render");
             if let Ok(data) = load(&pool, &server_id, &account_id).await {
                 apply(data, &widgets);
             }
         }
+        steps.finish(if sync_result.is_ok() { "ok" } else { "failed" }, items);
 
         // The manual trigger's own feedback — after the resolve above, so the banner already
         // shows whatever the toast is about; "Sync failed" carries no details itself.
@@ -1459,6 +1485,8 @@ fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk
 
 fn render_from_current_data(widgets: &LibraryWidgets) {
     let _slow = crate::perf::SlowJob::new("library render");
+    let render_started = std::time::Instant::now();
+    let blocked_at_start = crate::perf::main_loop_blocked_total();
     let query = abs_core::search::normalize_for_search(&widgets.search_entry.text());
     let sort = widgets.sort.get();
     let data = widgets.data.borrow();
@@ -1572,10 +1600,12 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         let entries = Rc::new(entries);
         let built = FIRST_RENDER_BATCH.min(entries.len());
         append_entries(widgets, mode, &entries[..built]);
+        let timing = RenderTiming { started: render_started, first: render_started.elapsed(), blocked_at_start };
         if built == entries.len() {
             *widgets.rendered_signature.borrow_mut() = Some(signature);
+            log_render_finished(entries.len(), 0, &timing, std::time::Duration::ZERO, std::time::Duration::ZERO);
         } else {
-            append_remaining_entries(widgets.clone(), mode, entries, built, generation, signature);
+            append_remaining_entries(widgets.clone(), mode, entries, built, generation, signature, timing);
         }
     }
 
@@ -1599,6 +1629,40 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
         widgets.scroller.set_visible(has_visible);
     } else if !data.items.is_empty() {
         widgets.status_page.set_title("No items yet");
+    }
+}
+
+/// When a render started and how long its first, synchronous batch took — carried into the idle
+/// slices that finish it, for [`log_render_finished`].
+struct RenderTiming {
+    started: std::time::Instant,
+    first: std::time::Duration,
+    blocked_at_start: std::time::Duration,
+}
+
+/// A render that took at least this long, start to fully drawn, is logged at `info`; quicker ones
+/// (most search keystrokes) only at `debug`.
+const RENDER_LOG_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// One line per finished render: how long until every book was on screen (`total_ms`, which
+/// includes other work the main loop did between slices), how much of that was this render's own
+/// work (`busy_ms`: the first batch plus every slice), the longest slice, and how long the main
+/// loop was frozen meanwhile.
+fn log_render_finished(books: usize, slices: u32, timing: &RenderTiming, slices_took: std::time::Duration, longest_slice: std::time::Duration) {
+    let total = timing.started.elapsed();
+    let blocked = crate::perf::main_loop_blocked_total().saturating_sub(timing.blocked_at_start);
+    let line = format!(
+        "library render finished books={books} slices={slices} total_ms={} busy_ms={} first_ms={} longest_slice_ms={} main_loop_blocked_ms={}",
+        total.as_millis(),
+        (timing.first + slices_took).as_millis(),
+        timing.first.as_millis(),
+        longest_slice.as_millis(),
+        blocked.as_millis(),
+    );
+    if total >= RENDER_LOG_AFTER {
+        tracing::info!("{line}");
+    } else {
+        tracing::debug!("{line}");
     }
 }
 
@@ -1660,23 +1724,40 @@ fn append_entries(widgets: &LibraryWidgets, mode: LibraryViewMode, entries: &[Re
 /// Builds `entries[from..]` in idle slices. Stops (leaving the partly built list for the render
 /// that replaced this one to clear) as soon as `widgets.render_generation` has moved on; on
 /// finishing, records `signature` as what is on screen and decodes the covers in view.
-fn append_remaining_entries(widgets: LibraryWidgets, mode: LibraryViewMode, entries: Rc<Vec<RenderEntry>>, from: usize, generation: u64, signature: String) {
+#[allow(clippy::too_many_arguments)]
+fn append_remaining_entries(
+    widgets: LibraryWidgets,
+    mode: LibraryViewMode,
+    entries: Rc<Vec<RenderEntry>>,
+    from: usize,
+    generation: u64,
+    signature: String,
+    timing: RenderTiming,
+) {
     let next = Cell::new(from);
+    let slices = Cell::new(0_u32);
+    let slices_took = Cell::new(std::time::Duration::ZERO);
+    let longest_slice = Cell::new(std::time::Duration::ZERO);
     glib::idle_add_local(move || {
         if widgets.render_generation.get() != generation {
             tracing::debug!("a library render was replaced before it finished");
             return glib::ControlFlow::Break;
         }
         let _slow = crate::perf::SlowJob::new("library render slice");
+        let slice_started = std::time::Instant::now();
         let start = next.get();
         let end = (start + RENDER_SLICE).min(entries.len());
         append_entries(&widgets, mode, &entries[start..end]);
         next.set(end);
+        let took = slice_started.elapsed();
+        slices.set(slices.get() + 1);
+        slices_took.set(slices_took.get() + took);
+        longest_slice.set(longest_slice.get().max(took));
         if end < entries.len() {
             return glib::ControlFlow::Continue;
         }
         *widgets.rendered_signature.borrow_mut() = Some(signature.clone());
-        tracing::debug!(books = entries.len(), "library render finished");
+        log_render_finished(entries.len(), slices.get(), &timing, slices_took.get(), longest_slice.get());
         let widgets = widgets.clone();
         glib::idle_add_local_once(move || decode_covers_in_viewport(&widgets));
         glib::ControlFlow::Break
@@ -1974,6 +2055,94 @@ pub(crate) mod tests {
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests` for why every fast GTK-touching
     /// scenario in this binary has to run from one single entry point.
+    /// Collects everything logged while it's the default subscriber, for asserting on log lines.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A library load logs one line naming
+    /// every step it took (cached read, render, sync, reconcile, re-read, re-render, covers), and a
+    /// render built in slices logs one line once every book is on screen — what the phone's log
+    /// needs to show where a slow library spends its time.
+    pub(crate) fn run_a_library_load_logs_each_step(runtime: &tokio::runtime::Runtime) {
+        let log = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        let items: Vec<_> = (0..120)
+            .map(|i| item_json(&format!("item-{i}"), &format!("Book {i}"), "Author", 1_700_000_000_000 - i * 1000, 3600.0))
+            .collect();
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "libraries": [{ "id": "e4bb1afb-4a4f-4dd6-8be0-e615d233185b", "name": "Audiobooks", "mediaType": "book" }]
+                })))
+                .mount(&mock_server),
+        );
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/api/libraries/e4bb1afb-4a4f-4dd6-8be0-e615d233185b/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": items })))
+                .mount(&mock_server),
+        );
+
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        let offline_mode = crate::offline_mode::OfflineModeState::new(pool.clone());
+        let _screen = build(pool, crate::test_support::test_paths(), server, account, session, offline_mode, |_| {}, || {}, || {});
+
+        pump_until(|| log.text().contains("library load finished"), Duration::from_secs(20));
+        pump_until(|| log.text().contains("library render finished books=120"), Duration::from_secs(10));
+        let text = log.text();
+        let load = text.lines().find(|line| line.contains("library load finished")).unwrap_or_else(|| panic!("no load line in:\n{text}"));
+        for field in [
+            "trigger=automatic",
+            "items=120",
+            "total_ms=",
+            "cached_read_ms=",
+            "cached_render_ms=",
+            "sync_ms=",
+            "reconcile_ms=",
+            "reread_ms=",
+            "rerender_ms=",
+            "covers_ms=",
+            "final_read_and_render_ms=",
+            "main_loop_blocked_ms=",
+            "outcome=ok",
+        ] {
+            assert!(load.contains(field), "{field} missing from: {load}");
+        }
+        let render = text.lines().find(|line| line.contains("library render finished books=120")).unwrap();
+        for field in ["slices=2", "total_ms=", "busy_ms=", "first_ms=", "longest_slice_ms=", "main_loop_blocked_ms="] {
+            assert!(render.contains(field), "{field} missing from: {render}");
+        }
+    }
+
     pub(crate) fn run_renders_all_synced_items(runtime: &tokio::runtime::Runtime) {
         let mock_server = runtime.block_on(MockServer::start());
         runtime.block_on(

@@ -739,11 +739,15 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
             let (claim_server_id, claim_account_id) = (server_id.clone(), account_id.clone());
             crate::sync_coordinator::on_completed(&claim_server_id, &claim_account_id, move |outcome| {
                 glib::spawn_future_local(async move {
+                    let mut steps = crate::perf::Steps::new("home load", "after Library's sync");
+                    steps.step("read");
                     let loaded = load(&pool, &server_id, &account_id).await;
                     let has_data = loaded.as_ref().is_ok_and(|data| !data.libraries.is_empty());
+                    steps.step("render");
                     if let (Ok(data), true) = (&loaded, has_data) {
                         apply(data, &widgets);
                     }
+                    steps.finish(if loaded.is_ok() { "ok" } else { "failed" }, None);
                     // How the other screen's sync went — told here too, so this screen never
                     // just redraws silently (or keeps its first-sync spinner) after a failure.
                     if let Some(outcome) = outcome {
@@ -760,8 +764,18 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         let SyncCtx { pool, paths, server, account, session } = ctx;
         let server_id = server.id.clone();
         let account_id = account.id.clone();
+        // One log line per load, step by step (`home load finished …`) — see `perf::Steps`.
+        let mut steps = crate::perf::Steps::new("home load", if manual.is_some() { "manual" } else { "automatic" });
 
-        render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()).await;
+        steps.step("cached read");
+        let cached = load(&pool, &server_id, &account_id).await;
+        steps.step("cached render");
+        if let Ok(data) = &cached {
+            if !data.libraries.is_empty() {
+                apply(data, &widgets);
+            }
+        }
+        steps.close();
 
         let spawned_sync = tokio::spawn({
             let pool = pool.clone();
@@ -780,10 +794,13 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     Err(err) => {
                         tracing::warn!(%err, "couldn't load the server's connection settings; sync skipped");
                         let data = Some(load(&pool, &server_id, &account_id).await);
-                        return (Err(err), data);
+                        return (Err(err), data, [std::time::Duration::ZERO; 3]);
                     }
                 };
+                let started = std::time::Instant::now();
                 let sync_result = abs_core::sync::sync_all(&pool, &connection, &server_id, &access_token).await;
+                let sync_took = started.elapsed();
+                let started = std::time::Instant::now();
 
                 // Reconciling "Continue Listening" against the server's progress runs after
                 // sync_all, not concurrently with it: an item's progress can only be attached
@@ -797,13 +814,19 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
                     tracing::warn!(%err, "couldn't reconcile Continue Listening progress with the server; showing local progress");
                 }
 
+                let reconcile_took = started.elapsed();
+
+                let started = std::time::Instant::now();
                 let data_after_sync = Some(load(&pool, &server_id, &account_id).await);
-                (sync_result, data_after_sync)
+                (sync_result, data_after_sync, [sync_took, reconcile_took, started.elapsed()])
             }
         });
-        let (sync_result, data_after_sync) = spawned_sync
+        let (sync_result, data_after_sync, [sync_took, reconcile_took, reread_took]) = spawned_sync
             .await
             .expect("the Home sync task must not panic");
+        steps.record("sync", sync_took);
+        steps.record("reconcile", reconcile_took);
+        steps.record("reread", reread_took);
         // Offline mode switched on mid-sync cut it short; that's not a failure to show.
         let sync_result = sync_result.or_else(|err| if matches!(err, CoreError::Offline) { Ok(()) } else { Err(err) });
         let local_read_error = data_after_sync.as_ref().and_then(|data| data.as_ref().err()).map(|err| {
@@ -811,11 +834,13 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
             err.to_string()
         });
         let data_after_sync = data_after_sync.and_then(Result::ok);
+        steps.step("rerender");
         if let Some(data) = &data_after_sync {
             if !data.libraries.is_empty() {
                 apply(data, &widgets);
             }
         }
+        steps.close();
 
         // Cover art is cosmetic and best-effort (same posture as `abs_core::covers` already
         // uses for the player screen) — fetched concurrently for every item just rendered,
@@ -853,13 +878,16 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
             })
         });
         if let Some(spawned_covers) = spawned_covers {
+            steps.step("covers");
             let data_after_covers = spawned_covers.await.expect("the Home cover-fetch task must not panic");
+            steps.step("final render");
             if let Some(data) = data_after_covers {
                 if !data.libraries.is_empty() {
                     apply(&data, &widgets);
                 }
             }
         }
+        steps.finish(if sync_result.is_ok() { "ok" } else { "failed" }, None);
 
         // Resolve the screen's final state for this cycle from the sync outcome plus whatever
         // actually landed in local storage. The two visible outcomes are mutually exclusive:
