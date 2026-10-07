@@ -47,6 +47,7 @@ pub async fn resolve_stream_target(connection: &crate::connection::ConnectionTar
         // "session expired — log in again" rather than a generic network failure — the same
         // 401/403-means-Auth convention `sync.rs`'s `auth_or_unexpected` already draws.
         abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
+        other if other.is_unreachable() => CoreError::Unreachable(other.details()),
         other => CoreError::UnexpectedResponse(other.details()),
     })?;
 
@@ -169,6 +170,16 @@ mod tests {
     use crate::connection::ConnectionTarget;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn resolving_against_a_server_that_refuses_connections_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let result = resolve_stream_target(&ConnectionTarget::direct(&url), "test-token", "item-1").await;
+        assert!(matches!(result, Err(CoreError::Unreachable(_))), "got {:?}", result.err());
+    }
 
     #[tokio::test]
     async fn resolve_stream_target_builds_the_expected_url() {

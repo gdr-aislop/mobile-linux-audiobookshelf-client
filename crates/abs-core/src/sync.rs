@@ -20,6 +20,17 @@ fn auth_or_unexpected(status: Option<u16>, fallback: String) -> CoreError {
     }
 }
 
+/// A generated-client call's error as a `CoreError`: `Unreachable` when the server never
+/// answered, `Auth` on 401/403, otherwise `UnexpectedResponse`. The string keeps the full error
+/// chain either way.
+fn api_error<E: std::fmt::Debug + 'static>(err: &abs_api::Error<E>) -> CoreError {
+    if abs_api::is_unreachable_error(err) {
+        CoreError::Unreachable(error_chain(err))
+    } else {
+        auth_or_unexpected(err.status().map(|s| s.as_u16()), error_chain(err))
+    }
+}
+
 /// Fetch the server's libraries and upsert them into local storage, returning how many were
 /// synced. Libraries the server no longer reports are left in place rather than deleted — a
 /// transient fetch failure or a server-side hiccup shouldn't nuke the local cache of a library a
@@ -33,7 +44,7 @@ pub async fn sync_libraries(pool: &SqlitePool, api: &abs_api::Client, server_id:
     let response = api
         .get_libraries()
         .await
-        .map_err(|e| auth_or_unexpected(e.status().map(|s| s.as_u16()), error_chain(&e)))?;
+        .map_err(|e| api_error(&e))?;
     let libraries = response.into_inner().libraries;
 
     let mut synced = 0;
@@ -78,6 +89,7 @@ pub async fn sync_items_for_library(
         .await
         .map_err(|e| match e {
             abs_api::LibraryItemsError::Unauthorized(_) => CoreError::Auth,
+            other if other.is_unreachable() => CoreError::Unreachable(other.details()),
             other => CoreError::UnexpectedResponse(other.details()),
         })?;
 
@@ -270,6 +282,28 @@ mod tests {
             matches!(result, Err(CoreError::UnexpectedResponse(_))),
             "a 500 is a server problem, not an auth failure — the UI must not offer 'Log in again' for it"
         );
+    }
+
+    /// A URL on this machine that nothing listens on: connecting to it is refused at once.
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    /// The server never answering is told apart from it answering badly, so the UI can say
+    /// "can't reach your server" instead of blaming the server's response.
+    #[tokio::test]
+    async fn a_refused_connection_is_unreachable_not_an_unexpected_response() {
+        let url = closed_port_url();
+        let (pool, server_id) = pool_with_server_and_library(&url, "lib-1").await;
+        let api = abs_api::Client::new(&url);
+
+        let libraries = sync_libraries(&pool, &api, &server_id).await;
+        assert!(matches!(libraries, Err(CoreError::Unreachable(_))), "libraries: {libraries:?}");
+        let items = sync_items_for_library(&pool, &api, &server_id, "lib-1").await;
+        assert!(matches!(items, Err(CoreError::Unreachable(_))), "items: {items:?}");
     }
 
     /// The classification the re-login flow is built on: a 401 from the libraries call means the

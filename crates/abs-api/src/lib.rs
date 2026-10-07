@@ -21,7 +21,8 @@ mod ext;
 pub use ext::{
     AudioFileRef, ChapterRef, ConnectionBuildError, ConnectionOptions, CoverBytes, ItemPlaybackInfo,
     LibraryItemSummary, LibraryItemsError, LibrarySeriesSummary, LoginError, LoginResult, SeriesBookSummary,
-    ServerProgress, TrackFileError, TrackFileResponse, error_chain, is_valid_header_name, is_valid_header_value,
+    ServerProgress, TrackFileError, TrackFileResponse, error_chain, is_no_answer, is_unreachable_error, is_valid_header_name,
+    is_valid_header_value,
     transport_error_kind, validate_client_cert_file,
 };
 

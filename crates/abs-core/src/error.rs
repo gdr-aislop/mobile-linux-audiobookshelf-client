@@ -12,6 +12,12 @@ pub enum CoreError {
     #[error("server returned an unexpected response: {0}")]
     UnexpectedResponse(String),
 
+    /// The server never answered: the connection was refused, the address didn't resolve or
+    /// lead anywhere, or nothing came back in time. Told apart from `UnexpectedResponse` so the
+    /// UI can say "can't reach your server" rather than blame the server's answer.
+    #[error("couldn't connect to the server: {0}")]
+    Unreachable(String),
+
     /// The app's offline mode is on: nothing may reach the server until it's switched off.
     #[error("offline mode is on")]
     Offline,

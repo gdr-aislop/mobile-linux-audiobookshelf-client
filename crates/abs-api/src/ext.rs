@@ -547,7 +547,25 @@ pub enum LibraryItemsError {
     NotFound(String),
 }
 
+/// Whether a transport failure means the server never answered at all — refused, unreachable,
+/// a name that doesn't resolve, or no reply in time — as opposed to an answer the app couldn't
+/// use. A certificate failure is excluded: the server is there, it just isn't trusted, which
+/// needs a different message.
+pub fn is_no_answer(err: &reqwest::Error) -> bool {
+    err.status().is_none() && !is_tls_error(err) && (err.is_connect() || err.is_timeout() || err.is_request())
+}
+
+/// [`is_no_answer`] for a generated-client call's error.
+pub fn is_unreachable_error<E>(err: &crate::Error<E>) -> bool {
+    matches!(err, crate::Error::CommunicationError(e) if is_no_answer(e))
+}
+
 impl LibraryItemsError {
+    /// Whether the server never answered (see [`is_no_answer`]).
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, LibraryItemsError::Network(e) if is_no_answer(e))
+    }
+
     /// What happened, in one line for logs: a transport failure ([`LibraryItemsError::Network`])
     /// gets a short classification ([`transport_error_kind`]) plus the full `source()` chain
     /// ([`error_chain`]) — reqwest's Display alone is identical for a timeout, a DNS failure

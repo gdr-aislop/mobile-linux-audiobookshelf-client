@@ -24,6 +24,16 @@ use crate::error::{CoreError, Result};
 /// (e.g. resolving a playable URL).
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `Unreachable` when the server never answered, otherwise `UnexpectedResponse` with the full
+/// error chain.
+fn progress_error(err: &abs_api::LibraryItemsError) -> CoreError {
+    if err.is_unreachable() {
+        CoreError::Unreachable(error_chain(err))
+    } else {
+        CoreError::UnexpectedResponse(error_chain(err))
+    }
+}
+
 /// Pulls a single item's progress from the server and, if the server's copy is newer than (or
 /// there is no) local record, overwrites local storage with it. Called right before starting
 /// playback, so resuming reflects the freshest progress across devices rather than only this
@@ -40,7 +50,7 @@ pub async fn reconcile_item_progress(
         .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
         .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
     let Some(server_progress) =
-        api.get_media_progress(item_id).await.map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?
+        api.get_media_progress(item_id).await.map_err(|e| progress_error(&e))?
     else {
         return Ok(());
     };
@@ -98,7 +108,7 @@ pub async fn reconcile_all_progress(
     let api = connection
         .api_client_with_timeout(access_token, RECONCILE_TIMEOUT)
         .map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
-    let all_progress = api.get_all_media_progress().await.map_err(|e| CoreError::UnexpectedResponse(error_chain(&e)))?;
+    let all_progress = api.get_all_media_progress().await.map_err(|e| progress_error(&e))?;
 
     let pushed = push_unconfirmed_progress(pool, connection, access_token, account_id, server_id, &all_progress, skip_item).await?;
 
