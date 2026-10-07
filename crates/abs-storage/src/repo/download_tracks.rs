@@ -126,6 +126,27 @@ pub async fn mark_failed(pool: &SqlitePool, server_id: &str, item_id: &str, ino:
     Ok(())
 }
 
+/// A finished download whose file turned out to be damaged (gone, or not the size recorded when
+/// it finished): no longer counted as downloaded anywhere, with `reason` saying why, and its
+/// progress reset so downloading it again starts from the first byte rather than "resuming" past
+/// the end of a file that can't be trusted. Only a `complete` row is changed, so a download that
+/// was meanwhile started again isn't disturbed.
+pub async fn mark_damaged(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str, reason: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE download_tracks SET status = 'failed', bytes_downloaded = 0, expected_size_bytes = NULL, error_reason = ?, updated_at = ?
+         WHERE server_id = ? AND item_id = ? AND ino = ? AND status = 'complete'",
+    )
+    .bind(reason)
+    .bind(now)
+    .bind(server_id)
+    .bind(item_id)
+    .bind(ino)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str) -> Result<Option<DownloadTrack>> {
     let row: Option<Row> = sqlx::query_as(&format!("SELECT {SELECT_COLUMNS} FROM download_tracks WHERE server_id = ? AND item_id = ? AND ino = ?"))
         .bind(server_id)
@@ -271,6 +292,35 @@ mod tests {
         assert_eq!(row.bytes_downloaded, 10_000);
         assert_eq!(row.expected_size_bytes, Some(10_000));
         assert_eq!(row.error_reason, None);
+    }
+
+    #[tokio::test]
+    async fn mark_damaged_uncounts_a_complete_download_and_resets_its_progress() {
+        let (pool, server_id) = pool_with_track("item-1", "ino-1").await;
+        upsert_pending(&pool, &server_id, "item-1", "ino-1", "/p.mp3").await.unwrap();
+        mark_complete(&pool, &server_id, "item-1", "ino-1", 10_000).await.unwrap();
+
+        mark_damaged(&pool, &server_id, "item-1", "ino-1", "the downloaded file was damaged").await.unwrap();
+
+        let row = get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Failed);
+        assert_eq!(row.bytes_downloaded, 0, "a fresh download must start from the first byte");
+        assert_eq!(row.expected_size_bytes, None);
+        assert_eq!(row.error_reason.as_deref(), Some("the downloaded file was damaged"));
+        assert_eq!(row.file_path, "/p.mp3", "the path is kept, so the next download overwrites the bad file");
+    }
+
+    #[tokio::test]
+    async fn mark_damaged_leaves_a_download_that_is_running_again_alone() {
+        let (pool, server_id) = pool_with_track("item-1", "ino-1").await;
+        upsert_pending(&pool, &server_id, "item-1", "ino-1", "/p.mp3").await.unwrap();
+        update_progress(&pool, &server_id, "item-1", "ino-1", 4_000, Some(10_000)).await.unwrap();
+
+        mark_damaged(&pool, &server_id, "item-1", "ino-1", "damaged").await.unwrap();
+
+        let row = get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Downloading);
+        assert_eq!(row.bytes_downloaded, 4_000);
     }
 
     #[tokio::test]

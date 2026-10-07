@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use sqlx::SqlitePool;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use abs_storage::models::{DownloadStatus, DownloadTrack};
 use abs_storage::AppPaths;
@@ -225,8 +225,17 @@ async fn verify_row(row: &DownloadTrack) -> TrackSource {
         DownloadStatus::Pending | DownloadStatus::Downloading => return TrackSource::Streamed(StreamReason::InProgress),
         DownloadStatus::Failed => return TrackSource::Streamed(StreamReason::Failed),
     }
-    let Ok(metadata) = tokio::fs::metadata(&row.file_path).await else {
-        return TrackSource::Streamed(StreamReason::FileMissing);
+    // Offline-first: everything here is local (the file, and the size recorded when it finished),
+    // and only proof of a problem counts against a download. A file that's definitely gone is
+    // missing; one that merely can't be checked right now (a permission or I/O error) is played
+    // anyway — refusing a download because of a hiccup would make it unavailable for no reason.
+    let metadata = match tokio::fs::metadata(&row.file_path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return TrackSource::Streamed(StreamReason::FileMissing),
+        Err(err) => {
+            tracing::warn!(%err, path = %row.file_path, "couldn't check a downloaded file; playing it anyway");
+            return TrackSource::Local(PathBuf::from(&row.file_path));
+        }
     };
     match row.expected_size_bytes {
         Some(expected) if expected as u64 != metadata.len() => {
@@ -241,12 +250,48 @@ async fn verify_row(row: &DownloadTrack) -> TrackSource {
 /// the reason. Never fails the caller: a DB read error is a `Streamed(LookupFailed)`, logged.
 pub async fn track_source(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str) -> TrackSource {
     match abs_storage::repo::download_tracks::get(pool, server_id, item_id, ino).await {
-        Ok(Some(row)) => verify_row(&row).await,
+        Ok(Some(row)) => {
+            let source = verify_row(&row).await;
+            if let TrackSource::Streamed(reason) = &source {
+                if row.status == DownloadStatus::Complete && is_proven_damage(&row, reason).await {
+                    mark_damaged(pool, &row, reason).await;
+                }
+            }
+            source
+        }
         Ok(None) => TrackSource::Streamed(StreamReason::NotDownloaded),
         Err(err) => {
             tracing::warn!(%err, item_id, ino, "couldn't read the downloads table; streaming this track");
             TrackSource::Streamed(StreamReason::LookupFailed(err.to_string()))
         }
+    }
+}
+
+/// Whether a finished download's failed check proves the download itself is bad, rather than
+/// only that it can't be reached right now. The wrong size is proof. A missing file is proof only
+/// when its folder is still there: if the whole folder is gone too (storage not mounted, say),
+/// the files may well come back, so nothing is written off.
+async fn is_proven_damage(row: &DownloadTrack, reason: &StreamReason) -> bool {
+    match reason {
+        StreamReason::SizeMismatch { .. } => true,
+        StreamReason::FileMissing => match std::path::Path::new(&row.file_path).parent() {
+            Some(dir) => tokio::fs::metadata(dir).await.is_ok_and(|m| m.is_dir()),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Stops counting a finished download whose file is proven bad (see [`is_proven_damage`]): every
+/// "downloaded" marker reads the row's status, so without this the chapter kept looking
+/// downloaded while playback refused it — and offline mode then said it "isn't downloaded".
+/// Downloading it again starts over from the first byte. Best-effort: a failed write is logged,
+/// and the next check tries again.
+async fn mark_damaged(pool: &SqlitePool, row: &DownloadTrack, reason: &StreamReason) {
+    tracing::warn!(item_id = %row.item_id, ino = %row.ino, %reason, "a downloaded file is damaged; it no longer counts as downloaded");
+    let message = format!("the downloaded file was damaged ({reason}) — download it again");
+    if let Err(err) = abs_storage::repo::download_tracks::mark_damaged(pool, &row.server_id, &row.item_id, &row.ino, &message).await {
+        tracing::warn!(%err, item_id = %row.item_id, ino = %row.ino, "couldn't record the damaged download");
     }
 }
 
@@ -354,7 +399,9 @@ pub async fn download_track(
         return Ok(TrackDownloadOutcome::Canceled);
     }
 
-    let mut resume_offset = existing.as_ref().map(|r| r.bytes_downloaded as u64).unwrap_or(0);
+    // A row marked complete got here only because its file failed verification above: its
+    // `bytes_downloaded` describes a file that can't be trusted, so start over from the first byte.
+    let mut resume_offset = existing.as_ref().filter(|r| r.status != DownloadStatus::Complete).map(|r| r.bytes_downloaded as u64).unwrap_or(0);
     let mut file_path: Option<PathBuf> = existing.map(|r| PathBuf::from(r.file_path));
 
     let mut attempt = 0u32;
@@ -375,6 +422,19 @@ pub async fn download_track(
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
         };
+
+        // Resuming needs the file to hold at least the saved checkpoint; one that's shorter (or
+        // gone) was changed outside this download, so its progress can't be trusted.
+        if resume_offset > 0 {
+            let on_disk = match &file_path {
+                Some(path) => tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0),
+                None => 0,
+            };
+            if on_disk < resume_offset {
+                tracing::warn!(item_id, ino, on_disk, resume_offset, "the partial download is shorter than its saved progress; starting it over");
+                resume_offset = 0;
+            }
+        }
 
         let range = (resume_offset > 0).then_some(resume_offset);
         let file_response = match client.get_item_file_response(item_id, ino, range).await {
@@ -414,7 +474,15 @@ pub async fn download_track(
         };
         file_path = Some(path.clone());
 
-        let mut file = match tokio::fs::OpenOptions::new().create(true).write(true).truncate(fresh_start || resume_offset == 0).append(!fresh_start && resume_offset > 0).open(&path).await {
+        // Resume from the saved checkpoint, not from the end of the file. Progress is saved every
+        // `PROGRESS_PERSIST_INTERVAL_BYTES`, so a download interrupted between saves leaves more
+        // bytes on disk than the checkpoint says — and the server sends from the checkpoint. The
+        // file used to be opened for appending, which wrote those bytes a second time (a file
+        // 512 KiB too big, refused by `verify_row` on a phone). Cutting it back to the checkpoint
+        // also drops a chunk that may only have been half written.
+        let resuming = !fresh_start && resume_offset > 0;
+        let opened = tokio::fs::OpenOptions::new().create(true).write(true).truncate(!resuming).open(&path).await;
+        let mut file = match opened {
             Ok(file) => file,
             Err(err) => {
                 let reason = format!("couldn't open the download file: {err}");
@@ -422,6 +490,17 @@ pub async fn download_track(
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
         };
+        if resuming {
+            let positioned = async {
+                file.set_len(resume_offset).await?;
+                file.seek(std::io::SeekFrom::Start(resume_offset)).await
+            };
+            if let Err(err) = positioned.await {
+                let reason = format!("couldn't resume the download file: {err}");
+                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                return Ok(TrackDownloadOutcome::Failed(reason));
+            }
+        }
 
         let total_size = file_response.total_size;
         let mut stream = file_response.response.bytes_stream();
@@ -489,6 +568,24 @@ pub async fn download_track(
             continue;
         }
 
+        // The counter says it's complete; the file itself has to agree before it's called that.
+        // `sync_all` first, so the size read back is what's really on disk.
+        let _ = file.sync_all().await;
+        drop(file);
+        let on_disk = tokio::fs::metadata(&path).await.map(|m| m.len()).ok();
+        if on_disk != Some(resume_offset) {
+            let reason = format!("the downloaded file is {} bytes, not the {resume_offset} received", on_disk.map_or("unreadable".to_string(), |n| n.to_string()));
+            tracing::warn!(item_id, ino, %reason, "a finished download didn't check out; starting it over");
+            resume_offset = 0;
+            abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, 0, total_size.map(|n| n as i64)).await?;
+            if attempt >= MAX_ATTEMPTS {
+                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                return Ok(TrackDownloadOutcome::Failed(reason));
+            }
+            backoff(attempt).await;
+            continue;
+        }
+
         abs_storage::repo::download_tracks::mark_complete(pool, server_id, item_id, ino, resume_offset as i64).await?;
         return Ok(TrackDownloadOutcome::Completed);
     }
@@ -500,7 +597,7 @@ mod tests {
     use crate::connection::ConnectionTarget;
     use std::cell::Cell;
     use std::rc::Rc;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn track(ino: &str, offset: f64, duration: f64) -> TrackRef {
@@ -949,5 +1046,176 @@ mod tests {
 
         assert_eq!(outcome, TrackDownloadOutcome::Completed);
         assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"full-bytes", "must restart fresh, not append the full body onto the old partial bytes");
+    }
+
+    /// A complete download of `body` at its usual path, as `download_track` would have left it.
+    async fn complete_download(paths: &AppPaths, pool: &SqlitePool, server_id: &str, on_disk: &[u8], recorded_size: i64) -> PathBuf {
+        let file_path = paths.track_file_path(server_id, "item-1", "ino-1", "mp3");
+        tokio::fs::create_dir_all(file_path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&file_path, on_disk).await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(pool, server_id, "item-1", "ino-1", file_path.to_str().unwrap()).await.unwrap();
+        abs_storage::repo::download_tracks::mark_complete(pool, server_id, "item-1", "ino-1", recorded_size).await.unwrap();
+        file_path
+    }
+
+    /// The phone's case: progress is saved every 256 KiB, so a download interrupted between saves
+    /// leaves more bytes on disk than its checkpoint. Resuming must write from the checkpoint —
+    /// it used to append after the end of the file, writing those bytes twice (a file 512 KiB too
+    /// big on the phone, which playback then rightly refused).
+    #[tokio::test]
+    async fn download_track_resumes_from_the_saved_progress_not_the_end_of_the_file() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header("Range", "bytes=5-"))
+            .respond_with(ResponseTemplate::new(206).insert_header("Content-Range", "bytes 5-9/10").set_body_bytes(b"world".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        let file_path = paths.track_file_path(&server_id, "item-1", "ino-1", "mp3");
+        tokio::fs::create_dir_all(file_path.parent().unwrap()).await.unwrap();
+        // 5 bytes recorded, 3 more written after the last save.
+        tokio::fs::write(&file_path, b"hellowor").await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "ino-1", file_path.to_str().unwrap()).await.unwrap();
+        abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "ino-1", 5, Some(10)).await.unwrap();
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+
+        assert_eq!(outcome, TrackDownloadOutcome::Completed);
+        assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"helloworld", "the server's bytes, exactly — nothing written twice");
+        assert!(matches!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Local(_)));
+    }
+
+    /// A partial file shorter than its saved progress was changed outside the download: its
+    /// progress can't be trusted, so it downloads again from the first byte.
+    #[tokio::test]
+    async fn download_track_starts_over_when_the_file_is_shorter_than_its_saved_progress() {
+        let mock_server = MockServer::start().await;
+        // A resume request would get the tail; it must not be asked for.
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header("Range", "bytes=5-"))
+            .respond_with(ResponseTemplate::new(206).insert_header("Content-Range", "bytes 5-9/10").set_body_bytes(b"world".to_vec()))
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10").set_body_bytes(b"helloworld".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        let file_path = paths.track_file_path(&server_id, "item-1", "ino-1", "mp3");
+        tokio::fs::create_dir_all(file_path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&file_path, b"hel").await.unwrap();
+        abs_storage::repo::download_tracks::upsert_pending(&pool, &server_id, "item-1", "ino-1", file_path.to_str().unwrap()).await.unwrap();
+        abs_storage::repo::download_tracks::update_progress(&pool, &server_id, "item-1", "ino-1", 5, Some(10)).await.unwrap();
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+
+        assert_eq!(outcome, TrackDownloadOutcome::Completed);
+        assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"helloworld");
+    }
+
+    /// A finished download that is already damaged (the phone's chapter): playback notices, it
+    /// stops counting as downloaded, and downloading it again gives a clean file.
+    #[tokio::test]
+    async fn a_damaged_download_stops_counting_as_downloaded_and_downloads_again_cleanly() {
+        let mock_server = MockServer::start().await;
+        // Any resume would corrupt it again: only a full download is right.
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(206).insert_header("Content-Range", "bytes 10-11/12").set_body_bytes(b"XX".to_vec()))
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10").set_body_bytes(b"helloworld".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        let file_path = complete_download(&paths, &pool, &server_id, b"hellowowworld", 10).await;
+
+        let source = track_source(&pool, &server_id, "item-1", "ino-1").await;
+        assert_eq!(source, TrackSource::Streamed(StreamReason::SizeMismatch { expected: 10, actual: 13 }));
+        let row = abs_storage::repo::download_tracks::get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Failed, "a damaged download must stop counting as downloaded");
+        assert!(row.error_reason.as_deref().is_some_and(|r| r.contains("damaged")), "got {:?}", row.error_reason);
+        assert!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().is_empty());
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        assert_eq!(outcome, TrackDownloadOutcome::Completed);
+        assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"helloworld");
+        assert!(matches!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Local(_)));
+    }
+
+    /// Straight to `download_track`, without playback noticing first: a complete row whose file
+    /// is the wrong size downloads again from the first byte, not from its recorded size.
+    #[tokio::test]
+    async fn download_track_redownloads_a_damaged_complete_file_from_the_start() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416))
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10").set_body_bytes(b"helloworld".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        let file_path = complete_download(&paths, &pool, &server_id, b"hellowowworld", 10).await;
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        assert_eq!(outcome, TrackDownloadOutcome::Completed);
+        assert_eq!(tokio::fs::read(&file_path).await.unwrap(), b"helloworld");
+    }
+
+    /// Offline-first: checking a download needs only the device — no server exists at all here —
+    /// and only proof of damage counts. A file that can't be checked right now plays from the
+    /// device and keeps counting as downloaded.
+    #[tokio::test]
+    async fn checking_a_download_is_local_and_only_proof_of_damage_counts() {
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+
+        // A good download: local, no server anywhere.
+        complete_download(&paths, &pool, &server_id, b"helloworld", 10).await;
+        assert!(matches!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Local(_)));
+
+        // A file that can't be checked (its "folder" is a file, so reading it fails with an error
+        // other than not-found): played anyway, and still counted as downloaded.
+        let blocker = paths.item_downloads_dir(&server_id, "item-1").join("not-a-dir");
+        tokio::fs::write(&blocker, b"x").await.unwrap();
+        let unreadable = blocker.join("ino-1.mp3");
+        sqlx::query("UPDATE download_tracks SET file_path = ? WHERE ino = 'ino-1'").bind(unreadable.to_str().unwrap()).execute(&pool).await.unwrap();
+        assert!(matches!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Local(_)), "a file that can't be checked plays from the device");
+        assert_eq!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().len(), 1, "and keeps counting as downloaded");
+
+        // Missing along with its whole folder (storage not mounted, say): streamed this time,
+        // but not written off.
+        let elsewhere = paths.item_downloads_dir(&server_id, "item-1").join("gone-folder").join("ino-1.mp3");
+        sqlx::query("UPDATE download_tracks SET file_path = ? WHERE ino = 'ino-1'").bind(elsewhere.to_str().unwrap()).execute(&pool).await.unwrap();
+        assert_eq!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Streamed(StreamReason::FileMissing));
+        assert_eq!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().len(), 1, "a whole missing folder may come back; nothing is written off");
+
+        // Missing from a folder that's there: that's proof, and it stops counting.
+        let missing = paths.item_downloads_dir(&server_id, "item-1").join("ino-1-deleted.mp3");
+        sqlx::query("UPDATE download_tracks SET file_path = ? WHERE ino = 'ino-1'").bind(missing.to_str().unwrap()).execute(&pool).await.unwrap();
+        assert_eq!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Streamed(StreamReason::FileMissing));
+        assert!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().is_empty());
     }
 }

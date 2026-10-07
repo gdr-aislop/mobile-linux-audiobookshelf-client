@@ -481,6 +481,23 @@ was and wasn't verified.
       space" row (from ID-10).
       *Expected:* no download starts, no partial state, no crash.
 
+- [ ] **ID-17 — An interrupted chapter download comes out whole.** Start downloading a single
+      large chapter, close the app (or let the phone suspend) halfway through, reopen it and
+      download that chapter again until it finishes. Then turn on offline mode and play that
+      chapter.
+      *Expected:* it plays from the device. The log never shows `streaming a track that has a
+      download, which can't be used … downloaded file is N bytes, expected M`. (Before 0.9.3 a
+      resume could write part of the file twice, so the finished file was refused.)
+
+- [ ] **ID-18 — A damaged download is noticed and fixed by downloading it again.** Needs a
+      download damaged by the bug above (or a downloaded chapter file made bigger by hand, e.g.
+      `truncate -s +1M` on it). Play that chapter.
+      *Expected:* the log shows `a downloaded file is damaged; it no longer counts as
+      downloaded`; the chapter loses its downloaded glyph and the book its downloaded badge;
+      downloading it again succeeds from the first byte and it then plays offline. This is
+      offline-first: with Wi-Fi off it's noticed just the same, and a download whose file merely
+      can't be checked at the moment (as opposed to proven wrong) keeps its glyph and plays.
+
 ---
 
 ## 7. Mini player (MP) — ✅ implemented
