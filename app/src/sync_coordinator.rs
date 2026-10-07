@@ -20,7 +20,45 @@ use std::collections::HashMap;
 
 struct Entry {
     completed: bool,
-    waiters: Vec<Box<dyn FnOnce()>>,
+    waiters: Vec<Box<dyn FnOnce(Option<SyncOutcome>)>>,
+}
+
+/// How the claimed sync ended, handed to every screen that waited for it — so the screen that
+/// didn't run the sync still says "can't reach your server" (or shows the error page on an empty
+/// install) instead of silently redrawing from cache, or spinning forever.
+#[derive(Clone)]
+pub(crate) enum SyncOutcome {
+    Ok,
+    Failed(std::rc::Rc<abs_core::CoreError>),
+}
+
+impl SyncOutcome {
+    pub(crate) fn from_result(result: &Result<(), abs_core::CoreError>) -> Self {
+        match result {
+            Ok(()) => SyncOutcome::Ok,
+            // `CoreError` isn't `Clone`; the waiters only need to read it.
+            Err(err) => SyncOutcome::Failed(std::rc::Rc::new(clone_error(err))),
+        }
+    }
+
+    pub(crate) fn error(&self) -> Option<&abs_core::CoreError> {
+        match self {
+            SyncOutcome::Ok => None,
+            SyncOutcome::Failed(err) => Some(err),
+        }
+    }
+}
+
+/// A copy of `err` good enough for showing it: the variant (which picks the wording) and its text.
+fn clone_error(err: &abs_core::CoreError) -> abs_core::CoreError {
+    use abs_core::CoreError::*;
+    match err {
+        Auth => Auth,
+        Offline => Offline,
+        Unreachable(text) => Unreachable(text.clone()),
+        UnexpectedResponse(text) => UnexpectedResponse(text.clone()),
+        other => UnexpectedResponse(other.to_string()),
+    }
 }
 
 thread_local! {
@@ -47,13 +85,14 @@ pub(crate) fn claim_startup_sync(server_id: &str, account_id: &str) -> bool {
 }
 
 /// Registers a one-shot callback for when the claimed sync for `(server_id, account_id)`
-/// finishes. If it already has — or nothing is currently claimed for these ids at all (the
-/// defensive case: a caller here without a matching `claim_startup_sync` should not happen, but
-/// must never silently drop the follow-up render a caller is relying on) — the callback runs
-/// immediately instead of being queued.
-pub(crate) fn on_completed(server_id: &str, account_id: &str, callback: impl FnOnce() + 'static) {
+/// finishes; it gets that sync's [`SyncOutcome`]. If it already has finished — or nothing is
+/// currently claimed for these ids at all (the defensive case: a caller here without a matching
+/// `claim_startup_sync` should not happen, but must never silently drop the follow-up render a
+/// caller is relying on) — the callback runs immediately, with `None`: there's no outcome to
+/// report any more, only the cache to redraw from.
+pub(crate) fn on_completed(server_id: &str, account_id: &str, callback: impl FnOnce(Option<SyncOutcome>) + 'static) {
     let key = (server_id.to_string(), account_id.to_string());
-    let mut callback: Option<Box<dyn FnOnce()>> = Some(Box::new(callback));
+    let mut callback: Option<Box<dyn FnOnce(Option<SyncOutcome>)>> = Some(Box::new(callback));
     CLAIMS.with(|claims| {
         let mut claims = claims.borrow_mut();
         if let Some(entry) = claims.get_mut(&key) {
@@ -63,20 +102,21 @@ pub(crate) fn on_completed(server_id: &str, account_id: &str, callback: impl FnO
         }
     });
     if let Some(callback) = callback {
-        callback();
+        callback(None);
     }
 }
 
 /// Called by whichever screen actually claimed the sync for `(server_id, account_id)`, once its
 /// full cycle (sync + reconcile + covers, whatever that screen's own `spawn_sync_cycle` considers
-/// "done") has landed and rendered. Fires every registered [`on_completed`] callback and removes
-/// the claim, so a later rebuild for the same ids (a relogin, an account switch that comes back
-/// around) starts a fresh automatic sync rather than skipping forever.
-pub(crate) fn mark_completed(server_id: &str, account_id: &str) {
+/// "done") has landed and rendered, with how it went. Fires every registered [`on_completed`]
+/// callback with that outcome and removes the claim, so a later rebuild for the same ids (a
+/// relogin, an account switch that comes back around) starts a fresh automatic sync rather than
+/// skipping forever.
+pub(crate) fn mark_completed(server_id: &str, account_id: &str, outcome: SyncOutcome) {
     let key = (server_id.to_string(), account_id.to_string());
     let waiters = CLAIMS.with(|claims| claims.borrow_mut().remove(&key).map(|entry| entry.waiters).unwrap_or_default());
     for waiter in waiters {
-        waiter();
+        waiter(Some(outcome.clone()));
     }
 }
 
@@ -111,8 +151,8 @@ mod tests {
         assert!(!claim_startup_sync("server-1", "account-1"));
         // A different account is a distinct key — never affected by another account's claim.
         assert!(claim_startup_sync("server-1", "account-2"));
-        mark_completed("server-1", "account-1");
-        mark_completed("server-1", "account-2");
+        mark_completed("server-1", "account-1", SyncOutcome::Ok);
+        mark_completed("server-1", "account-2", SyncOutcome::Ok);
     }
 
     #[test]
@@ -121,21 +161,35 @@ mod tests {
         let ran = Rc::new(Cell::new(false));
         on_completed("server-2", "account-1", {
             let ran = ran.clone();
-            move || ran.set(true)
+            move |_| ran.set(true)
         });
         assert!(!ran.get(), "must not run before the claimed sync actually completes");
-        mark_completed("server-2", "account-1");
+        mark_completed("server-2", "account-1", SyncOutcome::Ok);
         assert!(ran.get());
+    }
+
+    /// The screen that didn't run the sync must learn that it failed, and how.
+    #[test]
+    fn a_waiter_receives_the_failed_outcome() {
+        assert!(claim_startup_sync("server-6", "account-1"));
+        let seen: Rc<std::cell::RefCell<Option<Option<String>>>> = Default::default();
+        on_completed("server-6", "account-1", {
+            let seen = seen.clone();
+            move |outcome| *seen.borrow_mut() = Some(outcome.and_then(|o| o.error().map(|e| e.to_string())))
+        });
+        let failure: Result<(), abs_core::CoreError> = Err(abs_core::CoreError::Unreachable("connection refused".to_string()));
+        mark_completed("server-6", "account-1", SyncOutcome::from_result(&failure));
+        assert_eq!(seen.borrow().clone(), Some(Some("couldn't connect to the server: connection refused".to_string())));
     }
 
     #[test]
     fn on_completed_runs_immediately_if_already_completed() {
         assert!(claim_startup_sync("server-3", "account-1"));
-        mark_completed("server-3", "account-1");
+        mark_completed("server-3", "account-1", SyncOutcome::Ok);
         let ran = Rc::new(Cell::new(false));
         on_completed("server-3", "account-1", {
             let ran = ran.clone();
-            move || ran.set(true)
+            move |_| ran.set(true)
         });
         assert!(ran.get(), "a caller arriving after completion should render immediately, not wait forever");
     }
@@ -145,7 +199,7 @@ mod tests {
         let ran = Rc::new(Cell::new(false));
         on_completed("server-4", "account-1", {
             let ran = ran.clone();
-            move || ran.set(true)
+            move |_| ran.set(true)
         });
         assert!(ran.get(), "no matching claim must never mean a lost callback");
     }
@@ -153,7 +207,7 @@ mod tests {
     #[test]
     fn mark_completed_clears_the_claim_so_a_later_build_syncs_again() {
         assert!(claim_startup_sync("server-5", "account-1"));
-        mark_completed("server-5", "account-1");
+        mark_completed("server-5", "account-1", SyncOutcome::Ok);
         assert!(claim_startup_sync("server-5", "account-1"), "a relogin/account-switch reusing the same ids must sync again, not skip forever");
     }
 

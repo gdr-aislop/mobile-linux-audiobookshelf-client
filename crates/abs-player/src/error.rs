@@ -55,6 +55,9 @@ pub enum PlaybackErrorKind {
     AudioOutput,
     /// A network-shaped resource failure while streaming (dropped connection, read failure).
     Network,
+    /// The server never answered when a book was being started — nothing has played, so
+    /// "lost the connection while playing" would be wrong. Raised by the app, not by GStreamer.
+    Unreachable,
     /// The pipeline never got to a requested position — it kept playing from somewhere else
     /// even after the file was loaded again. Raised by the app, not by GStreamer.
     Seek,

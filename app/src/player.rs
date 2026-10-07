@@ -2146,10 +2146,10 @@ impl PlayerController {
                             // An expired session is the most common trigger in practice
                             // (`resolve_stream_target` distinguishes a 401/403 as `CoreError::Auth`).
                             tracing::warn!(%err, offline = %offline_err, item_id = %item.item_id, "couldn't resolve a playable URL");
-                            let kind = if matches!(err, abs_core::CoreError::Auth) {
-                                abs_player::PlaybackErrorKind::NotAuthorized
-                            } else {
-                                abs_player::PlaybackErrorKind::Network
+                            let kind = match err {
+                                abs_core::CoreError::Auth => abs_player::PlaybackErrorKind::NotAuthorized,
+                                abs_core::CoreError::Unreachable(_) => abs_player::PlaybackErrorKind::Unreachable,
+                                _ => abs_player::PlaybackErrorKind::Network,
                             };
                             fail_start(failed_now_playing(kind, err.to_string()));
                             return;

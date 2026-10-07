@@ -661,6 +661,12 @@ pub fn build(
                 let into = (snapshot.position_seconds - start).clamp(0.0, (end - start).max(0.0));
                 set_time_labels(&elapsed_label, &remaining_label, into, end - start);
             }
+            // A book that hasn't loaded (or failed to start) has no length yet: "0:00 / -0:00"
+            // would just be noise. Hidden by opacity, so the row keeps its height.
+            let length_known = snapshot.duration_seconds > 0.0;
+            for label in [&elapsed_label, &remaining_label] {
+                label.set_opacity(if length_known { 1.0 } else { 0.0 });
+            }
             if snapshot.chapter.is_some() {
                 let left = format!("{} left in book", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0)));
                 if book_left_label.label() != left {
@@ -672,7 +678,7 @@ pub fn build(
             }
             // Nothing to seek in, skip over, speed up or time until the book has loaded — each
             // of these would be a no-op the controller swallows, which reads as a dead button.
-            scrubber.set_sensitive(!snapshot.is_loading);
+            scrubber.set_sensitive(!snapshot.is_loading && length_known);
             skip_back.set_sensitive(!snapshot.is_loading);
             skip_forward.set_sensitive(!snapshot.is_loading);
             // Kept while loading (chapters aren't known yet) so the row doesn't reflow when they
@@ -693,9 +699,10 @@ pub fn build(
 
             match &snapshot.last_error {
                 Some(err) => {
-                    let (title, action) = friendly_message(err.kind);
-                    error_banner.set_title(title);
-                    error_banner.set_action_label(action);
+                    let message = friendly_message(err.kind);
+                    error_banner.set_title(message.headline);
+                    error_banner.set_description(Some(message.description));
+                    error_banner.set_action_label(message.action);
                     error_banner.set_details(Some(err.debug.as_deref().unwrap_or(&err.message)));
                     error_banner.set_revealed(true);
                 }
@@ -852,19 +859,49 @@ pub(crate) fn format_hms(total_seconds: f64) -> String {
 /// `debug`) is never derived from this — it always goes into the banner's "Show details" verbatim
 /// (see this screen's `update` closure), so a friendly headline here is never the *only* thing a
 /// self-hosting user debugging their server/codec setup can see.
-pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> (&'static str, Option<&'static str>) {
+pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> FriendlyMessage {
+    use abs_player::PlaybackErrorKind::*;
+    let (headline, description, action) = match kind {
+        MissingCodec => ("Can't play this file", "Support for its audio format is missing on this device.", None),
+        UnsupportedOrCorrupt => ("Can't decode this file", "It may be corrupted, or in a format this app doesn't support.", None),
+        ResourceNotFound => ("Audio not found on the server", "It may have been moved or deleted.", None),
+        NotAuthorized => ("The server refused this request", "Try signing in again.", None),
+        AudioOutput => ("Can't reach the audio output", "Check this device's sound settings and try again.", Some("Retry")),
+        Network => ("Connection lost", "Check your connection and try again.", Some("Retry")),
+        Unreachable => ("Can't reach your server", "This book can't start until it's back. Check your connection and try again.", Some("Retry")),
+        Seek => ("Couldn't get to that position", "Try again, or try another position.", Some("Retry")),
+        Offline => ("This part isn't downloaded", "Turn off offline mode to stream it.", None),
+        Unavailable => ("Playback isn't available", "No audio engine could be started on this device.", None),
+        Other => ("Playback stopped unexpectedly", "Try again.", Some("Retry")),
+    };
+    FriendlyMessage { headline, description, action }
+}
+
+/// What the player's error banner says: a short headline, a line on what to do, and the
+/// action, if retrying is plausibly useful.
+pub(crate) struct FriendlyMessage {
+    pub headline: &'static str,
+    pub description: &'static str,
+    pub action: Option<&'static str>,
+}
+
+/// A few words for the shell's toast — at most 20 characters, so the toast never cuts them off
+/// on a 360px phone next to its "View" and close buttons; the full message is in the player's
+/// banner, one tap ("View") away.
+pub(crate) fn short_message(kind: abs_player::PlaybackErrorKind) -> &'static str {
     use abs_player::PlaybackErrorKind::*;
     match kind {
-        MissingCodec => ("This app can't play this file — support for its audio format is missing on this device.", None),
-        UnsupportedOrCorrupt => ("This file's audio couldn't be decoded — it may be corrupted or in an unsupported format.", None),
-        ResourceNotFound => ("This title's audio couldn't be found on the server — it may have been moved or deleted.", None),
-        NotAuthorized => ("The server refused this request — try signing in again.", None),
-        AudioOutput => ("Couldn't reach this device's audio output.", Some("Retry")),
-        Network => ("Lost the connection while playing — check your connection and try again.", Some("Retry")),
-        Seek => ("Couldn't get to that position in the audio — try again, or try another position.", Some("Retry")),
-        Offline => ("This part of the book isn't downloaded — turn off offline mode to stream it.", None),
-        Unavailable => ("Playback isn't available on this device — no audio engine could be started.", None),
-        Other => ("Playback stopped unexpectedly.", Some("Retry")),
+        MissingCodec => "Can't play this file",
+        UnsupportedOrCorrupt => "Can't decode this file",
+        ResourceNotFound => "Audio not found",
+        NotAuthorized => "Playback refused",
+        AudioOutput => "No audio output",
+        Network => "Connection lost",
+        Unreachable => "Can't reach server",
+        Seek => "Couldn't seek",
+        Offline => "Not downloaded",
+        Unavailable => "Playback unavailable",
+        Other => "Playback stopped",
     }
 }
 

@@ -482,9 +482,8 @@ pub fn build(
             let mut last = last_toasted_error.borrow_mut();
             if new_kind.is_some() && new_kind != *last {
                 if let Some(kind) = new_kind {
-                    let (title, _) = screens::player::friendly_message(kind);
-                    let toast = adw::Toast::new(title);
-                    toast.set_button_label(Some("Details"));
+                    let toast = adw::Toast::new(screens::player::short_message(kind));
+                    toast.set_button_label(Some("View"));
                     toast.connect_button_clicked({
                         let open_player = open_player.clone();
                         move |_| open_player()
@@ -1415,7 +1414,7 @@ pub(crate) mod tests {
     }
 
     /// A real playback failure (the track file 404s) should toast once, shell-wide, regardless of
-    /// which tab is open — and the toast's "Details" action should open the Full Player screen,
+    /// which tab is open — and the toast's "View" action should open the Full Player screen,
     /// the same as tapping the mini bar. Starts playback directly via the controller (rather than
     /// through Home/Item Detail's UI, already covered above) since this test is about the toast,
     /// not the tap-through path.
@@ -1495,11 +1494,11 @@ pub(crate) mod tests {
         play_button.emit_clicked();
 
         pump_until(
-            || find_button_labeled(hooks.toast_overlay.upcast_ref(), "Details").is_some(),
+            || find_button_labeled(hooks.toast_overlay.upcast_ref(), "View").is_some(),
             std::time::Duration::from_secs(10),
         );
         let details_button =
-            find_button_labeled(hooks.toast_overlay.upcast_ref(), "Details").expect("a playback failure should toast with a Details action");
+            find_button_labeled(hooks.toast_overlay.upcast_ref(), "View").expect("a playback failure should toast with a View action");
         details_button.emit_clicked();
 
         pump_until(
@@ -1508,7 +1507,7 @@ pub(crate) mod tests {
         );
         assert!(
             app_window.content().is_some_and(|c| c != window.root),
-            "the toast's Details action should open the Full Player screen, same as the mini bar's own tap"
+            "the toast's View action should open the Full Player screen, same as the mini bar's own tap"
         );
     }
 
@@ -2325,5 +2324,137 @@ pub(crate) mod tests {
 
         let too_tall: Vec<_> = measured.iter().filter(|(_, minimum)| *minimum > PHONE_MAX_MIN_HEIGHT).collect();
         assert!(too_tall.is_empty(), "screens that can't get as short as a phone screen ({PHONE_MAX_MIN_HEIGHT}px): {too_tall:?}");
+    }
+
+    /// A URL nothing listens on: the server is down, and connecting is refused at once.
+    fn down_server_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    /// The first label under `root` reading exactly `text` that is actually on screen.
+    fn shown_label(root: &gtk4::Widget, text: &str) -> Option<gtk4::Label> {
+        if let Some(label) = root.downcast_ref::<gtk4::Label>() {
+            if label.text() == text && label.is_mapped() {
+                return Some(label.clone());
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = shown_label(&widget, text) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    /// The whole shell for `server`/`account` in a phone-sized window, shown.
+    fn phone_window(
+        runtime: &tokio::runtime::Runtime,
+        pool: &SqlitePool,
+        server: &abs_storage::models::Server,
+        account: &abs_storage::models::Account,
+    ) -> (adw::ApplicationWindow, MainWindow) {
+        runtime.block_on(abs_storage::repo::accounts::set_active(pool, &account.id)).unwrap();
+        let account = &runtime.block_on(abs_storage::repo::accounts::get(pool, &account.id)).unwrap();
+        let app_window = adw::ApplicationWindow::builder().default_width(360).default_height(648).build();
+        let window = build(
+            pool.clone(),
+            crate::test_support::test_paths(),
+            server.clone(),
+            account.clone(),
+            abs_core::auth::Session::new(pool.clone(), server, account),
+            abs_core::settings::PlaybackSettings::default(),
+            abs_core::settings::Theme::default(),
+            vec![(server.clone(), vec![account.clone()])],
+            app_window.clone(),
+        );
+        app_window.set_content(Some(&window.root));
+        app_window.present();
+        pump_until(|| app_window.is_mapped(), std::time::Duration::from_secs(5));
+        (app_window, window)
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The server down at launch, with
+    /// books saved from before: Home and Library both say so — only one of them runs the shared
+    /// startup sync, and the other used to redraw from its cache without a word — and the
+    /// banner's Retry runs a sync.
+    pub(crate) fn run_server_down_at_launch_is_shown_on_home_and_library(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(crate::player::tests::account_and_server(&pool, &down_server_url()));
+        runtime.block_on(crate::player::tests::insert_synced_item(&pool, &server.id, "item-1", "Saved Book"));
+        let (_app_window, window) = phone_window(runtime, &pool, &server, &account);
+        let hooks = window.test_hooks();
+        let home = hooks.stack.child_by_name("home").unwrap();
+        let library = hooks.stack.child_by_name("library").unwrap();
+
+        pump_until(|| shown_label(&home, "Can't reach your server").is_some(), std::time::Duration::from_secs(10));
+        assert!(shown_label(&home, "Can't reach your server").is_some(), "Home must say the server can't be reached");
+        assert!(shown_label(&home, "Showing what's saved on this device.").is_some());
+        assert!(shown_label(&home, "Saved Book").is_some(), "the saved books stay on screen");
+
+        hooks.stack.set_visible_child_name("library");
+        pump_until(|| shown_label(&library, "Can't reach your server").is_some(), std::time::Duration::from_secs(10));
+        assert!(shown_label(&library, "Can't reach your server").is_some(), "Library must say it too");
+
+        // Retry runs a sync — which fails again, and says so.
+        hooks.stack.set_visible_child_name("home");
+        pump_until(|| false, std::time::Duration::from_millis(300));
+        let retry = crate::test_support::find_button_with_label(&home, "Retry").expect("the banner offers Retry");
+        assert!(retry.is_mapped());
+        retry.emit_clicked();
+        pump_until(|| crate::test_support::any_label_reads(&home, "Sync failed"), std::time::Duration::from_secs(10));
+        assert!(crate::test_support::any_label_reads(&home, "Sync failed"), "Retry must run a sync");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A fresh install with the server
+    /// down: Home says it can't reach the server (with Try again) instead of spinning on
+    /// "Syncing your libraries…" for good.
+    pub(crate) fn run_server_down_on_a_fresh_install_is_shown_on_home(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(crate::player::tests::account_and_server(&pool, &down_server_url()));
+        let (_app_window, window) = phone_window(runtime, &pool, &server, &account);
+        let home = window.test_hooks().stack.child_by_name("home").unwrap();
+
+        pump_until(|| shown_label(&home, "Can't reach your server").is_some(), std::time::Duration::from_secs(10));
+        assert!(shown_label(&home, "Can't reach your server").is_some(), "Home must say the server can't be reached");
+        assert!(shown_label(&home, "Syncing your libraries…").is_none(), "and stop saying it's syncing");
+        assert!(crate::test_support::find_button_with_label(&home, "Try again").is_some_and(|b| b.is_mapped()));
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Play pressed with the server down:
+    /// the player says the book can't start (not "lost the connection while playing"), offers
+    /// Retry, shows no "0:00 / -0:00", and the toast fits.
+    pub(crate) fn run_play_with_the_server_down_says_it_cannot_start(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(pool());
+        let (server, account) = runtime.block_on(crate::player::tests::account_and_server(&pool, &down_server_url()));
+        runtime.block_on(crate::player::tests::insert_synced_item(&pool, &server.id, "item-1", "Saved Book"));
+        let (app_window, window) = phone_window(runtime, &pool, &server, &account);
+        let hooks = window.test_hooks();
+
+        window.controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Saved Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| window.controller.snapshot().is_some_and(|s| s.last_error.is_some()), std::time::Duration::from_secs(15));
+        assert_eq!(window.controller.snapshot().unwrap().last_error.map(|e| e.kind), Some(abs_player::PlaybackErrorKind::Unreachable));
+        pump_until(|| shown_label(hooks.toast_overlay.upcast_ref(), "Can't reach server").is_some(), std::time::Duration::from_secs(5));
+        assert!(shown_label(hooks.toast_overlay.upcast_ref(), "Can't reach server").is_some(), "the toast says it in a few words");
+
+        (hooks.open_player)();
+        pump_until(|| app_window.content().is_some_and(|c| c != window.root), std::time::Duration::from_secs(5));
+        let player = app_window.content().unwrap();
+        pump_until(|| shown_label(&player, "Can't reach your server").is_some(), std::time::Duration::from_secs(5));
+        assert!(shown_label(&player, "Can't reach your server").is_some());
+        assert!(shown_label(&player, "This book can't start until it's back. Check your connection and try again.").is_some());
+        assert!(crate::test_support::find_button_with_label(&player, "Retry").is_some_and(|b| b.is_mapped()), "Retry is offered");
+        assert!(shown_label(&player, "Lost the connection while playing — check your connection and try again.").is_none());
+        let remaining = shown_label(&player, "-0:00").expect("the remaining-time label");
+        assert_eq!(remaining.opacity(), 0.0, "no time shown for a book whose length isn't known");
+        window.controller.stop();
     }
 }

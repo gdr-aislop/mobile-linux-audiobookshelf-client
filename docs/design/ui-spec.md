@@ -64,11 +64,11 @@ Fractal) rather than copying Lissen's Material Design look.
   token) stay plain-text/purpose-managed.
 - **Error state**: on a failed connection attempt, an inline `AdwBanner`-style strip appears above
   the form, with copy that distinguishes *why* it failed rather than one generic message:
-  - **Authentication failure** (bad credentials/token): "Unable to sign in — check your username
-    and password and try again", and the offending field's (username/password/token) label
+  - **Authentication failure** (bad credentials/token): "Unable to sign in" / "Check your
+    username and password and try again.", and the offending field's (username/password/token) label
     switches to an error/red tint.
   - **Connectivity failure** (unreachable host, DNS failure, TLS/certificate error, timeout):
-    "Can't reach this server — check the URL and your connection", with no field-level red tint,
+    "Can't reach this server" / "Check the address and your connection.", with no field-level red tint,
     since this isn't a credentials problem and tinting the password field would misdirect the
     user. Self-hosted Audiobookshelf setups hit this case at least as often as bad passwords
     (wrong port, VPN not up, LAN-only address used off-network), so conflating the two would
@@ -103,10 +103,12 @@ Fractal) rather than copying Lissen's Material Design look.
   - **Syncing** (no cached data, sync in flight): an indeterminate `GtkSpinner` above the title
     "Syncing your libraries…", subline "This can take a moment on first sync." Animation-only
     feedback; the sync pipeline doesn't report per-step progress.
-  - **Failed** (sync errored, nothing cached): a warning glyph, "Couldn't sync your libraries",
-    "Check your connection and try again.", the underlying error text in a small selectable
-    details line, and a **Try again** button that re-runs the sync cycle (returning to the
-    Syncing state first).
+  - **Failed** (sync errored, nothing cached): when the server never answered (refused,
+    unreachable, no reply in time), a no-network glyph, "Can't reach your server", "Check your
+    connection, or that the server is running, then try again."; for any other failure, a
+    warning glyph, "Couldn't sync your libraries", "Check your connection and try again." Either
+    way, the underlying error text in a small selectable details line, and a **Try again** button
+    that re-runs the sync cycle (returning to the Syncing state first).
   - **Signed out** (authorization failure — 401/403 from any authenticated call, meaning the
     stored session itself is dead: expired or revoked refresh token, removed or demoted user):
     a lock glyph, "Sign in again", "Your session on this server has expired or was revoked.",
@@ -117,12 +119,15 @@ Fractal) rather than copying Lissen's Material Design look.
     happen on self-hosted servers.
   - **Empty** (sync succeeded but the server exposes no libraries): the folder-music glyph,
     "No library synced yet", "This server doesn't have any libraries yet.", and Try again.
-  Once anything is cached, shelves render normally and a failed re-sync surfaces as the
-  "Couldn't sync — showing what's cached." banner instead; that banner sits below the header
-  bar, outside the shelves' scroller, so it's visible in every state. On an authorization
-  failure the banner reads "Session expired — showing what's cached." and grows a **Log in
-  again** button of its own. Try again is the only user-triggerable sync until the Sync now menu
-  item (below) is built.
+  Once anything is cached, shelves render normally and a failed re-sync surfaces as the error
+  banner instead (see "Error/offline" under states for its look): "Can't reach your server" (or
+  "Couldn't update your library" when the server answered with an error), "Showing what's saved
+  on this device.", and a **Retry** button that runs the same sync as Sync now. It sits below
+  the header bar, outside the shelves' scroller, so it's visible in every state. On an
+  authorization failure it reads "Signed out by the server" and its button is **Log in again**.
+  Home and Library share one startup sync (only one of them runs it); the other is told how it
+  ended, so both show the same banner or failure state — never a silent redraw, or a spinner
+  that never ends.
 
 ### Re-login flow
 - When a session dies (the Signed-out state above), "Log in again" swaps the window's content for
@@ -536,11 +541,20 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 - **Loading:** `AdwSpinner`/`GtkSpinner` in place of content, skeleton-less (per HIG, prefer
   spinners over skeleton screens for this style of app).
 - **Empty:** `AdwStatusPage` with an icon, title, and short description (e.g. "No downloads yet").
-- **Error/offline:** `AdwBanner` at the top of the affected page, plus `AdwToast` for transient
-  errors (e.g. "Failed to sync progress — will retry"). On an authorization failure (the server
-  rejects the session), the banner swaps to "Session expired — showing what's cached." and grows
-  a "Log in again" button routing to the re-login flow (see Home) — on every screen that shows
-  the banner, not just Home.
+- **Error/offline:** a banner at the top of the affected page (the app's own `ErrorBanner`;
+  `AdwBanner` needs libadwaita 1.3), plus `AdwToast` for transient errors (e.g. "Failed to sync
+  progress — will retry"). The banner is a card: 12px from the screen's edges, 12px padding,
+  rounded corners, an amber tint (a server being down isn't the user's fault), a ⚠ glyph, a
+  short **bold headline** saying what happened, a dimmed line saying what still works or what
+  to do, and a bottom row with "Details" (the raw error, selectable, monospace) and the action
+  (Retry / Log in again). Toasts stay at most 20 characters ("Can't reach server", "Connection
+  lost") so they're never cut off next to their "View" button; the full sentence is in the
+  banner. On an authorization failure (the server rejects
+  the session), the banner reads "Signed out by the server" and its button is "Log in again",
+  routing to the re-login flow (see Home) — on every screen that shows the banner, not just
+  Home. The player's banner says "Can't reach your server" / "This book can't start until it's
+  back…" when a book couldn't start, and "Connection lost" when a stream that was playing
+  dropped; a book whose length isn't known yet shows no "0:00 / -0:00" times.
 - **Listening position:** never lost silently. Progress the server hasn't confirmed (listened to
   offline, or whose push failed) is kept marked on the device and pushed on the next sync or
   reconnect. Signing out or removing a server says so when it would delete such progress.

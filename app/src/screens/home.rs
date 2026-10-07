@@ -116,6 +116,8 @@ pub(crate) struct EmptyState {
     title: gtk4::Label,
     description: gtk4::Label,
     details: gtk4::Label,
+    /// "Details" — the raw error stays one tap away rather than filling the page.
+    details_toggle: gtk4::ToggleButton,
     retry: gtk4::Button,
     login_again: gtk4::Button,
     buttons: gtk4::Box,
@@ -126,7 +128,7 @@ impl EmptyState {
     /// no visible data is a sync that hasn't landed yet.
     fn build() -> Self {
         let spinner = gtk4::Spinner::builder().spinning(true).visible(false).build();
-        let icon = gtk4::Image::builder().icon_name("folder-music-symbolic").visible(false).build();
+        let icon = gtk4::Image::builder().icon_name("folder-music-symbolic").pixel_size(64).css_classes(["dim-label"]).visible(false).build();
         let title = gtk4::Label::builder().css_classes(["title-2"]).build();
         let description = gtk4::Label::builder()
             .wrap(true)
@@ -148,6 +150,17 @@ impl EmptyState {
             .css_classes(["dim-label", "caption"])
             .visible(false)
             .build();
+        crate::widgets::banner::ensure_banner_css();
+        let details_toggle =
+            gtk4::ToggleButton::builder().label("Details").css_classes(["app-link"]).halign(gtk4::Align::Center).visible(false).build();
+        let details_revealer = gtk4::Revealer::builder().child(&details).reveal_child(false).build();
+        details_toggle.connect_toggled({
+            let details_revealer = details_revealer.clone();
+            move |toggle| {
+                details_revealer.set_reveal_child(toggle.is_active());
+                toggle.set_label(if toggle.is_active() { "Hide details" } else { "Details" });
+            }
+        });
         let retry = gtk4::Button::builder()
             .label("Try again")
             .css_classes(["pill", "suggested-action"])
@@ -166,6 +179,7 @@ impl EmptyState {
             .spacing(12)
             .valign(gtk4::Align::Center)
             .halign(gtk4::Align::Center)
+            .vexpand(true)
             .margin_start(24)
             .margin_end(24)
             .visible(false)
@@ -174,18 +188,21 @@ impl EmptyState {
         root.append(&icon);
         root.append(&title);
         root.append(&description);
-        root.append(&details);
 
         let buttons = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(12)
+            .halign(gtk4::Align::Center)
+            .margin_top(6)
             .visible(false)
             .build();
         buttons.append(&retry);
         buttons.append(&login_again);
         root.append(&buttons);
+        root.append(&details_toggle);
+        root.append(&details_revealer);
 
-        let state = Self { root, spinner, icon, title, description, details, retry, login_again, buttons };
+        let state = Self { root, spinner, icon, title, description, details, details_toggle, retry, login_again, buttons };
         state.show_syncing();
         state
     }
@@ -196,20 +213,26 @@ impl EmptyState {
         self.icon.set_visible(false);
         self.title.set_label("Syncing your libraries…");
         self.description.set_label("This can take a moment on first sync.");
-        self.details.set_visible(false);
+        self.set_details("");
         self.buttons.set_visible(false);
         self.root.set_visible(true);
     }
 
-    fn show_error(&self, error: &str) {
+    fn show_error(&self, err: &CoreError) {
         self.spinner.set_visible(false);
         self.spinner.stop();
         self.icon.set_visible(true);
-        self.icon.set_icon_name(Some("dialog-warning-symbolic"));
-        self.title.set_label("Couldn't sync your libraries");
-        self.description.set_label("Check your connection and try again.");
-        self.details.set_label(error);
-        self.details.set_visible(!error.is_empty());
+        if matches!(err, CoreError::Unreachable(_)) {
+            self.icon.set_icon_name(Some("network-offline-symbolic"));
+            self.title.set_label("Can't reach your server");
+            self.description.set_label("Check your connection, or that the server is running, then try again.");
+        } else {
+            self.icon.set_icon_name(Some("dialog-warning-symbolic"));
+            self.title.set_label("Couldn't sync your libraries");
+            self.description.set_label("Check your connection and try again.");
+        }
+        let error = err.to_string();
+        self.set_details(&error);
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
         self.login_again.set_visible(false);
@@ -228,8 +251,7 @@ impl EmptyState {
         self.icon.set_icon_name(Some("system-lock-screen-symbolic"));
         self.title.set_label("Sign in again");
         self.description.set_label("Your session on this server has expired or was revoked.");
-        self.details.set_label(error);
-        self.details.set_visible(!error.is_empty());
+        self.set_details(error);
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
         self.login_again.set_visible(true);
@@ -245,8 +267,7 @@ impl EmptyState {
         self.icon.set_icon_name(Some("dialog-warning-symbolic"));
         self.title.set_label("Couldn't read local data");
         self.description.set_label("The library synced, but the app couldn't read it back. Try again, or restart the app.");
-        self.details.set_label(error);
-        self.details.set_visible(!error.is_empty());
+        self.set_details(error);
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
         self.login_again.set_visible(false);
@@ -260,7 +281,7 @@ impl EmptyState {
         self.icon.set_icon_name(Some("folder-music-symbolic"));
         self.title.set_label("No library synced yet");
         self.description.set_label("This server doesn't have any libraries yet.");
-        self.details.set_visible(false);
+        self.set_details("");
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
         self.login_again.set_visible(false);
@@ -270,6 +291,15 @@ impl EmptyState {
     fn hide(&self) {
         self.root.set_visible(false);
         self.spinner.stop();
+    }
+
+    /// The raw error behind "Details", collapsed; `""` hides both.
+    fn set_details(&self, error: &str) {
+        let has_details = !error.is_empty();
+        self.details.set_label(error);
+        self.details.set_visible(has_details);
+        self.details_toggle.set_active(false);
+        self.details_toggle.set_visible(has_details);
     }
 }
 
@@ -531,7 +561,17 @@ pub fn build(
             let on_relogin = on_relogin.clone();
             move |_| on_relogin()
         });
-        banner.action_button().connect_clicked(move |_| on_relogin());
+        // The banner's one action is "Retry" or "Log in again", whichever its failure offers.
+        let ctx = ctx.clone();
+        let widgets = widgets.clone();
+        let manual_sync = manual_sync.clone();
+        banner.action_button().connect_clicked(move |_| {
+            if widgets.banner.offers_login() {
+                on_relogin();
+            } else {
+                spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
+            }
+        });
     }
 
     // Shrunk to just forwarding into the shared state — every visible effect (banner, re-render,
@@ -697,8 +737,20 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
             // moves — borrowing `server_id`/`account_id` themselves here would conflict with the
             // `move` closure's own capture of them, evaluated as part of the same call.
             let (claim_server_id, claim_account_id) = (server_id.clone(), account_id.clone());
-            crate::sync_coordinator::on_completed(&claim_server_id, &claim_account_id, move || {
-                glib::spawn_future_local(render_from_cache(pool, server_id, account_id, widgets));
+            crate::sync_coordinator::on_completed(&claim_server_id, &claim_account_id, move |outcome| {
+                glib::spawn_future_local(async move {
+                    let loaded = load(&pool, &server_id, &account_id).await;
+                    let has_data = loaded.as_ref().is_ok_and(|data| !data.libraries.is_empty());
+                    if let (Ok(data), true) = (&loaded, has_data) {
+                        apply(data, &widgets);
+                    }
+                    // How the other screen's sync went — told here too, so this screen never
+                    // just redraws silently (or keeps its first-sync spinner) after a failure.
+                    if let Some(outcome) = outcome {
+                        let local_read_error = loaded.as_ref().err().map(|err| err.to_string());
+                        show_sync_result(&widgets, has_data, outcome.error(), local_read_error.as_deref());
+                    }
+                });
             });
             return;
         }
@@ -816,38 +868,8 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         // failure mode. Auth failures get their own copy and a "Log in again" action in both
         // places: they're the one failure retrying can't fix.
         let manual_ok = sync_result.is_ok();
-        if data_after_sync.as_ref().is_some_and(|data| !data.libraries.is_empty()) {
-            widgets.empty_state.hide();
-            match sync_result {
-                Ok(()) => widgets.banner.set_revealed(false),
-                Err(err) => {
-                    if matches!(err, CoreError::Auth) {
-                        widgets.banner.set_title("Session expired — showing what's cached.");
-                        widgets.banner.set_action_label(Some("Log in again"));
-                    } else {
-                        widgets.banner.set_title("Couldn't sync — showing what's cached.");
-                        widgets.banner.set_action_label(None);
-                    }
-                    widgets.banner.set_details(Some(&err.to_string()));
-                    widgets.banner.set_revealed(true);
-                }
-            }
-        } else {
-            widgets.banner.set_revealed(false);
-            match sync_result {
-                Ok(()) => match &local_read_error {
-                    Some(error) => widgets.empty_state.show_local_read_error(error),
-                    None => widgets.empty_state.show_empty(),
-                },
-                Err(err) => {
-                    if matches!(err, CoreError::Auth) {
-                        widgets.empty_state.show_auth_error(&err.to_string());
-                    } else {
-                        widgets.empty_state.show_error(&err.to_string());
-                    }
-                }
-            }
-        }
+        let has_data = data_after_sync.as_ref().is_some_and(|data| !data.libraries.is_empty());
+        show_sync_result(&widgets, has_data, sync_result.as_ref().err(), local_read_error.as_deref());
 
         // The manual trigger's own feedback — a transient outcome toast — lands only after the
         // resolve above, so the detailed surface (banner/empty state) is already showing
@@ -861,9 +883,34 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: HomeWidgets, manual: Option<crate::wi
         // Library, if it lost the claim, is waiting on exactly this to re-render from what just
         // landed.
         if is_automatic {
-            crate::sync_coordinator::mark_completed(&server_id, &account_id);
+            crate::sync_coordinator::mark_completed(&server_id, &account_id, crate::sync_coordinator::SyncOutcome::from_result(&sync_result));
         }
     });
+}
+
+/// Shows how a sync ended: with saved data to keep showing, on the banner (if anything went
+/// wrong); without, on the full-page state, which then carries the whole story. Auth failures
+/// get their own copy and a "Log in again" action in both places: they're the one failure
+/// retrying can't fix. Called by whichever of Home and Library ran the startup sync and by the
+/// one that waited for it (`sync_coordinator::SyncOutcome`), so both tell the same story.
+fn show_sync_result(widgets: &HomeWidgets, has_data: bool, error: Option<&CoreError>, local_read_error: Option<&str>) {
+    if has_data {
+        widgets.empty_state.hide();
+        match error {
+            None => widgets.banner.set_revealed(false),
+            Some(err) => widgets.banner.show_sync_failure(err),
+        }
+    } else {
+        widgets.banner.set_revealed(false);
+        match error {
+            None => match local_read_error {
+                Some(error) => widgets.empty_state.show_local_read_error(error),
+                None => widgets.empty_state.show_empty(),
+            },
+            Some(err @ CoreError::Auth) => widgets.empty_state.show_auth_error(&err.to_string()),
+            Some(err) => widgets.empty_state.show_error(err),
+        }
+    }
 }
 
 /// Reads whatever's currently cached locally and renders it — never talks to the network. Used
@@ -1308,7 +1355,7 @@ pub(crate) mod tests {
         assert!(hooks.empty_state.details.is_visible(), "the underlying error should be shown for debugging");
         assert!(
             !hooks.banner.widget().reveals_child(),
-            "the 'showing what's cached' banner must not appear when nothing is cached"
+            "the 'showing what's saved' banner must not appear when nothing is cached"
         );
         assert!(hooks.libraries_list.row_at_index(0).is_none());
 
@@ -1434,7 +1481,7 @@ pub(crate) mod tests {
         pump_until(|| crate::test_support::any_label_reads(hooks.toast_overlay.upcast_ref(), "Sync failed"), Duration::from_secs(10));
         assert_eq!(
             hooks.empty_state.title.label(),
-            "Couldn't sync your libraries",
+            "Can't reach your server",
             "the empty state stays the detailed failure surface"
         );
     }
@@ -1496,7 +1543,7 @@ pub(crate) mod tests {
         let pool = runtime.block_on(pool());
         let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
         // Data from a previous sync, so the shelves render and the failure must take the banner
-        // path ("showing what's cached"), not the empty-state path.
+        // path ("showing what's saved on this device"), not the empty-state path.
         runtime.block_on(abs_storage::repo::libraries::upsert(
             &pool,
             UpsertLibrary {
@@ -1522,7 +1569,7 @@ pub(crate) mod tests {
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
 
-        assert_eq!(hooks.banner.title(), "Session expired — showing what's cached.");
+        assert_eq!(hooks.banner.title(), "Signed out by the server");
         assert!(hooks.banner.action_visible(), "an auth failure must offer Log in again in the banner");
         assert_eq!(hooks.banner.action_label(), "Log in again");
         assert!(!hooks.empty_state.root.is_visible(), "cached data keeps the shelves up; no empty state");

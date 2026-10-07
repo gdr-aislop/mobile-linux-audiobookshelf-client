@@ -134,15 +134,15 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       then the main app shell (Home tab) replaces the login screen.
 
 - [x] **WT-7 — Wrong password error.** Connect with a wrong password.
-      *Expected:* a red banner strip above the form reading "Unable to sign in — check your
+      *Expected:* the error banner above the form reads "Unable to sign in" / "Check your
       username and password and try again."; the Username **and** Password fields get a red
-      error tint; **no** "Show details" disclosure (a bad password isn't a transport error).
+      error tint; **no** "Details" button (a bad password isn't a transport error).
 
 - [x] **WT-8 — Unreachable server error.** Connect with a valid-looking URL nothing listens on
       (e.g. `http://127.0.0.1:1`), any username/password.
-      *Expected:* banner reads "Can't reach this server — check the URL and your connection.";
-      the Username/Password fields are **not** tinted red (this isn't a credentials problem); a
-      "Show details" disclosure is available and reveals the raw error text.
+      *Expected:* banner reads "Can't reach this server" / "Check the address and your
+      connection."; the Username/Password fields are **not** tinted red (this isn't a
+      credentials problem); a "Details" button is available and reveals the raw error text.
 
 - [x] **WT-9 — Timeout error message.** Point the URL at a host that blackholes (e.g. a
       non-routable IP) and connect.
@@ -202,9 +202,11 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
 - [ ] **HT-2 — Empty server state.** Point the app at a server with no libraries / nothing
       synced (or first sync failing).
       *Expected:* while the first sync runs, a spinner with "Syncing your libraries…" instead of
-      empty shelves; if the sync fails, "Couldn't sync your libraries" with the error in a
-      details line and a Try again button that restarts the sync; if the server genuinely has no
-      libraries, "No library synced yet" with Try again.
+      empty shelves; if the server can't be reached, "Can't reach your server" (within a few
+      seconds, never an endless spinner), and for other failures "Couldn't sync your
+      libraries" — either with the error in a details line and a Try again button that restarts
+      the sync; if the server genuinely has no libraries, "No library synced yet" with Try
+      again.
 
 - [ ] **HT-2a — Dead session state.** Point the app at a server that 401s the sync (revoked
       refresh token, removed user — anything that makes the server reject the session).
@@ -246,14 +248,22 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       times); the filter hides finished and never-played books and shows the banner. Neither the
       sort nor the filter survives an app restart (session-transient).
 
-- [ ] **HT-4 — Sync failure banner.** Load Home with the server unreachable (kill the server /
-      turn off Wi-Fi, then switch to the Home tab so it re-syncs).
-      *Expected:* banner "Couldn't sync — showing what's cached." and the previously cached
-      shelves still render. With nothing cached, the retryable failure state shows instead
-      ("Couldn't sync your libraries" + Try again) — the error is never hidden behind an empty
-      state. If the failure is an authorization failure instead (server 401s the session), the
-      banner reads "Session expired — showing what's cached." and carries a **Log in again**
+- [ ] **HT-4 — Sync failure banner.** Stop the server (or turn off Wi-Fi) and restart the app.
+      *Expected:* **both** Home and Library show the banner "Can't reach your server" /
+      "Showing what's saved on this device." with a **Retry** button, and the previously cached
+      shelves still render. Retry runs a sync (a "Sync failed" toast while the server is still
+      down; the banner goes away once it's back). With nothing cached, Home shows the
+      "Can't reach your server" page + Try again instead — the error is never hidden behind an
+      empty state or a spinner. If the failure is an authorization failure instead (server 401s
+      the session), the banner reads "Signed out by the server" and carries a **Log in again**
       button (HT-2a). No crash, no blank page.
+
+- [ ] **HT-4b — The banner looks right.** With the HT-4 banner showing, in light and dark theme
+      on a 360-px-wide phone.
+      *Expected:* a rounded, amber-tinted card with clear space on all sides (not text pressed
+      into the corner); bold headline, dimmed second line, then "Details" on the left and Retry
+      on the right. "Details" opens the raw error underneath; long error text wraps and never
+      makes the page scroll sideways.
 
 - [ ] **HT-5 — Cached render beats the network.** With Wi-Fi off but a previously synced Home,
       launch the app.
@@ -583,8 +593,9 @@ was and wasn't verified.
 - [ ] **MP-21 — Partly downloaded book.** Download only some chapters, resume in a chapter that
       isn't downloaded, with the connection dead.
       *Expected:* the log names why the start track is streamed (`not downloaded`, `download not
-      finished`, `downloaded file is missing`, …); the failure reads "Lost the connection while
-      playing" rather than "Playback stopped unexpectedly".
+      finished`, `downloaded file is missing`, …); the failure reads "Can't reach your server"
+      (or "Connection lost", if that part had started playing) rather than "Playback stopped
+      unexpectedly".
 
 - [ ] **MP-22 — Offline mode is logged.** Toggle offline mode on Home or Library.
       *Expected:* the log shows `offline mode turned on|off` and `playback: offline mode on|off`;
@@ -636,6 +647,14 @@ was and wasn't verified.
       *Expected:* the tab bar stays fully visible above phosh's bottom bar every time; on a short
       screen the player's content scrolls instead.
 
+- [ ] **MP-29 — Play with the server down.** Stop the server (or turn off Wi-Fi), then tap Play
+      on a book that isn't downloaded.
+      *Expected:* within a few seconds a toast reads "Can't reach server" in full (not cut off)
+      with a View button that opens the player, and the mini bar shows ⚠. The full player's banner reads
+      "Can't reach your server" / "This book can't start until it's back. Check your connection
+      and try again." with Retry — not "Lost the connection while playing" — and shows no
+      "0:00 / -0:00" times. Retry with the server back starts the book.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.
@@ -663,7 +682,7 @@ was and wasn't verified.
       airplane mode or throttle Wi-Fi/mobile data, then tap Forward.
       *Expected:* the time label moves to `position + skip interval` and stays there — it must
       never read as, or jump to, the start of the current file/track. If the network is genuinely
-      gone, a "Lost the connection" banner appears rather than the app silently sitting on a dead
+      gone, a "Connection lost" banner appears rather than the app silently sitting on a dead
       pipeline; Retry (or Play) resumes from that position once the network is back, without
       needing to restart the app. Regression test for a Librem 5 field report where a second skip
       during a network stall both jumped backwards and left playback unrecoverable.

@@ -465,12 +465,6 @@ pub fn build(
     let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_row).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
-    // The "Log in again" action (revealed only on authorization failures) routes to the shell,
-    // same as Home's.
-    banner.action_button().connect_clicked({
-        let on_relogin = on_relogin.clone();
-        move |_| on_relogin()
-    });
 
     // Hidden until the user switches to Grid mode — List is the default (see `LibraryViewMode`).
     let flow_box = gtk4::FlowBox::builder()
@@ -998,6 +992,21 @@ pub fn build(
             spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
         });
     }
+    // The banner's one action is "Retry" or "Log in again", whichever its failure offers; the
+    // login one routes to the shell, same as Home's.
+    {
+        let ctx = ctx.clone();
+        let widgets = widgets.clone();
+        let manual_sync = manual_sync.clone();
+        let on_relogin = on_relogin.clone();
+        banner.action_button().connect_clicked(move |_| {
+            if widgets.banner.offers_login() {
+                on_relogin();
+            } else {
+                spawn_sync_cycle(ctx.clone(), widgets.clone(), Some(manual_sync.clone()));
+            }
+        });
+    }
 
     LibraryScreen {
         root: toast_overlay.clone().upcast(),
@@ -1093,8 +1102,19 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
     if is_automatic && !crate::sync_coordinator::claim_startup_sync(&ctx.server_id, &ctx.account_id) {
         let (pool, server_id, account_id) = (ctx.pool.clone(), ctx.server_id.clone(), ctx.account_id.clone());
         glib::spawn_future_local(render_from_cache(pool.clone(), server_id.clone(), account_id.clone(), widgets.clone()));
-        crate::sync_coordinator::on_completed(&ctx.server_id, &ctx.account_id, move || {
-            glib::spawn_future_local(render_from_cache(pool, server_id, account_id, widgets));
+        crate::sync_coordinator::on_completed(&ctx.server_id, &ctx.account_id, move |outcome| {
+            glib::spawn_future_local(async move {
+                let loaded = load(&pool, &server_id, &account_id).await;
+                let local_read_error = loaded.as_ref().err().map(|err| err.to_string());
+                if let Ok(data) = loaded {
+                    apply(data, &widgets);
+                }
+                // How Home's sync went — told here too, so a failure never goes unmentioned
+                // on this tab just because the other one ran the sync.
+                if let Some(outcome) = outcome {
+                    show_sync_result(&widgets, outcome.error(), local_read_error.as_deref());
+                }
+            });
         });
         return;
     }
@@ -1147,33 +1167,7 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
             apply(data, &widgets);
         }
 
-        match &sync_result {
-            // The sync worked but the result couldn't be read back: without this the grid
-            // silently keeps showing stale (or no) items, which reads as "nothing here".
-            Ok(()) => match &local_read_error {
-                Some(error) => {
-                    widgets.banner.set_title("Couldn't read local data — the list may be out of date.");
-                    widgets.banner.set_action_label(None);
-                    widgets.banner.set_details(Some(error));
-                    widgets.banner.set_revealed(true);
-                }
-                None => widgets.banner.set_revealed(false),
-            },
-            Err(err) => {
-                // An authorization failure is not fixable by re-syncing — the session itself
-                // is what died — so the banner swaps its copy and grows a "Log in again"
-                // action routed to the shell, mirroring Home's failure state.
-                if matches!(err, CoreError::Auth) {
-                    widgets.banner.set_title("Session expired — showing what's cached.");
-                    widgets.banner.set_action_label(Some("Log in again"));
-                } else {
-                    widgets.banner.set_title("Couldn't sync — showing what's cached.");
-                    widgets.banner.set_action_label(None);
-                }
-                widgets.banner.set_details(Some(&err.to_string()));
-                widgets.banner.set_revealed(true);
-            }
-        }
+        show_sync_result(&widgets, sync_result.as_ref().err(), local_read_error.as_deref());
 
         // Cover art is cosmetic and best-effort (same posture as Home's own cover fetch),
         // fetched concurrently for everything just rendered — after the rest of the screen
@@ -1215,9 +1209,29 @@ fn spawn_sync_cycle(ctx: SyncCtx, widgets: LibraryWidgets, manual: Option<crate:
         // Home, if it lost the claim, is waiting on exactly this to re-render from what just
         // landed.
         if is_automatic {
-            crate::sync_coordinator::mark_completed(&server_id, &account_id);
+            crate::sync_coordinator::mark_completed(&server_id, &account_id, crate::sync_coordinator::SyncOutcome::from_result(&sync_result));
         }
     });
+}
+
+/// Shows how a sync ended on the banner (Library has no full-page error state: its empty
+/// state is "no items", and a failure with nothing saved still shows the banner over it).
+/// Called by whichever of Home and Library ran the startup sync and by the one that waited for
+/// it (`sync_coordinator::SyncOutcome`), so both tell the same story.
+fn show_sync_result(widgets: &LibraryWidgets, error: Option<&CoreError>, local_read_error: Option<&str>) {
+    match (error, local_read_error) {
+        (Some(err), _) => widgets.banner.show_sync_failure(err),
+        // The sync worked but the result couldn't be read back: without this the grid
+        // silently keeps showing stale (or no) items, which reads as "nothing here".
+        (None, Some(read_error)) => {
+            widgets.banner.set_title("Couldn't read what's saved on this device");
+            widgets.banner.set_description(Some("The list may be out of date. Try again, or restart the app."));
+            widgets.banner.set_action_label(None);
+            widgets.banner.set_details(Some(read_error));
+            widgets.banner.set_revealed(true);
+        }
+        (None, None) => widgets.banner.set_revealed(false),
+    }
 }
 
 /// Reads whatever's currently cached locally and renders it — never talks to the network. Used
@@ -2393,7 +2407,7 @@ pub(crate) mod tests {
 
         pump_until(|| hooks.banner.widget().reveals_child(), Duration::from_secs(10));
 
-        assert_eq!(hooks.banner.title(), "Session expired — showing what's cached.");
+        assert_eq!(hooks.banner.title(), "Signed out by the server");
         assert!(hooks.banner.action_visible(), "an auth failure must offer Log in again in the banner");
         assert!(hooks.status_page.is_visible(), "no synced items yet, so the status page stays up");
         assert!(!relogin_requested.get(), "merely showing the banner must not trigger a re-login");

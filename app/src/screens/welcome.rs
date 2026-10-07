@@ -300,7 +300,9 @@ pub fn build(
                             username_row.add_css_class("error");
                             password_row.add_css_class("error");
                         }
-                        banner.set_title(&error_message(&err));
+                        let (title, description) = error_message(&err);
+                        banner.set_title(title);
+                        banner.set_description(Some(description));
                         banner.set_details(login_details(&err).as_deref());
                         banner.set_revealed(true);
                     }
@@ -325,7 +327,8 @@ pub fn build(
             password_row.remove_css_class("error");
 
             if !is_password_mode {
-                banner.set_title("Signing in with an API token isn't supported yet — use your username and password.");
+                banner.set_title("API tokens aren't supported yet");
+                banner.set_description(Some("Sign in with your username and password instead."));
                 banner.set_revealed(true);
                 return;
             }
@@ -462,21 +465,17 @@ fn replacement_warning(kind: &ReplacementKind, previous: &ReloginSeed, url: &str
 /// The username/password field tint (see the Connect click handler) is keyed off the same
 /// `InvalidCredentials` variant this function branches on, but deliberately not applied for
 /// `Network`/other variants — a connectivity failure isn't a credentials problem.
-fn error_message(err: &CoreError) -> String {
+fn error_message(err: &CoreError) -> (&'static str, &'static str) {
     match err {
-        CoreError::Login(abs_api::LoginError::InvalidCredentials) => {
-            "Unable to sign in — check your username and password and try again.".to_string()
-        }
+        CoreError::Login(abs_api::LoginError::InvalidCredentials) => ("Unable to sign in", "Check your username and password and try again."),
         CoreError::Login(abs_api::LoginError::Tls(_)) => {
-            "Can't verify this server's certificate — if you trust it, allow it in that server's connection settings.".to_string()
+            ("Can't verify this server's certificate", "If you trust it, allow it in that server's connection settings.")
         }
         CoreError::Login(abs_api::LoginError::Connect(_) | abs_api::LoginError::Network(_)) => {
-            "Can't reach this server — check the URL and your connection.".to_string()
+            ("Can't reach this server", "Check the address and your connection.")
         }
-        CoreError::Login(abs_api::LoginError::Timeout(_)) => {
-            "This server took too long to respond — check your connection and try again.".to_string()
-        }
-        _ => "Something went wrong — please try again.".to_string(),
+        CoreError::Login(abs_api::LoginError::Timeout(_)) => ("This server took too long to respond", "Check your connection and try again."),
+        _ => ("Something went wrong", "Please try again."),
     }
 }
 
@@ -829,10 +828,8 @@ pub(crate) mod tests {
             );
 
             assert!(hooks.banner.widget().reveals_child(), "the error banner should now be visible");
-            assert_eq!(
-                hooks.banner.title(),
-                "Can't reach this server — check the URL and your connection."
-            );
+            assert_eq!(hooks.banner.title(), "Can't reach this server");
+            assert_eq!(hooks.banner.description(), "Check the address and your connection.");
             assert!(
                 !hooks.username_row.has_css_class("error") && !hooks.password_row.has_css_class("error"),
                 "a connectivity failure must not tint the username/password fields"
@@ -875,10 +872,8 @@ pub(crate) mod tests {
                 hooks.banner.widget().reveals_child(),
                 "pressing Enter in the password field should submit the form"
             );
-            assert_eq!(
-                hooks.banner.title(),
-                "Can't reach this server — check the URL and your connection."
-            );
+            assert_eq!(hooks.banner.title(), "Can't reach this server");
+            assert_eq!(hooks.banner.description(), "Check the address and your connection.");
         }
     }
 }
