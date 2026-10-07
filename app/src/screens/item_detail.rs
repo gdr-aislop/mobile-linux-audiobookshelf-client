@@ -146,7 +146,16 @@ pub fn build(
 
     let progress_bar = gtk4::ProgressBar::builder().margin_top(10).visible(false).build();
 
-    let play_button = gtk4::Button::builder().label("Play").css_classes(["pill", "suggested-action"]).halign(gtk4::Align::Center).build();
+    // Invisible (but holding its place, so nothing shifts) and untappable until Pass 1 below has
+    // read this book's progress: shown straight away it read "Play" for a frame or two before
+    // turning into "Resume" on a started book.
+    let play_button = gtk4::Button::builder()
+        .label("Play")
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk4::Align::Center)
+        .opacity(0.0)
+        .sensitive(false)
+        .build();
 
     let toast_overlay = adw::ToastOverlay::new();
 
@@ -482,6 +491,9 @@ pub fn build(
                     progress_bar.set_visible(true);
                 }
             }
+            // Its label is final now (a failed read above falls back to "Play"), so show it.
+            play_button.set_opacity(1.0);
+            play_button.set_sensitive(true);
 
             // Seeds the download menu from whatever chapters are already cached locally (a
             // previous play or download) — the same fallback Pass 2 (chapters) below falls back
@@ -1007,7 +1019,10 @@ pub(crate) mod tests {
         pump_until(|| hooks.title_label.label() == "Project Hail Mary", Duration::from_secs(5));
         assert_eq!(hooks.author_label.label(), "Andy Weir · Narrated by Ray Porter");
         assert_eq!(hooks.duration_label.label(), "1.0h");
+        // The title is filled in before the progress read; the button only once that's done.
+        pump_until(|| hooks.play_button.opacity() == 1.0, Duration::from_secs(5));
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"), "an unstarted book's primary button should read Play");
+        assert!(hooks.play_button.opacity() == 1.0 && hooks.play_button.is_sensitive(), "the button is shown once its label is known");
         assert!(!hooks.progress_bar.is_visible(), "no progress bar for an unstarted book");
     }
 
@@ -1046,8 +1061,16 @@ pub(crate) mod tests {
         let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
         let screen = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), test_controller(pool.clone()), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
         let hooks = screen.test_hooks();
+        // Before the progress has been read the button must not show (or take) a "Play" that
+        // then turns into "Resume".
+        assert!(
+            hooks.play_button.opacity() == 0.0 && !hooks.play_button.is_sensitive(),
+            "the button stays hidden until its label is known, showing {:?}",
+            hooks.play_button.label()
+        );
 
         pump_until(|| hooks.play_button.label().as_deref() == Some("Resume"), Duration::from_secs(5));
+        assert!(hooks.play_button.opacity() == 1.0 && hooks.play_button.is_sensitive(), "and is shown, reading Resume, once it is");
         assert!(hooks.progress_bar.is_visible());
         assert!((hooks.progress_bar.fraction() - 0.5).abs() < 0.01, "1800s of 3600s should be a 50% progress bar");
     }
