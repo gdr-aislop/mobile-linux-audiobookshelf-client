@@ -375,6 +375,41 @@ async fn backoff(attempt: u32) {
 /// `cancel` is polled before every attempt and around every chunk read — a cooperative check, not
 /// a hard abort, so a cancellation always lands between well-defined units of work (never
 /// mid-write of a single chunk).
+/// How many times a download's final write (complete, or failed) is tried before giving up.
+const FINAL_WRITE_ATTEMPTS: u32 = 3;
+
+/// Saves how far a download has got. Bookkeeping only, so a failure — a database too busy to
+/// answer in time, as on a phone whose main loop froze for seconds and left every connection
+/// held — is logged and the transfer carries on: the next save records where it got to, and a
+/// resume trims the file back to whichever checkpoint was saved last. A failed save used to end
+/// the download (and, with the old resume, damage the file).
+async fn save_progress(pool: &SqlitePool, server_id: &str, item_id: &str, ino: &str, bytes_downloaded: u64, total_size: Option<i64>) {
+    if let Err(err) = abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, bytes_downloaded as i64, total_size).await {
+        tracing::warn!(%err, item_id, ino, bytes_downloaded, "couldn't save download progress; carrying on");
+    }
+}
+
+/// Retries a download's final write a few times, so a short database stall doesn't throw away a
+/// finished (or properly failed) download; only the last failure is returned.
+async fn retrying<F, Fut>(mut write: F) -> abs_storage::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = abs_storage::Result<()>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match write().await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < FINAL_WRITE_ATTEMPTS => {
+                tracing::warn!(%err, attempt, "couldn't record the download's outcome; trying again");
+                backoff(attempt).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn download_track(
     paths: &AppPaths,
@@ -418,7 +453,7 @@ pub async fn download_track(
                 // problem (missing/unreadable client certificate) — reported as the download's
                 // failure reason rather than crashing the download worker.
                 let reason = format!("couldn't set up the connection: {err}");
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
         };
@@ -442,7 +477,7 @@ pub async fn download_track(
             Err(err) => {
                 if !err.is_retryable() || attempt >= MAX_ATTEMPTS {
                     let reason = err.to_string();
-                    abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                    retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                     return Ok(TrackDownloadOutcome::Failed(reason));
                 }
                 backoff(attempt).await;
@@ -464,7 +499,7 @@ pub async fn download_track(
                 let dir = paths.item_downloads_dir(server_id, item_id);
                 if let Err(err) = tokio::fs::create_dir_all(&dir).await {
                     let reason = format!("couldn't create the download directory: {err}");
-                    abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                    retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                     return Ok(TrackDownloadOutcome::Failed(reason));
                 }
                 let path = paths.track_file_path(server_id, item_id, ino, extension);
@@ -486,7 +521,7 @@ pub async fn download_track(
             Ok(file) => file,
             Err(err) => {
                 let reason = format!("couldn't open the download file: {err}");
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
         };
@@ -497,7 +532,7 @@ pub async fn download_track(
             };
             if let Err(err) = positioned.await {
                 let reason = format!("couldn't resume the download file: {err}");
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
         }
@@ -509,7 +544,7 @@ pub async fn download_track(
 
         loop {
             if cancel() {
-                abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, resume_offset as i64, total_size.map(|n| n as i64)).await?;
+                save_progress(pool, server_id, item_id, ino, resume_offset, total_size.map(|n| n as i64)).await;
                 return Ok(TrackDownloadOutcome::Canceled);
             }
 
@@ -538,16 +573,16 @@ pub async fn download_track(
             on_progress(resume_offset, total_size);
 
             if bytes_since_persist >= PROGRESS_PERSIST_INTERVAL_BYTES {
-                abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, resume_offset as i64, total_size.map(|n| n as i64)).await?;
+                save_progress(pool, server_id, item_id, ino, resume_offset, total_size.map(|n| n as i64)).await;
                 bytes_since_persist = 0;
             }
         }
         let _ = file.flush().await;
 
         if let Some((retryable, reason)) = stream_error {
-            abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, resume_offset as i64, total_size.map(|n| n as i64)).await?;
+            save_progress(pool, server_id, item_id, ino, resume_offset, total_size.map(|n| n as i64)).await;
             if !retryable || attempt >= MAX_ATTEMPTS {
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
             backoff(attempt).await;
@@ -559,9 +594,9 @@ pub async fn download_track(
         if !transfer_is_complete(resume_offset, total_size) {
             let expected = total_size.expect("transfer_is_complete only returns false when total_size is Some");
             let reason = format!("stream ended early: got {resume_offset} of {expected} bytes");
-            abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, resume_offset as i64, Some(expected as i64)).await?;
+            save_progress(pool, server_id, item_id, ino, resume_offset, Some(expected as i64)).await;
             if attempt >= MAX_ATTEMPTS {
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
             backoff(attempt).await;
@@ -577,16 +612,16 @@ pub async fn download_track(
             let reason = format!("the downloaded file is {} bytes, not the {resume_offset} received", on_disk.map_or("unreadable".to_string(), |n| n.to_string()));
             tracing::warn!(item_id, ino, %reason, "a finished download didn't check out; starting it over");
             resume_offset = 0;
-            abs_storage::repo::download_tracks::update_progress(pool, server_id, item_id, ino, 0, total_size.map(|n| n as i64)).await?;
+            save_progress(pool, server_id, item_id, ino, 0, total_size.map(|n| n as i64)).await;
             if attempt >= MAX_ATTEMPTS {
-                abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason).await?;
+                retrying(|| abs_storage::repo::download_tracks::mark_failed(pool, server_id, item_id, ino, &reason)).await?;
                 return Ok(TrackDownloadOutcome::Failed(reason));
             }
             backoff(attempt).await;
             continue;
         }
 
-        abs_storage::repo::download_tracks::mark_complete(pool, server_id, item_id, ino, resume_offset as i64).await?;
+        retrying(|| abs_storage::repo::download_tracks::mark_complete(pool, server_id, item_id, ino, resume_offset as i64)).await?;
         return Ok(TrackDownloadOutcome::Completed);
     }
 }
@@ -1217,5 +1252,113 @@ mod tests {
         sqlx::query("UPDATE download_tracks SET file_path = ? WHERE ino = 'ino-1'").bind(missing.to_str().unwrap()).execute(&pool).await.unwrap();
         assert_eq!(track_source(&pool, &server_id, "item-1", "ino-1").await, TrackSource::Streamed(StreamReason::FileMissing));
         assert!(complete_inos_for_item(&pool, &server_id, "item-1").await.unwrap().is_empty());
+    }
+
+    /// Makes every progress save fail with a real database error, as the phone's did when a
+    /// frozen main loop left the pool with no free connection. Only progress saves: the row's
+    /// creation and its final "complete" go through.
+    async fn fail_progress_saves(pool: &SqlitePool) {
+        sqlx::query(
+            "CREATE TRIGGER fail_progress_saves BEFORE UPDATE ON download_tracks WHEN NEW.status = 'downloading'
+             BEGIN SELECT RAISE(ABORT, 'simulated: the database is too busy'); END",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// 600 KiB of distinct bytes: more than two progress-save intervals.
+    fn large_body() -> Vec<u8> {
+        (0..600 * 1024).map(|i: u32| (i % 251) as u8).collect()
+    }
+
+    /// The phone's failure: progress saves failing (the pool too busy to answer in time) used to
+    /// end the download. Saving progress is bookkeeping; the transfer carries on and completes.
+    #[tokio::test]
+    async fn a_download_keeps_going_when_its_progress_saves_fail() {
+        let body = large_body();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", body.len().to_string().as_str()).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        fail_progress_saves(&pool).await;
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await;
+
+        assert_eq!(outcome.ok(), Some(TrackDownloadOutcome::Completed), "failed progress saves must not end the download");
+        let row = abs_storage::repo::download_tracks::get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Complete);
+        assert_eq!(tokio::fs::read(&row.file_path).await.unwrap(), body, "the server's bytes, exactly");
+    }
+
+    /// Cancelling while progress can't be saved still cancels; the row then holds an older
+    /// checkpoint than the file, and the next download still comes out exact.
+    #[tokio::test]
+    async fn cancelling_while_progress_saves_fail_still_resumes_to_an_exact_file() {
+        let body = large_body();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", body.len().to_string().as_str()).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        fail_progress_saves(&pool).await;
+
+        // Cancel once some bytes are on disk.
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let cancel = {
+            let checks = checks.clone();
+            move || {
+                checks.set(checks.get() + 1);
+                checks.get() > 4
+            }
+        };
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &cancel).await;
+        assert_eq!(outcome.ok(), Some(TrackDownloadOutcome::Canceled));
+
+        sqlx::query("DROP TRIGGER fail_progress_saves").execute(&pool).await.unwrap();
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await.unwrap();
+        assert_eq!(outcome, TrackDownloadOutcome::Completed);
+        let row = abs_storage::repo::download_tracks::get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(tokio::fs::read(&row.file_path).await.unwrap(), body);
+    }
+
+    /// A finished download whose "complete" can't be recorded on the first try (a short
+    /// database stall) is retried rather than thrown away.
+    #[tokio::test]
+    async fn recording_a_finished_download_rides_out_a_short_stall() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/file/ino-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10").set_body_bytes(b"helloworld".to_vec()))
+            .mount(&mock_server)
+            .await;
+        let (_tmp, paths) = test_paths();
+        let (pool, server_id) = pool_with_synced_tracks("item-1", &["ino-1"]).await;
+        // Rejects the first "complete" only (RAISE(FAIL) keeps the counter's update).
+        sqlx::query("CREATE TABLE completions_seen (n INTEGER NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO completions_seen VALUES (0)").execute(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_first_completion BEFORE UPDATE ON download_tracks
+             WHEN NEW.status = 'complete' AND (SELECT n FROM completions_seen) = 0
+             BEGIN UPDATE completions_seen SET n = 1; SELECT RAISE(FAIL, 'simulated: the database is too busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = download_track(&paths, &pool, &ConnectionTarget::direct(&mock_server.uri()), "token", &server_id, "item-1", "ino-1", |_, _| {}, &no_cancel()).await;
+
+        assert_eq!(outcome.ok(), Some(TrackDownloadOutcome::Completed));
+        let seen: i64 = sqlx::query_scalar("SELECT n FROM completions_seen").fetch_one(&pool).await.unwrap();
+        assert_eq!(seen, 1, "the first try really was rejected");
+        let row = abs_storage::repo::download_tracks::get(&pool, &server_id, "item-1", "ino-1").await.unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Complete);
     }
 }

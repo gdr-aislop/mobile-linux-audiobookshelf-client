@@ -76,7 +76,7 @@ impl LowMemoryModeState {
             inner.value = value;
             (inner.pool.clone(), inner.on_persist_error.clone())
         };
-        tracing::info!(offline_mode = value, "low memory mode {}", if value { "turned on" } else { "turned off" });
+        tracing::info!(low_memory_mode = value, "low memory mode {}", if value { "turned on" } else { "turned off" });
         // `publish()` must run with no active borrow — listener callbacks call `.get()` (and
         // `apply()`/`render_from_current_data()` do too, transitively), which needs its own
         // immutable borrow, and a listener invoked while this method still held `borrow_mut()`
