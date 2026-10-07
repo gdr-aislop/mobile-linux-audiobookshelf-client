@@ -386,7 +386,10 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   "Sleep timer", "Playback speed", "Add bookmark").
 - Large cover art, title, author, and the current chapter (`<title> · n of m`, one ellipsized
   line; tapping it opens the chapters list), then a `GtkScale`-based scrubber with
-  elapsed/remaining time labels.
+  elapsed/remaining time labels. With chapters, the scrubber and both labels cover the current
+  chapter (dragging seeks inside it), and a centred "<h:mm:ss> left in book" label between them
+  keeps the book's own time on screen. Without chapters they cover the whole book. The mini bar's
+  progress line and MPRIS stay book-level.
 - Transport row: previous chapter, skip-back-N-seconds, play/pause (large),
   skip-forward-N-seconds, next chapter. Previous chapter restarts the current chapter when more
   than 3 s into it, and otherwise goes to the one before. Next chapter does nothing in the last

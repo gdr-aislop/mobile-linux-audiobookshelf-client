@@ -223,6 +223,9 @@ pub struct CurrentChapter {
     /// 1-based.
     pub number: usize,
     pub count: usize,
+    /// Book-level bounds, which the full player's scrubber spans.
+    pub start_seconds: f64,
+    pub end_seconds: f64,
 }
 
 impl PlayerSnapshot {
@@ -439,13 +442,15 @@ fn chapter_end_at(chapters: &[ChapterInfo], position: f64) -> Option<f64> {
 /// it restarts the current chapter instead, the way a music player's previous button works.
 const PREVIOUS_CHAPTER_RESTART_SECONDS: f64 = 3.0;
 
-/// Index of the chapter `position` falls in, clamped to the last chapter past every range (the
-/// same rule as `PlayerController::current_chapter_index`). `None` without chapters.
+/// Index of the chapter `position` is in: the last one that has started by then. Past every
+/// range that's the last chapter, and before the first one starts (a book whose first chapter
+/// doesn't begin at 0) it's the first — not, as a "which range contains it" test would fall
+/// through to, the last. `None` without chapters.
 fn chapter_index_at(chapters: &[ChapterInfo], position: f64) -> Option<usize> {
     if chapters.is_empty() {
         return None;
     }
-    chapters.iter().position(|c| c.start_seconds <= position && position < c.end_seconds).or(Some(chapters.len() - 1))
+    Some(chapters.iter().rposition(|c| c.start_seconds <= position).unwrap_or(0))
 }
 
 /// Where "next chapter" goes from `position`: the start of the chapter after the current one.
@@ -856,6 +861,8 @@ impl Inner {
             title: now_playing.chapters[index].title.clone(),
             number: index + 1,
             count: now_playing.chapters.len(),
+            start_seconds: now_playing.chapters[index].start_seconds,
+            end_seconds: now_playing.chapters[index].end_seconds,
         });
         Some(PlayerSnapshot {
             title: now_playing.title.clone(),
@@ -3059,15 +3066,7 @@ impl PlayerController {
         true
     }
 
-    pub fn seek_fraction(&self, fraction: f64) {
-        let Some(duration_seconds) = self.inner.borrow().now_playing.as_ref().map(|np| np.duration_seconds) else { return };
-        if duration_seconds <= 0.0 {
-            return;
-        }
-        self.seek_to_seconds(fraction.clamp(0.0, 1.0) * duration_seconds);
-    }
-
-    /// Seeks to an absolute book-level position — the primitive behind `seek_fraction`, `skip`,
+    /// Seeks to an absolute book-level position — the primitive behind the scrubber, `skip`,
     /// the chapters sheet (tap-to-seek to a chapter's start) and MPRIS `Seek`/`SetPosition`. A
     /// position inside a different file than the one loaded (or past its end) is a cross-track
     /// seek: the state machine switches to the target track and `spawn_load_track` brings the
@@ -6051,7 +6050,6 @@ pub(crate) mod tests {
         pump_until(|| false, Duration::from_millis(200));
         controller.skip(-15.0);
         controller.seek_to_seconds(5.0);
-        controller.seek_fraction(0.5);
         controller.play();
         assert_eq!(state.borrow().load_calls.len(), loads_at_switch, "nothing is loaded while the new book resolves");
         assert_eq!(state.borrow().seek_calls.len(), seeks_at_switch, "nothing is seeked while the new book resolves");
@@ -6168,7 +6166,6 @@ pub(crate) mod tests {
 
         controller.skip(-15.0);
         controller.skip(30.0);
-        controller.seek_fraction(0.5);
         controller.seek_to_seconds(100.0);
         controller.set_speed(1.5);
         controller.set_sleep_timer_end_of_chapter();
@@ -7277,6 +7274,18 @@ pub(crate) mod tests {
     fn previous_chapter_in_the_first_chapter_goes_to_its_start() {
         assert_eq!(previous_chapter_start(&three_chapters(), 1.0), Some(0.0));
         assert_eq!(previous_chapter_start(&three_chapters(), 50.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_position_before_the_first_chapter_is_in_the_first_chapter() {
+        let chapters: Vec<ChapterInfo> = [("One", 2.0, 100.0), ("Two", 100.0, 200.0)]
+            .into_iter()
+            .map(|(title, start_seconds, end_seconds)| ChapterInfo { title: title.to_string(), start_seconds, end_seconds })
+            .collect();
+        assert_eq!(chapter_index_at(&chapters, 1.0), Some(0));
+        assert_eq!(chapter_index_at(&three_chapters(), 120.0), Some(1));
+        assert_eq!(chapter_index_at(&three_chapters(), 500.0), Some(2), "past the end is the last chapter");
+        assert_eq!(next_chapter_start(&chapters, 1.0), Some(100.0));
     }
 
     #[test]

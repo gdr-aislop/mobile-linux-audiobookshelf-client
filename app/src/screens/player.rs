@@ -45,6 +45,7 @@ pub struct TestHooks {
     pub scrubber: gtk4::Scale,
     pub elapsed_label: gtk4::Label,
     pub remaining_label: gtk4::Label,
+    pub book_left_label: gtk4::Label,
     pub chapters_button: gtk4::MenuButton,
     pub chapters_popover: gtk4::Popover,
     pub chapters_list: gtk4::ListBox,
@@ -155,11 +156,21 @@ pub fn build(
     scrubber.set_draw_value(false);
     let elapsed_label = gtk4::Label::builder().xalign(0.0).css_classes(["caption", "dim-label"]).build();
     let remaining_label = gtk4::Label::builder().xalign(1.0).css_classes(["caption", "dim-label"]).build();
-    let time_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).margin_top(8).build();
-    elapsed_label.set_hexpand(true);
-    remaining_label.set_hexpand(true);
-    time_row.append(&elapsed_label);
-    time_row.append(&remaining_label);
+    // With chapters, the scrubber and the two labels above cover the current chapter, so the
+    // book's own time left goes in the middle of the row.
+    // A `GtkCenterBox` keeps it centred whatever the side labels' widths, at its full natural
+    // width; ellipsizing only lets it shrink on a screen too narrow for it.
+    let book_left_label = gtk4::Label::builder()
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .margin_start(6)
+        .margin_end(6)
+        .css_classes(["caption", "dim-label"])
+        .visible(false)
+        .build();
+    let time_row = gtk4::CenterBox::builder().margin_top(8).build();
+    time_row.set_start_widget(Some(&elapsed_label));
+    time_row.set_center_widget(Some(&book_left_label));
+    time_row.set_end_widget(Some(&remaining_label));
 
     // Previous/next chapter sit at the outer ends of the row, the same buttons the system media
     // card's ⏮/⏭ are (MPRIS `Previous`/`Next`), with the skip-N-seconds pair inside them.
@@ -559,10 +570,15 @@ pub fn build(
     // whatever moved it (a drag, a tap, a key, a scroll). Meanwhile the time labels follow the
     // knob, and the snapshot doesn't move it back under the finger.
     let pending_scrub: Rc<std::cell::RefCell<Option<glib::SourceId>>> = Rc::new(std::cell::RefCell::new(None));
+    // The book-level span the scrubber covers (see `scrub_range`). Like the knob, it's only
+    // updated while nothing is being scrubbed, so a drag that playback carries across a chapter
+    // boundary keeps mapping onto the chapter it started in.
+    let scrub_span: Rc<std::cell::Cell<(f64, f64)>> = Rc::new(std::cell::Cell::new((0.0, 0.0)));
     scrubber.connect_value_changed({
         let controller = controller.clone();
         let updating_from_snapshot = updating_from_snapshot.clone();
         let pending_scrub = pending_scrub.clone();
+        let scrub_span = scrub_span.clone();
         let elapsed_label = elapsed_label.clone();
         let remaining_label = remaining_label.clone();
         move |scale| {
@@ -570,9 +586,11 @@ pub fn build(
                 return;
             }
             let fraction = scale.value();
-            if let Some(duration) = controller.snapshot().map(|s| s.duration_seconds).filter(|d| *d > 0.0) {
-                set_time_labels(&elapsed_label, &remaining_label, fraction * duration, duration);
+            let (start, end) = scrub_span.get();
+            if end <= start {
+                return;
             }
+            set_time_labels(&elapsed_label, &remaining_label, fraction * (end - start), end - start);
             if let Some(source) = pending_scrub.borrow_mut().take() {
                 source.remove();
             }
@@ -582,8 +600,8 @@ pub fn build(
                 move || {
                     // Fired: the source is gone, so nothing may `remove()` it any more.
                     pending_scrub.borrow_mut().take();
-                    tracing::info!(fraction, "scrub: seeking");
-                    controller.seek_fraction(fraction);
+                    tracing::info!(fraction, start, end, "scrub: seeking");
+                    controller.seek_to_seconds(start + fraction * (end - start));
                 }
             });
             *pending_scrub.borrow_mut() = Some(source);
@@ -598,6 +616,8 @@ pub fn build(
         let scrubber = scrubber.clone();
         let elapsed_label = elapsed_label.clone();
         let remaining_label = remaining_label.clone();
+        let book_left_label = book_left_label.clone();
+        let scrub_span = scrub_span.clone();
         let speed_label = speed_label.clone();
         let sleep_timer_button = sleep_timer_button.clone();
         let skip_back = skip_back.clone();
@@ -629,17 +649,26 @@ pub fn build(
                 "media-playback-start-symbolic"
             }));
 
-            let fraction = if snapshot.duration_seconds > 0.0 {
-                (snapshot.position_seconds / snapshot.duration_seconds).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            // While the listener is still moving the knob, it and the time labels are theirs.
+            // While the listener is still moving the knob, it, its span and the time labels are
+            // theirs.
             if pending_scrub.borrow().is_none() {
+                let (start, end) = scrub_range(snapshot);
+                scrub_span.set((start, end));
+                let fraction = if end > start { ((snapshot.position_seconds - start) / (end - start)).clamp(0.0, 1.0) } else { 0.0 };
                 updating_from_snapshot.set(true);
                 scrubber.set_value(fraction);
                 updating_from_snapshot.set(false);
-                set_time_labels(&elapsed_label, &remaining_label, snapshot.position_seconds, snapshot.duration_seconds);
+                let into = (snapshot.position_seconds - start).clamp(0.0, (end - start).max(0.0));
+                set_time_labels(&elapsed_label, &remaining_label, into, end - start);
+            }
+            if snapshot.chapter.is_some() {
+                let left = format!("{} left in book", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0)));
+                if book_left_label.label() != left {
+                    book_left_label.set_label(&left);
+                }
+                book_left_label.set_visible(true);
+            } else {
+                book_left_label.set_visible(false);
             }
             // Nothing to seek in, skip over, speed up or time until the book has loaded — each
             // of these would be a no-op the controller swallows, which reads as a dead button.
@@ -696,6 +725,7 @@ pub fn build(
             scrubber,
             elapsed_label,
             remaining_label,
+            book_left_label,
             chapters_button,
             chapters_popover,
             chapters_list,
@@ -843,6 +873,15 @@ pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> (&'static
 const SCRUB_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The elapsed and remaining labels for `position` of `duration`, both book-level seconds.
+/// The book-level span the full player's scrubber covers: the current chapter when the book has
+/// chapters, otherwise the whole book.
+fn scrub_range(snapshot: &PlayerSnapshot) -> (f64, f64) {
+    match &snapshot.chapter {
+        Some(chapter) if chapter.end_seconds > chapter.start_seconds => (chapter.start_seconds, chapter.end_seconds),
+        _ => (0.0, snapshot.duration_seconds),
+    }
+}
+
 fn set_time_labels(elapsed_label: &gtk4::Label, remaining_label: &gtk4::Label, position: f64, duration: f64) {
     elapsed_label.set_label(&format_hms(position));
     remaining_label.set_label(&format!("-{}", format_hms((duration - position).max(0.0))));
@@ -1115,12 +1154,59 @@ pub(crate) mod tests {
         let hooks = screen.test_hooks();
         assert!(!hooks.previous_chapter_button.is_visible() && !hooks.next_chapter_button.is_visible(), "a book without chapters hides the chapter buttons");
         assert!(!hooks.chapter_label.is_visible(), "a book without chapters has no chapter line");
+        assert!(!hooks.book_left_label.is_visible(), "without chapters the bar is the whole book, so no separate book time");
 
         let position = || controller.snapshot().unwrap().position_seconds;
         let before = position();
         crate::player::MprisBridge::new(controller.clone()).next();
         pump_until(|| position() >= before + 4.0, Duration::from_secs(5));
         assert!(position() >= before + 4.0, "MPRIS Next without chapters should skip forward by the 5s interval, got {} from {before}", position());
+
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. With chapters, the scrubber and its
+    /// time labels cover the current chapter (a drag seeks inside it), and the book's own time
+    /// left sits between the labels.
+    pub(crate) fn run_scrubber_tracks_the_current_chapter(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(crate::player::tests::mock_playable_item_with_chapters(
+            &mock_server,
+            "item-1",
+            10,
+            &[("Intro", 0.0, 4.0), ("Chapter One", 4.0, 10.0)],
+        ));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Chaptered Book".to_string(), author: None },
+            1.0,
+        );
+        pump_until(|| !controller.chapters().is_empty(), Duration::from_secs(10));
+        pump_until(|| controller.snapshot().unwrap().position_seconds > 0.0, Duration::from_secs(5));
+        controller.pause();
+
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool.clone()), || {}, || {});
+        let hooks = screen.test_hooks();
+        let position = || controller.snapshot().unwrap().position_seconds;
+
+        hooks.next_chapter_button.emit_clicked();
+        pump_until(|| position() >= 4.0 && hooks.elapsed_label.label() == "0:00", Duration::from_secs(5));
+        assert_eq!(hooks.elapsed_label.label(), "0:00", "the time counts from the chapter's start");
+        assert_eq!(hooks.remaining_label.label(), "-0:06", "and down to the chapter's end");
+        assert!(hooks.scrubber.value() < 0.05, "the knob starts again at the left, got {}", hooks.scrubber.value());
+        assert!(hooks.book_left_label.is_visible());
+        assert_eq!(hooks.book_left_label.label(), "0:06 left in book");
+
+        hooks.scrubber.set_value(0.5);
+        assert_eq!(hooks.elapsed_label.label(), "0:03", "the time follows the knob within the chapter");
+        pump_until(|| (position() - 7.0).abs() < 0.5, Duration::from_secs(5));
+        assert!((position() - 7.0).abs() < 0.5, "halfway along the bar is halfway through Chapter One (7s), got {}", position());
 
         controller.stop();
     }
