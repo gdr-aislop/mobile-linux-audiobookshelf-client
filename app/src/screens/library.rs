@@ -1712,7 +1712,7 @@ fn append_entries(widgets: &LibraryWidgets, mode: LibraryViewMode, entries: &[Re
             }
             (LibraryViewMode::Grid, RenderEntry::Item { item, downloaded }) => {
                 let subtitle = item_subtitle(item);
-                let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, *downloaded);
+                let built = item_card::build_deferred(TILE_SIZE, item, &subtitle, &widgets.on_open, true, *downloaded, None);
                 widgets.flow_box.insert(&built.widget, -1);
                 pending.push(PendingCover { widget: built.widget, cover: built.cover, path: item.cover_cache_path.as_ref().map(std::path::PathBuf::from) });
             }
