@@ -239,8 +239,8 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       heading.
       *Expected:* switches to the Library tab sorted by last listened (newest last-listen first,
       never-played books last) and filtered to in-progress books: the filter banner ("Showing
-      books in progress", with a Show all button) is visible and the sort dropdown's icon is a
-      funnel. Show all (or unticking the dropdown's "In progress only") restores the full library.
+      books in progress", with a Show all button) is visible and the view-options funnel is
+      highlighted in the accent colour (it's a funnel either way). Show all (or unticking the dropdown's "In progress only") restores the full library.
 
 - [ ] **HT-3c — "Last listened" sort works from the dropdown.** Open the Library's "Sort &
       filter" dropdown, pick "Last listened"; enable "In progress only" manually.
@@ -365,7 +365,7 @@ one of them, per LB-4 below.
       *Expected:* grid shows covers; list shows `AdwActionRow`s (cover thumbnail, title,
       subtitle) — useful for podcast-style episode feeds. Both show the same items.
 
-- [x] **LB-6 — View options sheet opens.** Tap the view-options (adjustments) button.
+- [x] **LB-6 — View options sheet opens.** Tap the view-options (funnel) button.
       *Expected:* a bottom sheet slides up with a grip handle (no title), containing: "Downloaded
       only" switch, "Hide finished" switch, "Grouping" combo row, "Sort by" combo row, and an
       "Application settings" row with a chevron.

@@ -171,12 +171,12 @@ Fractal) rather than copying Lissen's Material Design look.
   header-bar space on a device where reaching a reveal-then-tap-then-type sequence one-handed is
   already awkward. Also a **"Sort & filter" `GtkMenuButton`** — one popover, two caption-labelled
   sections: **Sort** (Date added / Title / Author / Duration / **Last listened**) and **Filter**
-  ("In progress only" check). While the filter is active the header button swaps to a funnel icon
-  (Nautilus-style active-filter hint; Adwaita has no funnel, so the app ships `funnel-symbolic`
-  itself, compiled into the binary — see `app/src/icons.rs`), and an in-view banner ("Showing books in progress ·
+  ("In progress only" check). The header button always shows a funnel (Adwaita has no funnel, so
+  the app ships `funnel-symbolic` itself, compiled into the binary — see `app/src/icons.rs`); while
+  a filter is active the funnel is drawn in the accent colour, and an in-view banner ("Showing books in progress ·
   **Show all**") is the ambient indicator plus one-tap clear — same placement/idiom as the offline
   banner. Also a trailing **view-options button**
-  (three-line "adjustments" icon) that opens the view options sheet described below; these two stay
+  (the funnel) that opens the view options sheet described below; these two stay
   compact icon-buttons since they're used less often than search.
 - **Sync now**: same header-bar `⋯` menu item as Home (see above), forcing an immediate resync of
   this library's contents and the user's playback progress — plus the same pull-to-refresh gesture

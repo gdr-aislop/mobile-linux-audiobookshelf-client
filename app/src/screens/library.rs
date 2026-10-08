@@ -57,11 +57,11 @@ use crate::widgets::{combo_row, item_card};
 // enough to push the cell's natural width just past half the available content width.
 const TILE_SIZE: i32 = 108;
 
-/// The view-options button's indicator icons: its plain icon, and the funnel that (Nautilus
-/// style) signals "a filter is active" while the sheet is closed — see
-/// [`update_view_options_indicator`].
-const VIEW_OPTIONS_ICON: &str = "preferences-other-symbolic";
-const FILTER_ACTIVE_ICON: &str = "funnel-symbolic";
+/// The view-options button's icon: always the funnel — the button opens the sort and filter
+/// options. (It used to show `preferences-other-symbolic`, a toolbox in some themes, and switch
+/// to the funnel only while a filter was on.) A filter being on now shows as the funnel in the
+/// accent colour — see [`update_view_options_indicator`].
+const VIEW_OPTIONS_ICON: &str = "funnel-symbolic";
 
 #[derive(Clone)]
 pub struct LibraryScreen {
@@ -258,7 +258,7 @@ struct LibraryWidgets {
     search_entry: gtk4::SearchEntry,
     sort: Rc<Cell<SortKey>>,
     /// The one knob behind every "in progress only" surface — the sheet's switch, the view-options
-    /// button's funnel indicator, and the in-view banner all read/write it through
+    /// button's filter-active highlight, and the in-view banner all read/write it through
     /// [`set_in_progress_only`] so they can't drift apart. Persisted via the sheet's own switch
     /// handler (see [`spawn_persist_view_options`]) — but `apply_view`'s Home tap-through writes
     /// this Cell directly, without persisting, since that's a temporary navigation view rather
@@ -281,7 +281,7 @@ struct LibraryWidgets {
     data: Rc<std::cell::RefCell<LibraryData>>,
     on_open: Rc<dyn Fn(PlayRequest)>,
     /// The view-options button — mutated only to reflect whether any filter (in-progress-only,
-    /// hide-finished, downloaded-only) is active (funnel icon, Nautilus-style), never to *own*
+    /// hide-finished, downloaded-only) is active (its funnel in the accent colour), never to *own*
     /// any of them. See [`update_view_options_indicator`].
     view_options_button: gtk4::MenuButton,
     in_progress_only_switch: gtk4::Switch,
@@ -344,7 +344,7 @@ pub fn build(
     let search_entry = gtk4::SearchEntry::builder().hexpand(true).placeholder_text("Search library").build();
     header.set_title_widget(Some(&search_entry));
 
-    // The filter's ambient indicator while the sheet is closed (the funnel icon on the
+    // The filter's ambient indicator while the sheet is closed (the highlighted funnel on the
     // view-options button below is only a hint) — an in-view "why are books hidden" banner with a
     // one-tap escape,
     // built from the same banner row as the offline banner below. `ErrorBanner` is wrong here:
@@ -1272,7 +1272,7 @@ async fn render_from_cache(pool: SqlitePool, server_id: String, account_id: Stri
 }
 
 /// The single writer behind every "in progress only" surface — the sheet's switch, the view-
-/// options button's funnel indicator, and the in-view banner all change here, from the one
+/// options button's filter-active highlight, and the in-view banner all change here, from the one
 /// `Cell`, so they can't drift apart — and the visible list re-renders, since this is the only
 /// place the `Cell` changes. Writing the switch back is loop-safe: `set_active` to the value it
 /// already holds doesn't re-emit `state-set` (and the `state-set` handler routes back here,
@@ -1306,8 +1306,8 @@ fn set_grouping(widgets: &LibraryWidgets, grouping: Grouping) {
     request_render(widgets);
 }
 
-/// Whether the view-options button should show its "a filter is active" hint (the funnel icon,
-/// Nautilus-style) instead of its plain icon — true iff any of the three filters this screen
+/// Whether the view-options button should show its "a filter is active" hint (its funnel in the
+/// accent colour, the way the player's sleep-timer button shows a timer) — true iff any of the three filters this screen
 /// applies (in-progress-only, hide-finished, or downloaded-only/offline-mode) is currently
 /// active. Called from every setter that can flip one of those three (`set_in_progress_only`,
 /// `set_hide_finished`, the `offline_mode` listener), so the indicator can't fall out of sync
@@ -1315,7 +1315,11 @@ fn set_grouping(widgets: &LibraryWidgets, grouping: Grouping) {
 /// carried over onto the button that replaces it.
 fn update_view_options_indicator(widgets: &LibraryWidgets) {
     let active = widgets.in_progress_only.get() || widgets.hide_finished.get() || widgets.offline_mode.get();
-    widgets.view_options_button.set_icon_name(if active { FILTER_ACTIVE_ICON } else { VIEW_OPTIONS_ICON });
+    if active {
+        widgets.view_options_button.add_css_class("accent");
+    } else {
+        widgets.view_options_button.remove_css_class("accent");
+    }
     widgets.view_options_button.set_tooltip_text(Some(if active { "Filter active — view options" } else { "View options" }));
 }
 
@@ -2497,14 +2501,16 @@ pub(crate) mod tests {
         pump_until(|| flow_box_titles(&hooks.flow_box) == vec!["Reading Now".to_string()], Duration::from_secs(5));
         assert!(hooks.progress_banner.reveals_child());
         assert!(hooks.in_progress_only_switch.is_active());
-        assert_eq!(hooks.view_options_button.icon_name().as_deref(), Some("funnel-symbolic"), "the view-options button signals the active filter, Nautilus-style");
+        assert_eq!(hooks.view_options_button.icon_name().as_deref(), Some("funnel-symbolic"), "the view-options button always shows the funnel");
+        assert!(hooks.view_options_button.has_css_class("accent"), "and highlights it while a filter is on");
 
         // Via the banner's "Show all" — the escape hatch.
         hooks.progress_show_all.emit_clicked();
         pump_until(|| hooks.flow_box.child_at_index(2).is_some(), Duration::from_secs(5));
         assert!(!hooks.progress_banner.reveals_child());
         assert!(!hooks.in_progress_only_switch.is_active(), "the switch reflects the shared state, not just the banner");
-        assert_eq!(hooks.view_options_button.icon_name().as_deref(), Some("preferences-other-symbolic"));
+        assert_eq!(hooks.view_options_button.icon_name().as_deref(), Some("funnel-symbolic"), "still the funnel with no filter on");
+        assert!(!hooks.view_options_button.has_css_class("accent"), "no highlight with no filter on");
 
         // Via navigation (`apply_view`) — the Continue Listening header's path. The externally-
         // set state must sync the switch back the other way: switch → state, state → switch.
