@@ -138,7 +138,13 @@ When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislo
 
 - `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without
-  `RUST_BACKTRACE` set.
+  `RUST_BACKTRACE` set. By default the log is anonymized: server addresses,
+  URLs, usernames, access tokens and your home directory are replaced with
+  placeholders such as `<url>`, `<server>` and `<user>`, so it is safe to
+  attach. Settings → Diagnostics → "Anonymize logs" turns this off, which is
+  only useful while debugging a connection problem yourself. (Crash dumps
+  below are not anonymized; they contain no log text but can include memory
+  contents.)
 - `crashes/crash-<timestamp>-<pid>.dmp` — a Breakpad-format minidump written
   for a native (signal-level) crash a Rust panic hook can't catch (a
   segfault/abort inside GTK/GStreamer/glib). It's binary, not directly

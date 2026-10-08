@@ -72,6 +72,7 @@ mod keys {
     pub const VIEW_MODE: &str = "library.view_mode";
     pub const OFFLINE_MODE: &str = "browse.offline_mode";
     pub const LOW_MEMORY_MODE: &str = "app.low_memory_mode";
+    pub const ANONYMIZE_LOGS: &str = "diagnostics.anonymize_logs";
 }
 
 /// Parse a stored value, falling back to `default` (and logging) on a missing key or a value
@@ -332,6 +333,17 @@ pub async fn save_low_memory_mode(pool: &SqlitePool, enabled: bool) -> Result<()
     kv::set(pool, keys::LOW_MEMORY_MODE, &enabled.to_string()).await
 }
 
+/// Whether sensitive data (server address, tokens, usernames) is scrubbed from the log files.
+/// On by default, and on whenever the stored value is missing or unreadable: logs are what users
+/// attach to bug reports, so the failure mode must be "too private", never "leaked".
+pub async fn load_anonymize_logs(pool: &SqlitePool) -> Result<bool> {
+    parse_or_default(pool, keys::ANONYMIZE_LOGS, true).await
+}
+
+pub async fn save_anonymize_logs(pool: &SqlitePool, enabled: bool) -> Result<()> {
+    kv::set(pool, keys::ANONYMIZE_LOGS, &enabled.to_string()).await
+}
+
 pub async fn load_offline_mode(pool: &SqlitePool) -> Result<bool> {
     parse_or_default(pool, keys::OFFLINE_MODE, false).await
 }
@@ -511,5 +523,30 @@ mod tests {
         assert!(load_low_memory_mode(&pool).await.unwrap());
         save_low_memory_mode(&pool, false).await.unwrap();
         assert!(!load_low_memory_mode(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn anonymize_logs_defaults_to_on_and_round_trips() {
+        let pool = pool().await;
+        assert!(load_anonymize_logs(&pool).await.unwrap());
+        save_anonymize_logs(&pool, false).await.unwrap();
+        assert!(!load_anonymize_logs(&pool).await.unwrap());
+        save_anonymize_logs(&pool, true).await.unwrap();
+        assert!(load_anonymize_logs(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn anonymize_logs_falls_back_to_on_for_a_corrupt_value() {
+        let pool = pool().await;
+        kv::set(&pool, keys::ANONYMIZE_LOGS, "maybe").await.unwrap();
+        assert!(load_anonymize_logs(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn anonymize_logs_leaves_other_settings_alone() {
+        let pool = pool().await;
+        save_anonymize_logs(&pool, false).await.unwrap();
+        assert!(!load_low_memory_mode(&pool).await.unwrap());
+        assert_eq!(load_playback_settings(&pool).await.unwrap(), PlaybackSettings::default());
     }
 }

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct Server {
     pub id: String,
     pub url: String,
@@ -21,7 +21,7 @@ pub struct Server {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct Account {
     pub id: String,
     pub server_id: String,
@@ -33,6 +33,37 @@ pub struct Account {
     pub refresh_token: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+}
+
+// `Debug` is hand-written so a stray `{:?}` in a log call can never print credentials.
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("custom_headers_json", &"<redacted>")
+            .field("disable_ssl_verify", &self.disable_ssl_verify)
+            .field("client_cert_path", &self.client_cert_path)
+            .field("client_cert_password", &self.client_cert_password.as_ref().map(|_| "<redacted>"))
+            .field("local_network_address", &self.local_network_address)
+            .field("user_agent", &self.user_agent)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("id", &self.id)
+            .field("server_id", &self.server_id)
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("is_active", &self.is_active)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
@@ -158,4 +189,38 @@ pub struct DownloadTrack {
     pub status: DownloadStatus,
     pub error_reason: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let server = Server {
+            id: "s1".into(),
+            url: "https://abs.example.com".into(),
+            custom_headers_json: r#"{"X-Proxy-Auth":"proxy-secret"}"#.into(),
+            disable_ssl_verify: false,
+            client_cert_path: None,
+            client_cert_password: Some("cert-secret".into()),
+            local_network_address: None,
+            user_agent: None,
+            created_at: Utc::now(),
+        };
+        let account = Account {
+            id: "a1".into(),
+            server_id: "s1".into(),
+            username: "alice".into(),
+            token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            is_active: true,
+            created_at: Utc::now(),
+        };
+        let out = format!("{server:?} {account:?}");
+        for secret in ["proxy-secret", "cert-secret", "access-secret", "refresh-secret"] {
+            assert!(!out.contains(secret), "{secret} leaked via Debug: {out}");
+        }
+        assert!(out.contains("s1") && out.contains("a1"), "ids stay visible for debugging");
+    }
 }

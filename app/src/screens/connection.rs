@@ -199,6 +199,9 @@ pub fn build(
                                 show_error(&error_label, &err.to_string());
                                 return;
                             }
+                            if let Some(address) = address {
+                                crate::log_privacy::global().register_address(address);
+                            }
                             row.set_subtitle(&text_subtitle(address));
                             dialog.close();
                         });

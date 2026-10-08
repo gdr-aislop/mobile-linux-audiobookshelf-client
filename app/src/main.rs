@@ -3,6 +3,7 @@ mod crash_reporting;
 mod downloads;
 mod error_reporting;
 mod icons;
+mod log_privacy;
 mod low_memory_mode;
 mod offline_mode;
 mod perf;
@@ -112,6 +113,13 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
         pool
     };
     widgets::cover_image::set_low_memory_mode(low_memory_mode);
+
+    // Log anonymization is on from process start (see `log_privacy`); this applies the stored
+    // choice and teaches the scrubber the addresses/usernames already in the database.
+    let anonymize_logs = abs_core::settings::load_anonymize_logs(&pool).await.unwrap_or(true);
+    log_privacy::refresh_from_db(&pool).await;
+    log_privacy::global().set_enabled(anonymize_logs);
+    tracing::info!(anonymize_logs, "loaded the log anonymization setting");
 
     let playback_settings = abs_core::settings::load_playback_settings(&pool)
         .await
@@ -291,6 +299,7 @@ mod tests {
         (main_window_every_screen_fits_a_phone, crate::screens::main_window::tests::run_every_screen_fits_a_phone),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
+        (settings_anonymize_logs_switch_drives_the_scrubber_and_persists, crate::screens::settings::tests::run_anonymize_logs_switch_drives_the_scrubber_and_persists),
         (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
         (settings_servers_menu_actions_rebuild_the_shell, crate::screens::settings::tests::run_servers_menu_actions_rebuild_the_shell),

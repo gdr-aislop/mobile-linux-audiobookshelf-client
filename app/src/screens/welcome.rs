@@ -278,6 +278,10 @@ pub fn build(
             let connect_button = connect_button.clone();
             let banner = banner.clone();
 
+            // Before the first request: this attempt's own failure logs must already hide them.
+            crate::log_privacy::global().register_server_url(&url);
+            crate::log_privacy::global().register_username(&username);
+
             glib::spawn_future_local(async move {
                 let result = match &previous {
                     Some(seed) => abs_core::accounts::relogin(&pool, &paths, seed, &url, &username, &password).await,
@@ -288,6 +292,10 @@ pub fn build(
                 list.set_sensitive(true);
                 connect_button.set_label("Connect");
                 connect_button.set_sensitive(true);
+
+                if result.is_ok() {
+                    crate::log_privacy::refresh_from_db(&pool).await;
+                }
 
                 match result {
                     Ok(added) => on_success(added),

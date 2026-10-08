@@ -1959,7 +1959,7 @@ impl PlayerController {
                 intent: None,
                 session: session.clone(),
             });
-            tracing::info!(item_id = %item.item_id, title = %item.title, ?previous, ?start_chapter, session = generation, "starting playback");
+            tracing::info!(item_id = %item.item_id, ?previous, ?start_chapter, session = generation, "starting playback");
             inner.publish();
             generation
         };
