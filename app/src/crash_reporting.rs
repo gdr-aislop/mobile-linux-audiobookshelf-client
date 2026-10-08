@@ -102,10 +102,31 @@ impl LogHandle {
     }
 }
 
+/// The subscriber `init_logging` installs, with both sinks wrapped in the log-privacy scrubber
+/// (see `crate::log_privacy`). Split out so tests can drive the real pipeline into in-memory
+/// sinks.
+pub(crate) fn build_subscriber<F, O>(
+    filter: tracing_subscriber::EnvFilter,
+    file_sink: F,
+    stdout_sink: O,
+    redactor: crate::log_privacy::LogRedactor,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    F: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+    O: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use crate::log_privacy::RedactingMakeWriter;
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(RedactingMakeWriter::new(file_sink, redactor.clone()));
+    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter::new(stdout_sink, redactor));
+    tracing_subscriber::registry().with(filter).with(file_layer).with(stdout_layer)
+}
+
 /// Installs the global `tracing` subscriber: a rotating file layer under `paths.logs_dir()`
 /// (human-readable, no ANSI color codes — a user attaches this file to a bug report, nobody
 /// pipes it through a colorizer) plus an unconditional stdout layer (so `cargo run`'s dev
-/// experience is unchanged), both filtered to `info` by default (`RUST_LOG` overrides). Starts a
+/// experience is unchanged), both passing through the privacy scrubber, and both filtered to `info` by default (`RUST_LOG` overrides). Starts a
 /// detached background thread that flushes the file layer's buffer every
 /// [`PERIODIC_FLUSH_INTERVAL`] — see the module doc comment.
 ///
@@ -122,13 +143,11 @@ pub fn init_logging(paths: &abs_storage::AppPaths) -> LogHandle {
     let writer = BufferedLogWriter::new(appender);
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let file_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer({
+    let file_writer = {
         let writer = writer.clone();
         move || writer.clone()
-    });
-    let stdout_layer = tracing_subscriber::fmt::layer();
-
-    tracing_subscriber::registry().with(filter).with(file_layer).with(stdout_layer).init();
+    };
+    build_subscriber(filter, file_writer, std::io::stdout, crate::log_privacy::global().clone()).init();
 
     {
         let writer = writer.clone();
@@ -303,4 +322,116 @@ pub fn attach_crash_handler() -> Option<ClientHandles> {
     handler.set_ptracer(Some(server_process.id()));
 
     Some(ClientHandles { _handler: handler, _client: client, _server_process: server_process })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::log_privacy::LogRedactor;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Runs `emit` under the real subscriber with both sinks captured; returns (file, stdout).
+    fn run(redactor: LogRedactor, emit: impl FnOnce()) -> (String, String) {
+        let (file, stdout) = (Capture::default(), Capture::default());
+        let subscriber = super::build_subscriber(
+            tracing_subscriber::EnvFilter::new("debug"),
+            {
+                let file = file.clone();
+                move || file.clone()
+            },
+            {
+                let stdout = stdout.clone();
+                move || stdout.clone()
+            },
+            redactor,
+        );
+        tracing::subscriber::with_default(subscriber, emit);
+        (file.text(), stdout.text())
+    }
+
+    /// A real reqwest failure against a port nothing listens on: its Display carries the full
+    /// request URL, exactly what `%err` puts into the log at ~20 call sites.
+    fn real_reqwest_error(base: &str) -> reqwest::Error {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime
+            .block_on(reqwest::Client::new().get(format!("{base}/api/items/abc/file/1?token=SECRET-TOKEN")).send())
+            .expect_err("nothing listens there")
+    }
+
+    #[test]
+    fn reqwest_errors_hide_the_server_address_in_both_sinks_when_anonymizing() {
+        let base = "http://127.0.0.1:1";
+        let err = real_reqwest_error(base);
+        assert!(err.to_string().contains("127.0.0.1"), "premise: the raw error names the host: {err}");
+
+        let redactor = LogRedactor::new();
+        redactor.register_server_url(base);
+        let (file, stdout) = run(redactor, || tracing::warn!(%err, "couldn't sync"));
+        for out in [&file, &stdout] {
+            assert!(out.contains("couldn't sync"), "the event itself still logs: {out}");
+            assert!(!out.contains("127.0.0.1"), "server address leaked: {out}");
+            assert!(!out.contains("SECRET-TOKEN"), "token leaked: {out}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_scrubbed_when_anonymization_is_off() {
+        let base = "http://127.0.0.1:1";
+        let err = real_reqwest_error(base);
+        let redactor = LogRedactor::new();
+        redactor.register_server_url(base);
+        redactor.set_enabled(false);
+        let (file, stdout) = run(redactor, || tracing::warn!(%err, "couldn't sync"));
+        assert!(file.contains("127.0.0.1:1") && stdout.contains("127.0.0.1:1"), "{file} / {stdout}");
+    }
+
+    #[test]
+    fn third_party_targets_and_structured_fields_are_scrubbed_too() {
+        let (file, _) = run(LogRedactor::new(), || {
+            tracing::debug!(target: "hyper_util::client::legacy::connect::http", "connecting to http://abs.example.com:13378/ping");
+            tracing::info!(url = "https://abs.example.com/x", "structured");
+        });
+        assert!(!file.contains("abs.example.com"), "{file}");
+        assert!(file.contains("connecting to <url>") && file.contains("url=\"<url>\""), "{file}");
+    }
+
+    #[test]
+    fn toggling_takes_effect_on_the_live_subscriber() {
+        let redactor = LogRedactor::new();
+        let handle = redactor.clone();
+        let (file, _) = run(redactor, || {
+            tracing::info!("one https://abs.example.com/a");
+            handle.set_enabled(false);
+            tracing::info!("two https://abs.example.com/b");
+            handle.set_enabled(true);
+            tracing::info!("three https://abs.example.com/c");
+        });
+        assert!(file.contains("one <url>"), "{file}");
+        assert!(file.contains("two https://abs.example.com/b"), "{file}");
+        assert!(file.contains("three <url>"), "{file}");
+    }
+
+    #[test]
+    fn the_unconfigured_global_redactor_is_on() {
+        assert!(crate::log_privacy::global().is_enabled());
+    }
 }

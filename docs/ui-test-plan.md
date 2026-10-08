@@ -1121,7 +1121,7 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
 
 ---
 
-## 15. Settings (SE) — 🚧 partially implemented (Account, Servers, Playback, Appearance, About)
+## 15. Settings (SE) — 🚧 partially implemented (Account, Servers, Playback, Appearance, Diagnostics, About)
 
 - [x] **SE-1 — Groups exist.** Open the Settings tab.
       *Expected:* `AdwPreferencesPage`-style groups: Account, Servers, Playback, Appearance,
@@ -1207,6 +1207,15 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
       `AdwAboutWindow`; the version match is guaranteed by both reading `CARGO_PKG_VERSION`.
 
 ---
+
+- [ ] **SE-13 — Anonymize logs.** Open Settings → Diagnostics. Run with `RUST_LOG=debug`, point
+      the app at an unreachable server (Sign in with a typo'd host) and read
+      `~/.local/state/io.github.gdr_aislop.abs-app/logs/abs-app.*` and the terminal.
+      *Expected:* the "Anonymize logs" switch is on by default; the failure lines show `<url>` /
+      `<server>` / `<user>` and never the host, username or a `token=` value. Turn the switch
+      off and retry: real addresses appear. Restart: the switch keeps its state.
+      *Automated:* `settings_anonymize_logs_switch_drives_the_scrubber_and_persists`; the
+      scrubber itself by `log_privacy::tests` and `crash_reporting::tests`.
 
 ## 16. Connection page (CN) — ✅ implemented (Server connection row, Advanced group, Disconnect)
 

@@ -195,11 +195,12 @@ pub enum CustomHeadersError {
 /// Sorted, so the same row always resolves to the same options (and the same client behavior).
 pub fn parse_custom_headers(json: &str) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        tracing::warn!(custom_headers_json = %json, "server's custom headers don't parse as JSON; ignoring them");
+        // Never log the raw JSON: header values are often reverse-proxy credentials.
+        tracing::warn!("server's custom headers don't parse as JSON; ignoring them");
         return Vec::new();
     };
     let Some(entries) = value.as_object() else {
-        tracing::warn!(custom_headers_json = %json, "server's custom headers aren't a JSON object; ignoring them");
+        tracing::warn!("server's custom headers aren't a JSON object; ignoring them");
         return Vec::new();
     };
     let mut headers: Vec<(String, String)> = entries
@@ -272,6 +273,39 @@ pub fn validate_client_cert(path: &std::path::Path, password: Option<&str>) -> R
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unparsable_custom_headers_are_never_logged_verbatim() {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(parse_custom_headers("{X-Proxy-Auth: proxy-secret").is_empty());
+            assert!(parse_custom_headers(r#"["proxy-secret"]"#).is_empty());
+        });
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("ignoring them"), "the warning is still emitted: {logged}");
+        assert!(!logged.contains("proxy-secret"), "header contents leaked into the log: {logged}");
+    }
+
     use super::*;
 
     fn server(url: &str) -> Server {

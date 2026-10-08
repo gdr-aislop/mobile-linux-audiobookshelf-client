@@ -47,6 +47,7 @@ pub struct SettingsHooks {
     pub burst_buffering_switch: gtk4::Switch,
     pub burst_buffering_row: adw::ActionRow,
     pub low_memory_switch: gtk4::Switch,
+    pub anonymize_logs_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
     pub account_row: adw::ActionRow,
@@ -594,6 +595,49 @@ pub fn build(
     });
     page.add(&appearance_group);
 
+    // Diagnostics: the switch drives the process-wide log scrubber directly (logging is global,
+    // so is its switch — see `crate::log_privacy::global`); the stored value was applied at
+    // startup by `main.rs::setup`.
+    let diagnostics_group = adw::PreferencesGroup::new();
+    diagnostics_group.set_title("Diagnostics");
+    let anonymize_logs_switch = gtk4::Switch::new();
+    anonymize_logs_switch.set_valign(gtk4::Align::Center);
+    let anonymize_logs_on = crate::log_privacy::global().is_enabled();
+    anonymize_logs_switch.set_state(anonymize_logs_on);
+    anonymize_logs_switch.set_active(anonymize_logs_on);
+    let anonymize_logs_row = adw::ActionRow::builder()
+        .title("Anonymize logs")
+        .subtitle("Hides the server address, usernames and access tokens in log files. Turn off only while debugging.")
+        .build();
+    anonymize_logs_row.add_suffix(&anonymize_logs_switch);
+    anonymize_logs_row.set_activatable_widget(Some(&anonymize_logs_switch));
+    diagnostics_group.add(&anonymize_logs_row);
+    anonymize_logs_switch.connect_state_set({
+        let pool = pool.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_, state| {
+            let redactor = crate::log_privacy::global();
+            // The audit line is written while anonymization is on, so it is never the line that
+            // exposes anything.
+            if state {
+                redactor.set_enabled(true);
+                tracing::info!("log anonymization turned on");
+            } else {
+                tracing::info!("log anonymization turned off");
+                redactor.set_enabled(false);
+            }
+            let pool = pool.clone();
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                if let Err(err) = abs_core::settings::save_anonymize_logs(&pool, state).await {
+                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the log setting", err);
+                }
+            });
+            glib::signal::Propagation::Proceed
+        }
+    });
+    page.add(&diagnostics_group);
+
     let about_group = adw::PreferencesGroup::new();
     about_group.set_title("About");
     let about_row = adw::ActionRow::builder()
@@ -628,6 +672,7 @@ pub fn build(
             burst_buffering_switch,
             burst_buffering_row,
             low_memory_switch,
+            anonymize_logs_switch,
             theme_row,
             about_row,
             account_row,
@@ -1439,5 +1484,39 @@ pub(crate) mod tests {
         low_memory_mode.set(false);
         assert!(!hooks.low_memory_switch.is_active());
         assert!(!subtitle().contains("low memory mode"), "the hint goes with it");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Anonymize logs" switch is on by
+    /// default, drives the process-wide scrubber, and is saved.
+    pub(crate) fn run_anonymize_logs_switch_drives_the_scrubber_and_persists(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let screen = build(
+            pool.clone(),
+            controller,
+            test_download_manager(pool.clone()),
+            abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            adw::ApplicationWindow::builder().build(),
+        );
+        let switch = &screen.hooks.anonymize_logs_switch;
+        let redactor = crate::log_privacy::global();
+
+        assert!(switch.state(), "anonymization defaults to on");
+        assert!(redactor.is_enabled());
+
+        let _: bool = switch.emit_by_name("state-set", &[&false]);
+        assert!(!redactor.is_enabled(), "the switch reaches the scrubber");
+        pump_until(|| false, Duration::from_millis(500));
+        assert!(!runtime.block_on(abs_core::settings::load_anonymize_logs(&pool)).unwrap(), "off is saved");
+
+        let _: bool = switch.emit_by_name("state-set", &[&true]);
+        assert!(redactor.is_enabled());
+        pump_until(|| false, Duration::from_millis(500));
+        assert!(runtime.block_on(abs_core::settings::load_anonymize_logs(&pool)).unwrap(), "on is saved");
     }
 }
