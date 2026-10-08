@@ -1008,13 +1008,10 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
     clear_box(&widgets.continue_row);
     let continue_items: Vec<_> = data.continue_items.iter().filter(|(item, _)| !offline_mode || data.downloaded.contains(&item.id)).collect();
     for (item, progress) in &continue_items {
-        let percent = if item.duration_seconds > 0.0 {
-            (progress.current_time_seconds / item.duration_seconds * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
-        let subtitle = format!("{} · {percent:.0}% listened", item.author.as_deref().unwrap_or("Unknown author"));
-        widgets.continue_row.append(&item_card::build(132, item, &subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id)));
+        let fraction = if item.duration_seconds > 0.0 { (progress.current_time_seconds / item.duration_seconds).clamp(0.0, 1.0) } else { 0.0 };
+        // The card's progress row shows the percentage, so the subtitle is just the author.
+        let subtitle = item.author.as_deref().unwrap_or("Unknown author");
+        widgets.continue_row.append(&item_card::build(132, item, subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id), Some(fraction)));
     }
     widgets.continue_section.set_visible(!continue_items.is_empty());
 
@@ -1024,7 +1021,7 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
     // browsable", not "hidden entirely", since there's no per-library download concept).
     for item in data.recent_items.iter().filter(|item| !offline_mode || data.downloaded.contains(&item.id)) {
         let subtitle = item_subtitle(item);
-        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id)));
+        widgets.recent_row.append(&item_card::build(132, item, &subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id), None));
     }
 
     clear_listbox(&widgets.libraries_list);

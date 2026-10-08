@@ -19,9 +19,11 @@ use crate::widgets::cover_image::CoverImage;
 /// item's `PlayRequest` up to the caller, which opens Item Detail for it — this card never starts
 /// playback itself. Decodes the cover immediately; for a screen that wants to defer decoding
 /// (Library's viewport-aware lazy decode — see `screens::library`), use [`build_deferred`], which
-/// this is a thin wrapper around.
-pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> gtk4::Widget {
-    let built = build_deferred(size, item, subtitle, on_open, wrap_title, is_downloaded);
+/// this is a thin wrapper around. `progress` (a 0.0–1.0 listened fraction) adds a thin progress
+/// bar with its percentage between the cover and the title — Home's Continue Listening shelf uses
+/// it; `None` leaves the card exactly as before.
+pub fn build(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool, progress: Option<f64>) -> gtk4::Widget {
+    let built = build_deferred(size, item, subtitle, on_open, wrap_title, is_downloaded, progress);
     built.cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
     built.widget
 }
@@ -36,7 +38,7 @@ pub struct BuiltItemCard {
     pub cover: CoverImage,
 }
 
-pub fn build_deferred(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool) -> BuiltItemCard {
+pub fn build_deferred(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn Fn(PlayRequest)>, wrap_title: bool, is_downloaded: bool, progress: Option<f64>) -> BuiltItemCard {
     // Every widget in this card is explicitly `hexpand(false)` — a `GtkBox`'s own hexpand is
     // computed from its children unless overridden, so a single stray `true` here would propagate
     // all the way up to the wrapping `GtkButton` and stretch a single-item shelf/row's card full
@@ -107,6 +109,9 @@ pub fn build_deferred(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn F
         .build();
 
     card.append(&cover_overlay);
+    if let Some(fraction) = progress {
+        card.append(&progress_row(fraction));
+    }
     card.append(&title_label);
     card.append(&meta);
 
@@ -126,6 +131,40 @@ pub fn build_deferred(size: i32, item: &Item, subtitle: &str, on_open: &Rc<dyn F
     button.connect_clicked(move |_| on_open(request.clone()));
 
     BuiltItemCard { widget: button.upcast(), cover }
+}
+
+/// Lifts Adwaita's 150px minimum on a horizontal progress bar's trough, which would otherwise make
+/// bar + percentage wider than a 132px shelf card and push the card past its cover's width. Loaded
+/// once per process — same `Once`-guarded `CssProvider` idiom as `player::ensure_mini_bar_css`.
+fn ensure_card_progress_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data("progressbar.card-progress > trough { min-width: 0; }");
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("a display for the app's css"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
+/// A thin progress bar with the listened percentage to its right. The row is explicitly
+/// `hexpand(false)` — the bar itself needs `hexpand(true)` to fill the card's width, and without
+/// the explicit override that would propagate up and stretch the card (see `build_deferred`).
+fn progress_row(fraction: f64) -> gtk4::Box {
+    ensure_card_progress_css();
+    let fraction = fraction.clamp(0.0, 1.0);
+    let row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).hexpand(false).build();
+    let bar = gtk4::ProgressBar::builder().fraction(fraction).hexpand(true).valign(gtk4::Align::Center).build();
+    // `add_css_class`, not the builder's `css_classes`: that replaces the bar's classes, dropping
+    // the `horizontal` one GTK sets itself — which Adwaita's trough height hangs off, leaving a
+    // zero-height (invisible) bar.
+    bar.add_css_class("card-progress");
+    let percent = gtk4::Label::builder().label(format!("{:.0}%", fraction * 100.0)).css_classes(["caption", "numeric"]).build();
+    row.append(&bar);
+    row.append(&percent);
+    row
 }
 
 #[cfg(test)]
@@ -154,11 +193,31 @@ pub(crate) mod tests {
     fn title_label_of(widget: &gtk4::Widget) -> gtk4::Label {
         let button = widget.clone().downcast::<gtk4::Button>().expect("item_card::build returns a GtkButton");
         let card_box = button.child().and_then(|w| w.downcast::<gtk4::Box>().ok()).expect("button wraps the card box");
-        card_box
-            .first_child()
-            .and_then(|cover_overlay| cover_overlay.next_sibling())
-            .and_then(|w| w.downcast::<gtk4::Label>().ok())
-            .expect("card's second child is the title label")
+        let mut child = card_box.first_child();
+        while let Some(widget) = child {
+            if let Ok(label) = widget.clone().downcast::<gtk4::Label>() {
+                if label.has_css_class("heading") {
+                    return label;
+                }
+            }
+            child = widget.next_sibling();
+        }
+        panic!("card should contain a heading-styled title label");
+    }
+
+    /// The card's progress row (bar + percentage label), if it has one.
+    fn progress_of(widget: &gtk4::Widget) -> Option<(gtk4::ProgressBar, gtk4::Label)> {
+        let button = widget.clone().downcast::<gtk4::Button>().ok()?;
+        let card_box = button.child()?.downcast::<gtk4::Box>().ok()?;
+        let mut child = card_box.first_child();
+        while let Some(widget) = child {
+            if let Some(bar) = widget.first_child().and_then(|w| w.downcast::<gtk4::ProgressBar>().ok()) {
+                let label = bar.next_sibling()?.downcast::<gtk4::Label>().ok()?;
+                return Some((bar, label));
+            }
+            child = widget.next_sibling();
+        }
+        None
     }
 
     /// The card's cover `GtkPicture` (visible once a cover has decoded into it).
@@ -210,7 +269,7 @@ pub(crate) mod tests {
             Rc::new(move |request: PlayRequest| received.borrow_mut().push(request))
         };
 
-        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, false);
+        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, false, None);
         let button = widget.clone().downcast::<gtk4::Button>().expect("item_card::build returns a GtkButton");
         button.emit_clicked();
 
@@ -230,7 +289,7 @@ pub(crate) mod tests {
         let item = fixture_item();
         let on_open: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
 
-        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, true);
+        let widget = build(132, &item, "Andy Weir · 1.0h", &on_open, false, true, None);
         assert!(downloaded_badge_of(&widget).is_visible(), "is_downloaded: true should show the badge");
     }
 
@@ -240,11 +299,29 @@ pub(crate) mod tests {
         let item = fixture_item();
         let on_open: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
 
-        let widget = build(108, &item, "Andy Weir · 1.0h", &on_open, true, false);
+        let widget = build(108, &item, "Andy Weir · 1.0h", &on_open, true, false, None);
         let title_label = title_label_of(&widget);
 
         assert!(title_label.wraps(), "wrap_title: true should wrap instead of ellipsizing");
         assert_eq!(title_label.ellipsize(), gtk4::pango::EllipsizeMode::None, "no ellipsize when wrapping — the whole point is nothing gets cut off");
         assert_eq!(title_label.text(), "Project Hail Mary", "the full title text should still be set, just wrapped rather than truncated");
+    }
+
+    /// The progress row only appears when the caller passes progress (Continue Listening), and
+    /// reports the fraction both as the bar's fill and as a rounded percentage.
+    pub(crate) fn run_progress_row_shows_only_when_given_progress() {
+        let item = fixture_item();
+        let on_open: Rc<dyn Fn(PlayRequest)> = Rc::new(|_| {});
+
+        let widget = build(132, &item, "Andy Weir", &on_open, false, false, Some(0.46));
+        let (bar, label) = progress_of(&widget).expect("Some(progress) should add a progress row");
+        assert!((bar.fraction() - 0.46).abs() < 1e-9, "the bar should be filled to the given fraction");
+        assert_eq!(label.text(), "46%");
+        assert_eq!(title_label_of(&widget).text(), "Project Hail Mary", "the title still renders below the progress row");
+        assert!(bar.has_css_class("horizontal"), "the theme's progress bar styling (its height) needs GTK's own `horizontal` class kept");
+        assert!(bar.has_css_class("card-progress"), "the card's min-width override needs its class");
+
+        let without = build(132, &item, "Andy Weir", &on_open, false, false, None);
+        assert!(progress_of(&without).is_none(), "None should leave the card without a progress row");
     }
 }

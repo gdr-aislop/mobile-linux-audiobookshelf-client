@@ -90,8 +90,8 @@ Fractal) rather than copying Lissen's Material Design look.
 
 ### Home
 - `AdwToolbarView` with `AdwHeaderBar` (title "Home", avatar/account button on the right).
-- Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (progress ring overlay
-  on cover), "Recently added". Each cover is a tappable card pushing Item detail.
+- Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (thin progress bar with
+  percentage under the cover), "Recently added". Each cover is a tappable card pushing Item detail.
 - **Shelf headings are tappable** (tap-through): "Recently added" opens the Library tab pre-sorted
   by date added; "Continue listening" opens it pre-sorted by **last listened** (newest last-listen
   first) and filtered to **in-progress** books — the Library's own "Sort & filter" dropdown and
