@@ -65,6 +65,7 @@ pub struct TestHooks {
     pub download_popover_box: gtk4::Box,
     pub error_banner: crate::widgets::banner::ErrorBanner,
     pub download_progress_revealer: gtk4::Revealer,
+    pub cover: crate::widgets::cover_image::CoverImage,
 }
 
 #[cfg(test)]
@@ -126,6 +127,18 @@ pub fn build(
     let cover = crate::widgets::cover_image::CoverImage::new(264);
     cover.widget().set_halign(gtk4::Align::Center);
     cover.widget().set_margin_top(14);
+    cover.set_on_activate({
+        let controller = controller.clone();
+        let anchor = cover.widget().clone();
+        move |shown, thumbnail| {
+            let Some((session, server_id, item_id)) = controller.current_download_context() else { return };
+            let title = controller.snapshot().map(|s| s.title).unwrap_or_default();
+            crate::widgets::cover_viewer::open(
+                &anchor,
+                crate::widgets::cover_viewer::CoverSource { session, paths: controller.paths(), server_id, item_id, title, thumbnail, shown },
+            );
+        }
+    });
     // `max_width_chars(1)` caps each label's natural width regardless of `wrap` — this screen's
     // content scrolls only vertically (`hscrollbar_policy(Never)` below), so an unclamped, fully
     // server-controlled title/author string could otherwise force the whole window wider than
@@ -511,6 +524,10 @@ pub fn build(
         let controller = controller.clone();
         let on_collapse = on_collapse.clone();
         move || {
+            // Escape over the cover viewer closes the viewer, not the Player under it.
+            if crate::widgets::cover_viewer::close_current() {
+                return;
+            }
             controller.clear_full_update();
             on_collapse();
         }
@@ -722,6 +739,7 @@ pub fn build(
         actions,
         #[cfg(test)]
         hooks: TestHooks {
+            cover: cover.clone(),
             title_label,
             author_label,
             chapter_label,
@@ -936,7 +954,7 @@ const SWIPE_DOWN_MIN_DISTANCE_PX: f64 = 24.0;
 /// drag that traveled at least `SWIPE_DOWN_MIN_DISTANCE_PX`. `offset_x`/`offset_y` are
 /// `GestureDrag::offset()`'s values (total displacement from press to release); a mostly
 /// horizontal drag, an upward swipe, or a drag short of the threshold does nothing.
-fn player_gesture_should_collapse(offset_x: f64, offset_y: f64) -> bool {
+pub(crate) fn player_gesture_should_collapse(offset_x: f64, offset_y: f64) -> bool {
     offset_y >= SWIPE_DOWN_MIN_DISTANCE_PX && offset_y.abs() > offset_x.abs()
 }
 
@@ -1664,6 +1682,179 @@ pub(crate) mod tests {
         // Crosses the vertical threshold, but the horizontal component dominates — not a clean
         // downward swipe, so this must not collapse the screen.
         assert!(!player_gesture_should_collapse(SWIPE_DOWN_MIN_DISTANCE_PX * 2.0, SWIPE_DOWN_MIN_DISTANCE_PX));
+    }
+
+    /// A loaded book with a cached (resized) cover, its Player screen as the page of a phone-sized
+    /// window, and the original cover on the server — the setup every cover-viewer scenario
+    /// below starts from.
+    struct CoverScene {
+        _mock_server: wiremock::MockServer,
+        controller: crate::player::PlayerController,
+        screen: PlayerScreen,
+        window: adw::ApplicationWindow,
+        collapsed: std::rc::Rc<std::cell::Cell<bool>>,
+        server_id: String,
+    }
+
+    fn cover_scene(runtime: &tokio::runtime::Runtime, original_delay: Duration, original_requests: u64) -> CoverScene {
+        use crate::widgets::cover_viewer::tests::{mount_original, seed_thumbnail};
+        let mock_server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(mock_playable_item(&mock_server, "item-1", 5));
+        runtime.block_on(mount_original(&mock_server, "item-1", original_delay, original_requests));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        runtime.block_on(seed_thumbnail(&pool, &controller.paths(), &server.id, "item-1"));
+        controller.start(
+            abs_core::auth::Session::new(pool.clone(), &server, &account),
+            PlayRequest { item_id: "item-1".to_string(), title: "Project Hail Mary".to_string(), author: Some("Andy Weir".to_string()) },
+            1.0,
+        );
+        pump_until(|| controller.snapshot().is_some_and(|s| !s.is_loading), Duration::from_secs(10));
+
+        let collapsed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let screen = build(pool.clone(), controller.clone(), test_download_manager(pool), {
+            let collapsed = collapsed.clone();
+            move || collapsed.set(true)
+        }, || {});
+        let window = adw::ApplicationWindow::builder().default_width(360).default_height(648).build();
+        window.set_content(Some(&screen.root));
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+        CoverScene { _mock_server: mock_server, controller, screen, window, collapsed, server_id: server.id }
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. Tapping the Player's cover opens it
+    /// full-screen at once with what was on screen, then the uncropped small copy with a
+    /// download pill, then the full-size original; Escape closes the viewer, not the Player; a
+    /// second open is served from the cache; ✕ closes it too.
+    pub(crate) fn run_tapping_the_cover_opens_the_full_size_original(runtime: &tokio::runtime::Runtime) {
+        use crate::widgets::cover_viewer::{self, tests::*, Pill};
+        let scene = cover_scene(runtime, Duration::from_millis(1500), 1);
+        let hooks = scene.screen.test_hooks();
+        pump_until(|| hooks.cover.picture().is_visible(), Duration::from_secs(5));
+
+        let tapped = std::time::Instant::now();
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        assert!(tapped.elapsed() < Duration::from_millis(500), "the page opens at once: {:?}", tapped.elapsed());
+        assert!(viewer.shown_texture().is_some(), "it opens with the cover that was on screen, never empty");
+
+        wait_for_texture(&viewer, THUMBNAIL_SIZE, Duration::from_secs(5));
+        assert!(
+            matches!(viewer.pill(), Pill::Busy(ref text) if text.starts_with("Downloading full size")),
+            "while the original downloads the pill says so: {:?}",
+            viewer.pill()
+        );
+
+        wait_for_texture(&viewer, ORIGINAL_SIZE, Duration::from_secs(20));
+        pump_until(|| viewer.pill() == Pill::Hidden, Duration::from_secs(2));
+        assert_eq!(viewer.pill(), Pill::Hidden, "the pill goes once the original is shown");
+
+        // Zoomed in, the page scrolls over the bigger image.
+        viewer.zoom_for_test(3.0);
+        pump_until(|| false, Duration::from_millis(300));
+        let scroller = scroller(&viewer);
+        assert!(scroller.hadjustment().upper() > scroller.hadjustment().page_size() * 2.0, "3× is wider than the page");
+        assert_eq!(zoom_of(&viewer), 3.0);
+
+        // Escape (the Player's `collapse` accelerator) closes the viewer only.
+        scene.screen.actions.activate_action("collapse", None);
+        pump_until(|| false, Duration::from_millis(200));
+        assert!(viewer.is_closed());
+        assert!(!scene.collapsed.get(), "the Player underneath stays open");
+        assert_eq!(content_of(scene.window.upcast_ref()).as_ref(), Some(&scene.screen.root), "the Player page is back");
+        assert!(viewer.shown_texture().is_none(), "the images are let go");
+
+        // Again: from the cache this time (`expect(1)` on the original), closed with ✕.
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        wait_for_texture(&viewer, ORIGINAL_SIZE, Duration::from_secs(20));
+        close_button(&viewer).emit_clicked();
+        pump_until(|| false, Duration::from_millis(200));
+        assert!(cover_viewer::current().is_none());
+        assert_eq!(content_of(scene.window.upcast_ref()).as_ref(), Some(&scene.screen.root));
+        scene.controller.stop();
+    }
+
+    /// Closing before the original has arrived brings the Player back untouched, and the
+    /// download still finishes into the cache for the next open.
+    pub(crate) fn run_closing_the_cover_viewer_early_keeps_the_download(runtime: &tokio::runtime::Runtime) {
+        use crate::widgets::cover_viewer::{self, tests::*};
+        let scene = cover_scene(runtime, Duration::from_millis(1000), 1);
+        let hooks = scene.screen.test_hooks();
+        pump_until(|| hooks.cover.picture().is_visible(), Duration::from_secs(5));
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        assert!(cover_viewer::close_current());
+        pump_until(|| false, Duration::from_secs(3));
+        assert!(viewer.is_closed() && viewer.shown_texture().is_none(), "nothing arriving later reopens or fills it");
+        assert_eq!(content_of(scene.window.upcast_ref()).as_ref(), Some(&scene.screen.root));
+        let paths = scene.controller.paths();
+        assert!(
+            runtime.block_on(abs_core::covers::cached_original_cover(&paths, &scene.server_id, "item-1")).is_some(),
+            "the original was kept for the next open"
+        );
+        scene.controller.stop();
+    }
+
+    /// Low memory mode: the viewer opens with the small copy only, never fetching the original,
+    /// says why, and zooms less far.
+    pub(crate) fn run_the_cover_viewer_in_low_memory_mode_shows_the_small_copy(runtime: &tokio::runtime::Runtime) {
+        use crate::widgets::cover_viewer::{self, tests::*, Pill};
+        crate::widgets::cover_image::set_low_memory_mode(true);
+        let scene = cover_scene(runtime, Duration::ZERO, 0);
+        let hooks = scene.screen.test_hooks();
+        pump_until(|| false, Duration::from_millis(300));
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        wait_for_texture(&viewer, THUMBNAIL_SIZE, Duration::from_secs(5));
+        assert_eq!(viewer.pill(), Pill::Note(cover_viewer::LOW_MEMORY_NOTE.to_string()));
+        viewer.zoom_for_test(6.0);
+        assert_eq!(zoom_of(&viewer), 3.0, "the small copy zooms to 3× at most");
+        pump_until(|| false, Duration::from_secs(1));
+        assert_eq!(texture_size(&viewer), Some((THUMBNAIL_SIZE.0 as i32, THUMBNAIL_SIZE.1 as i32)), "no original replaces it");
+        viewer.close();
+        pump_until(|| false, Duration::from_millis(200));
+        assert!(viewer.shown_texture().is_none(), "the small copy is let go on close");
+        crate::widgets::cover_image::set_low_memory_mode(false);
+        scene.controller.stop();
+        // `expect(0)` on the original is checked as the mock server drops.
+    }
+
+    /// Not a check: the cover viewer at a phone's window size — fitted, zoomed in on the
+    /// original, and while the original is still downloading — in light and dark, into
+    /// `$ABS_SCREENSHOT_DIR` (does nothing when that isn't set).
+    pub(crate) fn run_cover_viewer_screenshots(runtime: &tokio::runtime::Runtime) {
+        use crate::widgets::cover_viewer::{self, tests::*};
+        let Some(dir) = std::env::var_os("ABS_SCREENSHOT_DIR").map(std::path::PathBuf::from) else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene = cover_scene(runtime, Duration::from_secs(4), 1);
+        let hooks = scene.screen.test_hooks();
+        pump_until(|| hooks.cover.picture().is_visible(), Duration::from_secs(5));
+        let style = adw::StyleManager::default();
+        let shot = |name: &str| {
+            pump_until(|| false, Duration::from_millis(600));
+            crate::screens::main_window::tests::save_window_png(&scene.window, &dir.join(format!("{name}.png")));
+        };
+        style.set_color_scheme(adw::ColorScheme::ForceLight);
+        shot("cover-0-player-light");
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        wait_for_texture(&viewer, THUMBNAIL_SIZE, Duration::from_secs(5));
+        shot("cover-1-downloading-light");
+        wait_for_texture(&viewer, ORIGINAL_SIZE, Duration::from_secs(20));
+        shot("cover-2-fitted-light");
+        style.set_color_scheme(adw::ColorScheme::ForceDark);
+        shot("cover-2-fitted-dark");
+        viewer.zoom_for_test(3.0);
+        shot("cover-3-zoomed-dark");
+        assert!(cover_viewer::close_current());
+        shot("cover-4-player-again-dark");
+        style.set_color_scheme(adw::ColorScheme::Default);
+        scene.controller.stop();
     }
 
     #[test]

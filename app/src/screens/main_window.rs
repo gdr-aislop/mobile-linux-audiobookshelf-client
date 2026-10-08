@@ -1982,7 +1982,7 @@ pub(crate) mod tests {
 
     /// Saves what `window` currently shows as a PNG — for the visual check of the mini bar's
     /// look (see `run_mini_bar_screenshots`).
-    fn save_window_png(window: &adw::ApplicationWindow, path: &std::path::Path) {
+    pub(crate) fn save_window_png(window: &adw::ApplicationWindow, path: &std::path::Path) {
         let (width, height) = (window.width(), window.height());
         let paintable = gtk4::WidgetPaintable::new(Some(window));
         let snapshot = gtk4::Snapshot::new();

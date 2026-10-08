@@ -1776,6 +1776,12 @@ impl PlayerController {
         self.inner.borrow().now_playing.as_ref().is_some_and(|np| !np.chapters.is_empty())
     }
 
+    /// Where the app keeps its files — for screens that open a book's cached files (the cover
+    /// viewer).
+    pub fn paths(&self) -> AppPaths {
+        self.inner.borrow().paths.clone()
+    }
+
     /// `(session, server_id, item_id)` for whatever is currently loaded — the context a download
     /// button needs to call `DownloadManager::start_download`. `None` if nothing is playing.
     pub fn current_download_context(&self) -> Option<(abs_core::auth::Session, String, String)> {
