@@ -364,6 +364,7 @@ mod tests {
         (playback_listeners_of_discarded_screens_are_dropped, crate::player::tests::run_listeners_of_discarded_screens_are_dropped),
         (playback_a_bouncing_headphone_jack_does_not_resume, crate::player::tests::run_a_bouncing_headphone_jack_does_not_resume),
         (playback_a_downloaded_book_starts_without_waiting_for_a_dead_server, crate::player::tests::run_a_downloaded_book_starts_without_waiting_for_a_dead_server),
+        (playback_a_downloaded_book_starts_without_waiting_for_a_token_refresh, crate::player::tests::run_a_downloaded_book_starts_without_waiting_for_a_token_refresh),
         (playback_offline_mode_starts_a_downloaded_book_without_contacting_the_server, crate::player::tests::run_offline_mode_starts_a_downloaded_book_without_contacting_the_server),
         (playback_a_book_whose_start_track_is_not_downloaded_still_waits_for_the_server, crate::player::tests::run_a_book_whose_start_track_is_not_downloaded_still_waits_for_the_server),
         (player_screen_renders, crate::screens::player::tests::run),

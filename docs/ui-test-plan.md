@@ -672,6 +672,18 @@ was and wasn't verified.
       and try again." with Retry — not "Lost the connection while playing" — and shows no
       "0:00 / -0:00" times. Retry with the server back starts the book.
 
+- [ ] **MP-30 — Resume a downloaded book after hours away, on a poor connection.** Leave the app
+      closed long enough for the login token to expire (a few hours), then open it on a weak or
+      dead connection and Resume a book whose current chapter is downloaded.
+      *Expected:* sound within ~3 s of tapping Resume (log: `starting playback`, then `the server
+      is slow or unreachable; starting from the downloaded files` within about 3 s). A token
+      refresh that fails is tried once, not by every screen in turn: the log shows at most one
+      `couldn't refresh the access token` per minute, followed by `skipping the token refresh:
+      the last attempt failed Ns ago`.
+      *Automated:* `playback_a_downloaded_book_starts_without_waiting_for_a_token_refresh`
+      (expired token, a server that never answers `/auth/refresh`); abs-core's
+      `a_failed_refresh_is_not_retried_by_the_next_caller`.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.

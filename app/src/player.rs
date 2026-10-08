@@ -2057,12 +2057,15 @@ impl PlayerController {
             // Asked at resolve time, not captured earlier — see `NowPlaying::session`. The
             // connection (settings + resolved base URL) is asked the same way: a settings
             // change is honored by the very next playback without any rebuild.
-            // Offline mode: the stored settings only (no reachability probe), and nothing below
-            // reaches the server.
+            //
+            // The device comes first: whether the track to start in is downloaded is decided from
+            // the stored settings and token alone (no reachability probe, no token refresh), so a
+            // downloaded book never waits on the network to find out it doesn't need it. A local
+            // file needs no token, and a streamed track gets a current one when it loads
+            // (`resolve_playable_url`). On the phone, an expired token on a poor connection used
+            // to hold this up for ~40 s before the downloaded chapter was even looked at.
             let offline_mode = session.is_offline();
-            let access_token = session.access_token().await;
-            let connection = if offline_mode { session.local_connection_target().await } else { session.connection_target().await };
-            let connection = match connection {
+            let local_connection = match session.local_connection_target().await {
                 Ok(connection) => connection,
                 Err(err) => {
                     tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
@@ -2070,45 +2073,74 @@ impl PlayerController {
                     return;
                 }
             };
+            let start_chapter_asked = inner_rc.borrow().pending_start.as_ref().and_then(|p| p.start_chapter);
+            let mut files_only = start_target_from_files(
+                &pool,
+                &session,
+                &item.item_id,
+                start_chapter_asked,
+                &local_connection,
+                &session.stored_access_token(),
+            )
+            .await;
             if superseded(&inner_rc.borrow()) {
                 return;
             }
 
             // Resolving the stream URL is required to proceed — unless the item can be played
-            // from locally cached state instead (below). Reconciling progress is a nice-to-have
-            // that must never add its own delay on top — run both concurrently rather than one
-            // after another, so a slow or unreachable server is only ever felt once, not twice.
+            // from the files on the device instead. Reconciling progress is a nice-to-have that
+            // must never add its own delay on top — both run concurrently, so a slow or
+            // unreachable server is only ever felt once, not twice.
             //
-            // When the track to start in is already on the device, the server isn't worth waiting
-            // for: with offline mode on it isn't asked at all, otherwise only for
-            // `LOCAL_START_SERVER_WAIT` (a reachable server answers well within that, and then
-            // still provides fresh metadata and progress from other devices).
-            let start_chapter_asked = inner_rc.borrow().pending_start.as_ref().and_then(|p| p.start_chapter);
-            let mut files_only =
-                start_target_from_files(&pool, &session, &item.item_id, start_chapter_asked, &connection, &access_token).await;
-            if superseded(&inner_rc.borrow()) {
-                return;
-            }
-            let answer = {
-                let server_calls = async {
-                tokio::join!(
-                    abs_core::streaming::resolve_stream_target(&connection, &access_token, &item.item_id),
-                    abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item.item_id),
-                )
+            // When the track to start in is on the device, the server isn't worth waiting for:
+            // with offline mode on it isn't asked at all, otherwise only for
+            // `LOCAL_START_SERVER_WAIT` — the token, the connection probe and both calls
+            // together (a reachable server answers well within that, and then still provides
+            // fresh metadata and progress from other devices).
+            let server_calls = |session: abs_core::auth::Session| {
+                let pool = pool.clone();
+                let item_id = item.item_id.clone();
+                async move {
+                    // Detached: a refresh the start stops waiting for still finishes and stores the
+                    // rotated tokens, instead of being dropped after the server may have rotated them.
+                    let access_token = {
+                        let session = session.clone();
+                        tokio::spawn(async move { session.access_token().await })
+                    };
+                    let connection = session.connection_target().await?;
+                    let access_token = access_token.await.unwrap_or_else(|_| session.stored_access_token());
+                    let answer = tokio::join!(
+                        abs_core::streaming::resolve_stream_target(&connection, &access_token, &item_id),
+                        abs_core::progress_sync::reconcile_item_progress(&pool, &connection, &access_token, session.account_id(), session.server_id(), &item_id),
+                    );
+                    Ok::<_, abs_core::CoreError>((connection, access_token, answer))
+                }
             };
-            match (&files_only, offline_mode) {
+            let from_the_device = || (local_connection.clone(), session.stored_access_token(), None);
+            let (connection, access_token, answer) = match (&files_only, offline_mode) {
                 (Some(_), true) => {
                     tracing::info!(item_id = %item.item_id, "offline mode is on and the book is on the device; starting from the downloaded files without contacting the server");
-                    None
+                    from_the_device()
                 }
-                (Some(_), false) => match tokio::time::timeout(LOCAL_START_SERVER_WAIT, server_calls).await {
-                    Ok(answer) => Some(answer),
+                (Some(_), false) => match tokio::time::timeout(LOCAL_START_SERVER_WAIT, server_calls(session.clone())).await {
+                    Ok(Ok((connection, access_token, answer))) => (connection, access_token, Some(answer)),
+                    Ok(Err(err)) => {
+                        tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings; starting from the downloaded files");
+                        from_the_device()
+                    }
                     Err(_) => {
                         tracing::info!(item_id = %item.item_id, wait_ms = LOCAL_START_SERVER_WAIT.as_millis() as u64, "the server is slow or unreachable; starting from the downloaded files");
-                        None
+                        from_the_device()
                     }
                 },
-                (None, false) => Some(server_calls.await),
+                (None, false) => match server_calls(session.clone()).await {
+                    Ok((connection, access_token, answer)) => (connection, access_token, Some(answer)),
+                    Err(err) => {
+                        tracing::warn!(%err, item_id = %item.item_id, "couldn't load the server's connection settings");
+                        fail_start(failed_now_playing(abs_player::PlaybackErrorKind::Network, err.to_string()));
+                        return;
+                    }
+                },
                 (None, true) => {
                     tracing::info!(item_id = %item.item_id, "offline mode is on and the track to start in isn't downloaded; not starting");
                     fail_start(failed_now_playing(
@@ -2116,7 +2148,6 @@ impl PlayerController {
                         "the part of the book to start in isn't downloaded".to_string(),
                     ));
                     return;
-                }
                 }
             };
             let (target_result, reconcile_result) = match answer {
@@ -7114,6 +7145,44 @@ pub(crate) mod tests {
         assert!(waited < LOCAL_START_SERVER_WAIT + Duration::from_secs(2), "started after {waited:?}; the dead server must not be waited for in full");
         assert!(waited >= LOCAL_START_SERVER_WAIT - Duration::from_millis(500), "a server that might still answer is given its short chance: {waited:?}");
         assert!(state.borrow().load_calls.iter().all(|uri| uri.starts_with("file://")), "only the downloaded files are loaded: {:?}", state.borrow().load_calls);
+        controller.stop();
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The same, with an access token that
+    /// expired while the app was closed: deciding that the book can start from the device must not
+    /// wait for the token refresh, which on a dead connection takes the full HTTP timeout. On the
+    /// phone this held a downloaded book up for ~40 s.
+    pub(crate) fn run_a_downloaded_book_starts_without_waiting_for_a_token_refresh(runtime: &tokio::runtime::Runtime) {
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_hanging_server(&mock_server));
+        runtime.block_on(
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+                .mount(&mock_server),
+        );
+        let pool = runtime.block_on(pool());
+        let paths = crate::test_support::test_paths();
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        // A JWT whose `exp` is long past, plus a refresh token to exchange for a new one.
+        let expired = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.c2lnbmF0dXJl";
+        runtime.block_on(abs_storage::repo::accounts::set_tokens(&pool, &account.id, expired, Some("refresh"))).unwrap();
+        let account = runtime.block_on(abs_storage::repo::accounts::get(&pool, &account.id)).unwrap();
+        assert!(abs_core::auth::jwt_exp_seconds(&account.token).is_some_and(|exp| exp < 60), "the test token must read as expired");
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Test Item"));
+        runtime.block_on(seed_track_metadata(&pool, &server.id, "item-1", &[("1", 3.0, 0.0)]));
+        runtime.block_on(seed_downloaded_track(&pool, &paths, &server.id, "item-1", "1", &silent_wav_bytes(3)));
+
+        let (controller, state) = scripted_controller(&pool);
+        let started = Instant::now();
+        controller.start(abs_core::auth::Session::new(pool.clone(), &server, &account), request("item-1", "Offline Book"), 1.0);
+        pump_until(|| controller.snapshot().is_some_and(|s| s.is_playing), Duration::from_secs(30));
+        let waited = started.elapsed();
+        assert!(controller.snapshot().is_some_and(|s| s.is_playing && s.last_error.is_none()), "it plays");
+        assert!(waited < LOCAL_START_SERVER_WAIT + Duration::from_secs(2), "started after {waited:?}; the token refresh must not be waited for");
+        assert!(state.borrow().load_calls.iter().all(|uri| uri.starts_with("file://")), "only the downloaded file is loaded: {:?}", state.borrow().load_calls);
+        let requests = runtime.block_on(mock_server.received_requests()).unwrap();
+        assert!(requests.iter().any(|r| r.url.path() == "/auth/refresh"), "the refresh is still tried, in the background");
         controller.stop();
     }
 
