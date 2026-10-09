@@ -136,7 +136,8 @@ mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfi
 
 When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislop.abs-app/`:
 
-- `logs/abs-app.*` — a rotating, human-readable log file (last 7 days kept).
+- `logs/abs-app.*` (Settings → Diagnostics → "Open latest log file" opens the
+  newest one) — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without
   `RUST_BACKTRACE` set. By default the log is anonymized: server addresses,
   URLs, usernames, access tokens and your home directory are replaced with

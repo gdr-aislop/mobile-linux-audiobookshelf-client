@@ -88,6 +88,19 @@ impl Write for BufferedLogWriter {
     }
 }
 
+/// The process-wide log writer, so UI code can force pending log lines to disk (see
+/// [`flush_logs`]) without being handed the writer itself.
+static LOG_WRITER: std::sync::OnceLock<BufferedLogWriter> = std::sync::OnceLock::new();
+
+/// Writes any buffered log lines to disk now. Logging buffers for up to a minute (see
+/// [`PERIODIC_FLUSH_INTERVAL`]), so anything about to hand the log file to the user — "open the
+/// log" — flushes first. A no-op before [`init_logging`] has run.
+pub fn flush_logs() {
+    if let Some(writer) = LOG_WRITER.get() {
+        writer.flush();
+    }
+}
+
 /// Held for the lifetime of `main()`. Dropping this has no special behavior (the buffered writer
 /// is happy to just stop being flushed); callers explicitly call [`flush`](Self::flush) at the
 /// moments that matter (panic, clean shutdown) rather than relying on `Drop` timing.
@@ -135,12 +148,13 @@ where
 pub fn init_logging(paths: &abs_storage::AppPaths) -> LogHandle {
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
-        .filename_prefix("abs-app")
+        .filename_prefix(abs_storage::paths::LOG_FILE_PREFIX)
         .max_log_files(7)
         .build(paths.logs_dir())
         .expect("build the rotating log file appender");
 
     let writer = BufferedLogWriter::new(appender);
+    let _ = LOG_WRITER.set(writer.clone());
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let file_writer = {
@@ -329,6 +343,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::log_privacy::LogRedactor;
+
+    #[test]
+    fn flush_makes_buffered_log_lines_visible_on_disk() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(abs_storage::paths::LOG_FILE_PREFIX)
+            .build(dir.path())
+            .unwrap();
+        let mut writer = super::BufferedLogWriter::new(appender);
+        writer.write_all(b"hello log\n").unwrap();
+
+        let read = || std::fs::read_to_string(dir.path().read_dir().unwrap().next().unwrap().unwrap().path()).unwrap();
+        assert_eq!(read(), "", "still sitting in the in-memory buffer");
+        writer.flush();
+        assert_eq!(read(), "hello log\n");
+    }
+
+    #[test]
+    fn flush_logs_before_init_is_a_no_op() {
+        super::flush_logs();
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);

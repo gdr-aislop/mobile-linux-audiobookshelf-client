@@ -1217,6 +1217,15 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
       *Automated:* `settings_anonymize_logs_switch_drives_the_scrubber_and_persists`; the
       scrubber itself by `log_privacy::tests` and `crash_reporting::tests`.
 
+- [ ] **SE-14 — Open latest log file.** In Settings → Diagnostics, tap "Open latest log file"
+      right after launching the app.
+      *Expected:* the newest `logs/abs-app.<date>` opens in the default text viewer and already
+      contains this session's startup lines (the log is flushed first). With the logs directory
+      emptied beforehand, a "No log file yet" toast appears instead; with no text handler
+      installed, an "Opening the log file failed" toast.
+      *Automated:* `settings_open_latest_log_row_reports_a_missing_log`;
+      `AppPaths::latest_log_file` by `abs-storage` `paths` tests.
+
 ## 16. Connection page (CN) — ✅ implemented (Server connection row, Advanced group, Disconnect)
 
 Reached from Settings → a server row's body. One instance per configured server. Shown as a

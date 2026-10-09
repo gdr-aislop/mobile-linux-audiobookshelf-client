@@ -299,6 +299,7 @@ mod tests {
         (main_window_every_screen_fits_a_phone, crate::screens::main_window::tests::run_every_screen_fits_a_phone),
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
+        (settings_open_latest_log_row_reports_a_missing_log, crate::screens::settings::tests::run_open_latest_log_row_reports_a_missing_log),
         (settings_anonymize_logs_switch_drives_the_scrubber_and_persists, crate::screens::settings::tests::run_anonymize_logs_switch_drives_the_scrubber_and_persists),
         (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),
