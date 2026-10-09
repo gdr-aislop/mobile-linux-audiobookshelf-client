@@ -481,6 +481,16 @@ pub struct CoverBytes {
     pub content_type: String,
 }
 
+/// A cover response's type; the server sends whatever the source file is (webp, jpeg, png).
+fn cover_content_type(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string()
+}
+
 #[derive(Debug, Serialize)]
 struct UpdateProgressRequest {
     #[serde(rename = "currentTime")]
@@ -775,29 +785,50 @@ impl Client {
     /// but Audiobookshelf may return jpeg/png depending on the source cover file), so callers must
     /// not assume a fixed extension.
     pub async fn get_item_cover(&self, item_id: &str) -> Result<CoverBytes, LibraryItemsError> {
-        let response = self.client().get(format!("{}/api/items/{item_id}/cover", self.baseurl())).send().await?;
+        let response = self.cover_response(item_id, false).await?;
+        let content_type = cover_content_type(&response);
+        let bytes = response.bytes().await?.to_vec();
+        Ok(CoverBytes { bytes, content_type })
+    }
+
+    /// The cover as it was uploaded to the server (`?raw=1`), not the resized copy (400 px wide)
+    /// that a plain `GET /api/items/:id/cover` returns — for showing the cover full-screen.
+    /// Streamed, with `on_progress(received, total)` after every chunk (`total` when the server
+    /// sends a length), since an original can be several MB on a slow connection.
+    pub async fn get_item_cover_original(
+        &self,
+        item_id: &str,
+        on_progress: impl Fn(u64, Option<u64>),
+    ) -> Result<CoverBytes, LibraryItemsError> {
+        let mut response = self.cover_response(item_id, true).await?;
+        let content_type = cover_content_type(&response);
+        let total = response.content_length();
+        let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(64 * 1024 * 1024) as usize);
+        on_progress(0, total);
+        while let Some(chunk) = response.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            on_progress(bytes.len() as u64, total);
+        }
+        Ok(CoverBytes { bytes, content_type })
+    }
+
+    async fn cover_response(&self, item_id: &str, original: bool) -> Result<reqwest::Response, LibraryItemsError> {
+        let query = if original { "?raw=1" } else { "" };
+        let response = self.client().get(format!("{}/api/items/{item_id}/cover{query}", self.baseurl())).send().await?;
 
         if is_auth_status(response.status()) {
             return Err(LibraryItemsError::Unauthorized(response.status().as_u16()));
         }
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(LibraryItemsError::NotFound(format!("GET /api/items/{item_id}/cover returned HTTP {}", response.status())));
+            return Err(LibraryItemsError::NotFound(format!("GET /api/items/{item_id}/cover{query} returned HTTP {}", response.status())));
         }
         if !response.status().is_success() {
             return Err(LibraryItemsError::UnexpectedResponse(format!(
-                "GET /api/items/{item_id}/cover returned HTTP {}",
+                "GET /api/items/{item_id}/cover{query} returned HTTP {}",
                 response.status()
             )));
         }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("image/jpeg")
-            .to_string();
-        let bytes = response.bytes().await?.to_vec();
-        Ok(CoverBytes { bytes, content_type })
+        Ok(response)
     }
 
     /// Fetch a track's audio file, optionally resuming with an HTTP `Range` request — the raw
@@ -1015,7 +1046,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -1765,6 +1796,27 @@ mod tests {
         let client = Client::new(&server.uri());
         let err = client.get_item_cover("item-1").await.unwrap_err();
         assert!(matches!(err, LibraryItemsError::UnexpectedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_item_cover_original_asks_for_the_uploaded_file_and_reports_progress() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .and(query_param("raw", "1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(vec![7; 5000]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let cover = client.get_item_cover_original("item-1", |received, total| seen.borrow_mut().push((received, total))).await.unwrap();
+        assert_eq!(cover.bytes.len(), 5000);
+        assert_eq!(cover.content_type, "image/png");
+        let seen = seen.into_inner();
+        assert_eq!(seen.first(), Some(&(0, Some(5000))));
+        assert_eq!(seen.last(), Some(&(5000, Some(5000))));
     }
 
     #[tokio::test]

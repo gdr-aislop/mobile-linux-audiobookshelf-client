@@ -146,6 +146,12 @@ impl AppPaths {
             .join(format!("{item_id}.{extension}"))
     }
 
+    /// The cover as uploaded to the server (the full-size original, fetched only when someone
+    /// opens the cover full-screen), next to the resized copy [`Self::cover_cache_path`] holds.
+    pub fn original_cover_path(&self, server_id: &str, item_id: &str, extension: &str) -> PathBuf {
+        self.covers_dir().join(server_id).join(format!("{item_id}.original.{extension}"))
+    }
+
     /// Where the covers cache remembers that the server had no cover for an item (an empty file
     /// whose modification time says when it last answered 404) — see `abs_core::covers`.
     pub fn missing_cover_marker_path(&self, server_id: &str, item_id: &str) -> PathBuf {

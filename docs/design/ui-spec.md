@@ -90,8 +90,8 @@ Fractal) rather than copying Lissen's Material Design look.
 
 ### Home
 - `AdwToolbarView` with `AdwHeaderBar` (title "Home", avatar/account button on the right).
-- Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (progress ring overlay
-  on cover), "Recently added". Each cover is a tappable card pushing Item detail.
+- Horizontally-scrolling `GtkListView`/carousel rows: "Continue listening" (thin progress bar with
+  percentage under the cover), "Recently added". Each cover is a tappable card pushing Item detail.
 - **Shelf headings are tappable** (tap-through): "Recently added" opens the Library tab pre-sorted
   by date added; "Continue listening" opens it pre-sorted by **last listened** (newest last-listen
   first) and filtered to **in-progress** books — the Library's own "Sort & filter" dropdown and
@@ -209,6 +209,7 @@ Fractal) rather than copying Lissen's Material Design look.
 ### Item detail
 - `AdwNavigationPage` pushed from Home/Library.
 - Top: large cover art, title, author/narrator, duration, progress bar if partially listened.
+  Tapping the cover opens it full-screen (see **Cover viewer** under Player — full).
 - Actions row: primary "Play"/"Resume" button, secondary download button.
 - **Download options (Lissen-style)**: the download button opens an `AdwBottomSheet` titled
   "Download book" (libadwaita's adaptive bottom-sheet widget, matching Lissen's own sheet) instead
@@ -404,6 +405,25 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   listing chapters, current one highlighted).
 - This screen carries the app's only arrow-key bindings (skip back/forward), plus the speed,
   chapters, and sleep-timer keys — all defined, with their scoping rationale, in § 6.
+- **Cover viewer.** Tapping the cover (here or on Item detail) opens it full-screen in the app, on
+  black, with ✕ top left and the title at the top; ✕, Escape and a swipe down (when not zoomed)
+  return to the page it was opened from, as it was.
+  - **The original, not the cached copy.** The cover cache holds the server's resize (400 px
+    wide). The viewer fetches the uploaded original (`/api/items/{id}/cover?raw=1`) and keeps it
+    in the cover cache, so opening it again is instant and works offline. It's scaled down to
+    2560 px on its long side at most.
+  - **Feedback while it loads.** A press dims and shrinks the cover slightly, and the viewer opens
+    on release without waiting. It shows, in order, the texture that was on screen, the
+    uncropped small copy, then the original with a short crossfade. A pill at the bottom says
+    "Downloading full size… N %" and then "Preparing full size…", and disappears once the
+    original is shown.
+  - **Zoom.** Pinch (around the fingers, 1×–6×), one-finger pan, double-tap toggles fit / 2.5×,
+    and Ctrl+scroll on a desktop.
+  - **Offline.** Without a cached original it shows the small copy with "Showing a smaller copy —
+    the full-size cover needs a connection".
+  - **Low memory mode.** The small copy only (about 0.6 MB as a texture, released on close). The
+    original is never fetched or decoded, zoom stops at 3×, and the pill says "Low memory mode is
+    on — showing a smaller copy".
 
 ### Downloads
 - `AdwPreferencesPage`-style grouped list: a summary row (storage used / device free space), then
@@ -429,7 +449,8 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   sleep-timer-default row.
 - **Low memory mode** (Playback group, next to "Buffer streams in bursts"): one switch for a
   phone short on RAM. It hides covers everywhere (Home, Library, Item detail, Player, mini bar,
-  Downloads show their placeholders — nothing is decoded), shrinks the cover texture cache from
+  Downloads show their placeholders — nothing is decoded; a tapped cover still opens the small
+  copy in the cover viewer), shrinks the cover texture cache from
   24 MiB to 4 MiB, and opens the database with 3 connections and a small page cache instead of 5
   and the default (the database part applies on the next launch; the rest applies at once).
   Burst buffering is **not** changed by it — it stays the user's own choice — but while both are

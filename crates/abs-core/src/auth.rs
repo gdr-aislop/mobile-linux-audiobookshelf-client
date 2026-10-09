@@ -27,6 +27,12 @@ use abs_storage::models::Account;
 /// expiry would otherwise still race the server's clock by the time a request lands.
 const FRESH_MARGIN_SECONDS: i64 = 60;
 
+/// After a failed refresh, how long callers get the stored token straight away instead of trying
+/// again. Without it every caller queued on the tokens lock retried in turn, each with a full
+/// timeout on a bad connection — on the phone four of them chained into ~40 s of waiting before
+/// a downloaded book could start.
+const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// The access token's `exp` claim, in Unix seconds. `None` when this isn't an expiring JWT at all
 /// (legacy servers' permanent tokens have no such claim — those need no refreshing), or the
 /// payload doesn't parse, which this treats the same way: "can't tell, don't touch it".
@@ -60,6 +66,9 @@ struct SessionInner {
     server_id: String,
     account_id: String,
     tokens: tokio::sync::Mutex<Tokens>,
+    /// A copy of the current access token readable without waiting for a refresh in progress —
+    /// see [`Session::stored_access_token`]. Updated whenever `tokens` is.
+    stored_token: std::sync::Mutex<String>,
     /// Last local-address probe result for this session's server — address, verdict, when.
     /// Scoped to the session (not a process-global) so a probe can never outlive the
     /// connection it was made for, and so tests sharing a process can't leak verdicts to each
@@ -77,6 +86,10 @@ struct SessionInner {
 struct Tokens {
     access_token: String,
     refresh_token: Option<String>,
+    /// When the last refresh failed, cleared by a successful one — see [`REFRESH_RETRY_AFTER`].
+    refresh_failed_at: Option<std::time::Instant>,
+    /// Whether the cool-down since `refresh_failed_at` has been logged yet: once, not per caller.
+    cool_down_logged: bool,
 }
 
 struct CachedProbe {
@@ -110,7 +123,10 @@ impl Session {
                 tokens: tokio::sync::Mutex::new(Tokens {
                     access_token: account.token.clone(),
                     refresh_token: account.refresh_token.clone(),
+                    refresh_failed_at: None,
+                    cool_down_logged: false,
                 }),
+                stored_token: std::sync::Mutex::new(account.token.clone()),
                 probe_cache: tokio::sync::Mutex::new(None),
                 client_cache: tokio::sync::Mutex::new(None),
                 offline: std::sync::atomic::AtomicBool::new(false),
@@ -186,11 +202,19 @@ impl Session {
         Ok(crate::connection::ConnectionTarget::resolve(&server, Some(reachable)))
     }
 
+    /// The access token as it stands, never refreshed and never waiting — not even for a refresh
+    /// in progress. For work that can go ahead without the server (starting a downloaded book)
+    /// and only needs a token to build URLs it may never use.
+    pub fn stored_access_token(&self) -> String {
+        self.inner.stored_token.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
     /// A current access token, refreshing first when the stored one is expired or within
     /// [`FRESH_MARGIN_SECONDS`] of it. Infallible by design: on a failed refresh the existing
     /// token comes back (the caller's request will surface the 401, if any, as its own error)
     /// and the failure is logged. Holding the tokens lock across the refresh makes concurrent
-    /// callers wait for — and then reuse — one shared refresh instead of racing several.
+    /// callers wait for — and then reuse — one shared refresh instead of racing several, and a
+    /// failed refresh isn't tried again for [`REFRESH_RETRY_AFTER`].
     pub async fn access_token(&self) -> String {
         let mut tokens = self.inner.tokens.lock().await;
         let fresh = match jwt_exp_seconds(&tokens.access_token) {
@@ -210,6 +234,23 @@ impl Session {
                 return tokens.access_token.clone();
             }
         };
+
+        // A refresh that just failed (often the server not answering at all) won't do better
+        // straight away; the callers that queued behind it shouldn't each wait for it again.
+        if let Some(failed_at) = tokens.refresh_failed_at {
+            let ago = failed_at.elapsed();
+            if ago < REFRESH_RETRY_AFTER {
+                if !tokens.cool_down_logged {
+                    tokens.cool_down_logged = true;
+                    tracing::info!(
+                        account_id = %self.inner.account_id,
+                        "skipping the token refresh: the last attempt failed {}s ago",
+                        ago.as_secs()
+                    );
+                }
+                return tokens.access_token.clone();
+            }
+        }
 
         // The refresh call must reach the server the same way everything else does — a
         // self-signed server's refresh can't be verified against the system CA store any more
@@ -247,8 +288,12 @@ impl Session {
                 tracing::info!(account_id = %self.inner.account_id, "refreshed the account's access token");
                 tokens.access_token = result.access_token;
                 tokens.refresh_token = new_refresh;
+                tokens.refresh_failed_at = None;
+                *self.inner.stored_token.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tokens.access_token.clone();
             }
             Err(err) => {
+                tokens.refresh_failed_at = Some(std::time::Instant::now());
+                tokens.cool_down_logged = false;
                 tracing::warn!(
                     %err,
                     account_id = %self.inner.account_id,
@@ -468,6 +513,64 @@ mod tests {
         assert_eq!(token, account.token, "the stored token is still what the caller uses");
         let stored = abs_storage::repo::accounts::get(&pool, &account.id).await.unwrap();
         assert_eq!(stored.token, account.token, "nothing is overwritten on a failed refresh");
+    }
+
+    /// On the phone a refresh that couldn't reach the server was retried by every caller queued
+    /// behind it, each waiting out its own timeout; the player, last in line, started ~40 s late.
+    #[tokio::test]
+    async fn a_failed_refresh_is_not_retried_by_the_next_caller() {
+        let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("refresh")).await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let session = session_for(&pool, &account).await;
+
+        assert_eq!(session.access_token().await, account.token);
+        let started = std::time::Instant::now();
+        let again: Vec<String> = futures::future::join_all((0..3).map(|_| session.access_token())).await;
+
+        assert!(again.iter().all(|t| *t == account.token), "the stored token, unrefreshed: {again:?}");
+        assert!(started.elapsed() < Duration::from_millis(500), "no waiting on a second attempt");
+        // `expect(1)` is verified when the mock server drops.
+    }
+
+    #[tokio::test]
+    async fn a_successful_refresh_after_the_cool_down_clears_it() {
+        let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("refresh")).await;
+        let session = session_for(&pool, &account).await;
+        // As if the last attempt failed longer ago than the cool-down.
+        session.inner.tokens.lock().await.refresh_failed_at =
+            Some(std::time::Instant::now() - REFRESH_RETRY_AFTER - Duration::from_secs(1));
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user": { "id": "user-1", "username": "jane", "accessToken": "new-access", "refreshToken": "new-refresh" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        assert_eq!(session.access_token().await, "new-access", "tried again once the cool-down was over");
+        assert!(session.inner.tokens.lock().await.refresh_failed_at.is_none());
+        assert_eq!(session.stored_access_token(), "new-access", "the no-wait copy follows the refresh");
+    }
+
+    #[tokio::test]
+    async fn the_stored_token_is_returned_without_waiting_for_a_refresh_in_progress() {
+        let mock_server = MockServer::start().await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("refresh")).await;
+        let session = session_for(&pool, &account).await;
+        let _refresh_in_progress = session.inner.tokens.lock().await;
+
+        assert_eq!(session.stored_access_token(), account.token);
     }
 
     #[tokio::test]

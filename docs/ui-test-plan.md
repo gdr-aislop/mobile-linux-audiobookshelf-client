@@ -498,6 +498,10 @@ was and wasn't verified.
       offline-first: with Wi-Fi off it's noticed just the same, and a download whose file merely
       can't be checked at the moment (as opposed to proven wrong) keeps its glyph and plays.
 
+- [ ] **ID-19 — The cover full-screen.** Tap the cover on a book's page.
+      *Expected:* the same viewer as FP-21; closing it returns to the book's page as it was. A
+      book without a cover isn't tappable.
+
 ---
 
 ## 7. Mini player (MP) — ✅ implemented
@@ -672,6 +676,18 @@ was and wasn't verified.
       and try again." with Retry — not "Lost the connection while playing" — and shows no
       "0:00 / -0:00" times. Retry with the server back starts the book.
 
+- [ ] **MP-30 — Resume a downloaded book after hours away, on a poor connection.** Leave the app
+      closed long enough for the login token to expire (a few hours), then open it on a weak or
+      dead connection and Resume a book whose current chapter is downloaded.
+      *Expected:* sound within ~3 s of tapping Resume (log: `starting playback`, then `the server
+      is slow or unreachable; starting from the downloaded files` within about 3 s). A token
+      refresh that fails is tried once, not by every screen in turn: the log shows at most one
+      `couldn't refresh the access token` per minute, followed by `skipping the token refresh:
+      the last attempt failed Ns ago`.
+      *Automated:* `playback_a_downloaded_book_starts_without_waiting_for_a_token_refresh`
+      (expired token, a server that never answers `/auth/refresh`); abs-core's
+      `a_failed_refresh_is_not_retried_by_the_next_caller`.
+
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
       the play button off screen.
@@ -781,6 +797,30 @@ was and wasn't verified.
       whose title wraps to two lines.
       *Expected:* everything down to and including the secondary row (speed, sleep timer,
       chapters, download) is on screen without scrolling; nothing scrolls sideways.
+
+- [ ] **FP-21 — The cover full-screen.** Tap the Player's cover.
+      *Expected:* the cover dims a little under the finger; on release the cover fills the screen
+      on black at once (it never opens empty), with ✕ top left and the title at the top. On a
+      book opened for the first time a pill at the bottom reads "Downloading full size… N %",
+      then "Preparing full size…", and the image sharpens with a short crossfade once the
+      original is ready. The log shows `fetched the full-size cover` (its pixel size) and
+      `showing the full-size cover` (how long the decode took). Pinch zooms around the fingers up
+      to 6×, one finger pans, double-tap toggles fit / 2.5×, Ctrl+scroll zooms on a desktop.
+      Zoomed in, fine print on the cover is sharp, not the blur of the 400 px copy. ✕, Escape and
+      a swipe down (when not zoomed) bring back the Player as it was; Escape doesn't also close
+      the Player. Opening it again is instant and needs no connection.
+      *Automated:* `player_screen_tapping_the_cover_opens_the_full_size_original`,
+      `player_screen_closing_the_cover_viewer_early_keeps_the_download`; screenshots from
+      `player_screen_cover_viewer_screenshots`.
+
+- [ ] **FP-22 — The cover full-screen, offline or in low memory mode.** With Wi-Fi off, open the
+      cover of a book whose cover hasn't been opened before; then turn on low memory mode and
+      open a cover.
+      *Expected:* offline: the small copy, with "Showing a smaller copy — the full-size cover
+      needs a connection". Low memory mode: the small copy with "Low memory mode is on — showing
+      a smaller copy", zoom stops at 3×, and the server isn't asked for the original.
+      *Automated:* `player_screen_the_cover_viewer_in_low_memory_mode_shows_the_small_copy`,
+      `item_detail_the_cover_opens_the_viewer_offline`.
 
 ---
 

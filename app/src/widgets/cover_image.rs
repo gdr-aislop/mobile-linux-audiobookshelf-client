@@ -142,8 +142,12 @@ struct WeakCover {
     placeholder: glib::WeakRef<gtk4::Box>,
     picture: glib::WeakRef<gtk4::Picture>,
     last_path: std::rc::Weak<RefCell<Option<PathBuf>>>,
+    on_activate: std::rc::Weak<RefCell<Option<OnActivate>>>,
     size: i32,
 }
+
+/// What a tap on a tappable cover does — see [`CoverImage::set_on_activate`].
+type OnActivate = Rc<dyn Fn(Option<gtk4::gdk::Texture>, PathBuf)>;
 
 impl WeakCover {
     fn upgrade(&self) -> Option<CoverImage> {
@@ -152,6 +156,7 @@ impl WeakCover {
             placeholder: self.placeholder.upgrade()?,
             picture: self.picture.upgrade()?,
             last_path: self.last_path.upgrade()?,
+            on_activate: self.on_activate.upgrade()?,
             size: self.size,
         })
     }
@@ -179,7 +184,7 @@ pub fn set_low_memory_mode(on: bool) {
     }
 }
 
-fn low_memory_mode() -> bool {
+pub(crate) fn low_memory_mode() -> bool {
     LOW_MEMORY.with(|flag| flag.get())
 }
 
@@ -193,6 +198,7 @@ pub struct CoverImage {
     /// decode continuation needs to *read* this without consuming it, to check it's still
     /// current before applying a possibly-stale result (see `set_path`'s staleness guard).
     last_path: Rc<RefCell<Option<PathBuf>>>,
+    on_activate: Rc<RefCell<Option<OnActivate>>>,
     /// Both the widget's fixed width/height and the cache key's size component.
     size: i32,
 }
@@ -240,7 +246,7 @@ impl CoverImage {
             .build();
         overlay.add_overlay(&picture);
 
-        let cover = Self { overlay, placeholder, picture, last_path: Rc::new(RefCell::new(None)), size };
+        let cover = Self { overlay, placeholder, picture, last_path: Rc::new(RefCell::new(None)), on_activate: Rc::new(RefCell::new(None)), size };
         LIVE_COVERS.with(|live| {
             let mut live = live.borrow_mut();
             if live.len() >= 256 {
@@ -251,6 +257,7 @@ impl CoverImage {
                 placeholder: cover.placeholder.downgrade(),
                 picture: cover.picture.downgrade(),
                 last_path: Rc::downgrade(&cover.last_path),
+                on_activate: Rc::downgrade(&cover.on_activate),
                 size,
             });
         });
@@ -259,6 +266,65 @@ impl CoverImage {
 
     pub fn widget(&self) -> &gtk4::Widget {
         self.overlay.upcast_ref()
+    }
+
+    /// Makes the cover tappable: a press dims and shrinks it a little at once (the finger gets an
+    /// answer before anything loads — see `widgets::cover_viewer`), and a release on it calls
+    /// `on_activate(texture shown now, cached cover path)`. A drag that turns into scrolling
+    /// cancels the press. Inert while there is no cover path (a cover-less placeholder).
+    pub fn set_on_activate(&self, on_activate: impl Fn(Option<gtk4::gdk::Texture>, PathBuf) + 'static) {
+        *self.on_activate.borrow_mut() = Some(Rc::new(on_activate));
+        ensure_cover_css();
+        self.overlay.add_css_class("cover-tappable");
+        self.overlay.set_cursor_from_name(Some("pointer"));
+        self.overlay.set_tooltip_text(Some("View cover"));
+        let click = gtk4::GestureClick::new();
+        click.connect_pressed({
+            let cover = self.clone();
+            move |_, _, _, _| {
+                if cover.last_path.borrow().is_some() {
+                    cover.overlay.add_css_class("cover-pressed");
+                }
+            }
+        });
+        click.connect_stopped({
+            let overlay = self.overlay.clone();
+            move |_| overlay.remove_css_class("cover-pressed")
+        });
+        click.connect_released({
+            let cover = self.clone();
+            move |gesture, _, x, y| {
+                cover.overlay.remove_css_class("cover-pressed");
+                if !cover.overlay.contains(x, y) {
+                    return;
+                }
+                if cover.last_path.borrow().is_none() {
+                    return;
+                }
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                cover.activate();
+            }
+        });
+        self.overlay.add_controller(click);
+    }
+
+    /// Calls the tap callback with what's on screen — the release half of a tap.
+    fn activate(&self) {
+        let Some(path) = self.last_path.borrow().clone() else { return };
+        let Some(on_activate) = self.on_activate.borrow().clone() else { return };
+        let shown = self
+            .picture
+            .is_visible()
+            .then(|| self.picture.paintable())
+            .flatten()
+            .and_then(|paintable| paintable.downcast::<gtk4::gdk::Texture>().ok());
+        on_activate(shown, path);
+    }
+
+    /// A tap, for scenarios (no real pointer under Xvfb).
+    #[cfg(test)]
+    pub(crate) fn tap(&self) {
+        self.activate();
     }
 
     /// The pixel resolution to actually decode at: `size` (logical) scaled by this widget's
@@ -363,6 +429,23 @@ impl CoverImage {
         self.picture.set_visible(false);
         self.placeholder.set_visible(true);
     }
+}
+
+/// The pressed look of a tappable cover (see [`CoverImage::set_on_activate`]).
+fn ensure_cover_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(
+            "overlay.cover-pressed { opacity: 0.7; transform: scale(0.97); } \
+             overlay.cover-tappable { transition: opacity 120ms ease-out, transform 120ms ease-out; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("a display for the app's css"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 /// Decodes an image file (format sniffed from the content, so the cached file's extension can't

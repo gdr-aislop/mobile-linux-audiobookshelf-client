@@ -202,6 +202,75 @@ async fn fetch_and_cache_cover_with(
     (Some(path), CoverOutcome::Fetched)
 }
 
+/// An original can be several MB; on a slow connection that takes longer than a thumbnail.
+const ORIGINAL_COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The item's full-size original cover, if one was fetched before (see [`fetch_original_cover`]).
+/// Disk only, no network — what makes a second full-screen open instant, and possible offline.
+pub async fn cached_original_cover(paths: &AppPaths, server_id: &str, item_id: &str) -> Option<PathBuf> {
+    let prefix = format!("{item_id}.original.");
+    let mut entries = tokio::fs::read_dir(paths.covers_dir().join(server_id)).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && !name.ends_with(".part") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// The cover as uploaded to the server — the full-size original, for showing it full-screen —
+/// from the disk cache if it was fetched before, else from the server (`?raw=1`), then kept in
+/// the covers cache. `on_progress(received, total)` follows the download. `None` on any failure
+/// (offline, no cover, not an image, disk error), logged: the caller keeps showing the smaller
+/// copy it already has.
+pub async fn fetch_original_cover(
+    paths: &AppPaths,
+    connection: &crate::connection::ConnectionTarget,
+    access_token: &str,
+    server_id: &str,
+    item_id: &str,
+    on_progress: impl Fn(u64, Option<u64>) + Send + Sync,
+) -> Option<PathBuf> {
+    if let Some(cached) = cached_original_cover(paths, server_id, item_id).await {
+        return Some(cached);
+    }
+    let api = connection.api_client_with_timeout(access_token, ORIGINAL_COVER_FETCH_TIMEOUT).ok()?;
+    let started = std::time::Instant::now();
+    let cover = match api.get_item_cover_original(item_id, on_progress).await {
+        Ok(cover) => cover,
+        Err(err) => {
+            tracing::warn!(details = err.details(), item_id, "couldn't fetch the full-size cover");
+            return None;
+        }
+    };
+    // Only the header is read: decoding a whole original just to validate it would cost tens
+    // of MB, and the viewer decodes it anyway.
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&cover.bytes)).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+    let Some((width, height)) = dimensions else {
+        tracing::warn!(item_id, content_type = %cover.content_type, "the server's full-size cover isn't an image; ignoring it");
+        return None;
+    };
+    let extension = crate::media_type::extension_for(&cover.content_type, "jpg");
+    let path = paths.original_cover_path(server_id, item_id, extension);
+    // Written aside and renamed into place, so an interrupted write is never taken for a cover.
+    let part = path.with_extension(format!("{extension}.part"));
+    let written = async {
+        tokio::fs::create_dir_all(paths.covers_dir().join(server_id)).await?;
+        tokio::fs::write(&part, &cover.bytes).await?;
+        tokio::fs::rename(&part, &path).await
+    }
+    .await;
+    if let Err(err) = written {
+        tracing::warn!(%err, item_id, "couldn't keep the full-size cover");
+        let _ = tokio::fs::remove_file(&part).await;
+        return None;
+    }
+    tracing::info!(item_id, width, height, bytes = cover.bytes.len(), elapsed_ms = started.elapsed().as_millis() as u64, "fetched the full-size cover");
+    Some(path)
+}
+
 /// The item's locally cached cover path, if one is recorded **and** the file it points to still
 /// actually exists on disk — the cache directory is evictable (`$XDG_CACHE_HOME`), so the
 /// recorded path can go stale without this client's own doing. This is the one canonical read
@@ -220,7 +289,7 @@ mod tests {
     use super::*;
     use crate::connection::ConnectionTarget;
     use abs_storage::repo::{accounts, items, libraries, servers};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn pool_with_synced_items(item_ids: &[&str]) -> (SqlitePool, String) {
@@ -279,6 +348,45 @@ mod tests {
         0xb0, 0x00, 0xfe, 0xf0, 0xc4, 0x0b, 0xff, 0x20, 0xb9, 0x61, 0x75, 0xc8, 0xd7, 0xff, 0x20, 0x3f, 0xe4, 0x07, 0xfc, 0x80, 0xff,
         0xf8, 0xf2, 0x00, 0x00, 0x00,
     ];
+
+    #[tokio::test]
+    async fn the_original_cover_is_fetched_once_then_read_from_the_cache() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .and(query_param("raw", "1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(PNG_1X1))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (_tmp, paths) = test_paths();
+        let connection = ConnectionTarget::direct(&mock_server.uri());
+
+        let first = fetch_original_cover(&paths, &connection, "token", "server-a", "item-1", |_, _| {}).await.unwrap();
+        assert_eq!(first, paths.original_cover_path("server-a", "item-1", "png"));
+        assert_eq!(std::fs::read(&first).unwrap(), PNG_1X1);
+        assert_eq!(cached_original_cover(&paths, "server-a", "item-1").await, Some(first.clone()));
+        let again = fetch_original_cover(&paths, &connection, "token", "server-a", "item-1", |_, _| {}).await;
+        assert_eq!(again, Some(first), "served from the cache; `expect(1)` checks no second request");
+    }
+
+    #[tokio::test]
+    async fn an_original_cover_that_is_missing_or_not_an_image_is_not_kept() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/items/item-1/cover"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png").set_body_bytes(b"<html>proxy login</html>".to_vec()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET")).and(path("/api/items/item-2/cover")).respond_with(ResponseTemplate::new(404)).mount(&mock_server).await;
+        let (_tmp, paths) = test_paths();
+        let connection = ConnectionTarget::direct(&mock_server.uri());
+
+        assert_eq!(fetch_original_cover(&paths, &connection, "token", "server-a", "item-1", |_, _| {}).await, None);
+        assert_eq!(fetch_original_cover(&paths, &connection, "token", "server-a", "item-2", |_, _| {}).await, None);
+        assert_eq!(cached_original_cover(&paths, "server-a", "item-1").await, None);
+        assert_eq!(cached_original_cover(&paths, "server-a", "item-2").await, None);
+    }
 
     #[tokio::test]
     async fn fetch_and_cache_cover_writes_the_file_with_the_right_extension() {

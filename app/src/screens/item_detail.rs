@@ -27,7 +27,7 @@
 //! final chapter ranges) both arrive a beat later — falling back to whatever chapters/tracks are
 //! already cached locally if the server can't be reached, so the page still works offline.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::glib;
@@ -67,6 +67,7 @@ pub struct TestHooks {
     pub reset_progress_button: gtk4::Button,
     pub mini_bar: crate::player::MiniPlayerHooks,
     pub download_progress_revealer: gtk4::Revealer,
+    pub cover: crate::widgets::cover_image::CoverImage,
 }
 
 #[cfg(test)]
@@ -127,6 +128,30 @@ pub fn build(
     let cover = CoverImage::new(220);
     cover.widget().set_halign(gtk4::Align::Center);
     cover.widget().set_margin_top(14);
+    // The title shown in the viewer, set once the item row is read below.
+    let cover_title = Rc::new(RefCell::new(String::new()));
+    cover.set_on_activate({
+        let anchor = cover.widget().clone();
+        let session = session.clone();
+        let paths = controller.paths();
+        let server_id = server.id.clone();
+        let item_id = item_id.clone();
+        let cover_title = cover_title.clone();
+        move |shown, thumbnail| {
+            crate::widgets::cover_viewer::open(
+                &anchor,
+                crate::widgets::cover_viewer::CoverSource {
+                    session: session.clone(),
+                    paths: paths.clone(),
+                    server_id: server_id.clone(),
+                    item_id: item_id.clone(),
+                    title: cover_title.borrow().clone(),
+                    thumbnail,
+                    shown,
+                },
+            );
+        }
+    });
 
     // `max_width_chars(1)` caps each label's natural width regardless of `wrap` — this content
     // sits in a `ScrolledWindow` with `hscrollbar_policy(Never)` (see below), so an unclamped,
@@ -428,6 +453,7 @@ pub fn build(
         let chapters_cell = chapters_cell.clone();
         let progress_seconds_cell = progress_seconds_cell.clone();
         let download_menu = download_menu.clone();
+        let cover = cover.clone();
         async move {
             let server_id = server.id.clone();
             let account_id = account.id.clone();
@@ -462,6 +488,7 @@ pub fn build(
                 }
                 duration_label.set_label(&format_duration(item.duration_seconds));
                 cover.set_path(item.cover_cache_path.as_deref().map(std::path::Path::new));
+                *cover_title.borrow_mut() = item.title.clone();
                 if let Some(description) = item.description.as_deref().filter(|d| !d.is_empty()) {
                     // Descriptions are (sanitized) HTML server-side — Audiobookshelf's allowlist is
                     // `p, ol, ul, li, a, strong, em, del, br, b, i` — so render via Pango markup
@@ -628,6 +655,7 @@ pub fn build(
         root: toast_overlay.clone().upcast(),
         #[cfg(test)]
         hooks: TestHooks {
+            cover: cover.clone(),
             back_button,
             title_label,
             author_label,
@@ -1073,6 +1101,64 @@ pub(crate) mod tests {
         assert!(hooks.play_button.opacity() == 1.0 && hooks.play_button.is_sensitive(), "and is shown, reading Resume, once it is");
         assert!(hooks.progress_bar.is_visible());
         assert!((hooks.progress_bar.fraction() - 0.5).abs() < 0.01, "1800s of 3600s should be a 50% progress bar");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The detail page's cover opens the
+    /// viewer too. Offline, with no original fetched yet, it shows the small copy and says so;
+    /// once an original is in the cache it's shown offline as well. A book without a cover
+    /// isn't tappable.
+    pub(crate) fn run_the_cover_opens_the_viewer_offline(runtime: &tokio::runtime::Runtime) {
+        use crate::widgets::cover_viewer::{self, tests::*, Pill};
+        let mock_server = runtime.block_on(MockServer::start());
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-1", 3600.0, &[]));
+        runtime.block_on(mock_item_with_chapters(&mock_server, "item-2", 3600.0, &[]));
+        runtime.block_on(mount_original(&mock_server, "item-1", Duration::ZERO, 0));
+
+        let pool = runtime.block_on(crate::test_support::pool());
+        let (server, account) = runtime.block_on(account_and_server(&pool, &mock_server.uri()));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-1", "Project Hail Mary", Some("Andy Weir"), None, None, 3600.0));
+        runtime.block_on(insert_synced_item(&pool, &server.id, "item-2", "No Cover Here", None, None, None, 3600.0));
+        let controller = test_controller(pool.clone());
+        let paths = controller.paths();
+        runtime.block_on(seed_thumbnail(&pool, &paths, &server.id, "item-1"));
+
+        let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+        session.set_offline(true);
+        let screen = build(pool.clone(), server.clone(), account.clone(), session.clone(), test_download_manager(pool.clone()), controller.clone(), "item-1".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        let hooks = screen.test_hooks();
+        let window = adw::ApplicationWindow::builder().default_width(360).default_height(648).build();
+        window.set_content(Some(&screen.root));
+        window.present();
+        pump_until(|| window.is_mapped() && hooks.cover.picture().is_visible(), Duration::from_secs(5));
+
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        wait_for_texture(&viewer, THUMBNAIL_SIZE, Duration::from_secs(5));
+        pump_until(|| matches!(viewer.pill(), Pill::Note(_)), Duration::from_secs(2));
+        assert_eq!(viewer.pill(), Pill::Note(cover_viewer::SMALLER_COPY_NOTE.to_string()));
+        close_button(&viewer).emit_clicked();
+        pump_until(|| false, Duration::from_millis(200));
+        assert_eq!(content_of(window.upcast_ref()).as_ref(), Some(&screen.root), "the detail page is back");
+
+        // An original fetched on an earlier open is shown offline.
+        let original = paths.original_cover_path(&server.id, "item-1", "png");
+        std::fs::write(&original, png(&cover_art(ORIGINAL_SIZE.0, ORIGINAL_SIZE.1))).unwrap();
+        hooks.cover.tap();
+        let viewer = wait_until_shown(Duration::from_secs(2));
+        wait_for_texture(&viewer, ORIGINAL_SIZE, Duration::from_secs(20));
+        pump_until(|| viewer.pill() == Pill::Hidden, Duration::from_secs(2));
+        assert_eq!(viewer.pill(), Pill::Hidden);
+        viewer.close();
+        pump_until(|| false, Duration::from_millis(200));
+
+        // No cover: nothing to open.
+        let coverless = build(pool.clone(), server, account, session, test_download_manager(pool.clone()), controller, "item-2".to_string(), |_, _| {}, || {}, || {}, |_| {}, || {});
+        window.set_content(Some(&coverless.root));
+        pump_until(|| coverless.test_hooks().title_label.label() == "No Cover Here", Duration::from_secs(5));
+        coverless.test_hooks().cover.tap();
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(cover_viewer::current().is_none(), "a book without a cover opens no viewer");
+        assert_eq!(content_of(window.upcast_ref()).as_ref(), Some(&coverless.root));
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The actions row's two buttons must
