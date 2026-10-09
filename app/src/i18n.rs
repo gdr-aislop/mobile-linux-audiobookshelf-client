@@ -161,11 +161,27 @@ pub(crate) mod audit {
 
     use gtk4::prelude::*;
 
+    static PSEUDO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static TRANSLATED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     static ON_SCREEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
     pub(super) fn record(text: &str) {
         TRANSLATED.lock().unwrap().get_or_insert_with(HashSet::new).insert(text.to_string());
+        // Pseudo-locale mode: every helper result must come out bracketed `[!! … !!]`; one that
+        // doesn't was not found in the catalog, i.e. the extracted msgid differs from the literal
+        // the program looks up (or the .pot is stale).
+        if PSEUDO.load(std::sync::atomic::Ordering::Relaxed) && !text.contains("[!!") {
+            append_line(&format!("MISS\t{}", text.replace('\n', "\\n")));
+        }
+    }
+
+    fn append_line(line: &str) {
+        use std::io::Write;
+        if let Some(path) = std::env::var_os("ABS_TEST_I18N_AUDIT") {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{line}");
+            }
+        }
     }
 
     fn collect(widget: &gtk4::Widget, into: &mut HashSet<String>) {
@@ -210,9 +226,15 @@ pub(crate) mod audit {
         ON_SCREEN.lock().unwrap().get_or_insert_with(HashSet::new).extend(found);
     }
 
-    /// Starts sampling the open windows every 20 ms when `ABS_TEST_I18N_AUDIT` is set.
+    /// Starts sampling the open windows every 20 ms when `ABS_TEST_I18N_AUDIT` is set. With
+    /// `ABS_TEST_I18N_PSEUDO` also set, the scenario runs under the catalog in `ABS_LOCALEDIR`
+    /// (see `scripts/pseudo-locale.py`) and `MISS` lines report helper results absent from it.
     pub(crate) fn start() {
         if std::env::var_os("ABS_TEST_I18N_AUDIT").is_some() {
+            if std::env::var_os("ABS_TEST_I18N_PSEUDO").is_some() {
+                super::init();
+                PSEUDO.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(20), || {
                 sample();
                 gtk4::glib::ControlFlow::Continue
