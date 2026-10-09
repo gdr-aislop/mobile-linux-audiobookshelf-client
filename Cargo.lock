@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abs-api"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "chrono",
  "openapiv3",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "abs-app"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "abs-api",
  "abs-core",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "abs-core"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "abs-api",
  "abs-storage",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "abs-player"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "futures",
  "gio",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "abs-storage"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "chrono",
  "directories",
