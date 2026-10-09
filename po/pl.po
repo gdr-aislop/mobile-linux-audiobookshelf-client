@@ -93,7 +93,7 @@ msgstr "Otwórz rozdziały"
 
 #: app/src/application.rs
 msgid "Open sleep timer"
-msgstr "Otwórz wyłącznik czasowy"
+msgstr "Otwórz timer"
 
 #: app/src/application.rs
 msgid "Collapse player"
@@ -527,11 +527,11 @@ msgstr "Oznaczanie jako ukończone"
 
 #: app/src/screens/item_detail.rs app/src/screens/player.rs
 msgid "Progress reset"
-msgstr "Postęp zresetowany"
+msgstr "Usunięto postęp słuchania"
 
 #: app/src/screens/item_detail.rs
 msgid "Resetting progress"
-msgstr "Resetowanie postępu"
+msgstr "Usuwanie postępu słuchania"
 
 #. TRANSLATORS: {author} is the book's author, {narrator} the person who reads the audiobook aloud.
 #: app/src/screens/item_detail.rs
@@ -989,7 +989,7 @@ msgstr "Wznów po ponownym podłączeniu słuchawek"
 #: app/src/screens/settings.rs
 msgid ""
 "Only undoes a pause caused by disconnecting — never a manual pause or a call"
-msgstr "Cofa tylko pauzę spowodowaną odłączeniem — niespowodowanej przyciskiem Pauza ani rozmową"
+msgstr "Cofa tylko pauzę spowodowaną odłączeniem — niespowodowaną przyciskiem Pauza ani rozmową"
 
 #: app/src/screens/settings.rs
 msgid "Default speed"
@@ -1144,7 +1144,7 @@ msgstr "Nie można wykryć typu połączenia na tym urządzeniu, więc pobierani
 msgid ""
 "Downloads ahead at full speed so the radio can idle. Turn off on a slow or "
 "capped connection."
-msgstr "Pobiera większe porcje danych z maksymalną prędkością aby oszczędzać energię. Wyłącz przy wolnym lub limitowanym łączu."
+msgstr "Pobiera większe porcje danych z maksymalną prędkością, aby oszczędzać energię. Wyłącz przy wolnym lub limitowanym łączu."
 
 #: app/src/screens/settings.rs
 msgid "Uses up to 64 MB of buffer; consider turning it off in low memory mode."
@@ -1296,7 +1296,7 @@ msgstr "Przygotowywanie pełnej rozdzielczości…"
 #. TRANSLATORS: {percent} is a whole number from 0 to 100; the "%" sign is part of this text.
 #: app/src/widgets/cover_viewer.rs
 msgid "Downloading full size… {percent} %"
-msgstr "Pobieranie pełnej rozdzielczości… {percent} %"
+msgstr "Pobieranie pełnej rozdzielczości… {percent}%"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Downloading full size…"
