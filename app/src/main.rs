@@ -2,6 +2,7 @@ mod application;
 mod crash_reporting;
 mod downloads;
 mod error_reporting;
+mod i18n;
 mod icons;
 mod log_privacy;
 mod low_memory_mode;
@@ -114,6 +115,12 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
     };
     widgets::cover_image::set_low_memory_mode(low_memory_mode);
 
+    // The language comes from the database, so it is applied here rather than at the top of
+    // `main`: after the database is open, but before GTK starts (GTK reads the same locale) and
+    // before any UI string is built. Never fails — the worst case is an English UI.
+    let language = abs_core::settings::load_language(&pool).await.unwrap_or_else(|_| i18n::SYSTEM.to_string());
+    i18n::init(&language);
+
     // Log anonymization is on from process start (see `log_privacy`); this applies the stored
     // choice and teaches the scrubber the addresses/usernames already in the database.
     let anonymize_logs = abs_core::settings::load_anonymize_logs(&pool).await.unwrap_or(true);
@@ -172,7 +179,9 @@ mod tests {
         abs_player::init().expect("gstreamer::init for the scenario process");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
+        crate::i18n::audit::start();
         scenario(&runtime);
+        crate::i18n::audit::finish(&std::thread::current().name().unwrap_or("scenario").to_string());
     }
 
     /// One entry per scenario: `(name, closure)`. The closure receives the shared `&Runtime`
@@ -301,6 +310,7 @@ mod tests {
         (settings_persistence, crate::screens::settings::tests::run),
         (settings_playback_defaults_theme_and_about, crate::screens::settings::tests::run_playback_defaults_theme_and_about),
         (settings_open_latest_log_row_reports_a_missing_log, crate::screens::settings::tests::run_open_latest_log_row_reports_a_missing_log),
+        (settings_language_row_offers_system_and_english_and_persists, crate::screens::settings::tests::run_language_row_offers_system_and_english_and_persists),
         (settings_anonymize_logs_switch_drives_the_scrubber_and_persists, crate::screens::settings::tests::run_anonymize_logs_switch_drives_the_scrubber_and_persists),
         (settings_low_memory_mode_switch_persists_and_hints_at_burst_buffering, crate::screens::settings::tests::run_low_memory_mode_switch_persists_and_hints_at_burst_buffering),
         (settings_account_and_servers_rows_reflect_the_database, crate::screens::settings::tests::run_account_and_servers_rows_reflect_the_database),

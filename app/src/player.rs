@@ -26,6 +26,7 @@ use sqlx::SqlitePool;
 use abs_core::streaming::locate_track;
 use abs_storage::AppPaths;
 
+use crate::i18n::tr;
 use crate::widgets::cover_image::CoverImage;
 
 /// The URL/URI to actually load for a track: a local `file://` path when it's been verifiably
@@ -3659,7 +3660,7 @@ fn build_mini_bar_widgets() -> MiniBarWidgets {
     // Full Player screen's full banner text, so this is deliberately just a glyph: enough for a
     // glance to know something needs attention, with "tap to open the full player" (already the
     // mini bar's own established gesture) as the way to actually see why.
-    let error_icon = gtk4::Image::builder().icon_name("dialog-warning-symbolic").tooltip_text("Playback error — tap for details").visible(false).build();
+    let error_icon = gtk4::Image::builder().icon_name("dialog-warning-symbolic").tooltip_text(tr("Playback error — tap for details")).visible(false).build();
 
     let content_row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)

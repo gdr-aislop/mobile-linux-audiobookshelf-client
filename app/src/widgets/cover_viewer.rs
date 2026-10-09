@@ -18,6 +18,8 @@ use std::rc::Rc;
 use adw::glib;
 use adw::prelude::*;
 
+use crate::i18n::{tr, tr_args, tr_noop};
+
 /// The original is scaled down to this on its long side: a square cover is then at most ~26 MB
 /// as a texture. Most covers are smaller anyway.
 const ORIGINAL_MAX_SIDE: u32 = 2560;
@@ -29,8 +31,8 @@ const LOW_MEMORY_MAX_ZOOM: f64 = 3.0;
 const DOUBLE_TAP_ZOOM: f64 = 2.5;
 const CROSSFADE_MS: u32 = 200;
 
-pub(crate) const LOW_MEMORY_NOTE: &str = "Low memory mode is on — showing a smaller copy";
-pub(crate) const SMALLER_COPY_NOTE: &str = "Showing a smaller copy — the full-size cover needs a connection";
+pub(crate) const LOW_MEMORY_NOTE: &str = tr_noop("Low memory mode is on — showing a smaller copy");
+pub(crate) const SMALLER_COPY_NOTE: &str = tr_noop("Showing a smaller copy — the full-size cover needs a connection");
 
 /// What a viewer shows, and what it needs to fetch the original.
 pub(crate) struct CoverSource {
@@ -140,7 +142,7 @@ impl CoverViewer {
 
         let close_button = gtk4::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Close")
+            .tooltip_text(tr("Close"))
             .css_classes(["circular", "osd"])
             .halign(gtk4::Align::Start)
             .valign(gtk4::Align::Start)
@@ -347,7 +349,7 @@ impl CoverViewer {
         });
 
         if low_memory {
-            self.set_pill(Pill::Note(LOW_MEMORY_NOTE.to_string()));
+            self.set_pill(Pill::Note(tr(LOW_MEMORY_NOTE)));
             return;
         }
 
@@ -358,10 +360,10 @@ impl CoverViewer {
                 return;
             }
             let Some(path) = original else {
-                viewer.set_pill(Pill::Note(SMALLER_COPY_NOTE.to_string()));
+                viewer.set_pill(Pill::Note(tr(SMALLER_COPY_NOTE)));
                 return;
             };
-            viewer.set_pill(Pill::Busy("Preparing full size…".to_string()));
+            viewer.set_pill(Pill::Busy(tr("Preparing full size…")));
             let started = std::time::Instant::now();
             let decoded = decode_off_thread(path, ORIGINAL_MAX_SIDE).await;
             if viewer.inner.closed.get() {
@@ -380,7 +382,7 @@ impl CoverViewer {
                     viewer.show(&texture, true);
                     viewer.set_pill(Pill::Hidden);
                 }
-                None => viewer.set_pill(Pill::Note(SMALLER_COPY_NOTE.to_string())),
+                None => viewer.set_pill(Pill::Note(tr(SMALLER_COPY_NOTE))),
             }
         });
     }
@@ -678,8 +680,9 @@ fn anchored_scroll(fit: f64, viewport: f64, old_zoom: f64, new_zoom: f64, focus:
 /// The pill's text while the original downloads.
 fn downloading_text(received: u64, total: Option<u64>) -> String {
     match total {
-        Some(total) if total > 0 => format!("Downloading full size… {} %", (received.min(total) * 100) / total),
-        _ => "Downloading full size…".to_string(),
+        // TRANSLATORS: {percent} is a whole number from 0 to 100; the "%" sign is part of this text.
+        Some(total) if total > 0 => tr_args("Downloading full size… {percent} %", &[("percent", &((received.min(total) * 100) / total).to_string())]),
+        _ => tr("Downloading full size…"),
     }
 }
 

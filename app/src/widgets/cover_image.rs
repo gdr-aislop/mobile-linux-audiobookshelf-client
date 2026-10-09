@@ -28,6 +28,8 @@ use std::rc::Rc;
 use adw::glib;
 use adw::prelude::*;
 
+use crate::i18n::tr;
+
 /// Every cached texture is downscaled to exactly the requesting `CoverImage`'s `size`×`size` —
 /// the source cover files are cached to disk at whatever resolution the server sent (no
 /// resizing anywhere in `abs_core::covers`), and decoding them at native resolution into this
@@ -277,7 +279,7 @@ impl CoverImage {
         ensure_cover_css();
         self.overlay.add_css_class("cover-tappable");
         self.overlay.set_cursor_from_name(Some("pointer"));
-        self.overlay.set_tooltip_text(Some("View cover"));
+        self.overlay.set_tooltip_text(Some(&tr("View cover")));
         let click = gtk4::GestureClick::new();
         click.connect_pressed({
             let cover = self.clone();

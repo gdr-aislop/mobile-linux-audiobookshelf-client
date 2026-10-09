@@ -132,6 +132,13 @@ Output lands in `build/appimage/abs-app-<version>-<arch>.AppImage`.
 (`ABS_APP_BIN`, `LINUXDEPLOY`, `APPIMAGE_TOOLS_DIR`); the docker wrapper
 mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfile`.
 
+## Translations
+
+The interface is translatable with gettext and available in English and Polish. It follows the
+system language by default; Settings → Appearance → Language overrides that. Improving a
+translation or adding a language is a `po/<lang>.po` file (Polish: [`po/pl.po`](po/pl.po)); see
+[docs/i18n.md](docs/i18n.md) for how to extract, translate and test strings.
+
 ## Reporting problems
 
 When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislop.abs-app/`:

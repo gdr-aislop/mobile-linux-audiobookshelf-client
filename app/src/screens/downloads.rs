@@ -25,6 +25,7 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
+use crate::i18n::{ntr, tr, tr_args};
 use crate::screens::settings::confirm;
 use abs_storage::models::DownloadStatus;
 
@@ -120,16 +121,16 @@ pub fn build(
     on_open: Rc<dyn Fn(crate::player::PlayRequest)>,
 ) -> DownloadsScreen {
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Downloads", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("Downloads"), "")));
 
     // Starts insensitive — nothing to clear until the first refresh below finds at least one
     // row; `spawn_refresh` toggles this the same place it already toggles
     // `status_page`/`scroller` from `any_row`. A single icon button rather than a menu: unlike
     // Player/Item Detail's `⋯` menus, there's only ever one action here.
-    let clear_all_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Clear all downloads").css_classes(["flat"]).sensitive(false).build();
+    let clear_all_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text(tr("Clear all downloads")).css_classes(["flat"]).sensitive(false).build();
     header.pack_end(&clear_all_button);
 
-    let status_page = adw::StatusPage::builder().icon_name("folder-download-symbolic").title("No downloads yet").vexpand(true).visible(false).build();
+    let status_page = adw::StatusPage::builder().icon_name("folder-download-symbolic").title(tr("No downloads yet")).vexpand(true).visible(false).build();
 
     let list_box = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).margin_start(12).margin_end(12).margin_top(12).build();
     let scroller = gtk4::ScrolledWindow::builder().child(&list_box).vexpand(true).build();
@@ -172,14 +173,14 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             confirm(
                 &window,
-                "Clear all downloads?",
-                "Every downloaded chapter for every book on this device will be removed — nothing on the server is affected.",
-                "Clear Downloads",
+                &tr("Clear all downloads?"),
+                &tr("Every downloaded chapter for every book on this device will be removed — nothing on the server is affected."),
+                &tr("Clear Downloads"),
                 Rc::new(move || {
                     let toast_overlay = toast_overlay.clone();
                     download_manager.clear_all(&server_id, move |result| {
                         if let Err(err) = result {
-                            crate::error_reporting::report_background_error(&toast_overlay, "Clearing downloads", err);
+                            crate::error_reporting::report_background_error(&toast_overlay, &tr("Clearing downloads"), err);
                         }
                     })
                 }),
@@ -310,7 +311,7 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
                 // Takes priority over the "N chapters, size" summary below: a failed batch may
                 // still have left some chapters `Complete` (see `finish_track`'s ordering), but
                 // *why the row is even still here* is the more useful thing to lead with.
-                Some(format!("Download failed — {reason}"))
+                Some(tr_args("Download failed — {reason}", &[("reason", reason)]))
             } else if is_downloading {
                 let batch = widgets.download_manager.batch_progress(&widgets.server_id, &item_id);
                 let bytes: u64 = tracks.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
@@ -325,7 +326,12 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
             } else {
                 let complete: Vec<_> = tracks.iter().filter(|track| track.status == DownloadStatus::Complete).collect();
                 let size: u64 = complete.iter().map(|track| track.bytes_downloaded.max(0) as u64).sum();
-                if complete.is_empty() { None } else { Some(format!("{}, {}", chapters_label(complete.len()), format_bytes(size))) }
+                if complete.is_empty() {
+                    None
+                } else {
+                    // TRANSLATORS: {chapters} is a chapter count such as "10 chapters", {size} the total size on disk such as "64.1 MB".
+                    Some(tr_args("{chapters}, {size}", &[("chapters", &chapters_label(complete.len())), ("size", &format_bytes(size))]))
+                }
             };
 
             let row = download_row(&item, is_downloading, &widgets.download_manager, &widgets.server_id, subtitle, &widgets.on_open, &widgets.toast_overlay);
@@ -341,10 +347,10 @@ fn spawn_refresh(widgets: Rc<Widgets>) {
         widgets.speeds.borrow_mut().retain(|id, _| all_ids.contains(id));
 
         if read_failed {
-            widgets.status_page.set_title("Couldn't read downloads");
-            widgets.status_page.set_description(Some("The app's local data couldn't be read. Restarting the app may help."));
+            widgets.status_page.set_title(&tr("Couldn't read downloads"));
+            widgets.status_page.set_description(Some(&tr("The app's local data couldn't be read. Restarting the app may help.")));
         } else {
-            widgets.status_page.set_title("No downloads yet");
+            widgets.status_page.set_title(&tr("No downloads yet"));
             widgets.status_page.set_description(None);
         }
         widgets.status_page.set_visible(!any_row);
@@ -388,7 +394,7 @@ fn download_row(
         let spinner = gtk4::Spinner::builder().spinning(true).valign(gtk4::Align::Center).build();
         // Stop, not cancel-delete: chapters that already completed stay downloaded (the row's own
         // subtitle switches to their "N chapters, size" summary once the batch winds down).
-        let stop_button = gtk4::Button::builder().icon_name("process-stop-symbolic").tooltip_text("Stop").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+        let stop_button = gtk4::Button::builder().icon_name("process-stop-symbolic").tooltip_text(tr("Stop")).css_classes(["flat"]).valign(gtk4::Align::Center).build();
         stop_button.connect_clicked({
             let download_manager = download_manager.clone();
             let server_id = server_id.to_string();
@@ -400,7 +406,7 @@ fn download_row(
         box_.append(&stop_button);
         row.add_suffix(&box_);
     } else {
-        let remove_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Remove").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+        let remove_button = gtk4::Button::builder().icon_name("user-trash-symbolic").tooltip_text(tr("Remove")).css_classes(["flat"]).valign(gtk4::Align::Center).build();
         remove_button.connect_clicked({
             let download_manager = download_manager.clone();
             let server_id = server_id.to_string();
@@ -410,7 +416,7 @@ fn download_row(
                 let toast_overlay = toast_overlay.clone();
                 download_manager.clear_item(&server_id, &item_id, move |result| {
                     if let Err(err) = result {
-                        crate::error_reporting::report_background_error(&toast_overlay, "Removing the download", err);
+                        crate::error_reporting::report_background_error(&toast_overlay, &tr("Removing the download"), err);
                     }
                 })
             }
@@ -423,7 +429,7 @@ fn download_row(
 
 /// "1 chapter" / "10 chapters" — the completed-download subtitle's first half.
 fn chapters_label(count: usize) -> String {
-    if count == 1 { "1 chapter".to_string() } else { format!("{count} chapters") }
+    ntr("{count} chapter", "{count} chapters", count as u32)
 }
 
 /// "5 B", "18.2 MB", "1.3 GB" — decimal units, matching how servers report Content-Length.
@@ -447,11 +453,13 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 pub(crate) fn downloading_subtitle(batch: Option<(usize, usize)>, bytes: u64, speed: Option<f64>) -> String {
     let mut parts = Vec::new();
     if let Some((finished, total)) = batch {
-        parts.push(format!("{finished}/{total} chapters"));
+        // TRANSLATORS: {finished} is how many chapters of this download are done, {total} how many it has in all, e.g. "3/10 chapters".
+        parts.push(tr_args("{finished}/{total} chapters", &[("finished", &finished.to_string()), ("total", &total.to_string())]));
     }
     parts.push(format_bytes(bytes));
     if let Some(speed) = speed.filter(|rate| *rate > 0.0) {
-        parts.push(format!("{}/s", format_bytes(speed as u64)));
+        // TRANSLATORS: {speed} is a data size such as "2.1 MB"; the whole phrase is a download speed, "2.1 MB/s".
+        parts.push(tr_args("{speed}/s", &[("speed", &format_bytes(speed as u64))]));
     }
     parts.join(" · ")
 }

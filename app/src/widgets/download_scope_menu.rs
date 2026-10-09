@@ -28,6 +28,7 @@ use abs_core::downloads::DownloadScope;
 use abs_core::tracks::TrackRef;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
+use crate::i18n::{tr, tr_args, tr_noop};
 
 /// The button + its popover. Callers embed `.widget` (a `GtkMenuButton`) wherever their layout
 /// wants a download action — Player's secondary control row, Item Detail's actions row.
@@ -103,7 +104,7 @@ pub fn build(
 ) -> DownloadScopeMenu {
     let popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     let popover = gtk4::Popover::builder().child(&popover_box).build();
-    let widget = gtk4::MenuButton::builder().icon_name("folder-download-symbolic").tooltip_text("Download").popover(&popover).build();
+    let widget = gtk4::MenuButton::builder().icon_name("folder-download-symbolic").tooltip_text(tr("Download")).popover(&popover).build();
 
     // Shared by `connect_show` below and `DownloadScopeMenu::refresh` — rebuilding whether
     // "Clear downloaded chapters" applies, the size estimates, the free-space guard, and now
@@ -238,7 +239,7 @@ pub fn build(
             // from Stop, and with the actual reason (metered connection, dead session, a 404)
             // sitting unread in the log.
             if let ItemDownloadState::Failed(reason) = state {
-                toast_overlay.add_toast(adw::Toast::new(&format!("Download failed — {reason}")));
+                toast_overlay.add_toast(adw::Toast::new(&tr_args("Download failed — {reason}", &[("reason", reason)])));
             }
             true
         }
@@ -254,7 +255,7 @@ pub fn build(
 }
 
 /// What a download asked for while offline mode is on gets instead of a download.
-pub(crate) const OFFLINE_DOWNLOAD_TOAST: &str = "Offline mode is on — turn it off to download";
+pub(crate) const OFFLINE_DOWNLOAD_TOAST: &str = tr_noop("Offline mode is on — turn it off to download");
 
 /// Estimated bytes a scope would fetch, or `None` when no honest estimate exists: sizes not
 /// cached yet, or nothing to fetch (a disabled row shouldn't advertise "≈0 B"). No chapters at
@@ -274,10 +275,16 @@ fn estimate_bytes_for(tracks: &[TrackRef], chapter_ranges: &[(f64, f64)], scope:
     abs_core::download_tracks::estimate_bytes_for_chapters(tracks, chapter_ranges, &indices)
 }
 
+/// The spec's estimate text ("≈340 MB").
+fn estimate_text(bytes: u64) -> String {
+    // TRANSLATORS: {size} is a data size such as "340 MB"; "≈" means approximately.
+    tr_args("≈{size}", &[("size", &crate::screens::downloads::format_bytes(bytes))])
+}
+
 /// The spec's estimate subtitle ("≈340 MB") — dim, on its own line under the row's title.
 fn estimate_label(bytes: u64) -> gtk4::Label {
     gtk4::Label::builder()
-        .label(format!("≈{}", crate::screens::downloads::format_bytes(bytes)))
+        .label(estimate_text(bytes))
         .css_classes(["dim-label"])
         .xalign(0.0)
         .build()
@@ -287,7 +294,7 @@ fn estimate_label(bytes: u64) -> gtk4::Label {
 /// manager just measured, so the row refuses to start anything (it toasts instead).
 fn blocked_label() -> gtk4::Label {
     gtk4::Label::builder()
-        .label("Not enough free space")
+        .label(tr("Not enough free space"))
         .css_classes(["error"])
         .xalign(0.0)
         .build()
@@ -298,8 +305,8 @@ fn blocked_label() -> gtk4::Label {
 /// hiding the tab bar), and the only screen with any progress/cancel affordance before this
 /// screen's own `widgets::download_progress::DownloadProgressStrip` reveals a moment later.
 fn started_download_toast(on_open_downloads: &Rc<dyn Fn()>) -> adw::Toast {
-    let toast = adw::Toast::new("Download started");
-    toast.set_button_label(Some("View"));
+    let toast = adw::Toast::new(&tr("Download started"));
+    toast.set_button_label(Some(&tr("View")));
     toast.connect_button_clicked({
         let on_open_downloads = on_open_downloads.clone();
         move |_| on_open_downloads()
@@ -349,7 +356,7 @@ fn populate_download_popover_rows(
     // libadwaita 1.6 and this crate's ceiling is 1.2, so the popover carries the title as a
     // heading row instead — rebuilt here (not once at construction) so it survives the clear
     // below on every re-open.
-    popover_box.append(&gtk4::Label::builder().label("Download book").css_classes(["heading"]).halign(gtk4::Align::Start).margin_bottom(4).build());
+    popover_box.append(&gtk4::Label::builder().label(tr("Download book")).css_classes(["heading"]).halign(gtk4::Align::Start).margin_bottom(4).build());
 
     // Estimated bytes for a scope — the same chapter->track mapping the actual download uses, so
     // the estimate is of exactly what would be fetched. The fallbacks (no chapters at all ->
@@ -380,11 +387,11 @@ fn populate_download_popover_rows(
             move |_| {
                 if session.is_offline() {
                     popover.popdown();
-                    toast_overlay.add_toast(adw::Toast::new(OFFLINE_DOWNLOAD_TOAST));
+                    toast_overlay.add_toast(adw::Toast::new(&tr(OFFLINE_DOWNLOAD_TOAST)));
                     return;
                 }
                 if blocked {
-                    toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
+                    toast_overlay.add_toast(adw::Toast::new(&tr("Not enough free space")));
                     return;
                 }
                 download_manager.start_download(session.clone(), item_id.clone(), scope, current_chapter_index);
@@ -399,7 +406,7 @@ fn populate_download_popover_rows(
     // keeping the chapters that already completed (same semantics as the Downloads screen's
     // stop button), whereas "Clear downloaded chapters" at the bottom deletes everything.
     if download_manager.is_downloading(session.server_id(), item_id) {
-        let stop_button = gtk4::Button::builder().label("Stop download").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        let stop_button = gtk4::Button::builder().label(tr("Stop download")).css_classes(["flat"]).halign(gtk4::Align::Start).build();
         stop_button.connect_clicked({
             let download_manager = download_manager.clone();
             let popover = popover.clone();
@@ -409,7 +416,7 @@ fn populate_download_popover_rows(
             move |_| {
                 download_manager.cancel_item(&server_id, &item_id);
                 popover.popdown();
-                toast_overlay.add_toast(adw::Toast::new("Download stopped"));
+                toast_overlay.add_toast(adw::Toast::new(&tr("Download stopped")));
             }
         });
         popover_box.append(&stop_button);
@@ -427,10 +434,10 @@ fn populate_download_popover_rows(
             .margin_bottom(4)
             .build();
         loading_row.append(&gtk4::Spinner::builder().spinning(true).build());
-        loading_row.append(&gtk4::Label::builder().label("Loading chapters…").css_classes(["dim-label"]).build());
+        loading_row.append(&gtk4::Label::builder().label(tr("Loading chapters…")).css_classes(["dim-label"]).build());
         popover_box.append(&loading_row);
     } else {
-        add_scope_row("Current chapter", DownloadScope::CurrentChapter);
+        add_scope_row(&tr("Current chapter"), DownloadScope::CurrentChapter);
 
         // "Next chapters" is the one scope row with an inline stepper (ui-spec: "− / count / +, each
         // button ≥44×44px per the touch-target note"; the row body outside the stepper starts the
@@ -439,14 +446,14 @@ fn populate_download_popover_rows(
         // insensitive rather than offering a download that could only ever no-op. Its subtitle
         // recomputes on every step, since the count is what the estimate is of.
         let remaining = chapter_ranges.len().saturating_sub(current_chapter_index + 1);
-        let next_title = gtk4::Label::builder().label("Next chapters").xalign(0.0).build();
+        let next_title = gtk4::Label::builder().label(tr("Next chapters")).xalign(0.0).build();
         let next_subtitle = gtk4::Label::builder().css_classes(["dim-label"]).xalign(0.0).visible(false).build();
         let next_inner = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).halign(gtk4::Align::Start).hexpand(true).valign(gtk4::Align::Center).build();
         next_inner.append(&next_title);
         next_inner.append(&next_subtitle);
         let next_button = gtk4::Button::builder().child(&next_inner).css_classes(["flat"]).build();
-        let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build();
-        let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build();
+        let minus_button = gtk4::Button::builder().label("−").css_classes(["flat"]).width_request(44).height_request(44).build(); // i18n: ignore — a mathematical symbol, not text
+        let plus_button = gtk4::Button::builder().label("+").css_classes(["flat"]).width_request(44).height_request(44).build(); // i18n: ignore — a mathematical symbol, not text
         let count_label = gtk4::Label::builder().width_chars(3).justify(gtk4::Justification::Center).build();
         // Whether the Next-chapters estimate currently exceeds free space — flipped by the subtitle
         // update (which knows) and read by the row's click handler, so stepping into or out of the
@@ -468,14 +475,14 @@ fn populate_download_popover_rows(
                 let scope = DownloadScope::NextChapters(next_count.get());
                 match (estimate_bytes_for(tracks.as_slice(), chapter_ranges.as_slice(), scope, current_chapter_index), free_space) {
                     (Some(bytes), Some(free)) if bytes > free => {
-                        next_subtitle.set_label("Not enough free space");
+                        next_subtitle.set_label(&tr("Not enough free space"));
                         next_subtitle.remove_css_class("dim-label");
                         next_subtitle.add_css_class("error");
                         next_subtitle.set_visible(true);
                         next_blocked.set(true);
                     }
                     (Some(bytes), _) => {
-                        next_subtitle.set_label(&format!("≈{}", crate::screens::downloads::format_bytes(bytes)));
+                        next_subtitle.set_label(&estimate_text(bytes));
                         next_subtitle.remove_css_class("error");
                         next_subtitle.add_css_class("dim-label");
                         next_subtitle.set_visible(true);
@@ -525,11 +532,11 @@ fn populate_download_popover_rows(
             move |_| {
                 if session.is_offline() {
                     popover.popdown();
-                    toast_overlay.add_toast(adw::Toast::new(OFFLINE_DOWNLOAD_TOAST));
+                    toast_overlay.add_toast(adw::Toast::new(&tr(OFFLINE_DOWNLOAD_TOAST)));
                     return;
                 }
                 if next_blocked.get() {
-                    toast_overlay.add_toast(adw::Toast::new("Not enough free space"));
+                    toast_overlay.add_toast(adw::Toast::new(&tr("Not enough free space")));
                     return;
                 }
                 download_manager.start_download(session.clone(), item_id.clone(), DownloadScope::NextChapters(next_count.get()), current_chapter_index);
@@ -555,12 +562,12 @@ fn populate_download_popover_rows(
         next_row.append(&stepper);
         popover_box.append(&next_row);
 
-        add_scope_row("Remaining chapters", DownloadScope::RemainingChapters);
-        add_scope_row("Entire book", DownloadScope::EntireBook);
+        add_scope_row(&tr("Remaining chapters"), DownloadScope::RemainingChapters);
+        add_scope_row(&tr("Entire book"), DownloadScope::EntireBook);
     }
 
     if availability != OfflineAvailability::None {
-        let clear_button = gtk4::Button::builder().label("Clear downloaded chapters").css_classes(["destructive-action"]).margin_top(6).build();
+        let clear_button = gtk4::Button::builder().label(tr("Clear downloaded chapters")).css_classes(["destructive-action"]).margin_top(6).build();
         clear_button.connect_clicked({
             let download_manager = download_manager.clone();
             let popover = popover.clone();
@@ -571,8 +578,8 @@ fn populate_download_popover_rows(
                 popover.popdown();
                 let toast_overlay = toast_overlay.clone();
                 download_manager.clear_item(session.server_id(), &item_id, move |result| match result {
-                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Downloaded chapters cleared")),
-                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Clearing downloaded chapters", err),
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new(&tr("Downloaded chapters cleared"))),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, &tr("Clearing downloaded chapters"), err),
                 });
             }
         });

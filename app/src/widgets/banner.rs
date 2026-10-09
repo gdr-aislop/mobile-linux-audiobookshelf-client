@@ -13,6 +13,8 @@
 use adw::glib;
 use adw::prelude::*;
 
+use crate::i18n::tr;
+
 #[derive(Clone)]
 pub struct ErrorBanner {
     revealer: gtk4::Revealer,
@@ -86,7 +88,7 @@ impl ErrorBanner {
         // (and copy, via `selectable`) the exact underlying error. Hidden entirely — not just
         // collapsed — when there's nothing to show (see `set_details`).
         let details_toggle =
-            gtk4::ToggleButton::builder().label("Details").css_classes(["app-link"]).halign(gtk4::Align::Start).valign(gtk4::Align::Center).visible(false).build();
+            gtk4::ToggleButton::builder().label(tr("Details")).css_classes(["app-link"]).halign(gtk4::Align::Start).valign(gtk4::Align::Center).visible(false).build();
         let details_label = gtk4::Label::builder()
             .wrap(true)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
@@ -100,7 +102,7 @@ impl ErrorBanner {
             let details_revealer = details_revealer.clone();
             move |toggle| {
                 details_revealer.set_reveal_child(toggle.is_active());
-                toggle.set_label(if toggle.is_active() { "Hide details" } else { "Details" });
+                toggle.set_label(&if toggle.is_active() { tr("Hide details") } else { tr("Details") });
             }
         });
 
@@ -236,14 +238,16 @@ impl ErrorBanner {
     /// The screen's action handler asks [`Self::offers_login`] which of the two to run.
     pub fn show_sync_failure(&self, err: &abs_core::CoreError) {
         let (title, description, login) = match err {
-            abs_core::CoreError::Auth => ("Signed out by the server", "Showing what's saved on this device. Log in again to update it.", true),
-            abs_core::CoreError::Unreachable(_) => ("Can't reach your server", "Showing what's saved on this device.", false),
-            _ => ("Couldn't update your library", "Showing what's saved on this device.", false),
+            abs_core::CoreError::Auth => {
+                (tr("Signed out by the server"), tr("Showing what's saved on this device. Log in again to update it."), true)
+            }
+            abs_core::CoreError::Unreachable(_) => (tr("Can't reach your server"), tr("Showing what's saved on this device."), false),
+            _ => (tr("Couldn't update your library"), tr("Showing what's saved on this device."), false),
         };
-        self.set_title(title);
-        self.set_description(Some(description));
+        self.set_title(&title);
+        self.set_description(Some(&description));
         self.offers_login.set(login);
-        self.set_action_label(Some(if login { "Log in again" } else { "Retry" }));
+        self.set_action_label(Some(&if login { tr("Log in again") } else { tr("Retry") }));
         self.set_details(Some(&err.to_string()));
         self.set_revealed(true);
     }

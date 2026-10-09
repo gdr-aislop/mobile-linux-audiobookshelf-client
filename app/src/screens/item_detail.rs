@@ -37,6 +37,7 @@ use sqlx::SqlitePool;
 use abs_storage::models::{Account, Server};
 
 use crate::downloads::DownloadManager;
+use crate::i18n::{ntr_args, tr, tr_args};
 use crate::widgets::cover_image::CoverImage;
 use crate::widgets::download_scope_menu;
 use crate::widgets::item_options_menu;
@@ -175,7 +176,7 @@ pub fn build(
     // read this book's progress: shown straight away it read "Play" for a frame or two before
     // turning into "Resume" on a started book.
     let play_button = gtk4::Button::builder()
-        .label("Play")
+        .label(tr("Play"))
         .css_classes(["pill", "suggested-action"])
         .halign(gtk4::Align::Center)
         .opacity(0.0)
@@ -202,9 +203,9 @@ pub fn build(
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .margin_top(4)
         .build();
-    let more_button = gtk4::Button::builder().label("more").css_classes(["flat"]).halign(gtk4::Align::Start).visible(false).build();
+    let more_button = gtk4::Button::builder().label(tr("more")).css_classes(["flat"]).halign(gtk4::Align::Start).visible(false).build();
     let description_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).margin_top(16).visible(false).build();
-    description_section.append(&gtk4::Label::builder().label("Description").xalign(0.0).css_classes(["heading"]).build());
+    description_section.append(&gtk4::Label::builder().label(tr("Description")).xalign(0.0).css_classes(["heading"]).build());
     description_section.append(&description_label);
     description_section.append(&more_button);
 
@@ -219,11 +220,11 @@ pub fn build(
             if now_expanded {
                 description_label.set_lines(-1);
                 description_label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
-                more_button.set_label("less");
+                more_button.set_label(&tr("less"));
             } else {
                 description_label.set_lines(3);
                 description_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                more_button.set_label("more");
+                more_button.set_label(&tr("more"));
             }
         }
     });
@@ -233,10 +234,10 @@ pub fn build(
     // meaning doesn't need to be inferred from a single unlabeled icon.
     let chapters_legend = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).margin_bottom(4).build();
     chapters_legend.append(&gtk4::Image::builder().icon_name("object-select-symbolic").css_classes(["dim-label"]).build());
-    chapters_legend.append(&gtk4::Label::builder().label("downloaded").css_classes(["caption", "dim-label"]).build());
+    chapters_legend.append(&gtk4::Label::builder().label(tr("downloaded")).css_classes(["caption", "dim-label"]).build());
     let chapters_list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list"]).build();
     let chapters_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).margin_top(16).visible(false).build();
-    chapters_section.append(&gtk4::Label::builder().label("Chapters").xalign(0.0).css_classes(["heading"]).margin_bottom(4).build());
+    chapters_section.append(&gtk4::Label::builder().label(tr("Chapters")).xalign(0.0).css_classes(["heading"]).margin_bottom(4).build());
     chapters_section.append(&chapters_legend);
     chapters_section.append(&chapters_list);
 
@@ -419,11 +420,11 @@ pub fn build(
         None,
         {
             let action = progress_action.clone();
-            move || action.apply("Marked as finished", "Marking as finished", |duration| (duration, true))
+            move || action.apply(&tr("Marked as finished"), &tr("Marking as finished"), |duration| (duration, true))
         },
         {
             let action = progress_action.clone();
-            move || action.apply("Progress reset", "Resetting progress", |_| (0.0, false))
+            move || action.apply(&tr("Progress reset"), &tr("Resetting progress"), |_| (0.0, false))
         },
     );
     header.pack_end(&options_menu.widget);
@@ -467,7 +468,10 @@ pub fn build(
             if let Some(item) = &item {
                 if let Some(author) = &item.author {
                     let subtitle = match item.narrator.as_deref().filter(|n| !n.is_empty()) {
-                        Some(narrator) => format!("{author} · Narrated by {narrator}"),
+                        Some(narrator) => {
+                            // TRANSLATORS: {author} is the book's author, {narrator} the person who reads the audiobook aloud.
+                            tr_args("{author} · Narrated by {narrator}", &[("author", author.as_str()), ("narrator", narrator)])
+                        }
                         None => author.clone(),
                     };
                     author_label.set_label(&subtitle);
@@ -512,7 +516,7 @@ pub fn build(
             let duration_seconds = item.as_ref().map(|i| i.duration_seconds).unwrap_or(0.0);
             duration_seconds_cell.set(duration_seconds);
             if progress_seconds > 0.0 {
-                play_button.set_label("Resume");
+                play_button.set_label(&tr("Resume"));
                 if duration_seconds > 0.0 {
                     progress_bar.set_fraction((progress_seconds / duration_seconds).clamp(0.0, 1.0));
                     progress_bar.set_visible(true);
@@ -564,9 +568,17 @@ pub fn build(
                     };
                     if synced {
                         if let Ok(Some(info)) = abs_core::series::series_info_for_item(&pool, &server_id, &item_id).await {
+                            let total_books = info.total_books.to_string();
                             let label = match &info.sequence {
-                                Some(seq) => format!("{}, {seq}/{}", info.series_name, info.total_books),
-                                None => format!("{} ({} books)", info.series_name, info.total_books),
+                                // TRANSLATORS: {series} is a book series name, {seq} this book's position in it (e.g. "2" or "2.5"), {total} how many books the series has: "Dune, 2/6".
+                                Some(seq) => tr_args("{series}, {seq}/{total}", &[("series", info.series_name.as_str()), ("seq", seq.as_str()), ("total", total_books.as_str())]),
+                                // TRANSLATORS: {series} is a book series name, {count} how many books it has: "Dune (6 books)".
+                                None => ntr_args(
+                                    "{series} ({count} book)",
+                                    "{series} ({count} books)",
+                                    u32::try_from(info.total_books).unwrap_or(u32::MAX),
+                                    &[("series", info.series_name.as_str())],
+                                ),
                             };
                             series_button_label.set_label(&label);
                         }
@@ -646,7 +658,7 @@ pub fn build(
             // on failure), so this screen is swapped out by the time there's anything to show
             // again; a fresh `build()` next time this screen opens starts from "Play"/"Resume".
             play_button.set_sensitive(false);
-            play_button.set_label("Starting…");
+            play_button.set_label(&tr("Starting…"));
             on_play(item_id.clone(), None);
         }
     });
@@ -714,7 +726,7 @@ fn refresh_chapter_rows(
             row.add_css_class("heading");
         }
         if is_downloaded {
-            row.add_suffix(&gtk4::Image::builder().icon_name("object-select-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+            row.add_suffix(&gtk4::Image::builder().icon_name("object-select-symbolic").css_classes(["dim-label"]).tooltip_text(tr("Downloaded")).build());
         }
         row.connect_activated({
             let on_play = on_play.clone();
@@ -734,9 +746,11 @@ fn refresh_chapter_rows(
 fn format_duration(total_seconds: f64) -> String {
     let total_seconds = total_seconds.max(0.0);
     if total_seconds >= 3600.0 {
-        format!("{:.1}h", total_seconds / 3600.0)
+        // TRANSLATORS: {hours} is a number of hours with one decimal, e.g. "1.5h" (a duration; "h" = hours).
+        tr_args("{hours}h", &[("hours", &format!("{:.1}", total_seconds / 3600.0))])
     } else {
-        format!("{}m", (total_seconds / 60.0).round() as u64)
+        // TRANSLATORS: {minutes} is a whole number of minutes, e.g. "12m" (a duration; "m" = minutes).
+        tr_args("{minutes}m", &[("minutes", &((total_seconds / 60.0).round() as u64).to_string())])
     }
 }
 
@@ -770,13 +784,13 @@ impl ProgressAction {
         self.progress_seconds.set(unfinished_position);
         let duration = self.duration_seconds.get();
         if unfinished_position > 0.0 {
-            self.play_button.set_label("Resume");
+            self.play_button.set_label(&tr("Resume"));
             if duration > 0.0 {
                 self.progress_bar.set_fraction((unfinished_position / duration).clamp(0.0, 1.0));
             }
             self.progress_bar.set_visible(duration > 0.0);
         } else {
-            self.play_button.set_label("Play");
+            self.play_button.set_label(&tr("Play"));
             self.progress_bar.set_visible(false);
         }
     }
@@ -784,7 +798,8 @@ impl ProgressAction {
     /// Runs one of the menu's actions: `target` maps the book's duration to the
     /// `(position, is_finished)` to write. Both actions throw the listening position away, so the
     /// success toast offers Undo, which writes back what was there before.
-    fn apply(&self, done_title: &'static str, error_context: &'static str, target: impl Fn(f64) -> (f64, bool)) {
+    fn apply(&self, done_title: &str, error_context: &str, target: impl Fn(f64) -> (f64, bool)) {
+        let (done_title, error_context) = (done_title.to_string(), error_context.to_string());
         let (position, is_finished) = target(self.duration_seconds.get());
         self.show(position, is_finished);
         if self.is_loaded_in_player() {
@@ -800,7 +815,7 @@ impl ProgressAction {
                     } else {
                         action.controller.reset_progress();
                     }
-                    action.toast_overlay.add_toast(action.undo_toast(done_title, before_position, before_finished));
+                    action.toast_overlay.add_toast(action.undo_toast(&done_title, before_position, before_finished));
                 });
                 return;
             }
@@ -812,7 +827,7 @@ impl ProgressAction {
             } else {
                 self.controller.reset_progress();
             }
-            self.toast_overlay.add_toast(self.undo_toast(done_title, before, false));
+            self.toast_overlay.add_toast(self.undo_toast(&done_title, before, false));
             return;
         }
         let action = self.clone();
@@ -824,9 +839,9 @@ impl ProgressAction {
             match action.write(position, is_finished).await {
                 Ok(()) => {
                     let (before_position, before_finished) = before.map(|p| (p.current_time_seconds, p.is_finished)).unwrap_or((0.0, false));
-                    action.toast_overlay.add_toast(action.undo_toast(done_title, before_position, before_finished));
+                    action.toast_overlay.add_toast(action.undo_toast(&done_title, before_position, before_finished));
                 }
-                Err(err) => crate::error_reporting::report_background_error(&action.toast_overlay, error_context, err),
+                Err(err) => crate::error_reporting::report_background_error(&action.toast_overlay, &error_context, err),
             }
         });
     }
@@ -848,7 +863,7 @@ impl ProgressAction {
     }
 
     fn undo_toast(&self, title: &str, before_position: f64, before_finished: bool) -> adw::Toast {
-        let toast = adw::Toast::builder().title(title).button_label("Undo").timeout(10).build();
+        let toast = adw::Toast::builder().title(title).button_label(tr("Undo")).timeout(10).build();
         let action = self.clone();
         toast.connect_button_clicked(move |_| {
             action.show(before_position, before_finished);
@@ -860,7 +875,7 @@ impl ProgressAction {
             let action = action.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = action.write(before_position, before_finished).await {
-                    crate::error_reporting::report_background_error(&action.toast_overlay, "Undoing", err);
+                    crate::error_reporting::report_background_error(&action.toast_overlay, &tr("Undoing"), err);
                 }
             });
         });

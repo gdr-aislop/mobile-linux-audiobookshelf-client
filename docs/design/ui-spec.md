@@ -436,7 +436,7 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
 ### Settings
 - `AdwPreferencesPage` with groups: **Account**, **Servers**, **Playback** (default speed,
   skip-forward/back intervals, sleep-timer default), **Appearance** (follow system / light /
-  dark), **About** (version, license, links).
+  dark; language), **About** (version, license, links).
 - **Partially built** (this is a living spec; the screen grows group by group): the **Playback**
   group is real — the headphone-behavior switches from "Hardware controls & interruptions"
   (pause-on-disconnect on, resume-on-reconnect off, the latter insensitive while the former is
@@ -444,7 +444,8 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   every new playback), the skip-back/forward interval combos (which the transport buttons, arrow
   keys and MPRIS next/previous read live), and the Wi-Fi-only downloads switch (applied live to
   the download manager). The **Appearance** group (Theme: system/light/dark, applied via
-  `AdwStyleManager` immediately and at startup), the **About** row, and the **Account** and
+  `AdwStyleManager` immediately and at startup; **Language**: "System (<language>)" by default,
+  or an explicit language — stored at once, applied at the next start, see `docs/i18n.md`), the **About** row, and the **Account** and
   **Servers** groups (below) are real too. The one remaining stub: Playback's
   sleep-timer-default row.
 - **Low memory mode** (Playback group, next to "Buffer streams in bursts"): one switch for a

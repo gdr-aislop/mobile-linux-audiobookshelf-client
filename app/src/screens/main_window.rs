@@ -25,6 +25,7 @@ use abs_core::settings::{PlaybackSettings, Theme};
 use abs_storage::models::{Account, Server};
 use abs_storage::AppPaths;
 
+use crate::i18n::{tr, tr_args, tr_noop};
 use crate::player::{self, PlayRequest};
 use crate::screens;
 
@@ -61,7 +62,7 @@ impl SuspendInhibitGuard {
         let started = std::time::Instant::now();
         match (is_playing, self.cookie.get()) {
             (true, 0) => {
-                let cookie = app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::SUSPEND, Some("Playing an audiobook"));
+                let cookie = app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::SUSPEND, Some(&tr("Playing an audiobook")));
                 self.cookie.set(cookie);
             }
             (false, cookie) if cookie != 0 => {
@@ -122,7 +123,8 @@ fn push_unconfirmed_progress(pool: sqlx::SqlitePool, session: abs_core::auth::Se
 }
 
 fn position_adopted_toast_title(to_seconds: f64) -> String {
-    format!("Continued at {} from another device", screens::player::format_hms(to_seconds))
+    // TRANSLATORS: {time} is a playback position such as "1:23:45".
+    tr_args("Continued at {time} from another device", &[("time", &screens::player::format_hms(to_seconds))])
 }
 
 pub struct MainWindow {
@@ -404,11 +406,11 @@ pub fn build(
     // whichever of the two tabs the toggle was flipped from.
     offline_mode.set_on_persist_error({
         let root = root.clone();
-        move |err| crate::error_reporting::report_background_error(&root, "Saving offline mode", err)
+        move |err| crate::error_reporting::report_background_error(&root, &tr("Saving offline mode"), err)
     });
     low_memory_mode.set_on_persist_error({
         let root = root.clone();
-        move |err| crate::error_reporting::report_background_error(&root, "Saving low memory mode", err)
+        move |err| crate::error_reporting::report_background_error(&root, &tr("Saving low memory mode"), err)
     });
 
     // Opens the full player by swapping the window's content — there's no
@@ -482,8 +484,8 @@ pub fn build(
             let mut last = last_toasted_error.borrow_mut();
             if new_kind.is_some() && new_kind != *last {
                 if let Some(kind) = new_kind {
-                    let toast = adw::Toast::new(screens::player::short_message(kind));
-                    toast.set_button_label(Some("View"));
+                    let toast = adw::Toast::new(&tr(screens::player::short_message(kind)));
+                    toast.set_button_label(Some(&tr("View")));
                     toast.connect_button_clicked({
                         let open_player = open_player.clone();
                         move |_| open_player()
@@ -504,7 +506,7 @@ pub fn build(
         let last_failure: Rc<Cell<Option<player::ProgressSyncOutcome>>> = Rc::new(Cell::new(None));
         move |outcome| {
             if let Some(title) = progress_sync_toast(&last_failure, outcome) {
-                toast_overlay.add_toast(adw::Toast::new(title));
+                toast_overlay.add_toast(adw::Toast::new(&tr(title)));
             }
         }
     });
@@ -528,7 +530,7 @@ pub fn build(
         move |from, to| {
             let toast = adw::Toast::builder()
                 .title(position_adopted_toast_title(to))
-                .button_label("Undo")
+                .button_label(tr("Undo"))
                 .timeout(10)
                 .build();
             let controller = controller.clone();
@@ -744,10 +746,10 @@ pub fn build(
     library_screen.follow_downloads(&download_manager);
     home_screen.follow_low_memory_mode(&low_memory_mode);
     library_screen.follow_low_memory_mode(&low_memory_mode);
-    stack.add_titled_with_icon(&home_screen.root, Some("home"), "Home", "go-home-symbolic");
-    stack.add_titled_with_icon(&library_screen.root, Some("library"), "Library", crate::icons::LIBRARY);
+    stack.add_titled_with_icon(&home_screen.root, Some("home"), &tr("Home"), "go-home-symbolic");
+    stack.add_titled_with_icon(&library_screen.root, Some("library"), &tr("Library"), crate::icons::LIBRARY);
     let downloads_screen = screens::downloads::build(pool.clone(), paths.clone(), server, account, session, download_manager.clone(), window.clone(), Rc::new(on_open.clone()));
-    stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), "Downloads", "folder-download-symbolic");
+    stack.add_titled_with_icon(&downloads_screen.root, Some("downloads"), &tr("Downloads"), "folder-download-symbolic");
 
     // A dot on the Downloads tab while anything is downloading, so "something is running in the
     // background" stays visible from Home/Library too, once the user has navigated away from
@@ -791,7 +793,7 @@ pub fn build(
         servers_with_accounts,
         window.clone(),
     );
-    stack.add_titled_with_icon(&settings_screen.root, Some("settings"), "Settings", crate::icons::SETTINGS);
+    stack.add_titled_with_icon(&settings_screen.root, Some("settings"), &tr("Settings"), crate::icons::SETTINGS);
 
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).reveal(true).build();
 
@@ -824,8 +826,8 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 match write.await {
-                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
-                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new(&tr("Bookmark added"))),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, &tr("Adding bookmark"), err),
                 }
             });
         }
@@ -921,8 +923,8 @@ pub(crate) fn progress_sync_toast(last_failure: &Cell<Option<player::ProgressSyn
         return None;
     }
     Some(match outcome {
-        ProgressSyncOutcome::SessionExpired => "Session expired — progress isn't syncing. Log in again",
-        _ => "Failed to sync progress — will retry",
+        ProgressSyncOutcome::SessionExpired => tr_noop("Session expired — progress isn't syncing. Log in again"),
+        _ => tr_noop("Failed to sync progress — will retry"),
     })
 }
 

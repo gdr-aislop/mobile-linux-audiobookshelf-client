@@ -7,6 +7,7 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
+use crate::i18n::tr;
 use crate::screens;
 
 thread_local! {
@@ -119,7 +120,7 @@ fn build_window(app: &adw::Application, state: &AppState) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Audiobookshelf")
+        .title("Audiobookshelf") // i18n: ignore — the product name
         .default_width(390)
         .default_height(760)
         .build();
@@ -409,6 +410,29 @@ fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow)
     add_single_key_shortcuts(window);
 }
 
+/// One `GtkShortcutsGroup` block of the overlay's `GtkBuilder` definition: `title` plus a
+/// `(title, accelerator)` row per shortcut. Titles are escaped here; accelerators are already
+/// XML-escaped literals.
+fn shortcuts_group(title: &str, shortcuts: &[(&str, &str)]) -> String {
+    let mut group = format!(
+        "        <child>\n          <object class=\"GtkShortcutsGroup\">\n            <property name=\"title\">{}</property>\n",
+        xml_escape(title)
+    );
+    for (shortcut_title, accelerator) in shortcuts {
+        group.push_str(&format!(
+            "            <child>\n              <object class=\"GtkShortcutsShortcut\">\n                <property name=\"title\">{}</property>\n                <property name=\"accelerator\">{accelerator}</property>\n              </object>\n            </child>\n",
+            xml_escape(shortcut_title)
+        ));
+    }
+    group.push_str("          </object>\n        </child>\n");
+    group
+}
+
+/// Escapes text for use inside an XML element.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// The `GtkShortcutsWindow` behind `Ctrl+?` — one item per row of ui-spec §6's table, grouped
 /// the same way, except that two of that table's rows ("Skip back / forward", "Speed up /
 /// down") become *two* rows here. `GtkShortcutsShortcut:accelerator` parses as one or two real
@@ -427,141 +451,59 @@ fn add_keyboard_support(app: &adw::Application, window: &adw::ApplicationWindow)
 /// PureOS Crimson handles this fine; a declarative definition is also the form upstream apps
 /// themselves use for this widget (Decibels ships its shortcuts dialog as a `.ui` file).
 fn build_shortcuts_overlay() -> gtk4::ShortcutsWindow {
-    const DEFINITION: &str = r#"
-<?xml version="1.0" encoding="UTF-8"?>
+    // Titles go through `tr` here, at the call sites, because `xgettext` can't see text inside an
+    // XML definition; `shortcuts_group` escapes them before they are spliced into the markup.
+    let definition = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <interface>
   <object class="GtkShortcutsWindow" id="overlay">
     <child>
       <object class="GtkShortcutsSection">
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">General</property>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Show shortcuts</property>
-                <property name="accelerator">&lt;Control&gt;question</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Quit</property>
-                <property name="accelerator">&lt;Control&gt;q</property>
-              </object>
-            </child>
-          </object>
-        </child>
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">Navigation</property>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Go to Home</property>
-                <property name="accelerator">&lt;Alt&gt;1</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Go to Library</property>
-                <property name="accelerator">&lt;Alt&gt;2</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Go to Downloads</property>
-                <property name="accelerator">&lt;Alt&gt;3</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Go to Settings</property>
-                <property name="accelerator">&lt;Alt&gt;4 &lt;Control&gt;comma</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Search the library</property>
-                <property name="accelerator">&lt;Control&gt;f</property>
-              </object>
-            </child>
-          </object>
-        </child>
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">Playback</property>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Play / pause</property>
-                <property name="accelerator">space</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Add bookmark</property>
-                <property name="accelerator">b</property>
-              </object>
-            </child>
-          </object>
-        </child>
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">Full player</property>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Skip back</property>
-                <property name="accelerator">Left</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Skip forward</property>
-                <property name="accelerator">Right</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Speed up</property>
-                <property name="accelerator">&lt;Control&gt;plus plus</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Speed down</property>
-                <property name="accelerator">&lt;Control&gt;minus minus</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Reset speed to 1×</property>
-                <property name="accelerator">&lt;Control&gt;0</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Open chapters</property>
-                <property name="accelerator">c</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Open sleep timer</property>
-                <property name="accelerator">t</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkShortcutsShortcut">
-                <property name="title">Collapse player</property>
-                <property name="accelerator">Escape</property>
-              </object>
-            </child>
-          </object>
-        </child>
-      </object>
+{general}{navigation}{playback}{full_player}      </object>
     </child>
   </object>
 </interface>
-"#;
+"#,
+        general = shortcuts_group(
+            &tr("General"),
+            &[
+                (&tr("Show shortcuts"), "&lt;Control&gt;question"),
+                (&tr("Quit"), "&lt;Control&gt;q"),
+            ],
+        ),
+        navigation = shortcuts_group(
+            &tr("Navigation"),
+            &[
+                (&tr("Go to Home"), "&lt;Alt&gt;1"),
+                (&tr("Go to Library"), "&lt;Alt&gt;2"),
+                (&tr("Go to Downloads"), "&lt;Alt&gt;3"),
+                (&tr("Go to Settings"), "&lt;Alt&gt;4 &lt;Control&gt;comma"),
+                (&tr("Search the library"), "&lt;Control&gt;f"),
+            ],
+        ),
+        playback = shortcuts_group(
+            &tr("Playback"),
+            &[
+                (&tr("Play / pause"), "space"),
+                (&tr("Add bookmark"), "b"),
+            ],
+        ),
+        full_player = shortcuts_group(
+            &tr("Full player"),
+            &[
+                (&tr("Skip back"), "Left"),
+                (&tr("Skip forward"), "Right"),
+                (&tr("Speed up"), "&lt;Control&gt;plus plus"),
+                (&tr("Speed down"), "&lt;Control&gt;minus minus"),
+                (&tr("Reset speed to 1×"), "&lt;Control&gt;0"),
+                (&tr("Open chapters"), "c"),
+                (&tr("Open sleep timer"), "t"),
+                (&tr("Collapse player"), "Escape"),
+            ],
+        ),
+    );
 
-    let builder = gtk4::Builder::from_string(DEFINITION);
+    let builder = gtk4::Builder::from_string(&definition);
     builder.object::<gtk4::ShortcutsWindow>("overlay").expect("the shortcuts overlay definition must contain its root object")
 }
 
