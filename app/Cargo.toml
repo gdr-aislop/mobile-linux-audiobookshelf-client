@@ -84,6 +84,7 @@ glib-networking, libssl3 | libssl3t64, libpulse0"""
 assets = [
     ["target/release/abs-app", "usr/bin/", "755"],
     ["../build/l10n/io.github.gdr_aislop.abs-app.desktop", "usr/share/applications/", "644"],
+    ["../build/l10n/locale/pl/LC_MESSAGES/abs-app.mo", "usr/share/locale/pl/LC_MESSAGES/", "644"],
     ["assets/io.github.gdr_aislop.abs-app.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["../LICENSE", "usr/share/doc/abs-app/", "644"],
 ]

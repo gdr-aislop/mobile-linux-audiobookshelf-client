@@ -134,9 +134,10 @@ mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfi
 
 ## Translations
 
-The interface is translatable with gettext, but no translations are bundled yet — the app is in
-English. Adding a language is a `po/<lang>.po` file; see [docs/i18n.md](docs/i18n.md) for how to
-extract, translate and test strings.
+The interface is translatable with gettext and available in English and Polish. It follows the
+system language by default; Settings → Appearance → Language overrides that. Improving a
+translation or adding a language is a `po/<lang>.po` file (Polish: [`po/pl.po`](po/pl.po)); see
+[docs/i18n.md](docs/i18n.md) for how to extract, translate and test strings.
 
 ## Reporting problems
 

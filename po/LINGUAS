@@ -1,2 +1,3 @@
 # Languages with a po/<lang>.po translation, one per line (e.g. de, fr, pt_BR). A language listed
 # here is compiled by scripts/build-l10n.sh and shipped in the AppImage, Flatpak and .deb.
+pl

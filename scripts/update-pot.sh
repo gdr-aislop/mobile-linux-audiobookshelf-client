@@ -62,7 +62,7 @@ echo "po/abs-app.pot: $((entries - 1)) messages"
 
 grep -v '^[[:space:]]*#' po/LINGUAS | grep -v '^[[:space:]]*$' | while read -r lang; do
     if [ -f "po/$lang.po" ]; then
-        msgmerge --update --backup=none --no-fuzzy-matching=false --add-location=file "po/$lang.po" po/abs-app.pot 2>&1 | sed "s|^|po/$lang.po: |"
+        msgmerge --update --backup=none --add-location=file "po/$lang.po" po/abs-app.pot 2>&1 | sed "s|^|po/$lang.po: |"
     else
         echo "po/$lang.po is listed in po/LINGUAS but missing" >&2
         exit 1
