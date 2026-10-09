@@ -51,7 +51,12 @@ Fractal) rather than copying Lissen's Material Design look.
 - A segmented toggle (`AdwToggleGroup`/two-button segmented control, matching the same pattern
   used for Settings' Theme picker) switches the form between two auth modes:
   - **Password** — Server URL, Username, and a masked Password field (with a show/hide eye-icon
-    toggle) as one grouped card of `AdwEntryRow`/`AdwPasswordEntryRow`-equivalent rows.
+    toggle) as one grouped card of `AdwEntryRow`/`AdwPasswordEntryRow`-equivalent rows, then a
+    **Remember password** row with a switch, **on by default** (subtitle "Signs you in again if
+    the server ends the session. Kept in your keyring."). A remembered password lives in the
+    desktop keyring (never the app's database). When the server rejects the refresh token for
+    good, the app signs in again with it silently, so one sign-in lasts however long the app goes
+    unused. Signing in with the switch off, signing out, or removing the server forgets it.
   - **API Token** — Server URL and a single Token field; username/password are hidden entirely
     rather than just disabled, since they're not applicable to this mode.
 - Primary `AdwButton` (suggested-action style, full width) "Connect", **disabled until the
@@ -513,7 +518,9 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   PEM identity loader rejects the widespread RSA PKCS#1 key encoding), **Local network server
   address** (used instead of the public URL whenever a short reachability probe — cached for a
   minute per session — finds it listening, so home-Wi-Fi traffic stays local and everything
-  else falls back cleanly), and **Change User Agent** (empty restores the default). Each row
+  else falls back cleanly), and **Change User Agent** (empty restores the default,
+  `abs-app/<version> (Linux)`, sent on API calls and audio streams alike; it deliberately avoids
+  the Audiobookshelf name, per the project's rules for third-party clients). Each row
   persists to the server's table row the moment it's saved and is picked up by the next
   connection mint — sync, downloads, playback — without any rebuild; the editors show a
   value-as-subtitle (or "None"/"Default") where the mockup showed a static description, and

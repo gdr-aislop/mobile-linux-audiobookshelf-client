@@ -4,7 +4,8 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: abs-app 0.9.4\n"
-"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues\n"
+"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-"
+"audiobookshelf-client/issues\n"
 "PO-Revision-Date: 2026-10-09 12:00+0000\n"
 "Last-Translator: \n"
 "Language-Team: Polish\n"
@@ -12,8 +13,8 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
-
+"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 "
+"|| n%100>=20) ? 1 : 2);\n"
 
 #: app/src/application.rs
 msgid "General"
@@ -130,6 +131,10 @@ msgstr "wystąpił błąd"
 msgid "{context} failed — try again"
 msgstr "{context} nie powiodło się — spróbuj ponownie"
 
+#: app/src/password_keyring.rs
+msgid "Audiobookshelf account password"
+msgstr "Hasło konta Audiobookshelf"
+
 #: app/src/player.rs
 msgid "Playback error — tap for details"
 msgstr "Błąd odtwarzania — dotknij, aby zobaczyć szczegóły"
@@ -146,7 +151,9 @@ msgstr "Połączenie z serwerem"
 msgid ""
 "This connection is used for syncing, streaming and downloads — every call "
 "the app makes to the server goes through it."
-msgstr "To połączenie służy do synchronizacji, streamingu i pobierania — przechodzi przez nie cały ruch aplikacji do serwera."
+msgstr ""
+"To połączenie służy do synchronizacji, streamingu i pobierania — przechodzi "
+"przez nie cały ruch aplikacji do serwera."
 
 #: app/src/screens/connection.rs
 msgid "Advanced"
@@ -180,7 +187,9 @@ msgstr "Adres serwera w sieci lokalnej"
 msgid ""
 "Define server access for home Wi-Fi — used when it's reachable, the public "
 "address otherwise."
-msgstr "Adres serwera w domowej sieci Wi-Fi — jeśli jest osiągalny; w przeciwnym razie używany jest adres publiczny."
+msgstr ""
+"Adres serwera w domowej sieci Wi-Fi — jeśli jest osiągalny; w przeciwnym "
+"razie używany jest adres publiczny."
 
 #: app/src/screens/connection.rs
 msgid "Change User Agent"
@@ -193,7 +202,8 @@ msgstr "Domyślny"
 #: app/src/screens/connection.rs
 msgid ""
 "Customize the application User-Agent header. Leave empty for the default."
-msgstr "Dostosuj nagłówek User-Agent aplikacji. Pozostaw puste, aby użyć domyślnego."
+msgstr ""
+"Dostosuj nagłówek User-Agent aplikacji. Pozostaw puste, aby użyć domyślnego."
 
 #: app/src/screens/connection.rs
 msgid "Disconnect from the Server"
@@ -208,7 +218,9 @@ msgstr "Rozłączyć z {host}?"
 msgid ""
 "{username}'s listening progress and bookmarks stored on this device will be "
 "removed — everything on the server stays where it is."
-msgstr "Postęp słuchania i zakładki użytkownika {username} zapisane na tym urządzeniu zostaną usunięte — wszystko na serwerze pozostanie bez zmian."
+msgstr ""
+"Postęp słuchania i zakładki użytkownika {username} zapisane na tym "
+"urządzeniu zostaną usunięte — wszystko na serwerze pozostanie bez zmian."
 
 #: app/src/screens/connection.rs
 msgid "Disconnect"
@@ -242,7 +254,9 @@ msgstr "Zapisz"
 msgid ""
 "Specify headers for server connections — one \"Name: Value\" pair per line. "
 "They're attached to every request to this server."
-msgstr "Podaj nagłówki HTTP dla połączeń z serwerem — jedna para „Nazwa: Wartość” w wierszu. Są dołączane do każdego zapytania wysyłanego do tego serwera."
+msgstr ""
+"Podaj nagłówki HTTP dla połączeń z serwerem — jedna para „Nazwa: Wartość” w "
+"wierszu. Są dołączane do każdego zapytania wysyłanego do tego serwera."
 
 #: app/src/screens/connection.rs
 msgid "Choose a certificate file first."
@@ -298,7 +312,9 @@ msgstr "Wyczyścić wszystkie pobrane?"
 msgid ""
 "Every downloaded chapter for every book on this device will be removed — "
 "nothing on the server is affected."
-msgstr "Każdy pobrany rozdział każdej książki na tym urządzeniu zostanie usunięty — nic na serwerze nie zostanie zmienione."
+msgstr ""
+"Każdy pobrany rozdział każdej książki na tym urządzeniu zostanie usunięty — "
+"nic na serwerze nie zostanie zmienione."
 
 #: app/src/screens/downloads.rs
 msgid "Clear Downloads"
@@ -323,7 +339,9 @@ msgstr "Nie udało się odczytać pobranych rozdziałów"
 
 #: app/src/screens/downloads.rs
 msgid "The app's local data couldn't be read. Restarting the app may help."
-msgstr "Nie udało się odczytać lokalnych danych aplikacji. Może pomóc ponowne uruchomienie aplikacji."
+msgstr ""
+"Nie udało się odczytać lokalnych danych aplikacji. Może pomóc ponowne "
+"uruchomienie aplikacji."
 
 #: app/src/screens/downloads.rs app/src/widgets/download_progress.rs
 msgid "Stop"
@@ -411,7 +429,9 @@ msgstr "Nie udało się odczytać lokalnych danych"
 msgid ""
 "The library synced, but the app couldn't read it back. Try again, or restart "
 "the app."
-msgstr "Biblioteka została zsynchronizowana, ale aplikacja nie mogła jej odczytać. Spróbuj ponownie lub uruchom aplikację od nowa."
+msgstr ""
+"Biblioteka została zsynchronizowana, ale aplikacja nie mogła jej odczytać. "
+"Spróbuj ponownie lub uruchom aplikację od nowa."
 
 #: app/src/screens/home.rs
 msgid "No library synced yet"
@@ -679,7 +699,8 @@ msgstr "Nie udało się odczytać danych zapisanych na tym urządzeniu"
 
 #: app/src/screens/library.rs
 msgid "The list may be out of date. Try again, or restart the app."
-msgstr "Lista może być nieaktualna. Spróbuj ponownie lub uruchom aplikację od nowa."
+msgstr ""
+"Lista może być nieaktualna. Spróbuj ponownie lub uruchom aplikację od nowa."
 
 #: app/src/screens/library.rs
 msgid "Filter active — view options"
@@ -842,7 +863,9 @@ msgstr "Utracono połączenie"
 #: app/src/screens/player.rs
 msgid ""
 "This book can't start until it's back. Check your connection and try again."
-msgstr "Ta książka nie może się rozpocząć, dopóki połączenie nie wróci. Sprawdź połączenie i spróbuj ponownie."
+msgstr ""
+"Ta książka nie może się rozpocząć, dopóki połączenie nie wróci. Sprawdź "
+"połączenie i spróbuj ponownie."
 
 #: app/src/screens/player.rs
 msgid "Couldn't get to that position"
@@ -964,7 +987,10 @@ msgstr "Usunąć {server}?"
 msgid ""
 "Every account, cached library, item and downloaded file for this server will "
 "be removed from this device. Everything on the server itself stays untouched."
-msgstr "Wszystkie konta, zbuforowane biblioteki, pozycje i pobrane pliki tego serwera zostaną usunięte z tego urządzenia. Nic na samym serwerze nie zostanie zmienione."
+msgstr ""
+"Wszystkie konta, zbuforowane biblioteki, pozycje i pobrane pliki tego "
+"serwera zostaną usunięte z tego urządzenia. Nic na samym serwerze nie "
+"zostanie zmienione."
 
 #: app/src/screens/settings.rs
 msgid "Removing the server"
@@ -989,7 +1015,9 @@ msgstr "Wznów po ponownym podłączeniu słuchawek"
 #: app/src/screens/settings.rs
 msgid ""
 "Only undoes a pause caused by disconnecting — never a manual pause or a call"
-msgstr "Cofa tylko pauzę spowodowaną odłączeniem — niespowodowaną przyciskiem Pauza ani rozmową"
+msgstr ""
+"Cofa tylko pauzę spowodowaną odłączeniem — niespowodowaną przyciskiem Pauza "
+"ani rozmową"
 
 #: app/src/screens/settings.rs
 msgid "Default speed"
@@ -1023,7 +1051,9 @@ msgstr "Tryb niskiej pamięci"
 msgid ""
 "Hides covers and keeps less in memory. The database part applies on the next "
 "launch."
-msgstr "Ukrywa okładki i zużywa mniej pamięci. Część dotycząca bazy danych zadziała po następnym uruchomieniu."
+msgstr ""
+"Ukrywa okładki i zużywa mniej pamięci. Część dotycząca bazy danych zadziała "
+"po następnym uruchomieniu."
 
 #: app/src/screens/settings.rs
 msgid "Appearance"
@@ -1081,7 +1111,9 @@ msgstr "Anonimizuj logi"
 msgid ""
 "Hides the server address, usernames and access tokens in log files. Turn off "
 "only while debugging."
-msgstr "Ukrywa adres serwera, nazwy użytkowników i tokeny dostępu w logach. Wyłączaj tylko na czas debugowania."
+msgstr ""
+"Ukrywa adres serwera, nazwy użytkowników i tokeny dostępu w logach. Wyłączaj "
+"tylko na czas debugowania."
 
 #: app/src/screens/settings.rs
 msgid "Saving the log setting"
@@ -1119,9 +1151,15 @@ msgid ""
 msgid_plural ""
 "Listening progress for {count} books hasn't reached the server yet and will "
 "be lost."
-msgstr[0] "Postęp słuchania {count} książki nie dotarł jeszcze do serwera i zostanie utracony."
-msgstr[1] "Postęp słuchania {count} książek nie dotarł jeszcze do serwera i zostanie utracony."
-msgstr[2] "Postęp słuchania {count} książek nie dotarł jeszcze do serwera i zostanie utracony."
+msgstr[0] ""
+"Postęp słuchania {count} książki nie dotarł jeszcze do serwera i zostanie "
+"utracony."
+msgstr[1] ""
+"Postęp słuchania {count} książek nie dotarł jeszcze do serwera i zostanie "
+"utracony."
+msgstr[2] ""
+"Postęp słuchania {count} książek nie dotarł jeszcze do serwera i zostanie "
+"utracony."
 
 #: app/src/screens/settings.rs
 msgid "{count} sec"
@@ -1138,13 +1176,17 @@ msgstr "Nie rozpoczynaj pobierania przy połączeniach z limitem danych"
 msgid ""
 "Can't detect the connection type on this device, so downloads aren't "
 "restricted"
-msgstr "Nie można wykryć typu połączenia na tym urządzeniu, więc pobieranie nie jest ograniczane"
+msgstr ""
+"Nie można wykryć typu połączenia na tym urządzeniu, więc pobieranie nie jest "
+"ograniczane"
 
 #: app/src/screens/settings.rs
 msgid ""
 "Downloads ahead at full speed so the radio can idle. Turn off on a slow or "
 "capped connection."
-msgstr "Pobiera większe porcje danych z maksymalną prędkością, aby oszczędzać energię. Wyłącz przy wolnym lub limitowanym łączu."
+msgstr ""
+"Pobiera większe porcje danych z maksymalną prędkością, aby oszczędzać "
+"energię. Wyłącz przy wolnym lub limitowanym łączu."
 
 #: app/src/screens/settings.rs
 msgid "Uses up to 64 MB of buffer; consider turning it off in low memory mode."
@@ -1179,6 +1221,15 @@ msgid "Username"
 msgstr "Nazwa użytkownika"
 
 #: app/src/screens/welcome.rs
+msgid "Remember password"
+msgstr "Zapamiętaj hasło"
+
+#: app/src/screens/welcome.rs
+msgid ""
+"Signs you in again if the server ends the session. Kept in your keyring."
+msgstr "Loguje ponownie, gdy serwer zakończy sesję. Przechowywane w bazie kluczy."
+
+#: app/src/screens/welcome.rs
 msgid "Connect"
 msgstr "Połącz"
 
@@ -1208,7 +1259,10 @@ msgid ""
 "Signing in as {username} will replace {previous_username}'s account on this "
 "device. Their listening progress stored here will be removed — everything on "
 "the server stays where it is."
-msgstr "Zalogowanie jako {username} zastąpi konto użytkownika {previous_username} na tym urządzeniu. Jego postęp słuchania zapisany tutaj zostanie usunięty — wszystko na serwerze pozostanie bez zmian."
+msgstr ""
+"Zalogowanie jako {username} zastąpi konto użytkownika {previous_username} na "
+"tym urządzeniu. Jego postęp słuchania zapisany tutaj zostanie usunięty — "
+"wszystko na serwerze pozostanie bez zmian."
 
 #: app/src/screens/welcome.rs
 msgid "Switch server?"
@@ -1219,7 +1273,10 @@ msgid ""
 "Signing in to {url} will remove {username}'s cached libraries, downloads, "
 "and progress from this device. Everything on {previous_url} itself stays "
 "untouched."
-msgstr "Zalogowanie do {url} usunie z tego urządzenia zbuforowane biblioteki, pobrane pliki i postęp użytkownika {username}. Zawartość serwera {previous_url} pozostanie bez zmian."
+msgstr ""
+"Zalogowanie do {url} usunie z tego urządzenia zbuforowane biblioteki, "
+"pobrane pliki i postęp użytkownika {username}. Zawartość serwera "
+"{previous_url} pozostanie bez zmian."
 
 #: app/src/screens/welcome.rs
 msgid "Check your username and password and try again."
@@ -1259,7 +1316,9 @@ msgstr "Coś poszło nie tak"
 
 #: app/src/widgets/banner.rs
 msgid "Showing what's saved on this device. Log in again to update it."
-msgstr "Wyświetlane są dane zapisane na tym urządzeniu. Zaloguj się ponownie, aby je zaktualizować."
+msgstr ""
+"Wyświetlane są dane zapisane na tym urządzeniu. Zaloguj się ponownie, aby je "
+"zaktualizować."
 
 #: app/src/widgets/banner.rs
 msgid "Signed out by the server"
@@ -1283,7 +1342,9 @@ msgstr "Tryb niskiej pamięci jest włączony — niższa rozdzielczość okład
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Showing a smaller copy — the full-size cover needs a connection"
-msgstr "Wyświetlana jest mniejsza kopia — okładka w pełnej rozdzielczości wymaga połączenia"
+msgstr ""
+"Wyświetlana jest mniejsza kopia — okładka w pełnej rozdzielczości wymaga "
+"połączenia"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Close"
@@ -1424,11 +1485,17 @@ msgstr "Klient serwera Audiobookshelf zaprojektowany dla mobilnego Linuksa"
 msgid ""
 "GNOME-native client for an Audiobookshelf media server, designed for mobile "
 "Linux (Phosh on the Librem 5, also usable on desktop)."
-msgstr "Natywny dla GNOME klient serwera multimediów Audiobookshelf, zaprojektowany dla mobilnego Linuksa (Phosh na Librem 5, ale działa też na komputerze)."
+msgstr ""
+"Natywny dla GNOME klient serwera multimediów Audiobookshelf, zaprojektowany "
+"dla mobilnego Linuksa (Phosh na Librem 5, ale działa też na komputerze)."
 
 #: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
 msgid ""
 "Browse your library, stream or play downloaded audiobooks and podcasts, and "
 "keep listening progress in sync with the server. Integrates with the desktop "
 "via MPRIS2 and pauses during phone calls."
-msgstr "Przeglądaj bibliotekę, streamuj lub odtwarzaj pobrane audiobooki i podcasty oraz utrzymuj synchronizację postępu słuchania z serwerem. Integruje się z pulpitem przez MPRIS2 i wstrzymuje odtwarzanie podczas połączeń telefonicznych."
+msgstr ""
+"Przeglądaj bibliotekę, streamuj lub odtwarzaj pobrane audiobooki i podcasty "
+"oraz utrzymuj synchronizację postępu słuchania z serwerem. Integruje się z "
+"pulpitem przez MPRIS2 i wstrzymuje odtwarzanie podczas połączeń "
+"telefonicznych."

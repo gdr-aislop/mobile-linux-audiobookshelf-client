@@ -16,6 +16,7 @@
         "--socket=wayland",
         "--device=dri",
         "--system-talk-name=org.freedesktop.ModemManager1",
+        "--talk-name=org.freedesktop.secrets",
         "--own-name=org.mpris.MediaPlayer2.abs-app"
     ],
     "build-options": {

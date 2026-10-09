@@ -12,6 +12,7 @@ pub mod download_tracks;
 pub mod downloads;
 pub mod error;
 pub mod media_type;
+pub mod passwords;
 pub mod playback;
 pub mod progress_sync;
 pub mod search;

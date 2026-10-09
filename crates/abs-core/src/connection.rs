@@ -116,9 +116,10 @@ impl ConnectionTarget {
         &self.options.extra_headers
     }
 
-    /// The user agent playback requests should send, if overridden.
-    pub fn user_agent(&self) -> Option<&str> {
-        self.options.user_agent.as_deref()
+    /// The user agent playback requests should send: the server's override, else the same
+    /// default every API call sends ([`abs_api::DEFAULT_USER_AGENT`]).
+    pub fn user_agent(&self) -> &str {
+        self.options.user_agent.as_deref().unwrap_or(abs_api::DEFAULT_USER_AGENT)
     }
 
     /// Whether playback should skip certificate verification (see
@@ -369,6 +370,7 @@ mod tests {
         assert_eq!(target.options.client_cert_path.as_deref(), Some(std::path::Path::new("/certs/client.p12")));
         assert_eq!(target.options.client_cert_password.as_deref(), Some("pw"));
         assert_eq!(target.options.user_agent.as_deref(), Some("MyAgent/1.0"), "trimmed");
+        assert_eq!(target.user_agent(), "MyAgent/1.0", "playback sends the override too");
     }
 
     #[test]
@@ -381,6 +383,7 @@ mod tests {
         assert_eq!(target.options.client_cert_path, None);
         assert_eq!(target.options.client_cert_password, None);
         assert_eq!(target.options.user_agent, None);
+        assert_eq!(target.user_agent(), abs_api::DEFAULT_USER_AGENT, "playback falls back to the app's own agent");
     }
 
     #[test]

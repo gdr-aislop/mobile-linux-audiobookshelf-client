@@ -35,6 +35,7 @@ pub struct TestHooks {
     pub url_row: adw::EntryRow,
     pub username_row: adw::EntryRow,
     pub password_row: adw::PasswordEntryRow,
+    pub remember_switch: gtk4::Switch,
     pub connect_button: gtk4::Button,
     pub cancel_button: gtk4::Button,
     pub banner: crate::widgets::banner::ErrorBanner,
@@ -129,12 +130,22 @@ pub fn build(
     crate::widgets::entry_row_input_purpose(&url_row, gtk4::InputPurpose::Url);
     let username_row = adw::EntryRow::builder().title(tr("Username")).show_apply_button(false).build();
     let password_row = adw::PasswordEntryRow::builder().title(tr("Password")).show_apply_button(false).build();
+    // On by default: a remembered password is what lets the app sign in again by itself when the
+    // server ends the session (see `abs_core::auth`), so one sign-in lasts.
+    let remember_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).active(true).build();
+    let remember_row = adw::ActionRow::builder()
+        .title(tr("Remember password"))
+        .subtitle(tr("Signs you in again if the server ends the session. Kept in your keyring."))
+        .activatable_widget(&remember_switch)
+        .build();
+    remember_row.add_suffix(&remember_switch);
     let token_row = adw::EntryRow::builder().title(tr("API Token")).show_apply_button(false).build();
     token_row.set_visible(false);
 
     list.append(&url_row);
     list.append(&username_row);
     list.append(&password_row);
+    list.append(&remember_row);
     list.append(&token_row);
     content.append(&list);
 
@@ -180,11 +191,13 @@ pub fn build(
     let update_visibility: Rc<dyn Fn(AuthMode)> = Rc::new({
         let username_row = username_row.clone();
         let password_row = password_row.clone();
+        let remember_row = remember_row.clone();
         let token_row = token_row.clone();
         move |mode: AuthMode| {
             let is_password = mode == AuthMode::Password;
             username_row.set_visible(is_password);
             password_row.set_visible(is_password);
+            remember_row.set_visible(is_password);
             token_row.set_visible(!is_password);
         }
     });
@@ -252,6 +265,7 @@ pub fn build(
         let url_row = url_row.clone();
         let username_row = username_row.clone();
         let password_row = password_row.clone();
+        let remember_switch = remember_switch.clone();
         let mode_box = mode_box.clone();
         let list = list.clone();
         let connect_button = connect_button.clone();
@@ -261,6 +275,7 @@ pub fn build(
             let url = url_row.text().trim().to_string();
             let username = username_row.text().trim().to_string();
             let password = password_row.text().to_string();
+            let remember = remember_switch.is_active();
 
             mode_box.set_sensitive(false);
             list.set_sensitive(false);
@@ -285,9 +300,10 @@ pub fn build(
             crate::log_privacy::global().register_username(&username);
 
             glib::spawn_future_local(async move {
+                let passwords = crate::password_keyring::store();
                 let result = match &previous {
-                    Some(seed) => abs_core::accounts::relogin(&pool, &paths, seed, &url, &username, &password).await,
-                    None => abs_core::accounts::add_server_and_login(&pool, &url, &username, &password).await,
+                    Some(seed) => abs_core::accounts::relogin(&pool, &paths, seed, &url, &username, &password, passwords.as_ref(), remember).await,
+                    None => abs_core::accounts::add_server_and_login(&pool, &url, &username, &password, passwords.as_ref(), remember).await,
                 };
 
                 mode_box.set_sensitive(true);
@@ -428,6 +444,7 @@ pub fn build(
         url_row: url_row.clone(),
         username_row: username_row.clone(),
         password_row: password_row.clone(),
+        remember_switch: remember_switch.clone(),
         connect_button: connect_button.clone(),
         cancel_button: cancel_button.clone(),
         banner: banner.clone(),
@@ -799,6 +816,7 @@ pub(crate) mod tests {
             let hooks = screen.test_hooks();
 
             assert!(!hooks.connect_button.is_sensitive(), "empty form should start disabled");
+            assert!(hooks.remember_switch.is_active(), "Remember password starts on, so one sign-in lasts");
             let url_text = hooks
                 .url_row
                 .delegate()

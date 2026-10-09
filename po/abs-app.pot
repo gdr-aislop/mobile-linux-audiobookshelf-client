@@ -133,6 +133,10 @@ msgstr ""
 msgid "{context} failed — try again"
 msgstr ""
 
+#: app/src/password_keyring.rs
+msgid "Audiobookshelf account password"
+msgstr ""
+
 #: app/src/player.rs
 msgid "Playback error — tap for details"
 msgstr ""
@@ -1173,6 +1177,15 @@ msgstr ""
 
 #: app/src/screens/welcome.rs
 msgid "Username"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Remember password"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid ""
+"Signs you in again if the server ends the session. Kept in your keyring."
 msgstr ""
 
 #: app/src/screens/welcome.rs

@@ -176,6 +176,18 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       session stays active). Replace proceeds with the login; if the login then fails, the old
       session is still intact (retryable, nothing was removed).
 
+- [ ] **WT-15 — Remember password is on by default and goes to the keyring.** Look at the form,
+      then sign in without touching the switch.
+      *Expected:* "Remember password" sits under the Password field, switched on, and is hidden in
+      API Token mode. After signing in, the keyring (Seahorse, or `secret-tool search xdg:schema
+      io.github.gdr_aislop.abs-app.Password`) holds one item for the account. If the keyring is
+      locked, the system unlock prompt may appear. Signing in again with the switch off, or
+      signing out, removes the item.
+      *Automated:* `welcome_connect` (switch starts on); abs-core's
+      `a_login_remembers_the_password_only_when_asked_to`,
+      `a_relogin_that_replaces_the_account_forgets_the_old_password`,
+      `signing_out_or_removing_the_server_forgets_the_password`.
+
 ---
 
 ## 2. App shell & navigation (NT) — ✅ implemented
@@ -681,12 +693,39 @@ was and wasn't verified.
       dead connection and Resume a book whose current chapter is downloaded.
       *Expected:* sound within ~3 s of tapping Resume (log: `starting playback`, then `the server
       is slow or unreachable; starting from the downloaded files` within about 3 s). A token
-      refresh that fails is tried once, not by every screen in turn: the log shows at most one
-      `couldn't refresh the access token` per minute, followed by `skipping the token refresh:
-      the last attempt failed Ns ago`.
+      refresh that fails is tried once, not by every screen in turn: the log shows
+      `couldn't refresh the access token` followed by `skipping the token refresh: the last
+      attempt failed Ns ago`. The only further attempts are the background retries of MP-31,
+      when that line says `unconfirmed=true`.
       *Automated:* `playback_a_downloaded_book_starts_without_waiting_for_a_token_refresh`
       (expired token, a server that never answers `/auth/refresh`); abs-core's
       `a_failed_refresh_is_not_retried_by_the_next_caller`.
+
+- [ ] **MP-31 — The login survives a token refresh whose reply is lost.** With the access token
+      expired (open the app after an hour or more away), make the refresh's reply fail to arrive:
+      e.g. block the server's responses at the reverse proxy for ~20 s, or drop the connection
+      right as the app wakes on a weak network.
+      *Expected:* the log shows `couldn't refresh the access token … unconfirmed=true`, then `the
+      server may have replaced the refresh token …; retrying while it still accepts the old one`,
+      then, once replies get through again, `refreshed the account's access token recovered=true`,
+      all within 9 minutes. The app stays signed in (no "Session expired" toast, syncing works),
+      and the phone doesn't suspend while the retries run. A slow reply (the server answers, then
+      the ~30 KB body trickles in) is waited for, up to 2 minutes, rather than thrown away.
+      *Automated:* abs-core's `a_refresh_whose_reply_was_lost_is_retried_with_the_same_token_until_it_lands`,
+      `a_rejection_ends_the_retries`, `the_retries_stop_once_the_server_no_longer_accepts_the_old_token`,
+      `the_device_is_kept_awake_for_exactly_as_long_as_a_refresh_is_in_flight`; abs-api's
+      `refresh_waits_for_a_slow_reply_once_the_server_has_answered`.
+      *And when the refresh token is gone for good* (the retries came too late, the app went
+      unused past the token's 30-day lifetime, or the server lost its sessions, e.g. after a
+      database restore): with a remembered
+      password (WT-15) the log shows `signed in again with the remembered password` right after
+      the refresh is refused, and the app stays signed in. If the password was changed on the
+      server, the log shows `the server refused the remembered password` once, no further sign-in
+      attempts follow, and the usual "Session expired — log in again" appears.
+      *Automated:* abs-core's `a_rejected_refresh_token_signs_in_again_with_the_remembered_password`,
+      `without_a_remembered_password_a_rejected_refresh_token_stays_rejected`,
+      `a_password_the_server_refuses_is_not_tried_again`,
+      `a_sign_in_that_fails_for_another_reason_is_tried_again_after_the_cool_down`.
 
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes
@@ -1303,10 +1342,14 @@ button restoring the shell.
       refresh specifically) in abs-api's and abs-core's mocked tests.
 
 - [ ] **CN-6 — User-Agent override.** Set a custom User-Agent and check the proxy/server logs.
-      *Expected:* requests carry the overridden value; clearing it restores the default.
+      *Expected:* before any override, API calls, token refreshes and audio stream requests all
+      show `abs-app/<version> (Linux)` in the server's access log (not `-`, not GStreamer's
+      agent). With an override they carry the overridden value; clearing it restores the default.
       *Automated:* the user-agent editor's set/clear paths in
-      `connection_advanced_rows_persist_and_edit`; the override reaching the wire in abs-api's
-      mocked test.
+      `connection_advanced_rows_persist_and_edit`; abs-api's
+      `requests_send_the_app_s_own_user_agent_unless_overridden` and
+      `custom_headers_and_user_agent_reach_the_wire`; abs-core's connection tests for the agent
+      playback is given.
 
 - [ ] **CN-7 — Client certificate (mTLS).** Import a client certificate for a server that
       requires one.

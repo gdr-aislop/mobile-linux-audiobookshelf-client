@@ -24,7 +24,7 @@ async fn live_login_against_demo_server_succeeds() {
         .await
         .expect("connect and migrate temp database");
 
-    let added = abs_core::accounts::add_server_and_login(&pool, DEMO_SERVER_URL, "demo", "demo")
+    let added = abs_core::accounts::add_server_and_login(&pool, DEMO_SERVER_URL, "demo", "demo", &abs_core::passwords::NoPasswords, false)
         .await
         .expect("login against the live demo server should succeed");
 
@@ -62,7 +62,7 @@ async fn live_login_against_demo_server_with_wrong_password_fails_cleanly() {
         .expect("connect and migrate temp database");
 
     let result =
-        abs_core::accounts::add_server_and_login(&pool, DEMO_SERVER_URL, "demo", "definitely-wrong")
+        abs_core::accounts::add_server_and_login(&pool, DEMO_SERVER_URL, "demo", "definitely-wrong", &abs_core::passwords::NoPasswords, false)
             .await;
 
     assert!(result.is_err(), "wrong credentials must not succeed");

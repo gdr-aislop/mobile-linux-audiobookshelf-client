@@ -47,6 +47,11 @@ image.workspace = true
 crash-handler.workspace = true
 minidumper.workspace = true
 
+# Remembered passwords live in the desktop keyring: the Secret Service on the host, the Secret
+# portal inside Flatpak. Pure Rust, so no new system library for the AppImage. See
+# `password_keyring.rs`.
+oo7 = { version = "0.5", default-features = false, features = ["tokio", "native_crypto"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
