@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use abs_storage::models::Item;
 
+use crate::i18n::tr_args;
 use crate::player::PlayRequest;
 use crate::widgets::cover_image::CoverImage;
 
@@ -161,7 +162,7 @@ fn progress_row(fraction: f64) -> gtk4::Box {
     // the `horizontal` one GTK sets itself — which Adwaita's trough height hangs off, leaving a
     // zero-height (invisible) bar.
     bar.add_css_class("card-progress");
-    let percent = gtk4::Label::builder().label(format!("{:.0}%", fraction * 100.0)).css_classes(["caption", "numeric"]).build();
+    let percent = gtk4::Label::builder().label(tr_args("{percent}%", &[("percent", &format!("{:.0}", fraction * 100.0))])).css_classes(["caption", "numeric"]).build();
     row.append(&bar);
     row.append(&percent);
     row

@@ -76,7 +76,7 @@ jobs:
           set -eux
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential pkg-config git curl ca-certificates \
+            build-essential pkg-config git curl ca-certificates gettext \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libssl-dev libpulse-dev
@@ -89,6 +89,9 @@ jobs:
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
+
+      - name: Compile translations
+        run: ./scripts/build-l10n.sh build/l10n
 
       - name: Build .deb
         run: cargo deb -p abs-app
@@ -131,7 +134,7 @@ jobs:
           set -eux
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential pkg-config git curl ca-certificates file patchelf zsync \
+            build-essential pkg-config git curl ca-certificates file patchelf zsync gettext \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libssl-dev libpulse-dev \

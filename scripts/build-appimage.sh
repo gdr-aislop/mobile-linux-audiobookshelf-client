@@ -176,9 +176,16 @@ install -Dm755 "$BIN" "$APPDIR/usr/bin/$APP_NAME"
 if command -v strip >/dev/null 2>&1; then
     strip "$APPDIR/usr/bin/$APP_NAME"
 fi
-install -Dm644 "app/assets/$APP_ID.desktop" "$APPDIR/usr/share/applications/$APP_ID.desktop"
+# Translations: the compiled .mo catalogs, plus the .desktop and metainfo with their translated
+# fields merged in (plain copies while po/LINGUAS is empty). The app finds the catalogs at
+# <exe dir>/../share/locale, i.e. $APPDIR/usr/share/locale (app/src/i18n.rs).
+L10N_DIR="$OUTPUT_DIR/l10n"
+./scripts/build-l10n.sh "$L10N_DIR"
+install -Dm644 "$L10N_DIR/$APP_ID.desktop" "$APPDIR/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "app/assets/$APP_ID.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
-install -Dm644 "app/assets/$APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
+install -Dm644 "$L10N_DIR/$APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
+mkdir -p "$APPDIR/usr/share/locale"
+cp -a "$L10N_DIR/locale/." "$APPDIR/usr/share/locale/"
 install -Dm644 LICENSE "$APPDIR/usr/share/doc/$APP_NAME/LICENSE"
 
 # GStreamer: core plugins ship in libgstreamer, so copying the whole plugin

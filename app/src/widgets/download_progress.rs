@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::downloads::{DownloadEvent, DownloadManager, ItemDownloadState};
+use crate::i18n::{tr, tr_args};
 
 /// Per-instance speed smoothing — same EMA shape as `screens::downloads`'s own `SpeedState`, just
 /// keyed to a single item (this widget is always built for exactly one) rather than a `HashMap`
@@ -64,7 +65,7 @@ impl DownloadProgressStrip {
     pub(crate) fn build(download_manager: DownloadManager, server_id: String, item_id: String) -> (gtk4::Revealer, std::rc::Rc<Self>) {
         let progress_bar = gtk4::ProgressBar::builder().hexpand(true).build();
         let label = gtk4::Label::builder().css_classes(["caption", "dim-label"]).xalign(0.0).build();
-        let stop_button = gtk4::Button::builder().label("Stop").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+        let stop_button = gtk4::Button::builder().label(&tr("Stop")).css_classes(["flat"]).valign(gtk4::Align::Center).build();
 
         let bar_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).build();
         bar_row.append(&progress_bar);
@@ -185,6 +186,8 @@ impl DownloadProgressStrip {
         let display_speed = (speed.ema > 0.0).then_some(speed.ema);
         drop(speed);
 
-        self.label.set_label(&format!("Downloading · {}", crate::screens::downloads::downloading_subtitle(batch, bytes, display_speed)));
+        let details = crate::screens::downloads::downloading_subtitle(batch, bytes, display_speed);
+        // TRANSLATORS: {details} is a progress summary such as "3 of 12 chapters · 40 MB of 200 MB · 2.1 MB/s".
+        self.label.set_label(&tr_args("Downloading · {details}", &[("details", &details)]));
     }
 }

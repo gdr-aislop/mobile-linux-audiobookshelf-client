@@ -20,6 +20,7 @@ use adw::prelude::*;
 use abs_core::playback::SPEED_PRESETS;
 
 use crate::downloads::DownloadManager;
+use crate::i18n::{ntr, tr, tr_args, tr_noop};
 use crate::player::{ChapterInfo, PlayerController, PlayerSnapshot};
 
 pub struct PlayerScreen {
@@ -104,7 +105,7 @@ pub fn build(
         }
     });
     header.pack_start(&collapse_button);
-    header.set_title_widget(Some(&adw::WindowTitle::new("Now Playing", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("Now Playing"), "")));
 
     // Surfaces `PlayerSnapshot::last_error` — see that field's doc comment for why this exists at
     // all (previously a playback failure was completely invisible: logged, silently paused, done).
@@ -122,7 +123,7 @@ pub fn build(
     // plan). "Mark as finished"/"Reset progress" themselves are the shared `item_options_menu`
     // widget (also used by Item Detail); only "Add bookmark" is built here, since bookmarking only
     // makes sense while something is actively loaded for playback.
-    let add_bookmark_button = gtk4::Button::builder().label("Add bookmark").css_classes(["flat"]).halign(gtk4::Align::Start).build();
+    let add_bookmark_button = gtk4::Button::builder().label(tr("Add bookmark")).css_classes(["flat"]).halign(gtk4::Align::Start).build();
 
     let cover = crate::widgets::cover_image::CoverImage::new(264);
     cover.widget().set_halign(gtk4::Align::Center);
@@ -159,7 +160,7 @@ pub fn build(
         .max_width_chars(1)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .css_classes(["accent"])
-        .tooltip_text("Chapters")
+        .tooltip_text(tr("Chapters"))
         .margin_top(6)
         .visible(false)
         .build();
@@ -189,7 +190,7 @@ pub fn build(
     // card's ⏮/⏭ are (MPRIS `Previous`/`Next`), with the skip-N-seconds pair inside them.
     let previous_chapter = gtk4::Button::builder()
         .css_classes(["circular", "flat"])
-        .tooltip_text("Previous chapter")
+        .tooltip_text(tr("Previous chapter"))
         .child(&gtk4::Image::from_icon_name("media-skip-backward-symbolic"))
         .build();
     let skip_back = gtk4::Button::builder()
@@ -214,7 +215,7 @@ pub fn build(
         .build();
     let next_chapter = gtk4::Button::builder()
         .css_classes(["circular", "flat"])
-        .tooltip_text("Next chapter")
+        .tooltip_text(tr("Next chapter"))
         .child(&gtk4::Image::from_icon_name("media-skip-forward-symbolic"))
         .build();
     // Five buttons have to fit a 360px-wide phone between `content`'s 28px margins, hence the
@@ -235,10 +236,10 @@ pub fn build(
     // codebase's existing convention of wiring everything through direct `connect_clicked`
     // closures rather than `GMenu`/`GAction` models.
 
-    let speed_label = gtk4::Label::new(Some("1.0×"));
+    let speed_label = gtk4::Label::new(Some("1.0×")); // i18n: ignore — speed placeholder, replaced by format_speed on the first snapshot
     let speed_popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     let speed_popover = gtk4::Popover::builder().child(&speed_popover_box).build();
-    let speed_button = gtk4::MenuButton::builder().child(&speed_label).tooltip_text("Playback speed").popover(&speed_popover).build();
+    let speed_button = gtk4::MenuButton::builder().child(&speed_label).tooltip_text(tr("Playback speed")).popover(&speed_popover).build();
     for speed in SPEED_PRESETS {
         let button = gtk4::Button::builder().label(format_speed(speed)).css_classes(["flat"]).build();
         button.connect_clicked({
@@ -256,16 +257,16 @@ pub fn build(
     let sleep_timer_popover = gtk4::Popover::builder().child(&sleep_timer_popover_box).build();
     let sleep_timer_button = gtk4::MenuButton::builder()
         .icon_name("weather-clear-night-symbolic")
-        .tooltip_text("Sleep timer")
+        .tooltip_text(tr("Sleep timer"))
         .popover(&sleep_timer_popover)
         .build();
     type SleepTimerAction = Box<dyn Fn(&PlayerController)>;
-    let sleep_timer_options: [(&str, SleepTimerAction); 5] = [
-        ("Off", Box::new(|c: &PlayerController| c.cancel_sleep_timer())),
-        ("15 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(15))),
-        ("30 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(30))),
-        ("45 minutes", Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(45))),
-        ("End of chapter", Box::new(|c: &PlayerController| c.set_sleep_timer_end_of_chapter())),
+    let sleep_timer_options: [(String, SleepTimerAction); 5] = [
+        (tr("Off"), Box::new(|c: &PlayerController| c.cancel_sleep_timer())),
+        (ntr("{count} minute", "{count} minutes", 15), Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(15))),
+        (ntr("{count} minute", "{count} minutes", 30), Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(30))),
+        (ntr("{count} minute", "{count} minutes", 45), Box::new(|c: &PlayerController| c.set_sleep_timer_minutes(45))),
+        (tr("End of chapter"), Box::new(|c: &PlayerController| c.set_sleep_timer_end_of_chapter())),
     ];
     for (label, apply) in sleep_timer_options {
         let button = gtk4::Button::builder().label(label).css_classes(["flat"]).build();
@@ -287,7 +288,7 @@ pub fn build(
     // badge use, so the icon itself is the legend.
     let chapters_legend = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(4).margin_bottom(4).build();
     chapters_legend.append(&gtk4::Image::builder().icon_name("folder-download-symbolic").css_classes(["dim-label"]).build());
-    chapters_legend.append(&gtk4::Label::builder().label("downloaded").css_classes(["caption", "dim-label"]).build());
+    chapters_legend.append(&gtk4::Label::builder().label(tr("downloaded")).css_classes(["caption", "dim-label"]).build());
     let chapters_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     chapters_box.append(&chapters_legend);
     chapters_box.append(&chapters_list);
@@ -301,7 +302,7 @@ pub fn build(
     let chapters_popover = gtk4::Popover::builder().child(&chapters_scroller).build();
     let chapters_button = gtk4::MenuButton::builder()
         .icon_name("view-list-symbolic")
-        .tooltip_text("Chapters")
+        .tooltip_text(tr("Chapters"))
         .popover(&chapters_popover)
         .build();
 
@@ -413,7 +414,7 @@ pub fn build(
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
                 // Only a controller that acted has anything to undo.
                 if controller.mark_as_finished() {
-                    toast_overlay.add_toast(undo_position_toast(&controller, "Marked as finished", before));
+                    toast_overlay.add_toast(undo_position_toast(&controller, &tr("Marked as finished"), before));
                 }
             }
         },
@@ -423,7 +424,7 @@ pub fn build(
             move || {
                 let before = controller.snapshot().map(|s| s.position_seconds).unwrap_or(0.0);
                 if controller.reset_progress() {
-                    toast_overlay.add_toast(undo_position_toast(&controller, "Progress reset", before));
+                    toast_overlay.add_toast(undo_position_toast(&controller, &tr("Progress reset"), before));
                 }
             }
         },
@@ -440,8 +441,8 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 match write.await {
-                    Ok(()) => toast_overlay.add_toast(adw::Toast::new("Bookmark added")),
-                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Adding bookmark", err),
+                    Ok(()) => toast_overlay.add_toast(adw::Toast::new(&tr("Bookmark added"))),
+                    Err(err) => crate::error_reporting::report_background_error(&toast_overlay, &tr("Adding bookmark"), err),
                 }
             });
         }
@@ -650,7 +651,11 @@ pub fn build(
             author_label.set_visible(snapshot.author.is_some());
             match &snapshot.chapter {
                 Some(chapter) => {
-                    let text = format!("{} · {} of {}", chapter.title, chapter.number, chapter.count);
+                    // TRANSLATORS: the chapter line under the author, e.g. "Chapter 3 · 3 of 12". {title} is the chapter's name, {number} its 1-based position and {total} how many chapters the book has.
+                    let text = tr_args(
+                        "{title} · {number} of {total}",
+                        &[("title", &chapter.title), ("number", &chapter.number.to_string()), ("total", &chapter.count.to_string())],
+                    );
                     // `update` runs 4 times a second; only touch the label when the chapter changes.
                     if chapter_label.label() != text {
                         chapter_label.set_label(&text);
@@ -685,7 +690,8 @@ pub fn build(
                 label.set_opacity(if length_known { 1.0 } else { 0.0 });
             }
             if snapshot.chapter.is_some() {
-                let left = format!("{} left in book", format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0)));
+                // TRANSLATORS: {time} is the time left in the whole book, e.g. "1:05:09".
+                let left = tr_args("{time} left in book", &[("time", &format_hms((snapshot.duration_seconds - snapshot.position_seconds).max(0.0)))]);
                 if book_left_label.label() != left {
                     book_left_label.set_label(&left);
                 }
@@ -717,9 +723,9 @@ pub fn build(
             match &snapshot.last_error {
                 Some(err) => {
                     let message = friendly_message(err.kind);
-                    error_banner.set_title(message.headline);
-                    error_banner.set_description(Some(message.description));
-                    error_banner.set_action_label(message.action);
+                    error_banner.set_title(&tr(message.headline));
+                    error_banner.set_description(Some(&tr(message.description)));
+                    error_banner.set_action_label(message.action.map(tr).as_deref());
                     error_banner.set_details(Some(err.debug.as_deref().unwrap_or(&err.message)));
                     error_banner.set_revealed(true);
                 }
@@ -818,7 +824,7 @@ fn build_chapter_row(chapter: &ChapterInfo, position: f64, is_downloaded: bool) 
     if is_downloaded {
         // Same glyph as the covers' downloaded badge — a "this is on disk and playable offline"
         // marker, not a completion checkmark (which is the download *button's* state icon).
-        row_box.append(&gtk4::Image::builder().icon_name("folder-download-symbolic").css_classes(["dim-label"]).tooltip_text("Downloaded").build());
+        row_box.append(&gtk4::Image::builder().icon_name("folder-download-symbolic").css_classes(["dim-label"]).tooltip_text(tr("Downloaded")).build());
     }
 
     if is_current {
@@ -844,7 +850,7 @@ pub(crate) fn format_speed(speed: f64) -> String {
 /// progress), with an Undo that returns playback to `before` and saves it back — local and
 /// server — as unfinished.
 fn undo_position_toast(controller: &crate::player::PlayerController, title: &str, before: f64) -> adw::Toast {
-    let toast = adw::Toast::builder().title(title).button_label("Undo").timeout(10).build();
+    let toast = adw::Toast::builder().title(title).button_label(tr("Undo")).timeout(10).build();
     let controller = controller.clone();
     // The Undo belongs to the book it was offered for; another book may be loaded by the time
     // it's tapped.
@@ -880,17 +886,17 @@ pub(crate) fn format_hms(total_seconds: f64) -> String {
 pub(crate) fn friendly_message(kind: abs_player::PlaybackErrorKind) -> FriendlyMessage {
     use abs_player::PlaybackErrorKind::*;
     let (headline, description, action) = match kind {
-        MissingCodec => ("Can't play this file", "Support for its audio format is missing on this device.", None),
-        UnsupportedOrCorrupt => ("Can't decode this file", "It may be corrupted, or in a format this app doesn't support.", None),
-        ResourceNotFound => ("Audio not found on the server", "It may have been moved or deleted.", None),
-        NotAuthorized => ("The server refused this request", "Try signing in again.", None),
-        AudioOutput => ("Can't reach the audio output", "Check this device's sound settings and try again.", Some("Retry")),
-        Network => ("Connection lost", "Check your connection and try again.", Some("Retry")),
-        Unreachable => ("Can't reach your server", "This book can't start until it's back. Check your connection and try again.", Some("Retry")),
-        Seek => ("Couldn't get to that position", "Try again, or try another position.", Some("Retry")),
-        Offline => ("This part isn't downloaded", "Turn off offline mode to stream it.", None),
-        Unavailable => ("Playback isn't available", "No audio engine could be started on this device.", None),
-        Other => ("Playback stopped unexpectedly", "Try again.", Some("Retry")),
+        MissingCodec => (tr_noop("Can't play this file"), tr_noop("Support for its audio format is missing on this device."), None),
+        UnsupportedOrCorrupt => (tr_noop("Can't decode this file"), tr_noop("It may be corrupted, or in a format this app doesn't support."), None),
+        ResourceNotFound => (tr_noop("Audio not found on the server"), tr_noop("It may have been moved or deleted."), None),
+        NotAuthorized => (tr_noop("The server refused this request"), tr_noop("Try signing in again."), None),
+        AudioOutput => (tr_noop("Can't reach the audio output"), tr_noop("Check this device's sound settings and try again."), Some(tr_noop("Retry"))),
+        Network => (tr_noop("Connection lost"), tr_noop("Check your connection and try again."), Some(tr_noop("Retry"))),
+        Unreachable => (tr_noop("Can't reach your server"), tr_noop("This book can't start until it's back. Check your connection and try again."), Some(tr_noop("Retry"))),
+        Seek => (tr_noop("Couldn't get to that position"), tr_noop("Try again, or try another position."), Some(tr_noop("Retry"))),
+        Offline => (tr_noop("This part isn't downloaded"), tr_noop("Turn off offline mode to stream it."), None),
+        Unavailable => (tr_noop("Playback isn't available"), tr_noop("No audio engine could be started on this device."), None),
+        Other => (tr_noop("Playback stopped unexpectedly"), tr_noop("Try again."), Some(tr_noop("Retry"))),
     };
     FriendlyMessage { headline, description, action }
 }
@@ -905,21 +911,21 @@ pub(crate) struct FriendlyMessage {
 
 /// A few words for the shell's toast — at most 20 characters, so the toast never cuts them off
 /// on a 360px phone next to its "View" and close buttons; the full message is in the player's
-/// banner, one tap ("View") away.
+/// banner, one tap (tr_noop("View")) away.
 pub(crate) fn short_message(kind: abs_player::PlaybackErrorKind) -> &'static str {
     use abs_player::PlaybackErrorKind::*;
     match kind {
-        MissingCodec => "Can't play this file",
-        UnsupportedOrCorrupt => "Can't decode this file",
-        ResourceNotFound => "Audio not found",
-        NotAuthorized => "Playback refused",
-        AudioOutput => "No audio output",
-        Network => "Connection lost",
-        Unreachable => "Can't reach server",
-        Seek => "Couldn't seek",
-        Offline => "Not downloaded",
-        Unavailable => "Playback unavailable",
-        Other => "Playback stopped",
+        MissingCodec => tr_noop("Can't play this file"),
+        UnsupportedOrCorrupt => tr_noop("Can't decode this file"),
+        ResourceNotFound => tr_noop("Audio not found"),
+        NotAuthorized => tr_noop("Playback refused"),
+        AudioOutput => tr_noop("No audio output"),
+        Network => tr_noop("Connection lost"),
+        Unreachable => tr_noop("Can't reach server"),
+        Seek => tr_noop("Couldn't seek"),
+        Offline => tr_noop("Not downloaded"),
+        Unavailable => tr_noop("Playback unavailable"),
+        Other => tr_noop("Playback stopped"),
     }
 }
 
@@ -939,7 +945,7 @@ fn scrub_range(snapshot: &PlayerSnapshot) -> (f64, f64) {
 
 fn set_time_labels(elapsed_label: &gtk4::Label, remaining_label: &gtk4::Label, position: f64, duration: f64) {
     elapsed_label.set_label(&format_hms(position));
-    remaining_label.set_label(&format!("-{}", format_hms((duration - position).max(0.0))));
+    remaining_label.set_label(&format!("-{}", format_hms((duration - position).max(0.0)))); // i18n: ignore — "-" plus a clock time, not words
 }
 
 /// Below this, a downward drag is ignored; at or above it, a predominantly-downward drag

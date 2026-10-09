@@ -13,6 +13,8 @@
 
 use adw::prelude::*;
 
+use crate::i18n::tr;
+
 /// Arms `on_refresh` to fire whenever the user pulls `scroller` past its top edge. The scroller
 /// must be the screen's main vertical one — attaching it to a horizontal shelf would fire on
 /// sideways overscrolls (the signal reports the edge, which is how `Top` is filtered here).
@@ -48,7 +50,7 @@ impl PullIndicator {
             .margin_bottom(8)
             .build();
         content.append(&spinner);
-        content.append(&gtk4::Label::new(Some("Syncing…")));
+        content.append(&gtk4::Label::new(Some(&tr("Syncing…"))));
         let revealer = gtk4::Revealer::builder()
             .transition_type(gtk4::RevealerTransitionType::SlideDown)
             .child(&content)

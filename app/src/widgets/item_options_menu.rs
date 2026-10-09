@@ -18,6 +18,8 @@
 
 use adw::prelude::*;
 
+use crate::i18n::tr;
+
 /// The button + its popover. Callers embed `.widget` wherever their layout wants this action —
 /// Player's header, Item Detail's header.
 pub struct ItemOptionsMenu {
@@ -48,8 +50,8 @@ pub fn build(
     on_mark_as_finished: impl Fn() + 'static,
     on_reset_progress: impl Fn() + 'static,
 ) -> ItemOptionsMenu {
-    let mark_as_finished_button = gtk4::Button::builder().label("Mark as finished").css_classes(["flat"]).halign(gtk4::Align::Start).build();
-    let reset_progress_button = gtk4::Button::builder().label("Reset progress").css_classes(["destructive-action"]).margin_top(6).build();
+    let mark_as_finished_button = gtk4::Button::builder().label(&tr("Mark as finished")).css_classes(["flat"]).halign(gtk4::Align::Start).build();
+    let reset_progress_button = gtk4::Button::builder().label(&tr("Reset progress")).css_classes(["destructive-action"]).margin_top(6).build();
 
     let popover_box = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
     if let Some(leading_widget) = &leading_widget {
@@ -60,7 +62,7 @@ pub fn build(
     popover_box.append(&reset_progress_button);
 
     let popover = gtk4::Popover::builder().child(&popover_box).build();
-    let widget = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").popover(&popover).build();
+    let widget = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text(tr("More")).popover(&popover).build();
 
     mark_as_finished_button.connect_clicked({
         let popover = popover.clone();

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- gettext ITS rules for the AppStream metainfo: which elements are translatable text.
+     (gettext 0.21 ships no AppStream rules of its own.) Found through GETTEXTDATADIRS=po/gettext-data
+     (see metainfo.loc) by scripts/update-pot.sh and scripts/build-l10n.sh. -->
+<its:rules xmlns:its="http://www.w3.org/2005/11/its" version="1.0">
+  <its:translateRule selector="/component" translate="no"/>
+  <its:translateRule selector="/component/name | /component/summary | /component/developer_name | /component/description/p | /component/description/ul/li | /component/description/ol/li | /component/screenshots/screenshot/caption" translate="yes"/>
+  <its:withinTextRule withinText="yes" selector="/component/description/p/* | /component/description/ul/li/* | /component/description/ol/li/*"/>
+</its:rules>

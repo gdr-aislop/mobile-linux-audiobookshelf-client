@@ -23,6 +23,7 @@ use crate::widgets::combo_row;
 use abs_storage::AppPaths;
 
 use crate::downloads::DownloadManager;
+use crate::i18n::{ntr, tr, tr_args, tr_noop};
 use crate::player::PlayerController;
 
 /// Skip-interval choices (seconds) for Settings → Playback — the full player's transport buttons,
@@ -93,7 +94,7 @@ pub fn build(
     let toast_overlay = adw::ToastOverlay::new();
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("Settings"), "")));
 
     let page = adw::PreferencesPage::new();
 
@@ -121,10 +122,11 @@ pub fn build(
         .expect("the signed-in shell requires an active account");
 
     let account_group = adw::PreferencesGroup::new();
-    account_group.set_title("Account");
+    account_group.set_title(&tr("Account"));
     let account_row = adw::ActionRow::builder()
         .title(&active_account.username)
-        .subtitle(format!("{} · active", host_of(&active_server.url)))
+        // TRANSLATORS: Subtitle of the signed-in account's row. {host} is the server's address; "active" marks it as the server in use.
+        .subtitle(tr_args("{host} · active", &[("host", host_of(&active_server.url))]))
         .build();
     account_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
     account_row.set_activatable(true);
@@ -146,16 +148,17 @@ pub fn build(
     // server/account at a time, since a global "Sign Out" would be ambiguous with multiple
     // servers supported. ---
     let servers_group = adw::PreferencesGroup::new();
-    servers_group.set_title("Servers");
+    servers_group.set_title(&tr("Servers"));
 
     #[cfg(test)]
     let mut server_rows_hooks = Vec::new();
     for (server, accounts) in &servers_with_accounts {
         let is_active_server = accounts.iter().any(|account| account.is_active);
         let subtitle = match accounts.first() {
-            Some(account) if is_active_server => format!("{} · active", account.username),
+            // TRANSLATORS: Subtitle of a server's row. {username} is the account signed in on that server; "active" marks the server in use.
+            Some(account) if is_active_server => tr_args("{username} · active", &[("username", account.username.as_str())]),
             Some(account) => account.username.clone(),
-            None => "No signed-in account".to_string(),
+            None => tr("No signed-in account"),
         };
         let row = adw::ActionRow::builder().title(host_of(&server.url)).subtitle(&subtitle).build();
 
@@ -165,7 +168,7 @@ pub fn build(
         // the shell around it — pointless when this server's account is already the active one,
         // and impossible when the server has none.
         let switch_item = gtk4::Button::builder()
-            .label("Switch to this server")
+            .label(tr("Switch to this server"))
             .css_classes(["flat"])
             .height_request(44)
             .build();
@@ -173,7 +176,7 @@ pub fn build(
         menu_box.append(&switch_item);
 
         let sign_out_item = gtk4::Button::builder()
-            .label("Sign Out")
+            .label(tr("Sign Out"))
             .css_classes(["flat"])
             .height_request(44)
             .build();
@@ -181,7 +184,7 @@ pub fn build(
         menu_box.append(&sign_out_item);
 
         let remove_item = gtk4::Button::builder()
-            .label("Remove Server")
+            .label(tr("Remove Server"))
             .css_classes(["flat", "destructive-action"])
             .height_request(44)
             .build();
@@ -225,7 +228,7 @@ pub fn build(
                     let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
                         if let Err(err) = abs_core::accounts::switch_active_account(&pool, &account_id).await {
-                            crate::error_reporting::report_background_error(&toast_overlay, "Switching accounts", err);
+                            crate::error_reporting::report_background_error(&toast_overlay, &tr("Switching accounts"), err);
                             return;
                         }
                         crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -255,13 +258,15 @@ pub fn build(
                         let unpushed = abs_storage::repo::progress::count_needing_push(&pool, Some(&account_id), None).await.unwrap_or(0);
                         confirm(
                             &dialog_window,
-                            &format!("Sign out of {username}?"),
+                            // TRANSLATORS: Dialog heading. {username} is the account being signed out.
+                            &tr_args("Sign out of {username}?", &[("username", username.as_str())]),
                             &format!(
-                                "{username}'s listening progress and bookmarks stored on this device will be \
-                                 removed — everything on the server stays where it is.{}",
+                                "{}{}",
+                                // TRANSLATORS: Dialog body. {username} is the account being signed out.
+                                tr_args("{username}'s listening progress and bookmarks stored on this device will be removed — everything on the server stays where it is.", &[("username", username.as_str())]),
                                 unpushed_progress_warning(unpushed)
                             ),
-                            "Sign Out",
+                            &tr("Sign Out"),
                             Rc::new(move || {
                                 let pool = pool.clone();
                                 let paths = paths.clone();
@@ -270,7 +275,7 @@ pub fn build(
                                 let toast_overlay = toast_overlay.clone();
                                 glib::spawn_future_local(async move {
                                     if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                                        crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
+                                        crate::error_reporting::report_background_error(&toast_overlay, &tr("Signing out"), err);
                                         return;
                                     }
                                     crate::application::show_main_or_welcome(&window, pool, paths, playback_settings);
@@ -304,13 +309,14 @@ pub fn build(
                     let unpushed = abs_storage::repo::progress::count_needing_push(&pool, None, Some(&server_id)).await.unwrap_or(0);
                     confirm(
                         &dialog_window,
-                        &format!("Remove {server_host}?"),
+                        // TRANSLATORS: Dialog heading. {server} is the address of the server being removed.
+                        &tr_args("Remove {server}?", &[("server", server_host.as_str())]),
                         &format!(
-                            "Every account, cached library, item and downloaded file for this server will be \
-                             removed from this device. Everything on the server itself stays untouched.{}",
+                            "{}{}",
+                            tr("Every account, cached library, item and downloaded file for this server will be removed from this device. Everything on the server itself stays untouched."),
                             unpushed_progress_warning(unpushed)
                         ),
-                        "Remove Server",
+                        &tr("Remove Server"),
                         Rc::new(move || {
                             let pool = pool.clone();
                             let paths = paths.clone();
@@ -319,7 +325,7 @@ pub fn build(
                             let toast_overlay = toast_overlay.clone();
                             glib::spawn_future_local(async move {
                                 if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
-                                    crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
+                                    crate::error_reporting::report_background_error(&toast_overlay, &tr("Removing the server"), err);
                                     return;
                                 }
                                 if let Err(err) = paths.purge_server_data(&server_id).await {
@@ -344,7 +350,7 @@ pub fn build(
 
     // "Add Server" — the only way a second server can ever enter the database: the Welcome flow
     // it reuses is otherwise only reachable when no account is active at all.
-    let add_server_row = adw::ActionRow::builder().title("Add Server").build();
+    let add_server_row = adw::ActionRow::builder().title(tr("Add Server")).build();
     add_server_row.add_prefix(&gtk4::Image::from_icon_name("list-add-symbolic"));
     add_server_row.set_activatable(true);
     add_server_row.connect_activated({
@@ -357,7 +363,7 @@ pub fn build(
     page.add(&servers_group);
 
     let playback_group = adw::PreferencesGroup::new();
-    playback_group.set_title("Playback");
+    playback_group.set_title(&tr("Playback"));
 
     let pause_on_unplug_switch = gtk4::Switch::new();
     pause_on_unplug_switch.set_valign(gtk4::Align::Center);
@@ -367,8 +373,8 @@ pub fn build(
     pause_on_unplug_switch.set_state(playback_settings.pause_on_headphone_unplug);
     pause_on_unplug_switch.set_active(playback_settings.pause_on_headphone_unplug);
     let pause_row = adw::ActionRow::builder()
-        .title("Pause when headphones disconnect")
-        .subtitle("Wired headphones unplugged, or Bluetooth audio lost")
+        .title(tr("Pause when headphones disconnect"))
+        .subtitle(tr("Wired headphones unplugged, or Bluetooth audio lost"))
         .build();
     pause_row.add_suffix(&pause_on_unplug_switch);
     pause_row.set_activatable_widget(Some(&pause_on_unplug_switch));
@@ -380,8 +386,8 @@ pub fn build(
     resume_on_replug_switch.set_active(playback_settings.resume_on_headphone_replug);
     resume_on_replug_switch.set_sensitive(playback_settings.pause_on_headphone_unplug);
     let resume_row = adw::ActionRow::builder()
-        .title("Resume when headphones reconnect")
-        .subtitle("Only undoes a pause caused by disconnecting — never a manual pause or a call")
+        .title(tr("Resume when headphones reconnect"))
+        .subtitle(tr("Only undoes a pause caused by disconnecting — never a manual pause or a call"))
         .build();
     resume_row.add_suffix(&resume_on_replug_switch);
     resume_row.set_activatable_widget(Some(&resume_on_replug_switch));
@@ -424,13 +430,13 @@ pub fn build(
     // speed popover and transport buttons use (one shared constant each, so they can't drift).
     // `set_selected` fires the same `notify::selected` handler user choice does, so the initial
     // value goes through the identical path; the handlers are connected after that.
-    let default_speed_row = combo_row("Default speed", "Speed every book starts at", &speed_labels());
+    let default_speed_row = combo_row(&tr("Default speed"), &tr("Speed every book starts at"), &speed_labels());
     default_speed_row.set_selected(speed_index(playback_settings.default_speed));
     playback_group.add(&default_speed_row);
-    let skip_back_row = combo_row("Skip back", "Seconds the back button and ← key jump", &skip_labels());
+    let skip_back_row = combo_row(&tr("Skip back"), &tr("Seconds the back button and ← key jump"), &skip_labels());
     skip_back_row.set_selected(skip_index(playback_settings.skip_back_seconds, 15));
     playback_group.add(&skip_back_row);
-    let skip_forward_row = combo_row("Skip forward", "Seconds the forward button and → key jump", &skip_labels());
+    let skip_forward_row = combo_row(&tr("Skip forward"), &tr("Seconds the forward button and → key jump"), &skip_labels());
     skip_forward_row.set_selected(skip_index(playback_settings.skip_forward_seconds, 30));
     playback_group.add(&skip_forward_row);
 
@@ -439,7 +445,7 @@ pub fn build(
     wifi_only_switch.set_state(playback_settings.wifi_only_downloads);
     wifi_only_switch.set_active(playback_settings.wifi_only_downloads);
     let wifi_only_row = adw::ActionRow::builder()
-        .title("Wi-Fi only downloads")
+        .title(tr("Wi-Fi only downloads"))
         .subtitle(wifi_only_subtitle(download_manager.can_detect_metered()))
         .build();
     wifi_only_row.add_suffix(&wifi_only_switch);
@@ -450,7 +456,7 @@ pub fn build(
     burst_buffering_switch.set_valign(gtk4::Align::Center);
     burst_buffering_switch.set_state(playback_settings.burst_buffering);
     burst_buffering_switch.set_active(playback_settings.burst_buffering);
-    let burst_buffering_row = adw::ActionRow::builder().title("Buffer streams in bursts").subtitle(BURST_BUFFERING_SUBTITLE).build();
+    let burst_buffering_row = adw::ActionRow::builder().title(tr("Buffer streams in bursts")).subtitle(tr(BURST_BUFFERING_SUBTITLE)).build();
     burst_buffering_row.add_suffix(&burst_buffering_switch);
     burst_buffering_row.set_activatable_widget(Some(&burst_buffering_switch));
     playback_group.add(&burst_buffering_row);
@@ -462,8 +468,8 @@ pub fn build(
     low_memory_switch.set_state(low_memory_mode.get());
     low_memory_switch.set_active(low_memory_mode.get());
     let low_memory_row = adw::ActionRow::builder()
-        .title("Low memory mode")
-        .subtitle("Hides covers and keeps less in memory. The database part applies on the next launch.")
+        .title(tr("Low memory mode"))
+        .subtitle(tr("Hides covers and keeps less in memory. The database part applies on the next launch."))
         .build();
     low_memory_row.add_suffix(&low_memory_switch);
     low_memory_row.set_activatable_widget(Some(&low_memory_switch));
@@ -574,8 +580,8 @@ pub fn build(
     page.add(&playback_group);
 
     let appearance_group = adw::PreferencesGroup::new();
-    appearance_group.set_title("Appearance");
-    let theme_row = combo_row("Theme", "", &["System", "Light", "Dark"].map(String::from));
+    appearance_group.set_title(&tr("Appearance"));
+    let theme_row = combo_row(&tr("Theme"), "", &[tr("System"), tr("Light"), tr("Dark")]);
     theme_row.set_selected(theme_index(theme));
     appearance_group.add(&theme_row);
     theme_row.connect_selected_notify({
@@ -588,7 +594,7 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_core::settings::save_theme(&pool, theme).await {
-                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the theme", err);
+                    crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving the theme"), err);
                 }
             });
         }
@@ -599,15 +605,15 @@ pub fn build(
     // so is its switch — see `crate::log_privacy::global`); the stored value was applied at
     // startup by `main.rs::setup`.
     let diagnostics_group = adw::PreferencesGroup::new();
-    diagnostics_group.set_title("Diagnostics");
+    diagnostics_group.set_title(&tr("Diagnostics"));
     let anonymize_logs_switch = gtk4::Switch::new();
     anonymize_logs_switch.set_valign(gtk4::Align::Center);
     let anonymize_logs_on = crate::log_privacy::global().is_enabled();
     anonymize_logs_switch.set_state(anonymize_logs_on);
     anonymize_logs_switch.set_active(anonymize_logs_on);
     let anonymize_logs_row = adw::ActionRow::builder()
-        .title("Anonymize logs")
-        .subtitle("Hides the server address, usernames and access tokens in log files. Turn off only while debugging.")
+        .title(tr("Anonymize logs"))
+        .subtitle(tr("Hides the server address, usernames and access tokens in log files. Turn off only while debugging."))
         .build();
     anonymize_logs_row.add_suffix(&anonymize_logs_switch);
     anonymize_logs_row.set_activatable_widget(Some(&anonymize_logs_switch));
@@ -630,7 +636,7 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_core::settings::save_anonymize_logs(&pool, state).await {
-                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the log setting", err);
+                    crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving the log setting"), err);
                 }
             });
             glib::signal::Propagation::Proceed
@@ -639,10 +645,11 @@ pub fn build(
     page.add(&diagnostics_group);
 
     let about_group = adw::PreferencesGroup::new();
-    about_group.set_title("About");
+    about_group.set_title(&tr("About"));
     let about_row = adw::ActionRow::builder()
-        .title("About Audiobookshelf")
-        .subtitle(format!("Version {}", env!("CARGO_PKG_VERSION")))
+        .title(tr("About Audiobookshelf"))
+        // TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
+        .subtitle(tr_args("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]))
         .build();
     about_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
     about_row.set_activatable(true);
@@ -727,22 +734,23 @@ pub(crate) fn push_about(window: &adw::ApplicationWindow) {
     });
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("About Audiobookshelf", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("About Audiobookshelf"), "")));
     header.pack_start(&back_button);
 
     let page = adw::PreferencesPage::new();
 
     let info_group = adw::PreferencesGroup::new();
     let version_row = adw::ActionRow::builder()
-        .title("Audiobookshelf")
-        .subtitle(format!("Version {}", env!("CARGO_PKG_VERSION")))
+        .title("Audiobookshelf") // i18n: ignore
+        // TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
+        .subtitle(tr_args("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]))
         .build();
     info_group.add(&version_row);
     page.add(&info_group);
 
     let links_group = adw::PreferencesGroup::new();
     let website_row = adw::ActionRow::builder()
-        .title("Website")
+        .title(tr("Website"))
         .subtitle(WEBSITE_URL)
         .activatable(true)
         .build();
@@ -754,12 +762,12 @@ pub(crate) fn push_about(window: &adw::ApplicationWindow) {
             // via the desktop's URL-opening portal) runs as its own detached process, so there's
             // nothing further to await.
             if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(WEBSITE_URL, None::<&gtk4::gio::AppLaunchContext>) {
-                crate::error_reporting::report_background_error(&toast_overlay, "Opening the website", err);
+                crate::error_reporting::report_background_error(&toast_overlay, &tr("Opening the website"), err);
             }
         }
     });
     links_group.add(&website_row);
-    let license_row = adw::ActionRow::builder().title("License").subtitle("GNU General Public License v3.0").build();
+    let license_row = adw::ActionRow::builder().title(tr("License")).subtitle("GNU General Public License v3.0").build(); // i18n: ignore
     links_group.add(&license_row);
     page.add(&links_group);
 
@@ -783,11 +791,15 @@ pub(crate) fn host_of(url: &str) -> &str {
 /// The extra sentence a sign-out/remove confirmation carries when some listening progress on this
 /// device hasn't reached the server yet — removing the rows would lose it for good.
 fn unpushed_progress_warning(unpushed_books: i64) -> String {
-    match unpushed_books {
-        0 => String::new(),
-        1 => "\n\nListening progress for 1 book hasn't reached the server yet and will be lost.".to_string(),
-        n => format!("\n\nListening progress for {n} books hasn't reached the server yet and will be lost."),
+    if unpushed_books <= 0 {
+        return String::new();
     }
+    let warning = ntr(
+        "Listening progress for {count} book hasn't reached the server yet and will be lost.",
+        "Listening progress for {count} books hasn't reached the server yet and will be lost.",
+        u32::try_from(unpushed_books).unwrap_or(u32::MAX),
+    );
+    format!("\n\n{warning}")
 }
 
 /// A modal Ok/Cancel confirmation for a destructive session change — the same
@@ -807,7 +819,7 @@ pub(crate) fn confirm(
         .modal(true)
         .transient_for(window)
         .build();
-    dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
+    dialog.add_button(&tr("Cancel"), gtk4::ResponseType::Cancel);
     let confirm_button = dialog.add_button(confirm_label, gtk4::ResponseType::Ok);
     confirm_button.add_css_class("destructive-action");
     dialog.connect_response(move |dialog, response| {
@@ -824,7 +836,8 @@ fn speed_labels() -> Vec<String> {
 }
 
 fn skip_labels() -> Vec<String> {
-    SKIP_CHOICES.iter().map(|seconds| format!("{seconds} sec")).collect()
+    // "sec" is the abbreviation for seconds; the plural form matters for languages whose number words differ by count.
+    SKIP_CHOICES.iter().map(|seconds| ntr("{count} sec", "{count} sec", *seconds as u32)).collect()
 }
 
 /// Index of a speed within `SPEED_PRESETS`, falling back to the default speed's position when the
@@ -864,24 +877,25 @@ fn theme_from_index(index: u32) -> Theme {
 
 /// The Wi-Fi-only row's subtitle. Without a way to detect the connection type the setting
 /// never blocks anything, so the row says that instead of promising something it can't do.
-fn wifi_only_subtitle(can_detect_metered: bool) -> &'static str {
+fn wifi_only_subtitle(can_detect_metered: bool) -> String {
     if can_detect_metered {
-        "Don't start downloads on metered connections"
+        tr("Don't start downloads on metered connections")
     } else {
-        "Can't detect the connection type on this device, so downloads aren't restricted"
+        tr("Can't detect the connection type on this device, so downloads aren't restricted")
     }
 }
 
-const BURST_BUFFERING_SUBTITLE: &str = "Downloads ahead at full speed so the radio can idle. Turn off on a slow or capped connection.";
-const BURST_BUFFERING_LOW_MEMORY_HINT: &str = "Uses up to 64 MB of buffer; consider turning it off in low memory mode.";
+// Translated where shown (`tr(BURST_BUFFERING_SUBTITLE)`); `tr_noop` only marks them for extraction.
+const BURST_BUFFERING_SUBTITLE: &str = tr_noop("Downloads ahead at full speed so the radio can idle. Turn off on a slow or capped connection.");
+const BURST_BUFFERING_LOW_MEMORY_HINT: &str = tr_noop("Uses up to 64 MB of buffer; consider turning it off in low memory mode.");
 
 /// The burst-buffering row's subtitle: with low memory mode on as well, it adds a hint — the
 /// setting itself is left as the user has it.
 fn burst_buffering_subtitle(burst_buffering: bool, low_memory: bool) -> String {
     if burst_buffering && low_memory {
-        format!("{BURST_BUFFERING_SUBTITLE}\n{BURST_BUFFERING_LOW_MEMORY_HINT}")
+        format!("{}\n{}", tr(BURST_BUFFERING_SUBTITLE), tr(BURST_BUFFERING_LOW_MEMORY_HINT))
     } else {
-        BURST_BUFFERING_SUBTITLE.to_string()
+        tr(BURST_BUFFERING_SUBTITLE)
     }
 }
 
@@ -931,7 +945,7 @@ fn persist(
             // The live controller already has the new values, so the change *looks* saved;
             // without a toast the user only learns otherwise on next launch.
             if let Err(err) = abs_core::settings::save_playback_settings(&pool, &snapshot).await {
-                crate::error_reporting::report_background_error(&toast_overlay, "Saving playback settings", err);
+                crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving playback settings"), err);
             }
         }
         writer_running.set(false);

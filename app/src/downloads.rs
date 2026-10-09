@@ -29,6 +29,8 @@ use abs_player::network_watch::NetworkMonitor;
 use abs_storage::models::DownloadStatus;
 use abs_storage::AppPaths;
 
+use crate::i18n::{tr, tr_args};
+
 /// How many tracks may download concurrently across the whole app, regardless of how many items
 /// are queued — bounded so downloads don't starve sync/cover/playback traffic sharing the same
 /// connection. Not user-configurable (yet); a fixed, conservative default.
@@ -245,7 +247,7 @@ impl DownloadManager {
         // is the backstop for any other caller.
         if session.is_offline() {
             tracing::info!(item_id, "offline mode is on; not starting a download");
-            self.inner.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed("offline mode is on".to_string()) });
+            self.inner.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(tr("offline mode is on")) });
             return;
         }
         let inner_rc = self.inner.clone();
@@ -265,7 +267,9 @@ impl DownloadManager {
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::warn!(%err, item_id, "couldn't load the server's connection settings");
-                        let reason = format!("couldn't load the server's connection settings: {err}");
+                        let err = err.to_string();
+                        // TRANSLATORS: {error} is the error message from the underlying library (not translated). This is the reason shown after "Download failed — ".
+                        let reason = tr_args("couldn't load the server's connection settings: {error}", &[("error", &err)]);
                         inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(reason) });
                         return;
                     }
@@ -290,7 +294,7 @@ impl DownloadManager {
             }
 
             if tracks.is_empty() {
-                let reason = "the server reported no audio files for this item".to_string();
+                let reason = tr("the server reported no audio files for this item");
                 inner_rc.borrow().publish(DownloadEvent::ItemStateChanged { item_id, state: ItemDownloadState::Failed(reason) });
                 return;
             }
@@ -356,7 +360,7 @@ impl DownloadManager {
             // checked once per track start, not continuously (see this module's doc comment).
             if wifi_only && is_metered == Some(true) {
                 drop(permit);
-                Self::finish_track(&inner_rc, &server_id, &item_id, TrackDownloadOutcome::Failed("waiting for a non-metered connection".to_string()));
+                Self::finish_track(&inner_rc, &server_id, &item_id, TrackDownloadOutcome::Failed(tr("waiting for a non-metered connection")));
                 return;
             }
 
@@ -401,7 +405,9 @@ impl DownloadManager {
             let connection = match session.connection_target().await {
                 Ok(connection) => connection,
                 Err(err) => {
-                    let reason = format!("the server's connection settings are gone: {err}");
+                    let err = err.to_string();
+                    // TRANSLATORS: {error} is the error message from the underlying library (not translated). This is the reason shown after "Download failed — ".
+                    let reason = tr_args("the server's connection settings are gone: {error}", &[("error", &err)]);
                     abs_storage::repo::download_tracks::mark_failed(&pool, &server_id, &item_id, &ino, &reason).await.ok();
                     Self::finish_track(&inner_rc, &server_id, &item_id, TrackDownloadOutcome::Failed(reason));
                     return;
@@ -447,7 +453,7 @@ impl DownloadManager {
             // `first_failure_reason` is only ever `None` here if every failing track somehow hit
             // `finish_track` without going through the `Failed(reason)` arm above — shouldn't
             // happen, but a generic message beats a blank one if it ever did.
-            ItemDownloadState::Failed(first_failure_reason.unwrap_or_else(|| "the download failed".to_string()))
+            ItemDownloadState::Failed(first_failure_reason.unwrap_or_else(|| tr("the download failed")))
         } else if canceled > 0 {
             // The user stopped the job — whatever completed chapters exist are kept (their files
             // and rows were never touched by cancellation), and a stop with nothing completed

@@ -2,6 +2,7 @@ mod application;
 mod crash_reporting;
 mod downloads;
 mod error_reporting;
+mod i18n;
 mod icons;
 mod log_privacy;
 mod low_memory_mode;
@@ -58,6 +59,10 @@ fn main() -> adw::glib::ExitCode {
         state_dir = %paths.state_dir().display(),
         "starting up"
     );
+    // Binds the gettext domain and the user's locale. After logging (so a problem is recorded) but
+    // before GTK starts (GTK reads the same locale) and before any UI string is built. Never
+    // fails — the worst case is an English UI.
+    i18n::init();
     crash_reporting::install_panic_hook(log_handle.clone());
     // Failure here degrades to a warning inside `attach_crash_handler` itself — crash-dump
     // capture must never block the app from starting (e.g. under a sandboxed/seccomp environment
@@ -172,7 +177,9 @@ mod tests {
         abs_player::init().expect("gstreamer::init for the scenario process");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
+        crate::i18n::audit::start();
         scenario(&runtime);
+        crate::i18n::audit::finish(&std::thread::current().name().unwrap_or("scenario").to_string());
     }
 
     /// One entry per scenario: `(name, closure)`. The closure receives the shared `&Runtime`

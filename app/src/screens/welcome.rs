@@ -12,6 +12,8 @@ use adw::glib;
 use adw::prelude::*;
 use sqlx::SqlitePool;
 
+use crate::i18n::{tr, tr_args, tr_noop};
+
 /// Only Password mode is wired to a real backend call right now — `abs-core`/`abs-api` have no
 /// token-based login (Audiobookshelf's `/login` is username+password only; a bare API token isn't
 /// a login mechanism the server exposes). The toggle is kept for visual completeness with the
@@ -78,14 +80,14 @@ pub fn build(
         .css_classes(["welcome-icon"])
         .build();
     let title = gtk4::Label::builder()
-        .label("Connect to your Audiobookshelf server")
+        .label(tr("Connect to your Audiobookshelf server"))
         .wrap(true)
         .justify(gtk4::Justification::Center)
         .css_classes(["title-2"])
         .margin_top(14)
         .build();
     let subtitle = gtk4::Label::builder()
-        .label("Enter your server address and sign in to start listening.")
+        .label(tr("Enter your server address and sign in to start listening."))
         .wrap(true)
         .justify(gtk4::Justification::Center)
         .css_classes(["dim-label"])
@@ -97,8 +99,8 @@ pub fn build(
 
     // Auth-mode toggle: two linked GtkToggleButtons — AdwToggleGroup is 1.4+ and won't compile
     // under this crate's v1_2 feature ceiling, so this is the hand-rolled equivalent.
-    let mode_password = gtk4::ToggleButton::builder().label("Password").active(true).build();
-    let mode_token = gtk4::ToggleButton::builder().label("API Token").build();
+    let mode_password = gtk4::ToggleButton::builder().label(tr("Password")).active(true).build();
+    let mode_token = gtk4::ToggleButton::builder().label(tr("API Token")).build();
     mode_token.set_group(Some(&mode_password));
     let mode_box = gtk4::Box::builder()
         .css_classes(["linked"])
@@ -123,11 +125,11 @@ pub fn build(
         .margin_top(12)
         .build();
 
-    let url_row = adw::EntryRow::builder().title("Server URL").show_apply_button(false).build();
+    let url_row = adw::EntryRow::builder().title(tr("Server URL")).show_apply_button(false).build();
     crate::widgets::entry_row_input_purpose(&url_row, gtk4::InputPurpose::Url);
-    let username_row = adw::EntryRow::builder().title("Username").show_apply_button(false).build();
-    let password_row = adw::PasswordEntryRow::builder().title("Password").show_apply_button(false).build();
-    let token_row = adw::EntryRow::builder().title("API Token").show_apply_button(false).build();
+    let username_row = adw::EntryRow::builder().title(tr("Username")).show_apply_button(false).build();
+    let password_row = adw::PasswordEntryRow::builder().title(tr("Password")).show_apply_button(false).build();
+    let token_row = adw::EntryRow::builder().title(tr("API Token")).show_apply_button(false).build();
     token_row.set_visible(false);
 
     list.append(&url_row);
@@ -137,7 +139,7 @@ pub fn build(
     content.append(&list);
 
     let connect_button = gtk4::Button::builder()
-        .label("Connect")
+        .label(tr("Connect"))
         .css_classes(["suggested-action", "pill"])
         .hexpand(true)
         .sensitive(false)
@@ -151,7 +153,7 @@ pub fn build(
     // Without it, "Log in again" would be a trap — a typo'd URL or a changed mind would leave
     // the user stuck on this screen with no route back to their libraries.
     let cancel_button = gtk4::Button::builder()
-        .label("Cancel")
+        .label(tr("Cancel"))
         .css_classes(["pill"])
         .hexpand(true)
         .visible(on_cancel.is_some())
@@ -263,7 +265,7 @@ pub fn build(
             mode_box.set_sensitive(false);
             list.set_sensitive(false);
             connect_button.set_sensitive(false);
-            connect_button.set_label("Connecting…");
+            connect_button.set_label(&tr("Connecting…"));
 
             // Cloned per call: this closure fires once per Connect press (and once per confirmed
             // replacement), so nothing may be moved out of it — widget handles included.
@@ -290,7 +292,7 @@ pub fn build(
 
                 mode_box.set_sensitive(true);
                 list.set_sensitive(true);
-                connect_button.set_label("Connect");
+                connect_button.set_label(&tr("Connect"));
                 connect_button.set_sensitive(true);
 
                 if result.is_ok() {
@@ -309,8 +311,8 @@ pub fn build(
                             password_row.add_css_class("error");
                         }
                         let (title, description) = error_message(&err);
-                        banner.set_title(title);
-                        banner.set_description(Some(description));
+                        banner.set_title(&tr(title));
+                        banner.set_description(Some(&tr(description)));
                         banner.set_details(login_details(&err).as_deref());
                         banner.set_revealed(true);
                     }
@@ -335,8 +337,8 @@ pub fn build(
             password_row.remove_css_class("error");
 
             if !is_password_mode {
-                banner.set_title("API tokens aren't supported yet");
-                banner.set_description(Some("Sign in with your username and password instead."));
+                banner.set_title(&tr("API tokens aren't supported yet"));
+                banner.set_description(Some(&tr("Sign in with your username and password instead.")));
                 banner.set_revealed(true);
                 return;
             }
@@ -360,8 +362,8 @@ pub fn build(
                     .secondary_text(body)
                     .modal(true)
                     .build();
-                dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
-                let replace = dialog.add_button("Replace", gtk4::ResponseType::Ok);
+                dialog.add_button(&tr("Cancel"), gtk4::ResponseType::Cancel);
+                let replace = dialog.add_button(&tr("Replace"), gtk4::ResponseType::Ok);
                 replace.add_css_class("destructive-action");
                 dialog.connect_response({
                     let run_connect = run_connect.clone();
@@ -450,19 +452,20 @@ pub fn build(
 fn replacement_warning(kind: &ReplacementKind, previous: &ReloginSeed, url: &str, username: &str) -> (String, String) {
     match kind {
         ReplacementKind::SameServerNewAccount => (
-            format!("Replace {} on this server?", previous.username),
-            format!(
-                "Signing in as {username} will replace {}'s account on this device. Their listening progress \
-                 stored here will be removed — everything on the server stays where it is.",
-                previous.username
+            // TRANSLATORS: {username} is the account that was signed in before.
+            tr_args("Replace {username} on this server?", &[("username", &previous.username)]),
+            // TRANSLATORS: {username} is the account being signed in now; {previous_username} is the account that was signed in before and will be replaced.
+            tr_args(
+                "Signing in as {username} will replace {previous_username}'s account on this device. Their listening progress stored here will be removed — everything on the server stays where it is.",
+                &[("username", username), ("previous_username", &previous.username)],
             ),
         ),
         ReplacementKind::NewServer => (
-            "Switch server?".to_string(),
-            format!(
-                "Signing in to {url} will remove {}'s cached libraries, downloads, and progress from this \
-                 device. Everything on {} itself stays untouched.",
-                previous.username, previous.url
+            tr("Switch server?"),
+            // TRANSLATORS: {url} is the address of the new server; {username} is the account that was signed in before; {previous_url} is the address of the old server.
+            tr_args(
+                "Signing in to {url} will remove {username}'s cached libraries, downloads, and progress from this device. Everything on {previous_url} itself stays untouched.",
+                &[("url", url), ("username", &previous.username), ("previous_url", &previous.url)],
             ),
         ),
     }
@@ -475,15 +478,20 @@ fn replacement_warning(kind: &ReplacementKind, previous: &ReloginSeed, url: &str
 /// `Network`/other variants — a connectivity failure isn't a credentials problem.
 fn error_message(err: &CoreError) -> (&'static str, &'static str) {
     match err {
-        CoreError::Login(abs_api::LoginError::InvalidCredentials) => ("Unable to sign in", "Check your username and password and try again."),
-        CoreError::Login(abs_api::LoginError::Tls(_)) => {
-            ("Can't verify this server's certificate", "If you trust it, allow it in that server's connection settings.")
+        CoreError::Login(abs_api::LoginError::InvalidCredentials) => {
+            (tr_noop("Unable to sign in"), tr_noop("Check your username and password and try again."))
         }
+        CoreError::Login(abs_api::LoginError::Tls(_)) => (
+            tr_noop("Can't verify this server's certificate"),
+            tr_noop("If you trust it, allow it in that server's connection settings."),
+        ),
         CoreError::Login(abs_api::LoginError::Connect(_) | abs_api::LoginError::Network(_)) => {
-            ("Can't reach this server", "Check the address and your connection.")
+            (tr_noop("Can't reach this server"), tr_noop("Check the address and your connection."))
         }
-        CoreError::Login(abs_api::LoginError::Timeout(_)) => ("This server took too long to respond", "Check your connection and try again."),
-        _ => ("Something went wrong", "Please try again."),
+        CoreError::Login(abs_api::LoginError::Timeout(_)) => {
+            (tr_noop("This server took too long to respond"), tr_noop("Check your connection and try again."))
+        }
+        _ => (tr_noop("Something went wrong"), tr_noop("Please try again.")),
     }
 }
 

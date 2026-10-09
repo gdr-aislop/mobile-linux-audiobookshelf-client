@@ -47,6 +47,7 @@ use abs_core::settings::{Grouping, LibraryViewMode, LibraryViewOptions, SortBy};
 use abs_storage::models::{Account, Item, Progress, Server};
 use abs_storage::AppPaths;
 
+use crate::i18n::{tr, tr_args, tr_ctx};
 use crate::player::PlayRequest;
 use crate::widgets::{combo_row, item_card};
 
@@ -341,7 +342,7 @@ pub fn build(
     // ui-spec's explicit reasoning: search is high-frequency in a large library, worth the
     // permanent header-bar space on a device where reveal-then-tap-then-type is already awkward
     // one-handed.
-    let search_entry = gtk4::SearchEntry::builder().hexpand(true).placeholder_text("Search library").build();
+    let search_entry = gtk4::SearchEntry::builder().hexpand(true).placeholder_text(tr("Search library")).build();
     header.set_title_widget(Some(&search_entry));
 
     // The filter's ambient indicator while the sheet is closed (the highlighted funnel on the
@@ -358,15 +359,15 @@ pub fn build(
         row.append(&label);
         (label, row)
     };
-    let (_, progress_banner_row) = caption_banner_row("Showing books in progress");
-    let progress_show_all = gtk4::Button::builder().label("Show all").css_classes(["flat"]).valign(gtk4::Align::Center).build();
+    let (_, progress_banner_row) = caption_banner_row(&tr("Showing books in progress"));
+    let progress_show_all = gtk4::Button::builder().label(&tr("Show all")).css_classes(["flat"]).valign(gtk4::Align::Center).build();
     progress_banner_row.append(&progress_show_all);
     let progress_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&progress_banner_row).reveal_child(false).build();
 
     // Grid/list toggle — a plain header-bar button per the ui-spec's own wording ("toggle between
     // the two via header bar button"), separate from the view-options popover below. Starts
     // active, showing the "switch to grid" icon, since List is the default mode.
-    let view_toggle = gtk4::ToggleButton::builder().active(true).icon_name("view-grid-symbolic").tooltip_text("Grid view").build();
+    let view_toggle = gtk4::ToggleButton::builder().active(true).icon_name("view-grid-symbolic").tooltip_text(tr("Grid view")).build();
     header.pack_end(&view_toggle);
 
     // The view-options popover (ui-spec "Library browse": Downloaded only/In progress only/Hide
@@ -379,7 +380,7 @@ pub fn build(
     // (below) were that popover's only two entries with no equivalent here; everything else it
     // offered already existed on this sheet.
     let downloaded_only_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
-    let downloaded_only_row = adw::ActionRow::builder().title("Downloaded only").build();
+    let downloaded_only_row = adw::ActionRow::builder().title(tr("Downloaded only")).build();
     downloaded_only_row.add_suffix(&downloaded_only_switch);
 
     // The one manual home of the "In progress only" filter — the same state Home's Continue
@@ -388,21 +389,21 @@ pub fn build(
     // `set_in_progress_only`. Unlike Home's tap-through, changing this switch persists (see its
     // `connect_state_set` handler below).
     let in_progress_only_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
-    let in_progress_only_row = adw::ActionRow::builder().title("In progress only").build();
+    let in_progress_only_row = adw::ActionRow::builder().title(tr("In progress only")).build();
     in_progress_only_row.add_suffix(&in_progress_only_switch);
 
     let hide_finished_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
-    let hide_finished_row = adw::ActionRow::builder().title("Hide finished").build();
+    let hide_finished_row = adw::ActionRow::builder().title(tr("Hide finished")).build();
     hide_finished_row.add_suffix(&hide_finished_switch);
 
-    let grouping_row = combo_row("Grouping", "", &["None".to_string(), "By Series".to_string(), "By Author".to_string()]);
+    let grouping_row = combo_row(&tr("Grouping"), "", &[tr("None"), tr("By Series"), tr("By Author")]);
     let sort_by_row = combo_row(
-        "Sort by",
+        &tr("Sort by"),
         "",
-        &["Date of creation".to_string(), "Title".to_string(), "Author".to_string(), "Duration".to_string(), "Last listened".to_string()],
+        &[tr("Date of creation"), tr("Title"), tr("Author"), tr("Duration"), tr("Last listened")],
     );
 
-    let settings_row = adw::ActionRow::builder().title("Application settings").activatable(true).build();
+    let settings_row = adw::ActionRow::builder().title(tr("Application settings")).activatable(true).build();
     settings_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
 
     // A `GtkListBox` (the "boxed list" convention `settings.rs`'s own preference groups use),
@@ -417,13 +418,13 @@ pub fn build(
     view_options_box.append(&sort_by_row);
     view_options_box.append(&settings_row);
     let view_options_popover = gtk4::Popover::builder().child(&view_options_box).build();
-    let view_options_button = gtk4::MenuButton::builder().icon_name(VIEW_OPTIONS_ICON).tooltip_text("View options").popover(&view_options_popover).build();
+    let view_options_button = gtk4::MenuButton::builder().icon_name(VIEW_OPTIONS_ICON).tooltip_text(tr("View options")).popover(&view_options_popover).build();
     header.pack_end(&view_options_button);
 
     // Offline-mode toggle (ui-spec: "leading side, opposite the avatar" on Home; mirrored here on
     // the leading side too, alongside the search entry). Shared persisted state with Home's own
     // toggle, not a per-screen setting — see `offline_mode`'s field doc.
-    let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
+    let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text(tr("Offline mode")).build();
     header.pack_start(&offline_toggle);
 
     // Category chips (ui-spec "Library browse": All/Author/Series/Genre), a horizontally
@@ -432,10 +433,10 @@ pub fn build(
     // — mirroring exactly what the combo does; Genre reveals a second row of the distinct genre
     // values currently loaded (see [`rebuild_genre_chips`]) rather than grouping, since a book
     // has several genres, not one grouping-per-genre (see [`CategoryFilter`]'s doc comment).
-    let category_all = gtk4::ToggleButton::builder().label("All").active(true).build();
-    let category_author = gtk4::ToggleButton::builder().label("Author").group(&category_all).build();
-    let category_series = gtk4::ToggleButton::builder().label("Series").group(&category_all).build();
-    let category_genre = gtk4::ToggleButton::builder().label("Genre").group(&category_all).build();
+    let category_all = gtk4::ToggleButton::builder().label(tr("All")).active(true).build();
+    let category_author = gtk4::ToggleButton::builder().label(tr("Author")).group(&category_all).build();
+    let category_series = gtk4::ToggleButton::builder().label(tr("Series")).group(&category_all).build();
+    let category_genre = gtk4::ToggleButton::builder().label(tr("Genre")).group(&category_all).build();
     let category_row = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(4).build();
     for chip in [&category_all, &category_author, &category_series, &category_genre] {
         category_row.append(chip);
@@ -452,16 +453,16 @@ pub fn build(
     // an immediate resync; the pull-to-refresh gesture on the main scroller (wired below) runs
     // the exact same manual path. Plain `GtkMenuButton` + flat button, per this crate's
     // no-GMenu convention.
-    let sync_now_button = gtk4::Button::builder().label("Sync now").css_classes(["flat"]).build();
+    let sync_now_button = gtk4::Button::builder().label(tr("Sync now")).css_classes(["flat"]).build();
     let sync_menu_popover = gtk4::Popover::builder().child(&sync_now_button).build();
     let sync_menu_button = gtk4::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("More")
+        .tooltip_text(tr("More"))
         .popover(&sync_menu_popover)
         .build();
     header.pack_end(&sync_menu_button);
 
-    let (_, offline_banner_row) = caption_banner_row("Showing downloaded items only");
+    let (_, offline_banner_row) = caption_banner_row(&tr("Showing downloaded items only"));
     let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_row).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
@@ -531,8 +532,8 @@ pub fn build(
 
     let status_page = adw::StatusPage::builder()
         .icon_name("folder-music-symbolic")
-        .title("No items yet")
-        .description("Check your connection and try again.")
+        .title(tr("No items yet"))
+        .description(tr("Check your connection and try again."))
         .vexpand(true)
         .visible(false)
         .build();
@@ -646,7 +647,7 @@ pub fn build(
                 let toast_overlay = toast_overlay.clone();
                 async move {
                     if let Err(err) = abs_core::settings::save_library_view_mode(&pool, mode).await {
-                        crate::error_reporting::report_background_error(&toast_overlay, "Saving view mode", err);
+                        crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving view mode"), err);
                     }
                 }
             });
@@ -746,7 +747,7 @@ pub fn build(
                     // stale snapshot.
                     match abs_core::download_tracks::downloaded_item_ids(&pool, &server_id).await {
                         Ok(downloaded) => widgets.data.borrow_mut().downloaded = downloaded.into_iter().collect(),
-                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Refreshing downloaded items", err),
+                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, &tr("Refreshing downloaded items"), err),
                     }
                     render_from_current_data(&widgets);
 
@@ -1250,8 +1251,8 @@ fn show_sync_result(widgets: &LibraryWidgets, error: Option<&CoreError>, local_r
         // The sync worked but the result couldn't be read back: without this the grid
         // silently keeps showing stale (or no) items, which reads as "nothing here".
         (None, Some(read_error)) => {
-            widgets.banner.set_title("Couldn't read what's saved on this device");
-            widgets.banner.set_description(Some("The list may be out of date. Try again, or restart the app."));
+            widgets.banner.set_title(&tr("Couldn't read what's saved on this device"));
+            widgets.banner.set_description(Some(&tr("The list may be out of date. Try again, or restart the app.")));
             widgets.banner.set_action_label(None);
             widgets.banner.set_details(Some(read_error));
             widgets.banner.set_revealed(true);
@@ -1320,7 +1321,7 @@ fn update_view_options_indicator(widgets: &LibraryWidgets) {
     } else {
         widgets.view_options_button.remove_css_class("accent");
     }
-    widgets.view_options_button.set_tooltip_text(Some(if active { "Filter active — view options" } else { "View options" }));
+    widgets.view_options_button.set_tooltip_text(Some(&if active { tr("Filter active — view options") } else { tr("View options") }));
 }
 
 /// Persists the sheet's four lasting fields as one `LibraryViewOptions` row — called after every
@@ -1337,7 +1338,7 @@ fn spawn_persist_view_options(pool: SqlitePool, toast_overlay: adw::ToastOverlay
             sort_by: widgets.sort.get().to_sort_by(),
         };
         if let Err(err) = abs_core::settings::save_library_view_options(&pool, &options).await {
-            crate::error_reporting::report_background_error(&toast_overlay, "Saving view options", err);
+            crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving view options"), err);
         }
     });
 }
@@ -1469,7 +1470,7 @@ fn request_render(widgets: &LibraryWidgets) {
 fn apply_view_mode(mode: LibraryViewMode, widgets: &LibraryWidgets, toggle: &gtk4::ToggleButton) {
     widgets.view_mode.set(mode);
     toggle.set_icon_name(if mode == LibraryViewMode::List { "view-grid-symbolic" } else { "view-list-symbolic" });
-    toggle.set_tooltip_text(Some(if mode == LibraryViewMode::List { "Grid view" } else { "List view" }));
+    toggle.set_tooltip_text(Some(&if mode == LibraryViewMode::List { tr("Grid view") } else { tr("List view") }));
     set_busy(widgets, true);
     let widgets = widgets.clone();
     glib::idle_add_local_once(move || {
@@ -1628,11 +1629,11 @@ fn render_from_current_data(widgets: &LibraryWidgets) {
     // is left as-is (a pre-existing gap outside this pass's scope), only offline mode's filter
     // gets this treatment since it's the one new way this screen can legitimately show nothing.
     if offline_mode {
-        widgets.status_page.set_title(if has_visible { "No items yet" } else { "No downloaded items" });
+        widgets.status_page.set_title(&if has_visible { tr("No items yet") } else { tr("No downloaded items") });
         widgets.status_page.set_visible(!has_visible);
         widgets.scroller.set_visible(has_visible);
     } else if !data.items.is_empty() {
-        widgets.status_page.set_title("No items yet");
+        widgets.status_page.set_title(&tr("No items yet"));
     }
 }
 
@@ -1797,7 +1798,9 @@ fn decode_covers_in_viewport(widgets: &LibraryWidgets) {
 
 fn item_subtitle(item: &Item) -> String {
     let hours = item.duration_seconds / 3600.0;
-    format!("{} · {hours:.1}h", item.author.as_deref().unwrap_or("Unknown author"))
+    let author = item.author.clone().unwrap_or_else(|| tr("Unknown author"));
+    // TRANSLATORS: Subtitle of a book: {author} and then its length in hours with one decimal, e.g. "Andy Weir · 16.1h".
+    tr_args("{author} · {hours}h", &[("author", &author), ("hours", &format!("{hours:.1}"))])
 }
 
 /// The section an item falls into under a given `Grouping`. `Named` carries a real author/series
@@ -1839,10 +1842,10 @@ fn group_key_for(item: &Item, grouping: Grouping) -> GroupKey {
     match grouping {
         Grouping::None => GroupKey::Named(String::new()),
         Grouping::ByAuthor => {
-            item.author.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback("Unknown author".to_string()))
+            item.author.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback(tr("Unknown author")))
         }
         Grouping::BySeries => {
-            item.series_name.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback("Other".to_string()))
+            item.series_name.clone().map(GroupKey::Named).unwrap_or_else(|| GroupKey::Fallback(tr_ctx("Group header for books without a series", "Other")))
         }
     }
 }

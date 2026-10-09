@@ -16,6 +16,7 @@ use abs_core::error::{CoreError, Result as CoreResult};
 use abs_storage::models::{Account, Item, Library, Progress, Server};
 use abs_storage::AppPaths;
 
+use crate::i18n::{tr, tr_args};
 use crate::player::PlayRequest;
 use crate::widgets::item_card;
 
@@ -152,24 +153,24 @@ impl EmptyState {
             .build();
         crate::widgets::banner::ensure_banner_css();
         let details_toggle =
-            gtk4::ToggleButton::builder().label("Details").css_classes(["app-link"]).halign(gtk4::Align::Center).visible(false).build();
+            gtk4::ToggleButton::builder().label(tr("Details")).css_classes(["app-link"]).halign(gtk4::Align::Center).visible(false).build();
         let details_revealer = gtk4::Revealer::builder().child(&details).reveal_child(false).build();
         details_toggle.connect_toggled({
             let details_revealer = details_revealer.clone();
             move |toggle| {
                 details_revealer.set_reveal_child(toggle.is_active());
-                toggle.set_label(if toggle.is_active() { "Hide details" } else { "Details" });
+                toggle.set_label(&if toggle.is_active() { tr("Hide details") } else { tr("Details") });
             }
         });
         let retry = gtk4::Button::builder()
-            .label("Try again")
+            .label(tr("Try again"))
             .css_classes(["pill", "suggested-action"])
             .visible(false)
             .build();
         // Only revealed by the authorization-failure mode — the one failure "Try again" can't
         // fix, since the stored session itself is what's dead.
         let login_again = gtk4::Button::builder()
-            .label("Log in again")
+            .label(tr("Log in again"))
             .css_classes(["pill"])
             .visible(false)
             .build();
@@ -211,8 +212,8 @@ impl EmptyState {
         self.spinner.set_visible(true);
         self.spinner.start();
         self.icon.set_visible(false);
-        self.title.set_label("Syncing your libraries…");
-        self.description.set_label("This can take a moment on first sync.");
+        self.title.set_label(&tr("Syncing your libraries…"));
+        self.description.set_label(&tr("This can take a moment on first sync."));
         self.set_details("");
         self.buttons.set_visible(false);
         self.root.set_visible(true);
@@ -224,12 +225,12 @@ impl EmptyState {
         self.icon.set_visible(true);
         if matches!(err, CoreError::Unreachable(_)) {
             self.icon.set_icon_name(Some("network-offline-symbolic"));
-            self.title.set_label("Can't reach your server");
-            self.description.set_label("Check your connection, or that the server is running, then try again.");
+            self.title.set_label(&tr("Can't reach your server"));
+            self.description.set_label(&tr("Check your connection, or that the server is running, then try again."));
         } else {
             self.icon.set_icon_name(Some("dialog-warning-symbolic"));
-            self.title.set_label("Couldn't sync your libraries");
-            self.description.set_label("Check your connection and try again.");
+            self.title.set_label(&tr("Couldn't sync your libraries"));
+            self.description.set_label(&tr("Check your connection and try again."));
         }
         let error = err.to_string();
         self.set_details(&error);
@@ -249,8 +250,8 @@ impl EmptyState {
         self.spinner.stop();
         self.icon.set_visible(true);
         self.icon.set_icon_name(Some("system-lock-screen-symbolic"));
-        self.title.set_label("Sign in again");
-        self.description.set_label("Your session on this server has expired or was revoked.");
+        self.title.set_label(&tr("Sign in again"));
+        self.description.set_label(&tr("Your session on this server has expired or was revoked."));
         self.set_details(error);
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
@@ -265,8 +266,8 @@ impl EmptyState {
         self.spinner.stop();
         self.icon.set_visible(true);
         self.icon.set_icon_name(Some("dialog-warning-symbolic"));
-        self.title.set_label("Couldn't read local data");
-        self.description.set_label("The library synced, but the app couldn't read it back. Try again, or restart the app.");
+        self.title.set_label(&tr("Couldn't read local data"));
+        self.description.set_label(&tr("The library synced, but the app couldn't read it back. Try again, or restart the app."));
         self.set_details(error);
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
@@ -279,8 +280,8 @@ impl EmptyState {
         self.spinner.stop();
         self.icon.set_visible(true);
         self.icon.set_icon_name(Some("folder-music-symbolic"));
-        self.title.set_label("No library synced yet");
-        self.description.set_label("This server doesn't have any libraries yet.");
+        self.title.set_label(&tr("No library synced yet"));
+        self.description.set_label(&tr("This server doesn't have any libraries yet."));
         self.set_details("");
         self.buttons.set_visible(true);
         self.retry.set_visible(true);
@@ -376,14 +377,14 @@ pub fn build(
     on_open_shelf: impl Fn(Shelf) + Clone + 'static,
 ) -> HomeScreen {
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Home", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("Home"), "")));
 
     let avatar_letter = account
         .username
         .chars()
         .next()
         .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string());
+        .unwrap_or_else(|| "?".to_string()); // i18n: ignore
     // There's no account-switcher/sign-out screen built yet (per `docs/design/ui-spec.md`, that
     // lives in Settings' Servers group, still a stub tab) — until it exists, this button can't
     // actually do anything, so a tooltip is the honest fix: it should read as "this is who I'm
@@ -391,7 +392,8 @@ pub fn build(
     let avatar = gtk4::Button::builder()
         .css_classes(["circular", "suggested-action"])
         .valign(gtk4::Align::Center)
-        .tooltip_text(format!("Signed in as {}", account.username))
+        // TRANSLATORS: {username} is the name of the account signed in on this device.
+        .tooltip_text(tr_args("Signed in as {username}", &[("username", account.username.as_str())]))
         .child(&gtk4::Label::new(Some(&avatar_letter)))
         .build();
     header.pack_end(&avatar);
@@ -401,21 +403,21 @@ pub fn build(
     // retry cycle. The pull-to-refresh gesture on the main scroller (wired below) runs the
     // exact same manual path. Plain `GtkMenuButton` + `GtkPopover` + flat button, matching the
     // no-GMenu convention everywhere else in this crate.
-    let sync_now_button = gtk4::Button::builder().label("Sync now").css_classes(["flat"]).build();
+    let sync_now_button = gtk4::Button::builder().label(tr("Sync now")).css_classes(["flat"]).build();
     let sync_menu_popover = gtk4::Popover::builder().child(&sync_now_button).build();
     let sync_menu_button = gtk4::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("More")
+        .tooltip_text(tr("More"))
         .popover(&sync_menu_popover)
         .build();
     header.pack_end(&sync_menu_button);
 
     // Offline-mode toggle (ui-spec: "leading side, opposite the avatar"). Shared persisted state
     // with Library's own toggle — see `HomeWidgets::offline_mode`'s field doc.
-    let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text("Offline mode").build();
+    let offline_toggle = gtk4::ToggleButton::builder().icon_name("airplane-mode-symbolic").tooltip_text(tr("Offline mode")).build();
     header.pack_start(&offline_toggle);
 
-    let offline_banner_label = gtk4::Label::builder().label("Showing downloaded items only").xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+    let offline_banner_label = gtk4::Label::builder().label(tr("Showing downloaded items only")).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
     let offline_banner = gtk4::Revealer::builder().transition_type(gtk4::RevealerTransitionType::SlideDown).child(&offline_banner_label).reveal_child(false).build();
 
     let banner = crate::widgets::banner::ErrorBanner::new();
@@ -426,8 +428,8 @@ pub fn build(
         .visible(false)
         .build();
     let continue_heading = section_heading_button(
-        "Continue Listening",
-        "Show in-progress books in the Library",
+        &tr("Continue Listening"),
+        &tr("Show in-progress books in the Library"),
         {
             let on_open_shelf = on_open_shelf.clone();
             move || on_open_shelf(Shelf::ContinueListening)
@@ -438,7 +440,7 @@ pub fn build(
 
     let recent_row = shelf_row();
     let recent_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    let recent_heading = section_heading_button("Recently Added", "Show the Library by date added", {
+    let recent_heading = section_heading_button(&tr("Recently Added"), &tr("Show the Library by date added"), {
         let on_open_shelf = on_open_shelf.clone();
         move || on_open_shelf(Shelf::RecentlyAdded)
     });
@@ -454,7 +456,7 @@ pub fn build(
         .margin_bottom(18)
         .build();
     let libraries_section = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).build();
-    libraries_section.append(&section_heading("Your Libraries"));
+    libraries_section.append(&section_heading(&tr("Your Libraries")));
     libraries_section.append(&libraries_list);
 
     let empty_state = EmptyState::build();
@@ -632,7 +634,7 @@ pub fn build(
                                 data.downloaded = downloaded.into_iter().collect();
                             }
                         }
-                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, "Refreshing downloaded items", err),
+                        Err(err) => crate::error_reporting::report_background_error(&toast_overlay, &tr("Refreshing downloaded items"), err),
                     }
                     // Borrowed and cloned in its own statement, not inline in the `if let`'s
                     // scrutinee — a `Ref` there lives for the whole `if let` body (temporary
@@ -1010,7 +1012,8 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
     for (item, progress) in &continue_items {
         let fraction = if item.duration_seconds > 0.0 { (progress.current_time_seconds / item.duration_seconds).clamp(0.0, 1.0) } else { 0.0 };
         // The card's progress row shows the percentage, so the subtitle is just the author.
-        let subtitle = item.author.as_deref().unwrap_or("Unknown author");
+        let unknown_author = tr("Unknown author");
+        let subtitle = item.author.as_deref().unwrap_or(&unknown_author);
         widgets.continue_row.append(&item_card::build(132, item, subtitle, &widgets.on_open, false, data.downloaded.contains(&item.id), Some(fraction)));
     }
     widgets.continue_section.set_visible(!continue_items.is_empty());
@@ -1032,7 +1035,10 @@ fn apply(data: &HomeData, widgets: &HomeWidgets) {
 
 fn item_subtitle(item: &Item) -> String {
     let hours = item.duration_seconds / 3600.0;
-    format!("{} · {hours:.1}h", item.author.as_deref().unwrap_or("Unknown author"))
+    let unknown_author = tr("Unknown author");
+    let author = item.author.as_deref().unwrap_or(&unknown_author);
+    // TRANSLATORS: A book's subtitle on a shelf card. {author} is the author's name; {hours} is the total length in hours with one decimal (e.g. "11.5"), followed by an "h" for hours.
+    tr_args("{author} · {hours}h", &[("author", author), ("hours", &format!("{hours:.1}"))])
 }
 
 fn section_heading(text: &str) -> gtk4::Label {

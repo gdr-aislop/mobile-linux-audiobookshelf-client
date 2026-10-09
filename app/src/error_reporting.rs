@@ -4,12 +4,15 @@
 //! button that appeared to do nothing. Anything a user just triggered (a toggle, a save) whose
 //! failure can happen this way should report through here instead of warning alone.
 
+use crate::i18n::tr_args;
+
 /// Logs `err` (same as a bare `tracing::warn!` would) and shows a short-lived toast on `overlay`
 /// naming what failed. `context` should read naturally before " failed" (e.g. "Saving offline
 /// mode failed — try again").
 pub fn report_background_error(overlay: &adw::ToastOverlay, context: &str, err: impl std::fmt::Display) {
     tracing::warn!(%err, "{context}");
-    overlay.add_toast(adw::Toast::new(&format!("{context} failed — try again")));
+    // TRANSLATORS: {context} is a short, already-translated phrase naming what the user just tried, e.g. "Saving offline mode".
+    overlay.add_toast(adw::Toast::new(&tr_args("{context} failed — try again", &[("context", context)])));
 }
 
 #[cfg(test)]

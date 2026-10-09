@@ -1,0 +1,1399 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR the abs-app authors
+# This file is distributed under the same license as the abs-app package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: abs-app 0.9.3\n"
+"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-"
+"audiobookshelf-client/issues\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=INTEGER; plural=EXPRESSION;\n"
+
+#: app/src/application.rs
+msgid "General"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Show shortcuts"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Quit"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Navigation"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Go to Home"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Go to Library"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Go to Downloads"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Go to Settings"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Search the library"
+msgstr ""
+
+#: app/src/application.rs app/src/screens/settings.rs
+msgid "Playback"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Play / pause"
+msgstr ""
+
+#: app/src/application.rs app/src/screens/player.rs
+msgid "Add bookmark"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Full player"
+msgstr ""
+
+#: app/src/application.rs app/src/screens/settings.rs
+msgid "Skip back"
+msgstr ""
+
+#: app/src/application.rs app/src/screens/settings.rs
+msgid "Skip forward"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Speed up"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Speed down"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Reset speed to 1×"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Open chapters"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Open sleep timer"
+msgstr ""
+
+#: app/src/application.rs
+msgid "Collapse player"
+msgstr ""
+
+#: app/src/downloads.rs
+msgid "offline mode is on"
+msgstr ""
+
+#. TRANSLATORS: {error} is the error message from the underlying library (not translated). This is the reason shown after "Download failed — ".
+#: app/src/downloads.rs
+msgid "couldn't load the server's connection settings: {error}"
+msgstr ""
+
+#: app/src/downloads.rs
+msgid "the server reported no audio files for this item"
+msgstr ""
+
+#: app/src/downloads.rs
+msgid "waiting for a non-metered connection"
+msgstr ""
+
+#. TRANSLATORS: {error} is the error message from the underlying library (not translated). This is the reason shown after "Download failed — ".
+#: app/src/downloads.rs
+msgid "the server's connection settings are gone: {error}"
+msgstr ""
+
+#: app/src/downloads.rs
+msgid "the download failed"
+msgstr ""
+
+#. TRANSLATORS: {context} is a short, already-translated phrase naming what the user just tried, e.g. "Saving offline mode".
+#: app/src/error_reporting.rs
+msgid "{context} failed — try again"
+msgstr ""
+
+#: app/src/player.rs
+msgid "Playback error — tap for details"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Connection"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Server connection"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid ""
+"This connection is used for syncing, streaming and downloads — every call "
+"the app makes to the server goes through it."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Advanced"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Custom Headers"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Disable SSL Verification"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Connect to servers with any certificate"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Saving the SSL verification setting"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Client Certificate"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Local Network Server Address"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid ""
+"Define server access for home Wi-Fi — used when it's reachable, the public "
+"address otherwise."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Change User Agent"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Default"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid ""
+"Customize the application User-Agent header. Leave empty for the default."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Disconnect from the Server"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Disconnect from {host}?"
+msgstr ""
+
+#. TRANSLATORS: Dialog body. {username} is the account being signed out.
+#: app/src/screens/connection.rs app/src/screens/settings.rs
+msgid ""
+"{username}'s listening progress and bookmarks stored on this device will be "
+"removed — everything on the server stays where it is."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Disconnect"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Disconnecting"
+msgstr ""
+
+#: app/src/screens/connection.rs app/src/screens/library.rs
+msgid "None"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "{count} header"
+msgid_plural "{count} headers"
+msgstr[0] ""
+msgstr[1] ""
+
+#: app/src/screens/connection.rs app/src/screens/settings.rs
+#: app/src/screens/welcome.rs
+msgid "Cancel"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Save"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid ""
+"Specify headers for server connections — one \"Name: Value\" pair per line. "
+"They're attached to every request to this server."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Choose a certificate file first."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid ""
+"Use a client certificate for mTLS — a .p12/.pfx bundle and its export "
+"password."
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "No file chosen"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Choose File…"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Choose a certificate"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "PKCS#12 certificate"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Export password"
+msgstr ""
+
+#: app/src/screens/connection.rs
+msgid "Remove Certificate"
+msgstr ""
+
+#: app/src/screens/downloads.rs app/src/screens/main_window.rs
+msgid "Downloads"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Clear all downloads"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "No downloads yet"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Clear all downloads?"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid ""
+"Every downloaded chapter for every book on this device will be removed — "
+"nothing on the server is affected."
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Clear Downloads"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Clearing downloads"
+msgstr ""
+
+#: app/src/screens/downloads.rs app/src/widgets/download_scope_menu.rs
+msgid "Download failed — {reason}"
+msgstr ""
+
+#. TRANSLATORS: {chapters} is a chapter count such as "10 chapters", {size} the total size on disk such as "64.1 MB".
+#: app/src/screens/downloads.rs
+msgid "{chapters}, {size}"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Couldn't read downloads"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "The app's local data couldn't be read. Restarting the app may help."
+msgstr ""
+
+#: app/src/screens/downloads.rs app/src/widgets/download_progress.rs
+msgid "Stop"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Remove"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "Removing the download"
+msgstr ""
+
+#: app/src/screens/downloads.rs
+msgid "{count} chapter"
+msgid_plural "{count} chapters"
+msgstr[0] ""
+msgstr[1] ""
+
+#. TRANSLATORS: {finished} is how many chapters of this download are done, {total} how many it has in all, e.g. "3/10 chapters".
+#: app/src/screens/downloads.rs
+msgid "{finished}/{total} chapters"
+msgstr ""
+
+#. TRANSLATORS: {speed} is a data size such as "2.1 MB"; the whole phrase is a download speed, "2.1 MB/s".
+#: app/src/screens/downloads.rs
+msgid "{speed}/s"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/widgets/banner.rs
+msgid "Details"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/widgets/banner.rs
+msgid "Hide details"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Try again"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/widgets/banner.rs
+msgid "Log in again"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Syncing your libraries…"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "This can take a moment on first sync."
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/player.rs app/src/widgets/banner.rs
+msgid "Can't reach your server"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Check your connection, or that the server is running, then try again."
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Couldn't sync your libraries"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs app/src/screens/player.rs
+#: app/src/screens/welcome.rs
+msgid "Check your connection and try again."
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Sign in again"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Your session on this server has expired or was revoked."
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Couldn't read local data"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid ""
+"The library synced, but the app couldn't read it back. Try again, or restart "
+"the app."
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "No library synced yet"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "This server doesn't have any libraries yet."
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/main_window.rs
+msgid "Home"
+msgstr ""
+
+#. TRANSLATORS: {username} is the name of the account signed in on this device.
+#: app/src/screens/home.rs
+msgid "Signed in as {username}"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "Sync now"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+#: app/src/widgets/item_options_menu.rs
+msgid "More"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "Offline mode"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "Showing downloaded items only"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Continue Listening"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Show in-progress books in the Library"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Recently Added"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Show the Library by date added"
+msgstr ""
+
+#: app/src/screens/home.rs
+msgid "Your Libraries"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "Refreshing downloaded items"
+msgstr ""
+
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "Unknown author"
+msgstr ""
+
+#. TRANSLATORS: A book's subtitle on a shelf card. {author} is the author's name; {hours} is the total length in hours with one decimal (e.g. "11.5"), followed by an "h" for hours.
+#. TRANSLATORS: Subtitle of a book: {author} and then its length in hours with one decimal, e.g. "Andy Weir · 16.1h".
+#: app/src/screens/home.rs app/src/screens/library.rs
+msgid "{author} · {hours}h"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Play"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "more"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Description"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "less"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/player.rs
+msgid "downloaded"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/player.rs
+msgid "Chapters"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/player.rs
+msgid "Marked as finished"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Marking as finished"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/player.rs
+msgid "Progress reset"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Resetting progress"
+msgstr ""
+
+#. TRANSLATORS: {author} is the book's author, {narrator} the person who reads the audiobook aloud.
+#: app/src/screens/item_detail.rs
+msgid "{author} · Narrated by {narrator}"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Resume"
+msgstr ""
+
+#. TRANSLATORS: {series} is a book series name, {seq} this book's position in it (e.g. "2" or "2.5"), {total} how many books the series has: "Dune, 2/6".
+#: app/src/screens/item_detail.rs
+msgid "{series}, {seq}/{total}"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "{series} ({count} book)"
+msgid_plural "{series} ({count} books)"
+msgstr[0] ""
+msgstr[1] ""
+
+#: app/src/screens/item_detail.rs
+msgid "Starting…"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/player.rs
+msgid "Downloaded"
+msgstr ""
+
+#. TRANSLATORS: {hours} is a number of hours with one decimal, e.g. "1.5h" (a duration; "h" = hours).
+#: app/src/screens/item_detail.rs
+msgid "{hours}h"
+msgstr ""
+
+#. TRANSLATORS: {minutes} is a whole number of minutes, e.g. "12m" (a duration; "m" = minutes).
+#: app/src/screens/item_detail.rs
+msgid "{minutes}m"
+msgstr ""
+
+#: app/src/screens/item_detail.rs app/src/screens/main_window.rs
+#: app/src/screens/player.rs
+msgid "Undo"
+msgstr ""
+
+#: app/src/screens/item_detail.rs
+msgid "Undoing"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Search library"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Showing books in progress"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Show all"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Grid view"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Downloaded only"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "In progress only"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Hide finished"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "By Author"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "By Series"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Grouping"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Sort by"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Author"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Date of creation"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Duration"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Last listened"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Title"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Application settings"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "View options"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "All"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Series"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Genre"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "No items yet"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Saving view mode"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Couldn't read what's saved on this device"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "The list may be out of date. Try again, or restart the app."
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Filter active — view options"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "Saving view options"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "List view"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgid "No downloaded items"
+msgstr ""
+
+#: app/src/screens/library.rs
+msgctxt "Group header for books without a series"
+msgid "Other"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Playing an audiobook"
+msgstr ""
+
+#. TRANSLATORS: {time} is a playback position such as "1:23:45".
+#: app/src/screens/main_window.rs
+msgid "Continued at {time} from another device"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Saving offline mode"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Saving low memory mode"
+msgstr ""
+
+#: app/src/screens/main_window.rs app/src/widgets/download_scope_menu.rs
+msgid "View"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Library"
+msgstr ""
+
+#: app/src/screens/main_window.rs app/src/screens/settings.rs
+msgid "Settings"
+msgstr ""
+
+#: app/src/screens/main_window.rs app/src/screens/player.rs
+msgid "Bookmark added"
+msgstr ""
+
+#: app/src/screens/main_window.rs app/src/screens/player.rs
+msgid "Adding bookmark"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Session expired — progress isn't syncing. Log in again"
+msgstr ""
+
+#: app/src/screens/main_window.rs
+msgid "Failed to sync progress — will retry"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Now Playing"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Previous chapter"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Next chapter"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback speed"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Sleep timer"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Off"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "{count} minute"
+msgid_plural "{count} minutes"
+msgstr[0] ""
+msgstr[1] ""
+
+#: app/src/screens/player.rs
+msgid "End of chapter"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "{title} · {number} of {total}"
+msgstr ""
+
+#. TRANSLATORS: {time} is the time left in the whole book, e.g. "1:05:09".
+#: app/src/screens/player.rs
+msgid "{time} left in book"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Can't play this file"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Support for its audio format is missing on this device."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Can't decode this file"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "It may be corrupted, or in a format this app doesn't support."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Audio not found on the server"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "It may have been moved or deleted."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "The server refused this request"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Try signing in again."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Can't reach the audio output"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Check this device's sound settings and try again."
+msgstr ""
+
+#: app/src/screens/player.rs app/src/widgets/banner.rs
+msgid "Retry"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Connection lost"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid ""
+"This book can't start until it's back. Check your connection and try again."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Couldn't get to that position"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Try again, or try another position."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "This part isn't downloaded"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Turn off offline mode to stream it."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "No audio engine could be started on this device."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback isn't available"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback stopped unexpectedly"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Try again."
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Audio not found"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback refused"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "No audio output"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Can't reach server"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Couldn't seek"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Not downloaded"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback unavailable"
+msgstr ""
+
+#: app/src/screens/player.rs
+msgid "Playback stopped"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Account"
+msgstr ""
+
+#. TRANSLATORS: Subtitle of the signed-in account's row. {host} is the server's address; "active" marks it as the server in use.
+#: app/src/screens/settings.rs
+msgid "{host} · active"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Servers"
+msgstr ""
+
+#. TRANSLATORS: Subtitle of a server's row. {username} is the account signed in on that server; "active" marks the server in use.
+#: app/src/screens/settings.rs
+msgid "{username} · active"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "No signed-in account"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Switch to this server"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Sign Out"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Remove Server"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Switching accounts"
+msgstr ""
+
+#. TRANSLATORS: Dialog heading. {username} is the account being signed out.
+#: app/src/screens/settings.rs
+msgid "Sign out of {username}?"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Signing out"
+msgstr ""
+
+#. TRANSLATORS: Dialog heading. {server} is the address of the server being removed.
+#: app/src/screens/settings.rs
+msgid "Remove {server}?"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Every account, cached library, item and downloaded file for this server will "
+"be removed from this device. Everything on the server itself stays untouched."
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Removing the server"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Add Server"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Pause when headphones disconnect"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Wired headphones unplugged, or Bluetooth audio lost"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Resume when headphones reconnect"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Only undoes a pause caused by disconnecting — never a manual pause or a call"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Default speed"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Speed every book starts at"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Seconds the back button and ← key jump"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Seconds the forward button and → key jump"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Wi-Fi only downloads"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Buffer streams in bursts"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Low memory mode"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Hides covers and keeps less in memory. The database part applies on the next "
+"launch."
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Appearance"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Dark"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Light"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "System"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Theme"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Saving the theme"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Diagnostics"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Anonymize logs"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Hides the server address, usernames and access tokens in log files. Turn off "
+"only while debugging."
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Saving the log setting"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "About"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "About Audiobookshelf"
+msgstr ""
+
+#. TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
+#: app/src/screens/settings.rs
+msgid "Version {version}"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Website"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Opening the website"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "License"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Listening progress for {count} book hasn't reached the server yet and will "
+"be lost."
+msgid_plural ""
+"Listening progress for {count} books hasn't reached the server yet and will "
+"be lost."
+msgstr[0] ""
+msgstr[1] ""
+
+#: app/src/screens/settings.rs
+msgid "{count} sec"
+msgid_plural "{count} sec"
+msgstr[0] ""
+msgstr[1] ""
+
+#: app/src/screens/settings.rs
+msgid "Don't start downloads on metered connections"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Can't detect the connection type on this device, so downloads aren't "
+"restricted"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid ""
+"Downloads ahead at full speed so the radio can idle. Turn off on a slow or "
+"capped connection."
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Uses up to 64 MB of buffer; consider turning it off in low memory mode."
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Saving playback settings"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Connect to your Audiobookshelf server"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Enter your server address and sign in to start listening."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Password"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "API Token"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Server URL"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Username"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Connect"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Connecting…"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "API tokens aren't supported yet"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Sign in with your username and password instead."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Replace"
+msgstr ""
+
+#. TRANSLATORS: {username} is the account that was signed in before.
+#: app/src/screens/welcome.rs
+msgid "Replace {username} on this server?"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid ""
+"Signing in as {username} will replace {previous_username}'s account on this "
+"device. Their listening progress stored here will be removed — everything on "
+"the server stays where it is."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Switch server?"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid ""
+"Signing in to {url} will remove {username}'s cached libraries, downloads, "
+"and progress from this device. Everything on {previous_url} itself stays "
+"untouched."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Check your username and password and try again."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Unable to sign in"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Can't verify this server's certificate"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "If you trust it, allow it in that server's connection settings."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Can't reach this server"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Check the address and your connection."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "This server took too long to respond"
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Please try again."
+msgstr ""
+
+#: app/src/screens/welcome.rs
+msgid "Something went wrong"
+msgstr ""
+
+#: app/src/widgets/banner.rs
+msgid "Showing what's saved on this device. Log in again to update it."
+msgstr ""
+
+#: app/src/widgets/banner.rs
+msgid "Signed out by the server"
+msgstr ""
+
+#: app/src/widgets/banner.rs
+msgid "Showing what's saved on this device."
+msgstr ""
+
+#: app/src/widgets/banner.rs
+msgid "Couldn't update your library"
+msgstr ""
+
+#: app/src/widgets/cover_image.rs
+msgid "View cover"
+msgstr ""
+
+#: app/src/widgets/cover_viewer.rs
+msgid "Low memory mode is on — showing a smaller copy"
+msgstr ""
+
+#: app/src/widgets/cover_viewer.rs
+msgid "Showing a smaller copy — the full-size cover needs a connection"
+msgstr ""
+
+#: app/src/widgets/cover_viewer.rs
+msgid "Close"
+msgstr ""
+
+#: app/src/widgets/cover_viewer.rs
+msgid "Preparing full size…"
+msgstr ""
+
+#. TRANSLATORS: {percent} is a whole number from 0 to 100; the "%" sign is part of this text.
+#: app/src/widgets/cover_viewer.rs
+msgid "Downloading full size… {percent} %"
+msgstr ""
+
+#: app/src/widgets/cover_viewer.rs
+msgid "Downloading full size…"
+msgstr ""
+
+#. TRANSLATORS: {details} is a progress summary such as "3 of 12 chapters · 40 MB of 200 MB · 2.1 MB/s".
+#: app/src/widgets/download_progress.rs
+msgid "Downloading · {details}"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Download"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Offline mode is on — turn it off to download"
+msgstr ""
+
+#. TRANSLATORS: {size} is a data size such as "340 MB"; "≈" means approximately.
+#: app/src/widgets/download_scope_menu.rs
+msgid "≈{size}"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Not enough free space"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Download started"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Download book"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Stop download"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Download stopped"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Loading chapters…"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Current chapter"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Next chapters"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Remaining chapters"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Entire book"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Clear downloaded chapters"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Downloaded chapters cleared"
+msgstr ""
+
+#: app/src/widgets/download_scope_menu.rs
+msgid "Clearing downloaded chapters"
+msgstr ""
+
+#: app/src/widgets/item_card.rs
+msgid "{percent}%"
+msgstr ""
+
+#: app/src/widgets/item_options_menu.rs
+msgid "Mark as finished"
+msgstr ""
+
+#: app/src/widgets/item_options_menu.rs
+msgid "Reset progress"
+msgstr ""
+
+#: app/src/widgets/mod.rs
+msgid "Sync complete"
+msgstr ""
+
+#: app/src/widgets/mod.rs
+msgid "Sync failed"
+msgstr ""
+
+#: app/src/widgets/mod.rs
+msgid "Offline mode is on — turn it off to sync"
+msgstr ""
+
+#: app/src/widgets/pull_to_refresh.rs
+msgid "Syncing…"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.desktop
+msgid "Audiobookshelf"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.desktop
+msgid "Audiobook Player"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.desktop
+msgid "Listen to audiobooks and podcasts from your Audiobookshelf server"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.desktop
+msgid "audiobook;podcast;player;streaming;"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+msgid "Client for an Audiobookshelf server, designed for mobile Linux"
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+msgid ""
+"GNOME-native client for an Audiobookshelf media server, designed for mobile "
+"Linux (Phosh on the Librem 5, also usable on desktop)."
+msgstr ""
+
+#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+msgid ""
+"Browse your library, stream or play downloaded audiobooks and podcasts, and "
+"keep listening progress in sync with the server. Integrates with the desktop "
+"via MPRIS2 and pauses during phone calls."
+msgstr ""

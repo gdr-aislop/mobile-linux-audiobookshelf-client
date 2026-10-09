@@ -23,6 +23,7 @@ use sqlx::SqlitePool;
 
 use abs_storage::models::{Account, Server};
 
+use crate::i18n::{ntr, tr, tr_args};
 use crate::screens::settings::{confirm, host_of};
 use crate::widgets::find_descendant;
 
@@ -71,13 +72,13 @@ pub fn build(
     });
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Connection", "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("Connection"), "")));
     header.pack_start(&back_button);
 
     let page = adw::PreferencesPage::new();
 
     let connection_group = adw::PreferencesGroup::new();
-    connection_group.set_title("Server connection");
+    connection_group.set_title(&tr("Server connection"));
     let url_row = adw::ActionRow::builder().title(host_of(&server.url)).subtitle(&server.url).build();
     url_row.add_css_class("mono-subtitle");
 
@@ -87,7 +88,7 @@ pub fn build(
         .valign(gtk4::Align::Center)
         .build();
     let info_label = gtk4::Label::builder()
-        .label("This connection is used for syncing, streaming and downloads — every call the app makes to the server goes through it.")
+        .label(tr("This connection is used for syncing, streaming and downloads — every call the app makes to the server goes through it."))
         .wrap(true)
         .max_width_chars(32)
         .margin_top(12)
@@ -105,10 +106,10 @@ pub fn build(
     // see `abs_core::connection` for how a row becomes real traffic.
     let server_id = server.id.clone();
     let advanced_group = adw::PreferencesGroup::new();
-    advanced_group.set_title("Advanced");
+    advanced_group.set_title(&tr("Advanced"));
 
     let headers_row = adw::ActionRow::builder()
-        .title("Custom Headers")
+        .title(tr("Custom Headers"))
         .subtitle(headers_subtitle(&server.custom_headers_json))
         .activatable(true)
         .build();
@@ -123,8 +124,8 @@ pub fn build(
     advanced_group.add(&headers_row);
 
     let ssl_row = adw::ActionRow::builder()
-        .title("Disable SSL Verification")
-        .subtitle("Connect to servers with any certificate")
+        .title(tr("Disable SSL Verification"))
+        .subtitle(tr("Connect to servers with any certificate"))
         .build();
     let ssl_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).state(server.disable_ssl_verify).active(server.disable_ssl_verify).build();
     ssl_switch.connect_state_set({
@@ -141,7 +142,7 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             glib::spawn_future_local(async move {
                 if let Err(err) = abs_storage::repo::servers::set_disable_ssl_verify(&pool, &server_id, disable).await {
-                    crate::error_reporting::report_background_error(&toast_overlay, "Saving the SSL verification setting", err);
+                    crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving the SSL verification setting"), err);
                 }
             });
             glib::signal::Propagation::Proceed
@@ -152,7 +153,7 @@ pub fn build(
     advanced_group.add(&ssl_row);
 
     let cert_row = adw::ActionRow::builder()
-        .title("Client Certificate")
+        .title(tr("Client Certificate"))
         .subtitle(cert_subtitle(server.client_cert_path.as_deref()))
         .activatable(true)
         .build();
@@ -168,7 +169,7 @@ pub fn build(
     advanced_group.add(&cert_row);
 
     let local_address_row = adw::ActionRow::builder()
-        .title("Local Network Server Address")
+        .title(tr("Local Network Server Address"))
         .subtitle(text_subtitle(server.local_network_address.as_deref()))
         .activatable(true)
         .build();
@@ -210,8 +211,8 @@ pub fn build(
             };
             show_entry_dialog(
                 &window,
-                "Local Network Server Address",
-                "Define server access for home Wi-Fi — used when it's reachable, the public address otherwise.",
+                &tr("Local Network Server Address"),
+                &tr("Define server access for home Wi-Fi — used when it's reachable, the public address otherwise."),
                 current.as_deref().unwrap_or(""),
                 gtk4::InputPurpose::Url,
                 on_save,
@@ -221,8 +222,8 @@ pub fn build(
     advanced_group.add(&local_address_row);
 
     let user_agent_row = adw::ActionRow::builder()
-        .title("Change User Agent")
-        .subtitle(server.user_agent.as_deref().map(str::trim).filter(|user_agent| !user_agent.is_empty()).map(str::to_string).unwrap_or_else(|| "Default".to_string()))
+        .title(tr("Change User Agent"))
+        .subtitle(server.user_agent.as_deref().map(str::trim).filter(|user_agent| !user_agent.is_empty()).map(str::to_string).unwrap_or_else(|| tr("Default")))
         .activatable(true)
         .build();
     user_agent_row.add_suffix(&chevron());
@@ -251,15 +252,15 @@ pub fn build(
                             show_error(&error_label, &err.to_string());
                             return;
                         }
-                        row.set_subtitle(&stored.map(str::to_string).unwrap_or_else(|| "Default".to_string()));
+                        row.set_subtitle(&stored.map(str::to_string).unwrap_or_else(|| tr("Default")));
                         dialog.close();
                     });
                 })
             };
             show_entry_dialog(
                 &window,
-                "Change User Agent",
-                "Customize the application User-Agent header. Leave empty for the default.",
+                &tr("Change User Agent"),
+                &tr("Customize the application User-Agent header. Leave empty for the default."),
                 current.as_deref().unwrap_or(""),
                 gtk4::InputPurpose::FreeForm,
                 on_save,
@@ -273,7 +274,7 @@ pub fn build(
     // A flat, destructive plain-text action below the groups — vertically separated rather
     // than boxed in a card (the spec's styling note for infrequent page-level actions).
     let disconnect_button = gtk4::Button::builder()
-        .label("Disconnect from the Server")
+        .label(tr("Disconnect from the Server"))
         .css_classes(["flat", "destructive-action"])
         .halign(gtk4::Align::Center)
         .margin_top(28)
@@ -292,13 +293,13 @@ pub fn build(
             let toast_overlay = toast_overlay.clone();
             confirm(
                 &window,
-                &format!("Disconnect from {}?", host_of(&server.url)),
-                &format!(
-                    "{}'s listening progress and bookmarks stored on this device will be removed — \
-                     everything on the server stays where it is.",
-                    account.username
+                &tr_args("Disconnect from {host}?", &[("host", host_of(&server.url))]),
+                // TRANSLATORS: {username} is the account being signed out of this server.
+                &tr_args(
+                    "{username}'s listening progress and bookmarks stored on this device will be removed — everything on the server stays where it is.",
+                    &[("username", &account.username)],
                 ),
-                "Disconnect",
+                &tr("Disconnect"),
                 Rc::new(move || {
                     let pool = pool.clone();
                     let account_id = account.id.clone();
@@ -306,7 +307,7 @@ pub fn build(
                     let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
                         if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
-                            crate::error_reporting::report_background_error(&toast_overlay, "Disconnecting", err);
+                            crate::error_reporting::report_background_error(&toast_overlay, &tr("Disconnecting"), err);
                             return;
                         }
                         on_session_changed();
@@ -365,7 +366,7 @@ fn chevron() -> gtk4::Image {
 /// Advanced rows that edit text.
 fn text_subtitle(value: Option<&str>) -> String {
     let value = value.map(str::trim).filter(|value| !value.is_empty());
-    value.map(str::to_string).unwrap_or_else(|| "None".to_string())
+    value.map(str::to_string).unwrap_or_else(|| tr("None"))
 }
 
 /// How many headers a server's `custom_headers_json` resolves to — the Custom Headers row's
@@ -373,9 +374,8 @@ fn text_subtitle(value: Option<&str>) -> String {
 /// fewer).
 fn headers_subtitle(custom_headers_json: &str) -> String {
     match abs_core::connection::parse_custom_headers(custom_headers_json).len() {
-        0 => "None".to_string(),
-        1 => "1 header".to_string(),
-        count => format!("{count} headers"),
+        0 => tr("None"),
+        count => ntr("{count} header", "{count} headers", count as u32),
     }
 }
 
@@ -386,7 +386,7 @@ fn cert_subtitle(path: Option<&str>) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string()),
-        None => "None".to_string(),
+        None => tr("None"),
     }
 }
 
@@ -413,8 +413,8 @@ fn save_cancel_dialog(
     on_save: SaveHandler,
 ) -> (gtk4::Dialog, gtk4::Label) {
     let dialog = gtk4::Dialog::builder().title(title).modal(true).transient_for(window).build();
-    dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
-    dialog.add_button("Save", gtk4::ResponseType::Ok);
+    dialog.add_button(&tr("Cancel"), gtk4::ResponseType::Cancel);
+    dialog.add_button(&tr("Save"), gtk4::ResponseType::Ok);
     // `max_width_chars(1)` caps this label's natural width regardless of `wrap`, so a long
     // validation error can't force this dialog window wider than the screen (see
     // `widgets::banner`'s identical fix for the same reasoning).
@@ -475,7 +475,7 @@ fn show_entry_dialog(
 /// The Custom Headers editor: one `Name: Value` pair per line (see
 /// `abs_core::connection::validate_custom_headers_text`, the single writer of the column).
 fn show_headers_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_id: &str, row: &adw::ActionRow) {
-    let (dialog, error_label) = save_cancel_dialog(window, "Custom Headers", {
+    let (dialog, error_label) = save_cancel_dialog(window, &tr("Custom Headers"), {
         let pool = pool.clone();
         let server_id = server_id.to_string();
         let row = row.clone();
@@ -503,7 +503,7 @@ fn show_headers_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, serve
             });
         })
     });
-    let content = add_dialog_content(&dialog, "Specify headers for server connections — one \"Name: Value\" pair per line. They're attached to every request to this server.");
+    let content = add_dialog_content(&dialog, &tr("Specify headers for server connections — one \"Name: Value\" pair per line. They're attached to every request to this server."));
     let text_view = gtk4::TextView::builder().wrap_mode(gtk4::WrapMode::WordChar).height_request(120).monospace(true).build();
     content.append(&gtk4::ScrolledWindow::builder().child(&text_view).hexpand(true).vexpand(true).build());
     content.append(&error_label);
@@ -517,14 +517,14 @@ fn show_headers_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, serve
 fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_id: &str, row: &adw::ActionRow, current_path: Option<&str>) {
     let chosen: Rc<std::cell::RefCell<Option<std::path::PathBuf>>> = Rc::new(std::cell::RefCell::new(current_path.map(std::path::PathBuf::from)));
 
-    let (dialog, save_error_label) = save_cancel_dialog(window, "Client Certificate", {
+    let (dialog, save_error_label) = save_cancel_dialog(window, &tr("Client Certificate"), {
         let pool = pool.clone();
         let server_id = server_id.to_string();
         let row = row.clone();
         let chosen = chosen.clone();
         Rc::new(move |dialog, error_label| {
             let Some(path) = chosen.borrow().clone() else {
-                return show_error(error_label, "Choose a certificate file first.");
+                return show_error(error_label, &tr("Choose a certificate file first."));
             };
             let password = find_descendant::<gtk4::PasswordEntry>(dialog.content_area().upcast_ref())
                 .map(|entry| entry.text().to_string())
@@ -555,22 +555,22 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
         })
     });
 
-    let content = add_dialog_content(&dialog, "Use a client certificate for mTLS — a .p12/.pfx bundle and its export password.");
-    let file_label = gtk4::Label::new(Some(&current_path.map(|path| path.to_string()).unwrap_or_else(|| "No file chosen".to_string())));
+    let content = add_dialog_content(&dialog, &tr("Use a client certificate for mTLS — a .p12/.pfx bundle and its export password."));
+    let file_label = gtk4::Label::new(Some(&current_path.map(|path| path.to_string()).unwrap_or_else(|| tr("No file chosen"))));
     file_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    let choose_button = gtk4::Button::builder().label("Choose File…").halign(gtk4::Align::Start).build();
+    let choose_button = gtk4::Button::builder().label(tr("Choose File…")).halign(gtk4::Align::Start).build();
     choose_button.connect_clicked({
         let window = window.clone();
         let file_label = file_label.clone();
         let chosen = chosen.clone();
         move |_| {
             let chooser = gtk4::FileChooserNative::builder()
-                .title("Choose a certificate")
+                .title(tr("Choose a certificate"))
                 .modal(true)
                 .transient_for(&window)
                 .build();
             let file_filter = gtk4::FileFilter::new();
-            file_filter.set_name(Some("PKCS#12 certificate"));
+            file_filter.set_name(Some(&tr("PKCS#12 certificate")));
             file_filter.add_pattern("*.p12");
             file_filter.add_pattern("*.pfx");
             chooser.add_filter(&file_filter);
@@ -591,14 +591,14 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
     });
     content.append(&file_label);
     content.append(&choose_button);
-    content.append(&gtk4::PasswordEntry::builder().show_peek_icon(true).placeholder_text("Export password").build());
+    content.append(&gtk4::PasswordEntry::builder().show_peek_icon(true).placeholder_text(tr("Export password")).build());
     // Reuses `save_cancel_dialog`'s own error label rather than appending a second, disconnected
     // one here (there used to be two — this dialog's on-save failures reached the first, and
     // nothing ever reached the second) — Remove's own failures below now show here too.
     content.append(&save_error_label);
 
     if current_path.is_some() {
-        let remove_button = gtk4::Button::builder().label("Remove Certificate").css_classes(["destructive-action"]).halign(gtk4::Align::Start).build();
+        let remove_button = gtk4::Button::builder().label(tr("Remove Certificate")).css_classes(["destructive-action"]).halign(gtk4::Align::Start).build();
         remove_button.connect_clicked({
             let pool = pool.clone();
             let server_id = server_id.to_string();
@@ -622,7 +622,7 @@ fn show_cert_dialog(window: &adw::ApplicationWindow, pool: &SqlitePool, server_i
                         show_error(&error_label, &err.to_string());
                         return;
                     }
-                    row.set_subtitle("None");
+                    row.set_subtitle(&tr("None"));
                     dialog.close();
                 });
             }

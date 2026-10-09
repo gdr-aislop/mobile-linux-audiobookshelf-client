@@ -21,6 +21,8 @@ use std::time::Duration;
 use adw::glib;
 use adw::prelude::*;
 
+use crate::i18n::tr;
+
 /// Swaps `window`'s content one main-loop idle tick later than requested, instead of immediately.
 /// GTK's click/gesture/row-activation handling expects the widget it's currently processing a
 /// press/release for to still exist in its original ancestor chain when that handling finishes;
@@ -126,15 +128,15 @@ impl ManualSync {
     pub(crate) fn finish(&self, ok: bool) {
         self.in_flight.set(false);
         self.indicator.hide();
-        let message = if ok { "Sync complete" } else { "Sync failed" };
-        self.toast_overlay.add_toast(adw::Toast::new(message));
+        let message = if ok { tr("Sync complete") } else { tr("Sync failed") };
+        self.toast_overlay.add_toast(adw::Toast::new(&message));
     }
 
     /// Releases the slot without syncing: offline mode is on, so nothing may reach the server.
     pub(crate) fn finish_offline(&self) {
         self.in_flight.set(false);
         self.indicator.hide();
-        self.toast_overlay.add_toast(adw::Toast::new("Offline mode is on — turn it off to sync"));
+        self.toast_overlay.add_toast(adw::Toast::new(&tr("Offline mode is on — turn it off to sync")));
     }
 }
 
