@@ -269,7 +269,7 @@ pub fn build(
                                 let account_id = account_id.clone();
                                 let toast_overlay = toast_overlay.clone();
                                 glib::spawn_future_local(async move {
-                                    if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
+                                    if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id, crate::password_keyring::store().as_ref()).await {
                                         crate::error_reporting::report_background_error(&toast_overlay, "Signing out", err);
                                         return;
                                     }
@@ -318,7 +318,7 @@ pub fn build(
                             let server_id = server_id.clone();
                             let toast_overlay = toast_overlay.clone();
                             glib::spawn_future_local(async move {
-                                if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id).await {
+                                if let Err(err) = abs_core::accounts::remove_server(&pool, &server_id, crate::password_keyring::store().as_ref()).await {
                                     crate::error_reporting::report_background_error(&toast_overlay, "Removing the server", err);
                                     return;
                                 }

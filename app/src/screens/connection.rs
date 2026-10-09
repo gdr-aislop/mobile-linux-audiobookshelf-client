@@ -305,7 +305,7 @@ pub fn build(
                     let on_session_changed = on_session_changed.clone();
                     let toast_overlay = toast_overlay.clone();
                     glib::spawn_future_local(async move {
-                        if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id).await {
+                        if let Err(err) = abs_core::accounts::sign_out(&pool, &account_id, crate::password_keyring::store().as_ref()).await {
                             crate::error_reporting::report_background_error(&toast_overlay, "Disconnecting", err);
                             return;
                         }

@@ -23,6 +23,12 @@
 //! live: a reply cut off at 15:45, the next attempt at 19:32 rejected, signed out). So a refresh
 //! that may have been acted on is retried in the background until it's confirmed, inside that
 //! window, and the device is kept awake meanwhile so a sleeping phone doesn't let it pass.
+//!
+//! When the server does reject the refresh token for good (that window missed, the token's
+//! 30-day lifetime run out, the server's sessions lost), the session signs in again with the
+//! account's remembered password, if there is one (see [`crate::passwords`]), so one sign-in lasts
+//! however long the app goes unused. A password the server rejects isn't tried again until the
+//! user signs in by hand.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +98,7 @@ struct SessionInner {
     server_url: String,
     server_id: String,
     account_id: String,
+    username: String,
     tokens: tokio::sync::Mutex<Tokens>,
     /// A copy of the current access token readable without waiting for a refresh in progress —
     /// see [`Session::stored_access_token`]. Updated whenever `tokens` is.
@@ -109,6 +116,8 @@ struct SessionInner {
     offline: std::sync::atomic::AtomicBool,
     /// See [`Session::set_keep_awake`].
     keep_awake: std::sync::OnceLock<Arc<dyn KeepAwake>>,
+    /// See [`Session::set_password_store`].
+    password_store: std::sync::OnceLock<Arc<dyn crate::passwords::PasswordStore>>,
     /// [`RECOVERY_DELAYS`], shortened by tests.
     recovery_delays: &'static [Duration],
 }
@@ -127,6 +136,8 @@ struct Tokens {
     unconfirmed: Option<Unconfirmed>,
     /// Whether the background retry task is running.
     recovering: bool,
+    /// Whether the server refused the remembered password; it isn't tried again by this session.
+    password_rejected: bool,
 }
 
 /// When an unconfirmed refresh was sent, on both clocks: the wall clock keeps counting while the
@@ -176,6 +187,7 @@ impl Session {
                 server_url: server.url.clone(),
                 server_id: server.id.clone(),
                 account_id: account.id.clone(),
+                username: account.username.clone(),
                 tokens: tokio::sync::Mutex::new(Tokens {
                     access_token: account.token.clone(),
                     refresh_token: account.refresh_token.clone(),
@@ -183,12 +195,14 @@ impl Session {
                     cool_down_logged: false,
                     unconfirmed: None,
                     recovering: false,
+                    password_rejected: false,
                 }),
                 stored_token: std::sync::Mutex::new(account.token.clone()),
                 probe_cache: tokio::sync::Mutex::new(None),
                 client_cache: tokio::sync::Mutex::new(None),
                 offline: std::sync::atomic::AtomicBool::new(false),
                 keep_awake: std::sync::OnceLock::new(),
+                password_store: std::sync::OnceLock::new(),
                 recovery_delays: RECOVERY_DELAYS,
             }),
         }
@@ -200,6 +214,13 @@ impl Session {
     /// Only the first call counts; without one, refreshes run unguarded.
     pub fn set_keep_awake(&self, keep_awake: Arc<dyn KeepAwake>) {
         let _ = self.inner.keep_awake.set(keep_awake);
+    }
+
+    /// Hands the session the app's remembered passwords, used to sign in again when the server
+    /// rejects the refresh token for good (see the module docs). Only the first call counts;
+    /// without one, a rejected refresh token means signing in by hand.
+    pub fn set_password_store(&self, store: Arc<dyn crate::passwords::PasswordStore>) {
+        let _ = self.inner.password_store.set(store);
     }
 
     fn keep_awake(&self) -> Option<Box<dyn Send>> {
@@ -357,23 +378,8 @@ impl Session {
                 // don't rotate (or pre-date rotation semantics) may omit it — keeping the
                 // existing token is the safe fallback there, and is also what the server's own
                 // grace window (v2.35.0+) tolerates.
-                let new_refresh = result.refresh_token.or_else(|| tokens.refresh_token.clone());
-                if let Err(err) = abs_storage::repo::accounts::set_tokens(
-                    &self.inner.pool,
-                    &self.inner.account_id,
-                    &result.access_token,
-                    new_refresh.as_deref(),
-                )
-                .await
-                {
-                    tracing::warn!(%err, "refreshed the access token but couldn't persist it; it will be re-refreshed next launch");
-                }
                 tracing::info!(account_id = %self.inner.account_id, recovered = tokens.unconfirmed.is_some(), "refreshed the account's access token");
-                tokens.access_token = result.access_token;
-                tokens.refresh_token = new_refresh;
-                tokens.refresh_failed_at = None;
-                tokens.unconfirmed = None;
-                *self.inner.stored_token.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tokens.access_token.clone();
+                self.adopt_pair(tokens, result.access_token, result.refresh_token).await;
             }
             Err(err) => {
                 tokens.refresh_failed_at = Some(std::time::Instant::now());
@@ -393,7 +399,57 @@ impl Session {
                 } else if matches!(err, abs_api::LoginError::SessionExpired) {
                     // The server has answered for this token for good; nothing left to recover.
                     tokens.unconfirmed = None;
+                    self.sign_in_again(tokens, &client).await;
                 }
+            }
+        }
+    }
+
+    /// Takes a new token pair from the server as the session's own, persisted. A missing refresh
+    /// token keeps the current one: servers that don't rotate (or pre-date rotation semantics)
+    /// may omit it, which is also what the server's own grace window (v2.35.0+) tolerates.
+    async fn adopt_pair(&self, tokens: &mut Tokens, access_token: String, refresh_token: Option<String>) {
+        let refresh_token = refresh_token.or_else(|| tokens.refresh_token.clone());
+        if let Err(err) =
+            abs_storage::repo::accounts::set_tokens(&self.inner.pool, &self.inner.account_id, &access_token, refresh_token.as_deref()).await
+        {
+            tracing::warn!(%err, "got a new access token but couldn't persist it; it will be renewed again next launch");
+        }
+        tokens.access_token = access_token;
+        tokens.refresh_token = refresh_token;
+        tokens.refresh_failed_at = None;
+        tokens.unconfirmed = None;
+        *self.inner.stored_token.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tokens.access_token.clone();
+    }
+
+    /// After the server rejected the refresh token for good: signs in with the remembered
+    /// password, if there is one, through the same `client` the refresh used. A failed attempt
+    /// leaves the cool-down set by the refresh in place, so it's tried again no sooner than a
+    /// refresh would be; a rejected password isn't tried again at all.
+    async fn sign_in_again(&self, tokens: &mut Tokens, client: &abs_api::Client) {
+        if tokens.password_rejected {
+            return;
+        }
+        let Some(store) = self.inner.password_store.get() else { return };
+        let password = match store.load(&self.inner.account_id).await {
+            Ok(Some(password)) => password,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(%err, account_id = %self.inner.account_id, "couldn't read the remembered password to sign in again");
+                return;
+            }
+        };
+        match client.login(&self.inner.username, &password).await {
+            Ok(result) => {
+                tracing::info!(account_id = %self.inner.account_id, "signed in again with the remembered password");
+                self.adopt_pair(tokens, result.access_token, result.refresh_token).await;
+            }
+            Err(abs_api::LoginError::InvalidCredentials) => {
+                tokens.password_rejected = true;
+                tracing::warn!(account_id = %self.inner.account_id, "the server refused the remembered password; signing in by hand is needed");
+            }
+            Err(err) => {
+                tracing::warn!(%err, account_id = %self.inner.account_id, "couldn't sign in again with the remembered password; will try again");
             }
         }
     }
@@ -955,5 +1011,81 @@ mod tests {
 
         assert_eq!(refreshing.await.unwrap(), "new-access");
         assert_eq!((keep_awake.active(), keep_awake.taken()), (0, 1), "released once the refresh is done");
+    }
+
+    /// A session whose refresh token the server rejects for good (`/auth/refresh` answers 401),
+    /// with `jane`'s password remembered as `remembered` (none when `None`).
+    async fn rejected_session(mock_server: &MockServer, remembered: Option<&str>) -> (SqlitePool, Account, Session) {
+        Mock::given(method("POST")).and(path("/auth/refresh")).respond_with(ResponseTemplate::new(401)).mount(mock_server).await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("dead-refresh")).await;
+        let session = session_for(&pool, &account).await;
+        let passwords = match remembered {
+            Some(password) => crate::passwords::MemoryPasswords::with(&account.id, password),
+            None => crate::passwords::MemoryPasswords::default(),
+        };
+        session.set_password_store(Arc::new(passwords));
+        (pool, account, session)
+    }
+
+    /// As if the cool-down after the last failure were over.
+    async fn skip_the_cool_down(session: &Session) {
+        session.inner.tokens.lock().await.refresh_failed_at = Some(std::time::Instant::now() - REFRESH_RETRY_AFTER - Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_refresh_token_signs_in_again_with_the_remembered_password() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({ "username": "jane", "password": "hunter2" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(new_pair()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (pool, account, session) = rejected_session(&mock_server, Some("hunter2")).await;
+
+        assert_eq!(session.access_token().await, "new-access");
+
+        let stored = abs_storage::repo::accounts::get(&pool, &account.id).await.unwrap();
+        assert_eq!(stored.token, "new-access");
+        assert_eq!(stored.refresh_token.as_deref(), Some("new-refresh"), "the new session's refresh token takes over");
+        assert_eq!(session.stored_access_token(), "new-access");
+    }
+
+    #[tokio::test]
+    async fn without_a_remembered_password_a_rejected_refresh_token_stays_rejected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(200).set_body_json(new_pair())).expect(0).mount(&mock_server).await;
+        let (_pool, account, session) = rejected_session(&mock_server, None).await;
+
+        assert_eq!(session.access_token().await, account.token);
+    }
+
+    #[tokio::test]
+    async fn a_password_the_server_refuses_is_not_tried_again() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(401)).expect(1).mount(&mock_server).await;
+        let (_pool, account, session) = rejected_session(&mock_server, Some("changed-since")).await;
+
+        assert_eq!(session.access_token().await, account.token);
+        skip_the_cool_down(&session).await;
+        assert_eq!(session.access_token().await, account.token);
+
+        assert!(session.inner.tokens.lock().await.password_rejected);
+        // `expect(1)` is verified when the mock server drops.
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_that_fails_for_another_reason_is_tried_again_after_the_cool_down() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(502)).up_to_n_times(1).mount(&mock_server).await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(200).set_body_json(new_pair())).mount(&mock_server).await;
+        let (_pool, account, session) = rejected_session(&mock_server, Some("hunter2")).await;
+
+        assert_eq!(session.access_token().await, account.token, "the server was down");
+        skip_the_cool_down(&session).await;
+
+        assert_eq!(session.access_token().await, "new-access");
     }
 }

@@ -176,6 +176,18 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       session stays active). Replace proceeds with the login; if the login then fails, the old
       session is still intact (retryable, nothing was removed).
 
+- [ ] **WT-15 — Remember password is on by default and goes to the keyring.** Look at the form,
+      then sign in without touching the switch.
+      *Expected:* "Remember password" sits under the Password field, switched on, and is hidden in
+      API Token mode. After signing in, the keyring (Seahorse, or `secret-tool search xdg:schema
+      io.github.gdr_aislop.abs-app.Password`) holds one item for the account. If the keyring is
+      locked, the system unlock prompt may appear. Signing in again with the switch off, or
+      signing out, removes the item.
+      *Automated:* `welcome_connect` (switch starts on); abs-core's
+      `a_login_remembers_the_password_only_when_asked_to`,
+      `a_relogin_that_replaces_the_account_forgets_the_old_password`,
+      `signing_out_or_removing_the_server_forgets_the_password`.
+
 ---
 
 ## 2. App shell & navigation (NT) — ✅ implemented
@@ -703,6 +715,17 @@ was and wasn't verified.
       `a_rejection_ends_the_retries`, `the_retries_stop_once_the_server_no_longer_accepts_the_old_token`,
       `the_device_is_kept_awake_for_exactly_as_long_as_a_refresh_is_in_flight`; abs-api's
       `refresh_waits_for_a_slow_reply_once_the_server_has_answered`.
+      *And when the refresh token is gone for good* (the retries came too late, the app went
+      unused past the token's 30-day lifetime, or the server lost its sessions, e.g. after a
+      database restore): with a remembered
+      password (WT-15) the log shows `signed in again with the remembered password` right after
+      the refresh is refused, and the app stays signed in. If the password was changed on the
+      server, the log shows `the server refused the remembered password` once, no further sign-in
+      attempts follow, and the usual "Session expired — log in again" appears.
+      *Automated:* abs-core's `a_rejected_refresh_token_signs_in_again_with_the_remembered_password`,
+      `without_a_remembered_password_a_rejected_refresh_token_stays_rejected`,
+      `a_password_the_server_refuses_is_not_tried_again`,
+      `a_sign_in_that_fails_for_another_reason_is_tried_again_after_the_cool_down`.
 
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes

@@ -3806,6 +3806,8 @@ pub(crate) mod tests {
                 "https://audiobooks.dev/audiobookshelf",
                 "demo",
                 "demo",
+                &abs_core::passwords::NoPasswords,
+                false,
             ))
             .expect("login against the live demo server should succeed");
         let server = runtime.block_on(abs_storage::repo::servers::get(&pool, &added.server_id)).unwrap();

@@ -51,7 +51,12 @@ Fractal) rather than copying Lissen's Material Design look.
 - A segmented toggle (`AdwToggleGroup`/two-button segmented control, matching the same pattern
   used for Settings' Theme picker) switches the form between two auth modes:
   - **Password** — Server URL, Username, and a masked Password field (with a show/hide eye-icon
-    toggle) as one grouped card of `AdwEntryRow`/`AdwPasswordEntryRow`-equivalent rows.
+    toggle) as one grouped card of `AdwEntryRow`/`AdwPasswordEntryRow`-equivalent rows, then a
+    **Remember password** row with a switch, **on by default** (subtitle "Signs you in again if
+    the server ends the session. Kept in your keyring."). A remembered password lives in the
+    desktop keyring (never the app's database). When the server rejects the refresh token for
+    good, the app signs in again with it silently, so one sign-in lasts however long the app goes
+    unused. Signing in with the switch off, signing out, or removing the server forgets it.
   - **API Token** — Server URL and a single Token field; username/password are hidden entirely
     rather than just disabled, since they're not applicable to this mode.
 - Primary `AdwButton` (suggested-action style, full width) "Connect", **disabled until the

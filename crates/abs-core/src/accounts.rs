@@ -9,6 +9,7 @@ use abs_storage::AppPaths;
 use sqlx::SqlitePool;
 
 use crate::error::Result;
+use crate::passwords::PasswordStore;
 
 pub struct AddedAccount {
     pub server_id: String,
@@ -66,12 +67,15 @@ pub fn replacement_kind(seed: &ReloginSeed, url: &str, username: &str) -> Option
 /// screen. On login failure, the newly-created server row is rolled back rather than left behind
 /// as an orphaned, credential-less entry. The new account becomes the active one: this is the
 /// only way to add an account today, so leaving it inactive would mean the app forgets you're
-/// signed in the next time it starts and shows the Welcome screen again.
+/// signed in the next time it starts and shows the Welcome screen again. With `remember`, the
+/// password is kept in `passwords` so the session can sign in again on its own later.
 pub async fn add_server_and_login(
     pool: &SqlitePool,
     url: &str,
     username: &str,
     password: &str,
+    passwords: &dyn PasswordStore,
+    remember: bool,
 ) -> Result<AddedAccount> {
     let server_id = servers::add(pool, url).await?;
 
@@ -94,6 +98,7 @@ pub async fn add_server_and_login(
     )
     .await?;
     accounts::set_active(pool, &account_id).await?;
+    crate::passwords::remember_after_login(passwords, &account_id, password, remember).await;
 
     Ok(AddedAccount { server_id, account_id })
 }
@@ -110,6 +115,10 @@ pub async fn add_server_and_login(
 ///   cascade) but the server's cache survives, since it's keyed by `server_id`;
 /// - different URL → the old server row is removed entirely (cascading its libraries, items,
 ///   chapters and downloads) and its on-disk cover/download files are purged.
+///
+/// The signed-in account's password is then remembered in `passwords` or forgotten, per
+/// `remember`; a removed previous account's is forgotten.
+#[allow(clippy::too_many_arguments)]
 pub async fn relogin(
     pool: &SqlitePool,
     paths: &AppPaths,
@@ -117,6 +126,8 @@ pub async fn relogin(
     url: &str,
     username: &str,
     password: &str,
+    passwords: &dyn PasswordStore,
+    remember: bool,
 ) -> Result<AddedAccount> {
     // Normalized once, up front: every use below (the HTTP client's baseurl, the same-server
     // comparison, the new server row) sees the same canonical form, so a user-typed trailing
@@ -145,6 +156,7 @@ pub async fn relogin(
             login_result.refresh_token.as_deref(),
         )
         .await?;
+        crate::passwords::remember_after_login(passwords, &previous.account_id, password, remember).await;
         return Ok(AddedAccount {
             server_id: previous.server_id.clone(),
             account_id: previous.account_id.clone(),
@@ -162,6 +174,8 @@ pub async fn relogin(
         .await?;
         accounts::set_active(pool, &account_id).await?;
         accounts::remove(pool, &previous.account_id).await?;
+        crate::passwords::forget(passwords, &previous.account_id).await;
+        crate::passwords::remember_after_login(passwords, &account_id, password, remember).await;
         return Ok(AddedAccount { server_id: previous.server_id.clone(), account_id });
     }
 
@@ -184,6 +198,8 @@ pub async fn relogin(
     };
     accounts::set_active(pool, &account_id).await?;
     servers::remove(pool, &previous.server_id).await?;
+    crate::passwords::forget(passwords, &previous.account_id).await;
+    crate::passwords::remember_after_login(passwords, &account_id, password, remember).await;
     if let Err(err) = paths.purge_server_data(&previous.server_id).await {
         tracing::warn!(%err, server_id = %previous.server_id, "couldn't purge the old server's on-disk cache after switching servers; the files are orphaned but harmless");
     }
@@ -199,16 +215,23 @@ pub async fn switch_active_account(pool: &SqlitePool, account_id: &str) -> Resul
 }
 
 /// Sign out of one account. Its local progress rows cascade-delete with it (see the storage
-/// layer's migration); the server itself and any other accounts on it are untouched.
-pub async fn sign_out(pool: &SqlitePool, account_id: &str) -> Result<()> {
+/// layer's migration); the server itself and any other accounts on it are untouched. Its
+/// remembered password is forgotten.
+pub async fn sign_out(pool: &SqlitePool, account_id: &str, passwords: &dyn PasswordStore) -> Result<()> {
     accounts::remove(pool, account_id).await?;
+    crate::passwords::forget(passwords, account_id).await;
     Ok(())
 }
 
 /// Remove a server entirely — "Remove Server" from Settings' per-server menu. Cascades to every
-/// account, library, item, and download record for that server.
-pub async fn remove_server(pool: &SqlitePool, server_id: &str) -> Result<()> {
+/// account, library, item, and download record for that server, and forgets those accounts'
+/// remembered passwords.
+pub async fn remove_server(pool: &SqlitePool, server_id: &str, passwords: &dyn PasswordStore) -> Result<()> {
+    let removed = accounts::list_for_server(pool, server_id).await?;
     servers::remove(pool, server_id).await?;
+    for account in removed {
+        crate::passwords::forget(passwords, &account.id).await;
+    }
     Ok(())
 }
 
@@ -216,6 +239,7 @@ pub async fn remove_server(pool: &SqlitePool, server_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::error::CoreError;
+    use crate::passwords::{MemoryPasswords, NoPasswords};
     use abs_storage::connect_and_migrate;
     use abs_storage::repo::items::{self, UpsertItem};
     use abs_storage::repo::libraries::{self, UpsertLibrary};
@@ -284,7 +308,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2")
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false)
             .await
             .unwrap();
 
@@ -304,7 +328,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
 
         let pool = pool().await;
-        let result = add_server_and_login(&pool, &server.uri(), "jane", "wrong").await;
+        let result = add_server_and_login(&pool, &server.uri(), "jane", "wrong", &NoPasswords, false).await;
 
         assert!(matches!(result, Err(CoreError::Login(_))));
         assert!(servers::list(&pool).await.unwrap().is_empty(), "no server row should remain");
@@ -316,7 +340,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
 
         switch_active_account(&pool, &added.account_id).await.unwrap();
         assert!(accounts::get(&pool, &added.account_id).await.unwrap().is_active);
@@ -328,9 +352,9 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
 
-        sign_out(&pool, &added.account_id).await.unwrap();
+        sign_out(&pool, &added.account_id, &NoPasswords).await.unwrap();
 
         assert!(accounts::get(&pool, &added.account_id).await.is_err());
         assert!(servers::get(&pool, &added.server_id).await.is_ok(), "server should survive");
@@ -342,9 +366,9 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
 
-        remove_server(&pool, &added.server_id).await.unwrap();
+        remove_server(&pool, &added.server_id, &NoPasswords).await.unwrap();
 
         assert!(servers::get(&pool, &added.server_id).await.is_err());
         assert!(accounts::get(&pool, &added.account_id).await.is_err());
@@ -386,7 +410,7 @@ mod tests {
             .await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
         seed_cache(&pool, &added.server_id, &added.account_id).await;
         let previous = ReloginSeed {
             server_id: added.server_id.clone(),
@@ -402,7 +426,7 @@ mod tests {
             }),
         )).mount(&server).await;
 
-        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &format!("{}/", server.uri()), "jane", "hunter2")
+        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &format!("{}/", server.uri()), "jane", "hunter2", &NoPasswords, false)
             .await
             .unwrap();
 
@@ -426,7 +450,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).up_to_n_times(1).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
         seed_cache(&pool, &added.server_id, &added.account_id).await;
         let previous = ReloginSeed {
             server_id: added.server_id.clone(),
@@ -440,7 +464,7 @@ mod tests {
             }),
         )).mount(&server).await;
 
-        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "bob", "hunter2")
+        let relogged = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "bob", "hunter2", &NoPasswords, false)
             .await
             .unwrap();
 
@@ -474,7 +498,7 @@ mod tests {
         )).mount(&server_b).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server_a.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server_a.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
         seed_cache(&pool, &added.server_id, &added.account_id).await;
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
@@ -490,7 +514,7 @@ mod tests {
             url: server_a.uri(),
             username: "jane".into(),
         };
-        let relogged = relogin(&pool, &paths, &previous, &server_b.uri(), "bob", "hunter2").await.unwrap();
+        let relogged = relogin(&pool, &paths, &previous, &server_b.uri(), "bob", "hunter2", &NoPasswords, false).await.unwrap();
 
         assert_ne!(relogged.server_id, added.server_id);
         assert!(servers::get(&pool, &added.server_id).await.is_err(), "the old server row must go");
@@ -510,7 +534,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).up_to_n_times(1).mount(&server).await;
 
         let pool = pool().await;
-        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2").await.unwrap();
+        let added = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &NoPasswords, false).await.unwrap();
         let previous = ReloginSeed {
             server_id: added.server_id.clone(),
             account_id: added.account_id.clone(),
@@ -519,11 +543,72 @@ mod tests {
         };
         Mock::given(method("POST")).and(path("/login")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
 
-        let result = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "jane", "wrong").await;
+        let result = relogin(&pool, &AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused"), &previous, &server.uri(), "jane", "wrong", &NoPasswords, false).await;
 
         assert!(matches!(result, Err(CoreError::Login(_))));
         assert!(accounts::get(&pool, &added.account_id).await.is_ok(), "the old account must survive a failed re-login");
         assert!(accounts::get(&pool, &added.account_id).await.unwrap().is_active, "and must still be the active one");
         assert_eq!(servers::list(&pool).await.unwrap().len(), 1, "no new server row from a failed re-login");
+    }
+
+    #[tokio::test]
+    async fn a_login_remembers_the_password_only_when_asked_to() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
+        let pool = pool().await;
+        let passwords = MemoryPasswords::default();
+
+        let remembered = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &passwords, true).await.unwrap();
+        assert_eq!(passwords.get(&remembered.account_id).as_deref(), Some("hunter2"));
+
+        let previous = ReloginSeed {
+            server_id: remembered.server_id.clone(),
+            account_id: remembered.account_id.clone(),
+            url: server.uri(),
+            username: "jane".into(),
+        };
+        let unpaths = AppPaths::rooted_at("/tmp/unused", "/tmp/unused", "/tmp/unused");
+        relogin(&pool, &unpaths, &previous, &server.uri(), "jane", "hunter2", &passwords, false).await.unwrap();
+        assert_eq!(passwords.get(&remembered.account_id), None, "signing in with the box unticked forgets it");
+    }
+
+    #[tokio::test]
+    async fn a_relogin_that_replaces_the_account_forgets_the_old_password() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server_a).await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server_b).await;
+        let pool = pool().await;
+        let passwords = MemoryPasswords::default();
+        let added = add_server_and_login(&pool, &server_a.uri(), "jane", "hunter2", &passwords, true).await.unwrap();
+        let previous = ReloginSeed {
+            server_id: added.server_id.clone(),
+            account_id: added.account_id.clone(),
+            url: server_a.uri(),
+            username: "jane".into(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(tmp.path().join("data"), tmp.path().join("cache"), tmp.path().join("state"));
+
+        let relogged = relogin(&pool, &paths, &previous, &server_b.uri(), "jane", "other-pass", &passwords, true).await.unwrap();
+
+        assert_eq!(passwords.get(&added.account_id), None, "the removed account's password goes with it");
+        assert_eq!(passwords.get(&relogged.account_id).as_deref(), Some("other-pass"));
+    }
+
+    #[tokio::test]
+    async fn signing_out_or_removing_the_server_forgets_the_password() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/login")).respond_with(mock_login_success()).mount(&server).await;
+        let pool = pool().await;
+        let passwords = MemoryPasswords::default();
+
+        let signed_out = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &passwords, true).await.unwrap();
+        sign_out(&pool, &signed_out.account_id, &passwords).await.unwrap();
+        assert_eq!(passwords.get(&signed_out.account_id), None);
+
+        let removed = add_server_and_login(&pool, &server.uri(), "jane", "hunter2", &passwords, true).await.unwrap();
+        remove_server(&pool, &removed.server_id, &passwords).await.unwrap();
+        assert_eq!(passwords.get(&removed.account_id), None);
     }
 }

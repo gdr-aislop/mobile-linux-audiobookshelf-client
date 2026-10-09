@@ -7,6 +7,7 @@ mod keep_awake;
 mod log_privacy;
 mod low_memory_mode;
 mod offline_mode;
+mod password_keyring;
 mod perf;
 mod player;
 mod rich_text;
