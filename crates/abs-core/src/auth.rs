@@ -365,11 +365,11 @@ impl Session {
         let client = match self.connection_target().await {
             Ok(target) => target.plain_client().unwrap_or_else(|err| {
                 tracing::warn!(%err, "couldn't mint a client honoring the connection settings; token refresh will use the defaults");
-                abs_api::Client::new(&self.inner.server_url)
+                abs_api::Client::with_default_options(&self.inner.server_url)
             }),
             Err(err) => {
                 tracing::warn!(%err, "couldn't load the server's connection settings; token refresh will use the defaults");
-                abs_api::Client::new(&self.inner.server_url)
+                abs_api::Client::with_default_options(&self.inner.server_url)
             }
         };
         match client.refresh(refresh_token).await {

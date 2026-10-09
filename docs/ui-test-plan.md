@@ -1342,10 +1342,14 @@ button restoring the shell.
       refresh specifically) in abs-api's and abs-core's mocked tests.
 
 - [ ] **CN-6 — User-Agent override.** Set a custom User-Agent and check the proxy/server logs.
-      *Expected:* requests carry the overridden value; clearing it restores the default.
+      *Expected:* before any override, API calls, token refreshes and audio stream requests all
+      show `abs-app/<version> (Linux)` in the server's access log (not `-`, not GStreamer's
+      agent). With an override they carry the overridden value; clearing it restores the default.
       *Automated:* the user-agent editor's set/clear paths in
-      `connection_advanced_rows_persist_and_edit`; the override reaching the wire in abs-api's
-      mocked test.
+      `connection_advanced_rows_persist_and_edit`; abs-api's
+      `requests_send_the_app_s_own_user_agent_unless_overridden` and
+      `custom_headers_and_user_agent_reach_the_wire`; abs-core's connection tests for the agent
+      playback is given.
 
 - [ ] **CN-7 — Client certificate (mTLS).** Import a client certificate for a server that
       requires one.

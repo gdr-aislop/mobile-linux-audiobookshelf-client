@@ -517,7 +517,9 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   PEM identity loader rejects the widespread RSA PKCS#1 key encoding), **Local network server
   address** (used instead of the public URL whenever a short reachability probe — cached for a
   minute per session — finds it listening, so home-Wi-Fi traffic stays local and everything
-  else falls back cleanly), and **Change User Agent** (empty restores the default). Each row
+  else falls back cleanly), and **Change User Agent** (empty restores the default,
+  `abs-app/<version> (Linux)`, sent on API calls and audio streams alike; it deliberately avoids
+  the Audiobookshelf name, per the project's rules for third-party clients). Each row
   persists to the server's table row the moment it's saved and is picked up by the next
   connection mint — sync, downloads, playback — without any rebuild; the editors show a
   value-as-subtitle (or "None"/"Default") where the mockup showed a static description, and

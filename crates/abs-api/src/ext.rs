@@ -214,9 +214,8 @@ struct RawMetadata {
 /// converts them into reqwest primitives (`HeaderMap`, `Identity`, TLS flags), so no other crate
 /// ever names a reqwest type to describe connection settings.
 ///
-/// `ConnectionOptions::default()` is exactly the behavior [`Client::with_bearer_token`] always
-/// had: no extra headers, certificate verification on, no client certificate, no user-agent
-/// override.
+/// `ConnectionOptions::default()` is what [`Client::with_bearer_token`] uses: no extra headers,
+/// certificate verification on, no client certificate, and the app's own [`DEFAULT_USER_AGENT`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConnectionOptions {
     /// Headers attached to every request, on top of the generated client's own. The
@@ -239,9 +238,15 @@ pub struct ConnectionOptions {
     pub client_cert_path: Option<std::path::PathBuf>,
     /// The PKCS#12 bundle's export password, if it has one.
     pub client_cert_password: Option<String>,
-    /// Replaces reqwest's default `User-Agent` when set.
+    /// Replaces [`DEFAULT_USER_AGENT`] when set.
     pub user_agent: Option<String>,
 }
+
+/// The `User-Agent` every request sends unless a server's settings override it, so the app is
+/// recognizable in a server's logs. Deliberately not "Audiobookshelf": the project asks
+/// third-party clients not to use its name in a way that suggests affiliation
+/// (https://audiobookshelf.org/docs/faq/app#i-want-to-build-a-client-app-what-are-the-rules).
+pub const DEFAULT_USER_AGENT: &str = concat!("abs-app/", env!("CARGO_PKG_VERSION"), " (Linux)");
 
 /// Why minting a [`Client`] with connection options failed. Unlike the plain
 /// headers/timeout-only constructors (which cannot fail beyond an invalid token), honoring a
@@ -310,6 +315,13 @@ fn load_client_identity(
 /// all and gets `401`s back (caught live against `https://audiobooks.dev/audiobookshelf`, not
 /// just in theory).
 impl Client {
+    /// An unauthenticated client with default [`ConnectionOptions`] — for the calls that run
+    /// before any server settings exist (the first login) or when they can't be loaded. Unlike
+    /// the generated `Client::new`, it sends [`DEFAULT_USER_AGENT`].
+    pub fn with_default_options(baseurl: &str) -> Self {
+        Self::with_options(baseurl, &ConnectionOptions::default()).expect("a client with default connection options always builds")
+    }
+
     /// Builds a client that attaches `Authorization: Bearer <token>` to every request it sends.
     /// `token` is normally `LoginResult::access_token` fresh from `login`, or an already-persisted
     /// account's stored token. Uses a 15s connect/request timeout — long enough to tolerate a slow
@@ -385,9 +397,7 @@ impl Client {
         if options.disable_ssl_verify {
             builder = builder.danger_accept_invalid_certs(true);
         }
-        if let Some(user_agent) = &options.user_agent {
-            builder = builder.user_agent(user_agent);
-        }
+        builder = builder.user_agent(options.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT));
         if let Some(path) = &options.client_cert_path {
             builder = builder.identity(load_client_identity(path, options.client_cert_password.as_deref())?);
         }
@@ -2183,5 +2193,35 @@ mod tests {
 
         assert!(matches!(err, LoginError::SessionExpired));
         assert!(!err.server_may_have_acted());
+    }
+
+    /// The app identifies itself as `abs-app/<version> (Linux)` unless a server's settings say
+    /// otherwise — never without a User-Agent (a `"-"` in the server's log), and never with the
+    /// Audiobookshelf name.
+    #[tokio::test]
+    async fn requests_send_the_app_s_own_user_agent_unless_overridden() {
+        assert!(DEFAULT_USER_AGENT.starts_with(concat!("abs-app/", env!("CARGO_PKG_VERSION"))));
+        assert!(!DEFAULT_USER_AGENT.to_lowercase().contains("audiobookshelf"));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .and(header("user-agent", DEFAULT_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user": { "id": "user-1", "username": "jane", "accessToken": "abc123" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/libraries"))
+            .and(header("user-agent", "MyAgent/1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "libraries": [] })))
+            .mount(&server)
+            .await;
+
+        Client::with_default_options(&server.uri()).login("jane", "hunter2").await.expect("sent the default agent");
+
+        let options = ConnectionOptions { user_agent: Some("MyAgent/1.0".to_string()), ..Default::default() };
+        let client = Client::with_bearer_token_and_options(&server.uri(), "abc123", std::time::Duration::from_secs(5), &options).unwrap();
+        client.get_libraries().await.expect("sent the override instead");
     }
 }

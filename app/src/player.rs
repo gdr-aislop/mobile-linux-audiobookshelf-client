@@ -104,7 +104,7 @@ async fn start_target_from_files(
 fn playback_properties(connection: &abs_core::connection::ConnectionTarget) -> abs_player::ConnectionProperties {
     abs_player::ConnectionProperties {
         extra_headers: connection.extra_headers().to_vec(),
-        user_agent: connection.user_agent().map(str::to_string),
+        user_agent: Some(connection.user_agent().to_string()),
         ssl_strict: !connection.disable_ssl_verify(),
     }
 }

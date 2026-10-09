@@ -79,7 +79,7 @@ pub async fn add_server_and_login(
 ) -> Result<AddedAccount> {
     let server_id = servers::add(pool, url).await?;
 
-    let client = abs_api::Client::new(url);
+    let client = abs_api::Client::with_default_options(url);
     let login_result = match client.login(username, password).await {
         Ok(result) => result,
         Err(err) => {
