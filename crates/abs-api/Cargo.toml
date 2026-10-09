@@ -20,6 +20,8 @@ uuid.workspace = true
 chrono.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
+# `Client::refresh` limits the wait for the server's answer separately from the reply.
+tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -3,6 +3,7 @@ mod crash_reporting;
 mod downloads;
 mod error_reporting;
 mod icons;
+mod keep_awake;
 mod log_privacy;
 mod low_memory_mode;
 mod offline_mode;

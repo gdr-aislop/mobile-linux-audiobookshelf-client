@@ -25,7 +25,7 @@ prettyplease = "0.2"
 # Shared runtime/data deps
 # `net` backs `abs_core::connection::probe_reachable`'s TCP reachability check (the Connection
 # page's local-network-address policy); everything else is runtime/macros/fs as before.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time"] }
 futures = "0.3"
 # `native-tls` is the backend already in use via reqwest's default features; naming it
 # explicitly additionally unlocks the client-certificate API (`ClientBuilder::identity`,

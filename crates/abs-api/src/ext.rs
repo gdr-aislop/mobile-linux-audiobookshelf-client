@@ -16,6 +16,15 @@ struct LoginRequest<'a> {
     password: &'a str,
 }
 
+/// How long a token refresh waits for the server to start answering. Longer than the clients'
+/// 15 s connect limit, so a connection that never comes up fails as a connect error first (which
+/// [`LoginError::server_may_have_acted`] can rule out) rather than as [`LoginError::NoAnswer`].
+const REFRESH_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a token refresh waits for the rest of a reply once the server has answered with
+/// success — see [`Client::refresh`].
+const REFRESH_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Debug, Deserialize)]
 struct LoginResponseBody {
     user: LoginUser,
@@ -50,6 +59,10 @@ pub enum LoginError {
     Connect(reqwest::Error),
     #[error("timed out waiting for this server to respond: {0}")]
     Timeout(reqwest::Error),
+    /// The server hadn't started answering when the wait for it ran out (see [`Client::refresh`],
+    /// which waits on the answer and on the rest of the reply separately).
+    #[error("timed out waiting for this server to respond")]
+    NoAnswer,
     #[error("network error: {0}")]
     Network(reqwest::Error),
     #[error("server returned an unexpected response: {0}")]
@@ -64,9 +77,29 @@ impl LoginError {
     pub fn details(&self) -> Option<String> {
         let err: &(dyn std::error::Error + 'static) = match self {
             LoginError::Tls(e) | LoginError::Connect(e) | LoginError::Timeout(e) | LoginError::Network(e) => e,
-            LoginError::InvalidCredentials | LoginError::SessionExpired | LoginError::UnexpectedResponse(_) => return None,
+            LoginError::InvalidCredentials | LoginError::SessionExpired | LoginError::NoAnswer | LoginError::UnexpectedResponse(_) => {
+                return None
+            }
         };
         Some(error_chain(err))
+    }
+
+    /// Whether the server may have acted on the request even though no usable answer came back:
+    /// the connection was made, so the request may have arrived, and the failure came after. For
+    /// a token refresh this matters: the server swaps the token pair as soon as it handles the
+    /// request, so a reply that never arrives can leave this client holding a refresh token the
+    /// server has already replaced. `false` for failures before anything was sent (couldn't
+    /// connect, TLS) and for definite answers (a rejection, an error status).
+    pub fn server_may_have_acted(&self) -> bool {
+        match self {
+            LoginError::NoAnswer => true,
+            LoginError::Timeout(err) | LoginError::Network(err) => !err.is_connect(),
+            LoginError::InvalidCredentials
+            | LoginError::SessionExpired
+            | LoginError::Tls(_)
+            | LoginError::Connect(_)
+            | LoginError::UnexpectedResponse(_) => false,
+        }
     }
 }
 
@@ -1007,14 +1040,30 @@ impl Client {
     /// use** — the new pair from the response must replace the old one in storage, and a 401 here
     /// means the server no longer knows this session at all (expired, revoked, or the server lost
     /// its session store), so the only way back in is signing in again.
+    ///
+    /// The wait has two parts. The server gets [`REFRESH_ANSWER_TIMEOUT`] to start answering,
+    /// like any call. Once it has answered with success, it has already swapped the pair and
+    /// this reply holds the only copy of the new one, so the rest of it gets
+    /// [`REFRESH_BODY_TIMEOUT`]. The reply is large (the server sends the whole user record,
+    /// ~30 KB), and on a phone just out of sleep it can take longer than the answer did; giving
+    /// up on it is what loses the login.
     pub async fn refresh(&self, refresh_token: &str) -> Result<LoginResult, LoginError> {
-        let response = self
+        self.refresh_within(refresh_token, REFRESH_ANSWER_TIMEOUT, REFRESH_BODY_TIMEOUT).await
+    }
+
+    async fn refresh_within(&self, refresh_token: &str, answer_timeout: std::time::Duration, body_timeout: std::time::Duration) -> Result<LoginResult, LoginError> {
+        let request = self
             .client()
             .post(format!("{}/auth/refresh", self.baseurl()))
             .header("x-return-tokens", "true")
             .header("x-refresh-token", refresh_token)
-            .send()
+            // Replaces the client's own limit for the whole request, which would cut the reply
+            // off; the wait for the answer is limited separately below.
+            .timeout(answer_timeout + body_timeout)
+            .send();
+        let response = tokio::time::timeout(answer_timeout, request)
             .await
+            .map_err(|_| LoginError::NoAnswer)?
             .map_err(classify_transport_error)?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -2044,5 +2093,95 @@ mod tests {
         let client = Client::new(&server.uri());
         let err = client.login("jane", "hunter2").await.unwrap_err();
         assert!(matches!(err, LoginError::UnexpectedResponse(_)));
+    }
+
+    /// A one-connection HTTP server for the refresh tests: accepts, reads the request up to the
+    /// blank line, then hands the stream to `respond` (which may write, stall or just drop it).
+    fn one_shot_server(respond: impl FnOnce(std::net::TcpStream) + Send + 'static) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the test client should connect");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                request.push(byte[0]);
+            }
+            respond(stream);
+        });
+        format!("http://{addr}")
+    }
+
+    /// The failure that cost a real login: the server answered 200 (and so had already swapped
+    /// the pair), then the ~30 KB reply trickled in slower than the client's whole-request limit
+    /// and was thrown away. The reply now gets its own, longer wait — here longer than both the
+    /// client's own limit and the wait for the answer.
+    #[tokio::test]
+    async fn refresh_waits_for_a_slow_reply_once_the_server_has_answered() {
+        use std::io::Write;
+        let url = one_shot_server(|mut stream| {
+            let body = serde_json::json!({
+                "user": { "id": "user-1", "username": "jane", "accessToken": "new-access", "refreshToken": "new-refresh" }
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        let client = Client::with_options_and_headers(&url, &ConnectionOptions::default(), None, std::time::Duration::from_millis(200)).unwrap();
+
+        let result = client
+            .refresh_within("old-refresh", std::time::Duration::from_millis(300), std::time::Duration::from_secs(5))
+            .await
+            .expect("the reply arrived, just slowly");
+
+        assert_eq!(result.access_token, "new-access");
+        assert_eq!(result.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_the_server_never_answers_may_have_been_acted_on() {
+        let url = one_shot_server(|_stream| std::thread::sleep(std::time::Duration::from_secs(60)));
+        let client = Client::new(&url);
+
+        let started = std::time::Instant::now();
+        let err = client
+            .refresh_within("old-refresh", std::time::Duration::from_millis(200), std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, LoginError::NoAnswer), "got {err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "the wait for the answer is what ran out");
+        assert!(err.server_may_have_acted(), "the request went out; the server may have swapped the pair");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_cut_off_after_it_was_sent_may_have_been_acted_on() {
+        let url = one_shot_server(drop);
+        let err = Client::new(&url).refresh("old-refresh").await.unwrap_err();
+
+        assert!(err.server_may_have_acted(), "the connection closed after the request was sent: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_never_connected_was_not_acted_on() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let err = Client::new(&format!("http://{addr}")).refresh("old-refresh").await.unwrap_err();
+
+        assert!(matches!(err, LoginError::Connect(_)), "got {err:?}");
+        assert!(!err.server_may_have_acted());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_refresh_was_not_acted_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/refresh")).respond_with(ResponseTemplate::new(401)).mount(&server).await;
+
+        let err = Client::new(&server.uri()).refresh("old-refresh").await.unwrap_err();
+
+        assert!(matches!(err, LoginError::SessionExpired));
+        assert!(!err.server_may_have_acted());
     }
 }

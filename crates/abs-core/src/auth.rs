@@ -15,6 +15,14 @@
 //! `covers`/`progress_sync`: if a refresh can't be attempted (legacy server, no refresh token)
 //! or fails (server down, session revoked), the current token is returned and the failure is
 //! only logged — the next 401 is no worse than what would happen without this module.
+//!
+//! The one failure that isn't harmless is a refresh the server acted on whose reply never
+//! arrived: the server has swapped the pair, and this client still holds the refresh token it
+//! replaced. The server keeps accepting that old token for a grace window (10 minutes by
+//! default) and answers it with the new pair; after that, the login is gone for good (observed
+//! live: a reply cut off at 15:45, the next attempt at 19:32 rejected, signed out). So a refresh
+//! that may have been acted on is retried in the background until it's confirmed, inside that
+//! window, and the device is kept awake meanwhile so a sleeping phone doesn't let it pass.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +40,25 @@ const FRESH_MARGIN_SECONDS: i64 = 60;
 /// timeout on a bad connection — on the phone four of them chained into ~40 s of waiting before
 /// a downloaded book could start.
 const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long after a refresh that may have been acted on (see the module docs) it is still retried
+/// in the background: inside the server's grace window for the refresh token it replaced
+/// (`REFRESH_TOKEN_GRACE_PERIOD`, 10 minutes by default), with a margin.
+const RECOVERY_WINDOW: Duration = Duration::from_secs(9 * 60);
+
+/// The waits between background retries of an unconfirmed refresh; the last one repeats until it
+/// is confirmed or [`RECOVERY_WINDOW`] runs out.
+const RECOVERY_DELAYS: &[Duration] = &[Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30), Duration::from_secs(60)];
+
+/// What the device is told it's being kept awake for, while a refresh is in flight or retried.
+const KEEP_AWAKE_REASON: &str = "Refreshing the server login";
+
+/// Keeps the device out of suspend while held. The app supplies it (this crate can't name GTK);
+/// see [`Session::set_keep_awake`].
+pub trait KeepAwake: Send + Sync {
+    /// Starts keeping the device awake; it stops when the returned value is dropped.
+    fn hold(&self, reason: &'static str) -> Box<dyn Send>;
+}
 
 /// The access token's `exp` claim, in Unix seconds. `None` when this isn't an expiring JWT at all
 /// (legacy servers' permanent tokens have no such claim — those need no refreshing), or the
@@ -80,6 +107,10 @@ struct SessionInner {
     /// The app's offline mode (see [`Session::set_offline`]): while set, nothing minted through
     /// this session reaches the server.
     offline: std::sync::atomic::AtomicBool,
+    /// See [`Session::set_keep_awake`].
+    keep_awake: std::sync::OnceLock<Arc<dyn KeepAwake>>,
+    /// [`RECOVERY_DELAYS`], shortened by tests.
+    recovery_delays: &'static [Duration],
 }
 
 #[derive(Clone)]
@@ -90,6 +121,31 @@ struct Tokens {
     refresh_failed_at: Option<std::time::Instant>,
     /// Whether the cool-down since `refresh_failed_at` has been logged yet: once, not per caller.
     cool_down_logged: bool,
+    /// When the earliest refresh the server may have acted on without this client getting the
+    /// new pair was sent; cleared once a refresh is confirmed or definitely rejected, or
+    /// [`RECOVERY_WINDOW`] after it. While set, refreshes are retried in the background.
+    unconfirmed: Option<Unconfirmed>,
+    /// Whether the background retry task is running.
+    recovering: bool,
+}
+
+/// When an unconfirmed refresh was sent, on both clocks: the wall clock keeps counting while the
+/// device sleeps, as the server's grace window does, and the monotonic one can't be set back.
+#[derive(Clone, Copy)]
+struct Unconfirmed {
+    at: std::time::SystemTime,
+    at_instant: std::time::Instant,
+}
+
+impl Unconfirmed {
+    fn now() -> Self {
+        Self { at: std::time::SystemTime::now(), at_instant: std::time::Instant::now() }
+    }
+
+    fn window_over(&self) -> bool {
+        let wall = std::time::SystemTime::now().duration_since(self.at).unwrap_or_default();
+        wall.max(self.at_instant.elapsed()) >= RECOVERY_WINDOW
+    }
 }
 
 struct CachedProbe {
@@ -125,13 +181,29 @@ impl Session {
                     refresh_token: account.refresh_token.clone(),
                     refresh_failed_at: None,
                     cool_down_logged: false,
+                    unconfirmed: None,
+                    recovering: false,
                 }),
                 stored_token: std::sync::Mutex::new(account.token.clone()),
                 probe_cache: tokio::sync::Mutex::new(None),
                 client_cache: tokio::sync::Mutex::new(None),
                 offline: std::sync::atomic::AtomicBool::new(false),
+                keep_awake: std::sync::OnceLock::new(),
+                recovery_delays: RECOVERY_DELAYS,
             }),
         }
+    }
+
+    /// Hands the session the app's way of keeping the device awake, held for every token refresh
+    /// and for the background retries of an unconfirmed one. A phone that suspends with a
+    /// refresh in flight can lose the reply, and with it the only copy of the new token pair.
+    /// Only the first call counts; without one, refreshes run unguarded.
+    pub fn set_keep_awake(&self, keep_awake: Arc<dyn KeepAwake>) {
+        let _ = self.inner.keep_awake.set(keep_awake);
+    }
+
+    fn keep_awake(&self) -> Option<Box<dyn Send>> {
+        self.inner.keep_awake.get().map(|keep_awake| keep_awake.hold(KEEP_AWAKE_REASON))
     }
 
     pub fn account_id(&self) -> &str {
@@ -252,6 +324,17 @@ impl Session {
             }
         }
 
+        self.refresh_locked(&mut tokens, &refresh_token).await;
+        tokens.access_token.clone()
+    }
+
+    /// One refresh attempt, with the tokens lock held by the caller. Updates `tokens` with the
+    /// outcome; when the server may have acted on a request whose reply didn't arrive, marks the
+    /// refresh unconfirmed and starts the background retries (see the module docs).
+    async fn refresh_locked(&self, tokens: &mut Tokens, refresh_token: &str) {
+        let _awake = self.keep_awake();
+        let sent = Unconfirmed::now();
+
         // The refresh call must reach the server the same way everything else does — a
         // self-signed server's refresh can't be verified against the system CA store any more
         // than its sync calls can. Both resolve steps are best-effort here (this function is
@@ -268,7 +351,7 @@ impl Session {
                 abs_api::Client::new(&self.inner.server_url)
             }
         };
-        match client.refresh(&refresh_token).await {
+        match client.refresh(refresh_token).await {
             Ok(result) => {
                 // Rotation: the response's refresh token replaces the old one. Servers that
                 // don't rotate (or pre-date rotation semantics) may omit it — keeping the
@@ -285,24 +368,96 @@ impl Session {
                 {
                     tracing::warn!(%err, "refreshed the access token but couldn't persist it; it will be re-refreshed next launch");
                 }
-                tracing::info!(account_id = %self.inner.account_id, "refreshed the account's access token");
+                tracing::info!(account_id = %self.inner.account_id, recovered = tokens.unconfirmed.is_some(), "refreshed the account's access token");
                 tokens.access_token = result.access_token;
                 tokens.refresh_token = new_refresh;
                 tokens.refresh_failed_at = None;
+                tokens.unconfirmed = None;
                 *self.inner.stored_token.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tokens.access_token.clone();
             }
             Err(err) => {
                 tokens.refresh_failed_at = Some(std::time::Instant::now());
                 tokens.cool_down_logged = false;
+                let unconfirmed = err.server_may_have_acted();
                 tracing::warn!(
                     %err,
                     account_id = %self.inner.account_id,
+                    unconfirmed,
                     "couldn't refresh the access token; the stored token will be used and may be rejected"
                 );
+                if unconfirmed {
+                    tokens.unconfirmed.get_or_insert(sent);
+                    if !tokens.recovering {
+                        tokens.recovering = self.start_recovery();
+                    }
+                } else if matches!(err, abs_api::LoginError::SessionExpired) {
+                    // The server has answered for this token for good; nothing left to recover.
+                    tokens.unconfirmed = None;
+                }
             }
         }
+    }
 
-        tokens.access_token.clone()
+    /// Spawns the background retries of an unconfirmed refresh, keeping the device awake until
+    /// they end. Holds the session weakly, so signing out ends them too. Returns whether they
+    /// started (they can't without an async runtime to run on).
+    fn start_recovery(&self) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(account_id = %self.inner.account_id, "no async runtime to retry the unconfirmed token refresh on");
+            return false;
+        };
+        tracing::info!(
+            account_id = %self.inner.account_id,
+            "the server may have replaced the refresh token without this app getting the new one; retrying while it still accepts the old one"
+        );
+        let session = Arc::downgrade(&self.inner);
+        let delays = self.inner.recovery_delays;
+        let awake = self.keep_awake();
+        runtime.spawn(async move {
+            let _awake = awake;
+            for attempt in 0.. {
+                tokio::time::sleep(delays[attempt.min(delays.len() - 1)]).await;
+                let Some(inner) = session.upgrade() else { return };
+                if !(Session { inner }).recovery_attempt().await {
+                    return;
+                }
+            }
+        });
+        true
+    }
+
+    /// One background retry of an unconfirmed refresh. Returns whether to keep retrying.
+    async fn recovery_attempt(&self) -> bool {
+        let mut tokens = self.inner.tokens.lock().await;
+        let Some(unconfirmed) = tokens.unconfirmed else {
+            // Settled by another caller's refresh in the meantime.
+            tokens.recovering = false;
+            return false;
+        };
+        if unconfirmed.window_over() {
+            tracing::warn!(
+                account_id = %self.inner.account_id,
+                "couldn't confirm the token refresh in time; if the server replaced the refresh token, signing in again will be needed"
+            );
+            tokens.unconfirmed = None;
+            tokens.recovering = false;
+            return false;
+        }
+        // Offline mode allows no server calls; wait for it to end while the window lasts.
+        if self.is_offline() {
+            return true;
+        }
+        let Some(refresh_token) = tokens.refresh_token.clone() else {
+            tokens.unconfirmed = None;
+            tokens.recovering = false;
+            return false;
+        };
+        self.refresh_locked(&mut tokens, &refresh_token).await;
+        if tokens.unconfirmed.is_none() {
+            tokens.recovering = false;
+            return false;
+        }
+        true
     }
 
     /// A ready-to-use authenticated `abs_api::Client` for this session's server, reused across
@@ -368,6 +523,100 @@ mod tests {
         let account_id = abs_storage::repo::accounts::add(&pool, &server_id, "jane", token, refresh_token).await.unwrap();
         let account = abs_storage::repo::accounts::get(&pool, &account_id).await.unwrap();
         (pool, account, server_id)
+    }
+
+    impl Session {
+        fn with_recovery_delays(mut self, delays: &'static [Duration]) -> Self {
+            Arc::get_mut(&mut self.inner).expect("before the session is shared").recovery_delays = delays;
+            self
+        }
+    }
+
+    const FAST_RETRIES: &[Duration] = &[Duration::from_millis(20)];
+
+    /// How one connection to [`scripted_refresh_server`] is answered.
+    enum Reply {
+        /// Reads the request, then hangs up without answering: the server may have acted on it.
+        HangUp,
+        Ok(serde_json::Value),
+        Rejected,
+    }
+
+    fn new_pair() -> serde_json::Value {
+        serde_json::json!({ "user": { "id": "user-1", "username": "jane", "accessToken": "new-access", "refreshToken": "new-refresh" } })
+    }
+
+    /// An HTTP server answering one connection per entry of `replies`, in order. Returns its URL
+    /// and the `x-refresh-token` each request carried.
+    fn scripted_refresh_server(replies: Vec<Reply>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request).to_lowercase();
+                let token = request.lines().find_map(|line| line.strip_prefix("x-refresh-token: ")).unwrap_or_default();
+                seen_by_server.lock().unwrap().push(token.to_string());
+                let (status, body) = match reply {
+                    Reply::HangUp => continue,
+                    Reply::Ok(body) => ("200 OK", body.to_string()),
+                    Reply::Rejected => ("401 Unauthorized", r#"{"error":"Invalid refresh token"}"#.to_string()),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    async fn wait_until(what: &str, mut condition: impl AsyncFnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !condition().await {
+            assert!(started.elapsed() < Duration::from_secs(5), "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Counts the holds a session takes on the device's wakefulness.
+    #[derive(Default)]
+    struct CountingKeepAwake {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        taken: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KeepAwake for CountingKeepAwake {
+        fn hold(&self, _reason: &'static str) -> Box<dyn Send> {
+            struct Release(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            self.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(Release(self.active.clone()))
+        }
+    }
+
+    impl CountingKeepAwake {
+        fn active(&self) -> usize {
+            self.active.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn taken(&self) -> usize {
+            self.taken.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     /// Builds the session from the server row the pool already holds — Session reads its
@@ -611,5 +860,100 @@ mod tests {
         let token = session.access_token().await;
 
         assert_eq!(token, "new-access", "the refresh went through only if the custom header was sent");
+    }
+
+    /// The failure that signed a real user out: the server swapped the pair, the reply never
+    /// arrived, and nothing retried while the server still accepted the old refresh token.
+    #[tokio::test]
+    async fn a_refresh_whose_reply_was_lost_is_retried_with_the_same_token_until_it_lands() {
+        let (url, seen) = scripted_refresh_server(vec![Reply::HangUp, Reply::HangUp, Reply::Ok(new_pair())]);
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&url, &jwt_with_exp(expired), Some("old-refresh")).await;
+        let session = session_for(&pool, &account).await.with_recovery_delays(FAST_RETRIES);
+        let keep_awake = Arc::new(CountingKeepAwake::default());
+        session.set_keep_awake(keep_awake.clone());
+
+        assert_eq!(session.access_token().await, account.token, "the caller isn't held up by the retries");
+        wait_until("the retry lands", async || abs_storage::repo::accounts::get(&pool, &account.id).await.unwrap().token == "new-access").await;
+
+        assert_eq!(*seen.lock().unwrap(), ["old-refresh"; 3], "every retry carries the token the server may have replaced");
+        let stored = abs_storage::repo::accounts::get(&pool, &account.id).await.unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(session.stored_access_token(), "new-access");
+        wait_until("the retries end", async || !session.inner.tokens.lock().await.recovering).await;
+        assert!(session.inner.tokens.lock().await.unconfirmed.is_none());
+        wait_until("the device may sleep again", async || keep_awake.active() == 0).await;
+        assert!(keep_awake.taken() >= 4, "each attempt and the retries as a whole kept the device awake");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_never_reached_the_server_is_not_retried_in_the_background() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&format!("http://{closed}"), &jwt_with_exp(expired), Some("old-refresh")).await;
+        let session = session_for(&pool, &account).await.with_recovery_delays(FAST_RETRIES);
+
+        assert_eq!(session.access_token().await, account.token);
+
+        let tokens = session.inner.tokens.lock().await;
+        assert!(tokens.unconfirmed.is_none() && !tokens.recovering, "the old token is still the server's current one");
+    }
+
+    #[tokio::test]
+    async fn a_rejection_ends_the_retries() {
+        let (url, seen) = scripted_refresh_server(vec![Reply::HangUp, Reply::Rejected, Reply::Ok(new_pair())]);
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&url, &jwt_with_exp(expired), Some("old-refresh")).await;
+        let session = session_for(&pool, &account).await.with_recovery_delays(FAST_RETRIES);
+
+        session.access_token().await;
+        wait_until("the retries end", async || !session.inner.tokens.lock().await.recovering).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(seen.lock().unwrap().len(), 2, "nothing after the server's definite answer");
+        assert!(session.inner.tokens.lock().await.unconfirmed.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_retries_stop_once_the_server_no_longer_accepts_the_old_token() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/refresh")).respond_with(ResponseTemplate::new(500)).expect(0).mount(&mock_server).await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
+        let session = session_for(&pool, &account).await.with_recovery_delays(FAST_RETRIES);
+        {
+            let mut tokens = session.inner.tokens.lock().await;
+            tokens.unconfirmed = Some(Unconfirmed { at: std::time::SystemTime::now() - RECOVERY_WINDOW, at_instant: std::time::Instant::now() });
+            tokens.recovering = session.start_recovery();
+        }
+
+        wait_until("the retries end", async || !session.inner.tokens.lock().await.recovering).await;
+
+        assert!(session.inner.tokens.lock().await.unconfirmed.is_none());
+        // `expect(0)` is verified when the mock server drops.
+    }
+
+    #[tokio::test]
+    async fn the_device_is_kept_awake_for_exactly_as_long_as_a_refresh_is_in_flight() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(new_pair()).set_delay(Duration::from_millis(300)))
+            .mount(&mock_server)
+            .await;
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let (pool, account, _) = pool_with_account(&mock_server.uri(), &jwt_with_exp(expired), Some("old-refresh")).await;
+        let session = session_for(&pool, &account).await;
+        let keep_awake = Arc::new(CountingKeepAwake::default());
+        session.set_keep_awake(keep_awake.clone());
+
+        let refreshing = tokio::spawn({
+            let session = session.clone();
+            async move { session.access_token().await }
+        });
+        wait_until("the refresh is in flight", async || keep_awake.active() == 1).await;
+
+        assert_eq!(refreshing.await.unwrap(), "new-access");
+        assert_eq!((keep_awake.active(), keep_awake.taken()), (0, 1), "released once the refresh is done");
     }
 }

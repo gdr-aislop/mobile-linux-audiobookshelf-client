@@ -681,12 +681,28 @@ was and wasn't verified.
       dead connection and Resume a book whose current chapter is downloaded.
       *Expected:* sound within ~3 s of tapping Resume (log: `starting playback`, then `the server
       is slow or unreachable; starting from the downloaded files` within about 3 s). A token
-      refresh that fails is tried once, not by every screen in turn: the log shows at most one
-      `couldn't refresh the access token` per minute, followed by `skipping the token refresh:
-      the last attempt failed Ns ago`.
+      refresh that fails is tried once, not by every screen in turn: the log shows
+      `couldn't refresh the access token` followed by `skipping the token refresh: the last
+      attempt failed Ns ago`. The only further attempts are the background retries of MP-31,
+      when that line says `unconfirmed=true`.
       *Automated:* `playback_a_downloaded_book_starts_without_waiting_for_a_token_refresh`
       (expired token, a server that never answers `/auth/refresh`); abs-core's
       `a_failed_refresh_is_not_retried_by_the_next_caller`.
+
+- [ ] **MP-31 — The login survives a token refresh whose reply is lost.** With the access token
+      expired (open the app after an hour or more away), make the refresh's reply fail to arrive:
+      e.g. block the server's responses at the reverse proxy for ~20 s, or drop the connection
+      right as the app wakes on a weak network.
+      *Expected:* the log shows `couldn't refresh the access token … unconfirmed=true`, then `the
+      server may have replaced the refresh token …; retrying while it still accepts the old one`,
+      then, once replies get through again, `refreshed the account's access token recovered=true`,
+      all within 9 minutes. The app stays signed in (no "Session expired" toast, syncing works),
+      and the phone doesn't suspend while the retries run. A slow reply (the server answers, then
+      the ~30 KB body trickles in) is waited for, up to 2 minutes, rather than thrown away.
+      *Automated:* abs-core's `a_refresh_whose_reply_was_lost_is_retried_with_the_same_token_until_it_lands`,
+      `a_rejection_ends_the_retries`, `the_retries_stop_once_the_server_no_longer_accepts_the_old_token`,
+      `the_device_is_kept_awake_for_exactly_as_long_as_a_refresh_is_in_flight`; abs-api's
+      `refresh_waits_for_a_slow_reply_once_the_server_has_answered`.
 
 - [ ] **MP-8 — Long titles ellipsize.** Play the long-title book and look at the mini bar.
       *Expected:* title/author are single-line with "…" — the bar never grows, wraps, or pushes

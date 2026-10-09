@@ -298,6 +298,7 @@ async fn build_main_window(
         .expect("an active account's server must exist");
     let theme = abs_core::settings::load_theme(&pool).await.expect("load theme");
     let session = abs_core::auth::Session::new(pool.clone(), &server, &account);
+    session.set_keep_awake(std::sync::Arc::new(crate::keep_awake::GtkKeepAwake));
     // Before any screen is built: the first sync, cover fetch or progress push must already see
     // offline mode if it is on (the shell's `OfflineModeState` only loads it asynchronously).
     let offline_mode = abs_core::settings::load_offline_mode(&pool).await.unwrap_or(false);
