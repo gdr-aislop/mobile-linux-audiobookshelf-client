@@ -110,7 +110,7 @@ msgstr "nie udało się wczytać ustawień połączenia z serwerem: {error}"
 
 #: app/src/downloads.rs
 msgid "the server reported no audio files for this item"
-msgstr "serwer nie zgłosił żadnych plików audio dla tej pozycji"
+msgstr "serwer zgłosił brak plików audio dla tej pozycji"
 
 #: app/src/downloads.rs
 msgid "waiting for a non-metered connection"
@@ -146,7 +146,7 @@ msgstr "Połączenie z serwerem"
 msgid ""
 "This connection is used for syncing, streaming and downloads — every call "
 "the app makes to the server goes through it."
-msgstr "To połączenie służy do synchronizacji, strumieniowania i pobierania — przechodzi przez nie każde wywołanie aplikacji do serwera."
+msgstr "To połączenie służy do synchronizacji, streamingu i pobierania — przechodzi przez nie cały ruch aplikacji do serwera."
 
 #: app/src/screens/connection.rs
 msgid "Advanced"
@@ -180,7 +180,7 @@ msgstr "Adres serwera w sieci lokalnej"
 msgid ""
 "Define server access for home Wi-Fi — used when it's reachable, the public "
 "address otherwise."
-msgstr "Określ dostęp do serwera w domowej sieci Wi-Fi — używany, gdy jest osiągalny; w przeciwnym razie używany jest adres publiczny."
+msgstr "Adres serwera w domowej sieci Wi-Fi — jeśli jest osiągalny; w przeciwnym razie używany jest adres publiczny."
 
 #: app/src/screens/connection.rs
 msgid "Change User Agent"
@@ -242,11 +242,11 @@ msgstr "Zapisz"
 msgid ""
 "Specify headers for server connections — one \"Name: Value\" pair per line. "
 "They're attached to every request to this server."
-msgstr "Podaj nagłówki dla połączeń z serwerem — jedna para „Nazwa: Wartość” w wierszu. Są dołączane do każdego żądania wysyłanego do tego serwera."
+msgstr "Podaj nagłówki HTTP dla połączeń z serwerem — jedna para „Nazwa: Wartość” w wierszu. Są dołączane do każdego zapytania wysyłanego do tego serwera."
 
 #: app/src/screens/connection.rs
 msgid "Choose a certificate file first."
-msgstr "Najpierw wybierz plik certyfikatu."
+msgstr "Najpierw wybierz plik z certyfikatem."
 
 #: app/src/screens/connection.rs
 msgid ""
@@ -319,7 +319,7 @@ msgstr "{chapters}, {size}"
 
 #: app/src/screens/downloads.rs
 msgid "Couldn't read downloads"
-msgstr "Nie udało się odczytać pobranych"
+msgstr "Nie udało się odczytać pobranych rozdziałów"
 
 #: app/src/screens/downloads.rs
 msgid "The app's local data couldn't be read. Restarting the app may help."
@@ -384,7 +384,7 @@ msgstr "Nie można połączyć się z serwerem"
 
 #: app/src/screens/home.rs
 msgid "Check your connection, or that the server is running, then try again."
-msgstr "Sprawdź połączenie lub czy serwer działa, a potem spróbuj ponownie."
+msgstr "Sprawdź połączenie oraz sprawność serwera i spróbuj ponownie."
 
 #: app/src/screens/home.rs
 msgid "Couldn't sync your libraries"
@@ -765,7 +765,7 @@ msgstr "Prędkość odtwarzania"
 
 #: app/src/screens/player.rs
 msgid "Sleep timer"
-msgstr "Wyłącznik czasowy"
+msgstr "Timer"
 
 #: app/src/screens/player.rs
 msgid "Off"
@@ -858,7 +858,7 @@ msgstr "Ta część nie jest pobrana"
 
 #: app/src/screens/player.rs
 msgid "Turn off offline mode to stream it."
-msgstr "Wyłącz tryb offline, aby ją strumieniować."
+msgstr "Wyłącz tryb offline, aby ją streamować."
 
 #: app/src/screens/player.rs
 msgid "No audio engine could be started on this device."
@@ -976,11 +976,11 @@ msgstr "Dodaj serwer"
 
 #: app/src/screens/settings.rs
 msgid "Pause when headphones disconnect"
-msgstr "Wstrzymaj po odłączeniu słuchawek"
+msgstr "Pauza po odłączeniu słuchawek"
 
 #: app/src/screens/settings.rs
 msgid "Wired headphones unplugged, or Bluetooth audio lost"
-msgstr "Odłączenie słuchawek przewodowych lub utrata dźwięku Bluetooth"
+msgstr "Odłączenie słuchawek przewodowych lub utrata połączenia Bluetooth"
 
 #: app/src/screens/settings.rs
 msgid "Resume when headphones reconnect"
@@ -989,7 +989,7 @@ msgstr "Wznów po ponownym podłączeniu słuchawek"
 #: app/src/screens/settings.rs
 msgid ""
 "Only undoes a pause caused by disconnecting — never a manual pause or a call"
-msgstr "Cofa tylko pauzę spowodowaną odłączeniem — nigdy pauzy ręcznej ani rozmowy"
+msgstr "Cofa tylko pauzę spowodowaną odłączeniem — niespowodowanej przyciskiem Pauza ani rozmową"
 
 #: app/src/screens/settings.rs
 msgid "Default speed"
@@ -1013,7 +1013,7 @@ msgstr "Pobieranie tylko przez Wi-Fi"
 
 #: app/src/screens/settings.rs
 msgid "Buffer streams in bursts"
-msgstr "Buforuj strumienie seriami"
+msgstr "Buforuj strumienie skokowo"
 
 #: app/src/screens/settings.rs
 msgid "Low memory mode"
@@ -1075,17 +1075,17 @@ msgstr "Diagnostyka"
 
 #: app/src/screens/settings.rs
 msgid "Anonymize logs"
-msgstr "Anonimizuj dzienniki"
+msgstr "Anonimizuj logi"
 
 #: app/src/screens/settings.rs
 msgid ""
 "Hides the server address, usernames and access tokens in log files. Turn off "
 "only while debugging."
-msgstr "Ukrywa adres serwera, nazwy użytkowników i tokeny dostępu w plikach dzienników. Wyłączaj tylko na czas debugowania."
+msgstr "Ukrywa adres serwera, nazwy użytkowników i tokeny dostępu w logach. Wyłączaj tylko na czas debugowania."
 
 #: app/src/screens/settings.rs
 msgid "Saving the log setting"
-msgstr "Zapisywanie ustawienia dzienników"
+msgstr "Zapisywanie ustawienia logów"
 
 #: app/src/screens/settings.rs
 msgid "About"
@@ -1144,11 +1144,11 @@ msgstr "Nie można wykryć typu połączenia na tym urządzeniu, więc pobierani
 msgid ""
 "Downloads ahead at full speed so the radio can idle. Turn off on a slow or "
 "capped connection."
-msgstr "Pobiera z wyprzedzeniem z pełną prędkością, aby moduł radiowy mógł odpoczywać. Wyłącz przy wolnym lub limitowanym łączu."
+msgstr "Pobiera większe porcje danych z maksymalną prędkością aby oszczędzać energię. Wyłącz przy wolnym lub limitowanym łączu."
 
 #: app/src/screens/settings.rs
 msgid "Uses up to 64 MB of buffer; consider turning it off in low memory mode."
-msgstr "Zużywa do 64 MB bufora; rozważ wyłączenie w trybie niskiej pamięci."
+msgstr "Zużywa do 64 MB pamięci; rozważ wyłączenie w trybie niskiej pamięci."
 
 #: app/src/screens/settings.rs
 msgid "Saving playback settings"
@@ -1279,11 +1279,11 @@ msgstr "Zobacz okładkę"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Low memory mode is on — showing a smaller copy"
-msgstr "Tryb niskiej pamięci jest włączony — wyświetlana jest mniejsza kopia"
+msgstr "Tryb niskiej pamięci jest włączony — niższa rozdzielczość okładki"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Showing a smaller copy — the full-size cover needs a connection"
-msgstr "Wyświetlana jest mniejsza kopia — okładka w pełnym rozmiarze wymaga połączenia"
+msgstr "Wyświetlana jest mniejsza kopia — okładka w pełnej rozdzielczości wymaga połączenia"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Close"
@@ -1291,16 +1291,16 @@ msgstr "Zamknij"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Preparing full size…"
-msgstr "Przygotowywanie pełnego rozmiaru…"
+msgstr "Przygotowywanie pełnej rozdzielczości…"
 
 #. TRANSLATORS: {percent} is a whole number from 0 to 100; the "%" sign is part of this text.
 #: app/src/widgets/cover_viewer.rs
 msgid "Downloading full size… {percent} %"
-msgstr "Pobieranie pełnego rozmiaru… {percent} %"
+msgstr "Pobieranie pełnej rozdzielczości… {percent} %"
 
 #: app/src/widgets/cover_viewer.rs
 msgid "Downloading full size…"
-msgstr "Pobieranie pełnego rozmiaru…"
+msgstr "Pobieranie pełnej rozdzielczości…"
 
 #. TRANSLATORS: {details} is a progress summary such as "3 of 12 chapters · 40 MB of 200 MB · 2.1 MB/s".
 #: app/src/widgets/download_progress.rs
@@ -1313,7 +1313,7 @@ msgstr "Pobierz"
 
 #: app/src/widgets/download_scope_menu.rs
 msgid "Offline mode is on — turn it off to download"
-msgstr "Tryb offline jest włączony — wyłącz go, aby pobierać"
+msgstr "Tryb offline jest włączony — wyłącz go, aby móc pobierać"
 
 #. TRANSLATORS: {size} is a data size such as "340 MB"; "≈" means approximately.
 #: app/src/widgets/download_scope_menu.rs
@@ -1382,7 +1382,7 @@ msgstr "Oznacz jako ukończone"
 
 #: app/src/widgets/item_options_menu.rs
 msgid "Reset progress"
-msgstr "Zresetuj postęp"
+msgstr "Usuń postęp słuchania"
 
 #: app/src/widgets/mod.rs
 msgid "Sync complete"
@@ -1414,21 +1414,21 @@ msgstr "Słuchaj audiobooków i podcastów ze swojego serwera Audiobookshelf"
 
 #: app/assets/io.github.gdr_aislop.abs-app.desktop
 msgid "audiobook;podcast;player;streaming;"
-msgstr "audiobook;audiobooki;książka;podcast;odtwarzacz;strumieniowanie;"
+msgstr "audiobook;audiobooki;książka;podcast;odtwarzacz;streaming;"
 
 #: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
 msgid "Client for an Audiobookshelf server, designed for mobile Linux"
-msgstr "Klient serwera Audiobookshelf, zaprojektowany dla mobilnego Linuksa"
+msgstr "Klient serwera Audiobookshelf zaprojektowany dla mobilnego Linuksa"
 
 #: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
 msgid ""
 "GNOME-native client for an Audiobookshelf media server, designed for mobile "
 "Linux (Phosh on the Librem 5, also usable on desktop)."
-msgstr "Natywny dla GNOME klient serwera multimediów Audiobookshelf, zaprojektowany dla mobilnego Linuksa (Phosh na Librem 5, można go też używać na komputerze)."
+msgstr "Natywny dla GNOME klient serwera multimediów Audiobookshelf, zaprojektowany dla mobilnego Linuksa (Phosh na Librem 5, ale działa też na komputerze)."
 
 #: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
 msgid ""
 "Browse your library, stream or play downloaded audiobooks and podcasts, and "
 "keep listening progress in sync with the server. Integrates with the desktop "
 "via MPRIS2 and pauses during phone calls."
-msgstr "Przeglądaj bibliotekę, strumieniuj lub odtwarzaj pobrane audiobooki i podcasty oraz utrzymuj synchronizację postępu słuchania z serwerem. Integruje się z pulpitem przez MPRIS2 i wstrzymuje odtwarzanie podczas połączeń telefonicznych."
+msgstr "Przeglądaj bibliotekę, streamuj lub odtwarzaj pobrane audiobooki i podcasty oraz utrzymuj synchronizację postępu słuchania z serwerem. Integruje się z pulpitem przez MPRIS2 i wstrzymuje odtwarzanie podczas połączeń telefonicznych."
