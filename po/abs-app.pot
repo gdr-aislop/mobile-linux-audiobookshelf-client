@@ -482,6 +482,18 @@ msgstr ""
 msgid "{author} · {hours}h"
 msgstr ""
 
+#. TRANSLATORS: kind of an Audiobookshelf library, shown under its name on Home. Lowercase in English.
+#: app/src/screens/home.rs
+msgctxt "library kind"
+msgid "book"
+msgstr ""
+
+#. TRANSLATORS: kind of an Audiobookshelf library, shown under its name on Home. Lowercase in English.
+#: app/src/screens/home.rs
+msgctxt "library kind"
+msgid "podcast"
+msgstr ""
+
 #: app/src/screens/item_detail.rs
 msgid "Play"
 msgstr ""

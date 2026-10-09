@@ -16,7 +16,7 @@ use abs_core::error::{CoreError, Result as CoreResult};
 use abs_storage::models::{Account, Item, Library, Progress, Server};
 use abs_storage::AppPaths;
 
-use crate::i18n::{tr, tr_args};
+use crate::i18n::{tr, tr_args, tr_ctx};
 use crate::player::PlayRequest;
 use crate::widgets::item_card;
 
@@ -1096,7 +1096,15 @@ fn shelf_scroller(row: &gtk4::Box) -> gtk4::ScrolledWindow {
 
 fn library_row(library: &Library) -> adw::ActionRow {
     let icon_name = if library.media_type == "podcast" { "audio-input-microphone-symbolic" } else { crate::icons::LIBRARY };
-    let row = adw::ActionRow::builder().title(library.name.as_str()).subtitle(library.media_type.as_str()).build();
+    // The server's `mediaType` value; the two known kinds are translated, anything else is shown as sent.
+    let kind = match library.media_type.as_str() {
+        // TRANSLATORS: kind of an Audiobookshelf library, shown under its name on Home. Lowercase in English.
+        "book" => tr_ctx("library kind", "book"),
+        // TRANSLATORS: kind of an Audiobookshelf library, shown under its name on Home. Lowercase in English.
+        "podcast" => tr_ctx("library kind", "podcast"),
+        other => other.to_string(),
+    };
+    let row = adw::ActionRow::builder().title(library.name.as_str()).subtitle(kind.as_str()).build();
     row.add_prefix(&gtk4::Image::from_icon_name(icon_name));
     row
 }
