@@ -1091,6 +1091,14 @@ msgid "Saving the log setting"
 msgstr ""
 
 #: app/src/screens/settings.rs
+msgid "Open latest log file"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Opens it in your default text viewer"
+msgstr ""
+
+#: app/src/screens/settings.rs
 msgid "About"
 msgstr ""
 
@@ -1101,6 +1109,18 @@ msgstr ""
 #. TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
 #: app/src/screens/settings.rs
 msgid "Version {version}"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Opening the log file"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "No log file yet"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Finding the log file"
 msgstr ""
 
 #: app/src/screens/settings.rs

@@ -23,6 +23,10 @@ use directories::BaseDirs;
 /// (`g_application_id_is_valid` only forbids a leading hyphen per element). Flatpak's stricter rule
 /// wins here so this id can stay one string across AppStream metainfo, the Flatpak manifest, and
 /// this data directory, instead of forking it per packaging format.
+/// File-name prefix of the rolling log files in [`AppPaths::logs_dir`]. The `app` crate's
+/// logger writes with it and [`AppPaths::latest_log_file`] looks for it, so the two can't drift.
+pub const LOG_FILE_PREFIX: &str = "abs-app";
+
 pub const APP_ID: &str = "io.github.gdr_aislop.abs-app";
 
 #[derive(Debug, Clone)]
@@ -72,6 +76,33 @@ impl AppPaths {
     /// Rotating application logs — see `crash_reporting::init_logging` in the `app` crate.
     pub fn logs_dir(&self) -> PathBuf {
         self.state_dir.join("logs")
+    }
+
+    /// The newest log file in [`logs_dir`](Self::logs_dir), or `None` if there isn't one (nothing
+    /// logged yet, or the directory doesn't exist). Chosen by file name, not modification time:
+    /// the rolling appender suffixes each file with its date (`abs-app.2026-10-09`), which sorts
+    /// chronologically and can't be skewed by a file being touched or restored from a backup.
+    pub fn latest_log_file(&self) -> std::io::Result<Option<PathBuf>> {
+        let entries = match std::fs::read_dir(self.logs_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut newest: Option<(std::ffi::OsString, PathBuf)> = None;
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let is_log = name.to_str().is_some_and(|n| {
+                n == LOG_FILE_PREFIX || n.strip_prefix(LOG_FILE_PREFIX).is_some_and(|rest| rest.starts_with('.'))
+            });
+            if is_log && newest.as_ref().is_none_or(|(best, _)| name > *best) {
+                newest = Some((name, entry.path()));
+            }
+        }
+        Ok(newest.map(|(_, path)| path))
     }
 
     /// Local Breakpad-format `.dmp` files written on a native (signal-level) crash — see
@@ -256,6 +287,41 @@ mod tests {
             assert!(!dir.starts_with(paths.data_dir()));
         }
         assert_ne!(paths.logs_dir(), paths.crash_dumps_dir());
+    }
+
+    #[test]
+    fn latest_log_file_is_none_without_a_logs_dir_or_logs() {
+        let (_tmp, paths) = test_paths();
+        assert_eq!(paths.latest_log_file().unwrap(), None, "no directory yet");
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        assert_eq!(paths.latest_log_file().unwrap(), None, "empty directory");
+    }
+
+    #[test]
+    fn latest_log_file_picks_the_newest_date_even_when_mtimes_disagree() {
+        let (_tmp, paths) = test_paths();
+        let dir = paths.logs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Written newest-date-first, so the newest *date* has the oldest mtime.
+        for day in ["2026-10-09", "2026-10-07", "2026-10-08"] {
+            std::fs::write(dir.join(format!("abs-app.{day}")), day).unwrap();
+        }
+        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("abs-app.2026-10-09")));
+    }
+
+    #[test]
+    fn latest_log_file_ignores_other_files_and_directories() {
+        let (_tmp, paths) = test_paths();
+        let dir = paths.logs_dir();
+        std::fs::create_dir_all(dir.join("abs-app.2099-01-01")).unwrap(); // a directory
+        std::fs::write(dir.join("other.log"), "").unwrap();
+        std::fs::write(dir.join("abs-app-old.txt"), "").unwrap();
+        std::fs::create_dir_all(paths.crash_dumps_dir()).unwrap();
+        std::fs::write(paths.crash_dumps_dir().join("abs-app.2099-01-01"), "").unwrap();
+        assert_eq!(paths.latest_log_file().unwrap(), None);
+
+        std::fs::write(dir.join("abs-app"), "undated").unwrap();
+        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("abs-app")), "the undated name is still a log");
     }
 
     #[test]

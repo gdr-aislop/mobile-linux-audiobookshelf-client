@@ -49,6 +49,7 @@ pub struct SettingsHooks {
     pub burst_buffering_row: adw::ActionRow,
     pub low_memory_switch: gtk4::Switch,
     pub anonymize_logs_switch: gtk4::Switch,
+    pub open_log_row: adw::ActionRow,
     pub theme_row: adw::ComboRow,
     pub language_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
@@ -672,6 +673,20 @@ pub fn build(
             glib::signal::Propagation::Proceed
         }
     });
+    // A pseudo-setting: it only does something when activated. Logs are buffered, so flush first
+    // — otherwise a fresh launch would open a file that doesn't have this session in it yet.
+    let open_log_row = adw::ActionRow::builder()
+        .title(tr("Open latest log file"))
+        .subtitle(tr("Opens it in your default text viewer"))
+        .activatable(true)
+        .build();
+    open_log_row.add_suffix(&gtk4::Image::from_icon_name("adw-external-link-symbolic"));
+    open_log_row.connect_activated({
+        let paths = paths.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| open_latest_log(&paths, &toast_overlay)
+    });
+    diagnostics_group.add(&open_log_row);
     page.add(&diagnostics_group);
 
     let about_group = adw::PreferencesGroup::new();
@@ -710,6 +725,7 @@ pub fn build(
             burst_buffering_row,
             low_memory_switch,
             anonymize_logs_switch,
+            open_log_row,
             theme_row,
             language_row,
             about_row,
@@ -717,6 +733,23 @@ pub fn build(
             server_rows: server_rows_hooks,
             add_server_row,
         },
+    }
+}
+
+/// Hands the newest log file to the desktop's default handler for it (a text editor, via the
+/// OpenURI portal when sandboxed). Failures are reported as toasts: nothing else on this page
+/// would tell the user why a tap did nothing.
+fn open_latest_log(paths: &AppPaths, toast_overlay: &adw::ToastOverlay) {
+    crate::crash_reporting::flush_logs();
+    match paths.latest_log_file() {
+        Ok(Some(path)) => {
+            let uri = gtk4::gio::File::for_path(&path).uri();
+            if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
+                crate::error_reporting::report_background_error(toast_overlay, &tr("Opening the log file"), err);
+            }
+        }
+        Ok(None) => toast_overlay.add_toast(adw::Toast::new(&tr("No log file yet"))),
+        Err(err) => crate::error_reporting::report_background_error(toast_overlay, &tr("Finding the log file"), err),
     }
 }
 
@@ -1643,5 +1676,42 @@ pub(crate) mod tests {
         assert!(redactor.is_enabled());
         pump_until(|| false, Duration::from_millis(500));
         assert!(runtime.block_on(abs_core::settings::load_anonymize_logs(&pool)).unwrap(), "on is saved");
+    }
+
+    /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. The "Open latest log file" row sits
+    /// right under the anonymize switch; with no log yet, tapping it says so.
+    pub(crate) fn run_open_latest_log_row_reports_a_missing_log(runtime: &tokio::runtime::Runtime) {
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+        let window = adw::ApplicationWindow::builder().build();
+        let screen = build(
+            pool.clone(),
+            controller,
+            test_download_manager(pool.clone()),
+            abs_core::settings::PlaybackSettings::default(),
+            crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
+            abs_core::settings::Theme::default(),
+            crate::test_support::test_paths(),
+            servers,
+            window.clone(),
+        );
+        window.set_content(Some(&screen.root));
+        window.present();
+        pump_until(|| window.is_mapped(), Duration::from_secs(5));
+        let row = &screen.hooks.open_log_row;
+
+        let switch_row = screen.hooks.anonymize_logs_switch.ancestor(adw::ActionRow::static_type()).expect("the switch lives in a row");
+        assert_eq!(
+            switch_row.next_sibling().as_ref(),
+            Some(row.upcast_ref::<gtk4::Widget>()),
+            "the log row sits directly below the anonymize row"
+        );
+        assert!(row.is_activatable());
+
+        row.emit_by_name::<()>("activated", &[]);
+        pump_until(|| crate::test_support::any_label_reads(&screen.root, "No log file yet"), Duration::from_secs(5));
+        assert!(crate::test_support::any_label_reads(&screen.root, "No log file yet"), "no log, no pretending");
+        window.destroy();
     }
 }

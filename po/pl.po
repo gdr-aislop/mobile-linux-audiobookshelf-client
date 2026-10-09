@@ -1120,6 +1120,14 @@ msgid "Saving the log setting"
 msgstr "Zapisywanie ustawienia logów"
 
 #: app/src/screens/settings.rs
+msgid "Open latest log file"
+msgstr "Otwórz najnowszy plik logu"
+
+#: app/src/screens/settings.rs
+msgid "Opens it in your default text viewer"
+msgstr "Otwiera go w domyślnej przeglądarce tekstu"
+
+#: app/src/screens/settings.rs
 msgid "About"
 msgstr "O programie"
 
@@ -1131,6 +1139,18 @@ msgstr "O aplikacji Audiobookshelf"
 #: app/src/screens/settings.rs
 msgid "Version {version}"
 msgstr "Wersja {version}"
+
+#: app/src/screens/settings.rs
+msgid "Opening the log file"
+msgstr "Otwieranie pliku logu"
+
+#: app/src/screens/settings.rs
+msgid "No log file yet"
+msgstr "Brak pliku logu"
+
+#: app/src/screens/settings.rs
+msgid "Finding the log file"
+msgstr "Wyszukiwanie pliku logu"
 
 #: app/src/screens/settings.rs
 msgid "Website"
