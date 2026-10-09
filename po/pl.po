@@ -3,9 +3,8 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: abs-app 0.9.3\n"
-"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-"
-"audiobookshelf-client/issues\n"
+"Project-Id-Version: abs-app 0.9.4\n"
+"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues\n"
 "PO-Revision-Date: 2026-10-09 12:00+0000\n"
 "Last-Translator: \n"
 "Language-Team: Polish\n"
