@@ -1049,6 +1049,26 @@ msgid "Saving the theme"
 msgstr ""
 
 #: app/src/screens/settings.rs
+msgid "System ({language})"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Changes the next time the app starts"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Language"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "The language changes the next time the app starts"
+msgstr ""
+
+#: app/src/screens/settings.rs
+msgid "Saving the language"
+msgstr ""
+
+#: app/src/screens/settings.rs
 msgid "Diagnostics"
 msgstr ""
 

@@ -64,6 +64,7 @@ mod keys {
     pub const RESUME_ON_HEADPHONE_REPLUG: &str = "playback.resume_on_headphone_replug";
     pub const BURST_BUFFERING: &str = "playback.burst_buffering";
     pub const THEME: &str = "appearance.theme";
+    pub const LANGUAGE: &str = "appearance.language";
     pub const DOWNLOADED_ONLY: &str = "library.downloaded_only";
     pub const HIDE_FINISHED: &str = "library.hide_finished";
     pub const GROUPING: &str = "library.grouping";
@@ -169,6 +170,36 @@ pub async fn load_theme(pool: &SqlitePool) -> Result<Theme> {
 
 pub async fn save_theme(pool: &SqlitePool, theme: Theme) -> Result<()> {
     kv::set(pool, keys::THEME, theme.as_str()).await
+}
+
+/// The stored value meaning "follow the system's language" — also what a missing, empty or
+/// malformed value reads as.
+pub const LANGUAGE_SYSTEM: &str = "system";
+
+/// The user's language choice: [`LANGUAGE_SYSTEM`], or a language code such as `en`, `de` or
+/// `pt_BR` naming one of the app's translations. Whether that code still has a translation is the
+/// app's business (a language can disappear in a downgrade), so any well-formed code is returned.
+pub async fn load_language(pool: &SqlitePool) -> Result<String> {
+    let stored = kv::get(pool, keys::LANGUAGE).await?;
+    Ok(match stored {
+        Some(code) if is_language_code(&code) => code,
+        Some(code) => {
+            tracing::warn!(value = %code, "ignoring an unrecognized stored language");
+            LANGUAGE_SYSTEM.to_string()
+        }
+        None => LANGUAGE_SYSTEM.to_string(),
+    })
+}
+
+pub async fn save_language(pool: &SqlitePool, code: &str) -> Result<()> {
+    let code = if is_language_code(code) { code } else { LANGUAGE_SYSTEM };
+    kv::set(pool, keys::LANGUAGE, code).await
+}
+
+/// `system`, or a gettext-style language code: letters/digits with `_`, `-` and `@` (a locale
+/// modifier such as `sr@latin`), at most 32 characters.
+fn is_language_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= 32 && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '@'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -410,6 +441,32 @@ mod tests {
             save_theme(&pool, theme).await.unwrap();
             assert_eq!(load_theme(&pool).await.unwrap(), theme);
         }
+    }
+
+    #[tokio::test]
+    async fn language_defaults_to_system() {
+        let pool = pool().await;
+        assert_eq!(load_language(&pool).await.unwrap(), LANGUAGE_SYSTEM);
+    }
+
+    #[tokio::test]
+    async fn language_round_trips_codes_and_system() {
+        let pool = pool().await;
+        for code in ["en", "de", "pt_BR", "sr@latin", LANGUAGE_SYSTEM] {
+            save_language(&pool, code).await.unwrap();
+            assert_eq!(load_language(&pool).await.unwrap(), code);
+        }
+    }
+
+    #[tokio::test]
+    async fn language_ignores_malformed_stored_values() {
+        let pool = pool().await;
+        for bad in ["", "de de", "../../etc", "x".repeat(33).as_str()] {
+            kv::set(&pool, "appearance.language", bad).await.unwrap();
+            assert_eq!(load_language(&pool).await.unwrap(), LANGUAGE_SYSTEM, "{bad:?}");
+        }
+        save_language(&pool, "not a code!").await.unwrap();
+        assert_eq!(load_language(&pool).await.unwrap(), LANGUAGE_SYSTEM, "an unsaveable code is stored as system");
     }
 
     #[tokio::test]

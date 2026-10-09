@@ -4,7 +4,7 @@
 //! per configured server with a Switch/Sign Out/Remove menu, plus Add Server — which reuses
 //! the Welcome flow, the only way a second server can ever enter the database) are real, as
 //! are the **Playback** group (headphone switches, default speed, skip intervals, Wi-Fi-only
-//! downloads), the **Appearance** group (Theme) and the **About** row. Still to come:
+//! downloads), the **Appearance** group (Theme, Language) and the **About** row. Still to come:
 //! Playback's sleep-timer-default row — it arrives with the sleep-timer popover feature, since
 //! every row here is live wiring rather than decoration.
 
@@ -50,6 +50,7 @@ pub struct SettingsHooks {
     pub low_memory_switch: gtk4::Switch,
     pub anonymize_logs_switch: gtk4::Switch,
     pub theme_row: adw::ComboRow,
+    pub language_row: adw::ComboRow,
     pub about_row: adw::ActionRow,
     pub account_row: adw::ActionRow,
     pub server_rows: Vec<ServerRowHooks>,
@@ -599,6 +600,35 @@ pub fn build(
             });
         }
     });
+
+    // Language: "System (<the language it resolves to>)" first, then every language the app has a
+    // translation for (English always). The choice is stored right away but only applies at the
+    // next start — screens already built keep their text — so the row says so, and a change that
+    // would alter the language adds a toast.
+    let language_codes = crate::i18n::available_languages();
+    let mut language_items = vec![tr_args("System ({language})", &[("language", &crate::i18n::language_name(&crate::i18n::system_language()))])];
+    language_items.extend(language_codes.iter().map(|code| crate::i18n::language_name(code)));
+    let language_row = combo_row(&tr("Language"), &tr("Changes the next time the app starts"), &language_items);
+    language_row.set_selected(language_index(&crate::i18n::selected_setting(), &language_codes));
+    appearance_group.add(&language_row);
+    language_row.connect_selected_notify({
+        let pool = pool.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |row| {
+            let setting = language_setting(row.selected(), &language_codes);
+            crate::i18n::set_selected_setting(&setting);
+            if crate::i18n::language_for_setting(&setting) != crate::i18n::active_language() {
+                toast_overlay.add_toast(adw::Toast::new(&tr("The language changes the next time the app starts")));
+            }
+            let pool = pool.clone();
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                if let Err(err) = abs_core::settings::save_language(&pool, &setting).await {
+                    crate::error_reporting::report_background_error(&toast_overlay, &tr("Saving the language"), err);
+                }
+            });
+        }
+    });
     page.add(&appearance_group);
 
     // Diagnostics: the switch drives the process-wide log scrubber directly (logging is global,
@@ -681,6 +711,7 @@ pub fn build(
             low_memory_switch,
             anonymize_logs_switch,
             theme_row,
+            language_row,
             about_row,
             account_row,
             server_rows: server_rows_hooks,
@@ -857,6 +888,22 @@ fn skip_index(seconds: i64, fallback: i64) -> u32 {
         .iter()
         .position(|choice| *choice == seconds)
         .unwrap_or_else(|| SKIP_CHOICES.iter().position(|choice| *choice == fallback).unwrap_or(0)) as u32
+}
+
+/// The Language row's position for a stored `setting`: 0 is "System", then one per available
+/// language. A language that has since lost its catalog shows as "System", which is what it
+/// resolves to.
+fn language_index(setting: &str, codes: &[String]) -> u32 {
+    codes.iter().position(|code| code == setting).map_or(0, |position| position as u32 + 1)
+}
+
+/// The inverse of [`language_index`]: the value to store for the row's `index`.
+fn language_setting(index: u32, codes: &[String]) -> String {
+    index
+        .checked_sub(1)
+        .and_then(|position| codes.get(position as usize))
+        .cloned()
+        .unwrap_or_else(|| crate::i18n::SYSTEM.to_string())
 }
 
 fn theme_index(theme: Theme) -> u32 {
@@ -1148,6 +1195,70 @@ pub(crate) mod tests {
             crate::widgets::find_descendant(&about_content).expect("the About screen must have a back button");
         back_button.emit_clicked();
         pump_until(|| window.content().is_some_and(|c| c == shell_root), Duration::from_secs(2));
+    }
+
+    /// The Language row offers "System (<language>)" first — resolved to English here, since
+    /// there are no other catalogs — then English; choosing one persists, survives reopening
+    /// Settings, and (as English on an English system changes nothing) shows no restart toast.
+    pub(crate) fn run_language_row_offers_system_and_english_and_persists(runtime: &tokio::runtime::Runtime) {
+        let build_screen = |pool: &sqlx::SqlitePool, servers: Vec<(abs_storage::models::Server, Vec<abs_storage::models::Account>)>| {
+            let controller = crate::player::PlayerController::new(pool.clone(), crate::test_support::test_paths(), test_backend(), |_| {});
+            build(
+                pool.clone(),
+                controller,
+                test_download_manager(pool.clone()),
+                abs_core::settings::PlaybackSettings::default(),
+                crate::low_memory_mode::LowMemoryModeState::new(pool.clone()),
+                abs_core::settings::Theme::default(),
+                crate::test_support::test_paths(),
+                servers,
+                adw::ApplicationWindow::builder().build(),
+            )
+        };
+        let pool = runtime.block_on(crate::test_support::pool());
+        let servers = vec![seed_active_session(runtime, &pool, "http://127.0.0.1:1", "jane")];
+        let screen = build_screen(&pool, servers.clone());
+        let row = &screen.hooks.language_row;
+
+        assert_eq!(row.title(), "Language");
+        let model = row.model().expect("the row has a model");
+        let item = |position: u32| {
+            model.item(position).and_downcast::<gtk4::StringObject>().map(|s| s.string().to_string())
+        };
+        assert_eq!(model.n_items(), 2, "System plus English — the only language with strings so far");
+        assert_eq!(item(0).as_deref(), Some("System (English)"), "System names the language it resolves to");
+        assert_eq!(item(1).as_deref(), Some("English"));
+        assert_eq!(row.selected(), 0, "the language defaults to System");
+
+        row.set_selected(1);
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(runtime.block_on(abs_core::settings::load_language(&pool)).unwrap(), "en", "the choice must persist");
+        assert_eq!(crate::i18n::selected_setting(), "en");
+        assert!(
+            !crate::test_support::any_label_reads(&screen.root, "The language changes the next time the app starts"),
+            "English on an English system changes nothing, so there is nothing to restart for"
+        );
+
+        let reopened = build_screen(&pool, servers);
+        assert_eq!(reopened.hooks.language_row.selected(), 1, "reopening Settings must show the stored choice");
+
+        reopened.hooks.language_row.set_selected(0);
+        pump_until(|| false, Duration::from_millis(500));
+        assert_eq!(runtime.block_on(abs_core::settings::load_language(&pool)).unwrap(), "system");
+        assert_eq!(crate::i18n::selected_setting(), "system");
+    }
+
+    #[test]
+    fn language_row_positions_map_to_settings_and_back() {
+        let codes = vec!["en".to_string(), "de".to_string()];
+        assert_eq!(super::language_index("system", &codes), 0);
+        assert_eq!(super::language_index("en", &codes), 1);
+        assert_eq!(super::language_index("de", &codes), 2);
+        assert_eq!(super::language_index("fr", &codes), 0, "a language that lost its catalog reads as System");
+        assert_eq!(super::language_setting(0, &codes), "system");
+        assert_eq!(super::language_setting(1, &codes), "en");
+        assert_eq!(super::language_setting(2, &codes), "de");
+        assert_eq!(super::language_setting(9, &codes), "system", "an out-of-range position is System");
     }
 
     /// A theme or playback-setting change that applies live but fails to persist must say so,
