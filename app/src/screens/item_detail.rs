@@ -158,7 +158,12 @@ pub fn build(
     // sits in a `ScrolledWindow` with `hscrollbar_policy(Never)` (see below), so an unclamped,
     // fully server-controlled title/author string could otherwise force the whole window wider
     // than the screen (see `widgets::banner`'s identical fix for the same reasoning).
-    let title_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["title-2"]).margin_top(18).build();
+    let title_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["title-2"]).margin_top(18).selectable(true).build();
+    // Selectable so the title can be copied (long-press or drag, then Copy), but never focusable:
+    // a selectable label is focusable by default, and the first focusable label in a freshly
+    // shown page gets its whole text selected — the title would open highlighted. Must come after
+    // `selectable`, which turns focusability back on.
+    title_label.set_focusable(false);
     let author_label = gtk4::Label::builder().wrap(true).max_width_chars(1).justify(gtk4::Justification::Center).css_classes(["dim-label"]).margin_top(4).visible(false).build();
     // One widget, whose *text* changes in place from the plain series name (Pass 1, local) to
     // "Name, N/M" (Pass 2, once the network call resolves) — never swapped for a different widget
@@ -1067,6 +1072,18 @@ pub(crate) mod tests {
         assert_eq!(hooks.play_button.label().as_deref(), Some("Play"), "an unstarted book's primary button should read Play");
         assert!(hooks.play_button.opacity() == 1.0 && hooks.play_button.is_sensitive(), "the button is shown once its label is known");
         assert!(!hooks.progress_bar.is_visible(), "no progress bar for an unstarted book");
+
+        // The title can be selected and copied, but never takes focus — so opening the page
+        // doesn't highlight it, the way GTK does with the first focusable label it finds.
+        assert!(hooks.title_label.is_selectable(), "the title can be selected for copying");
+        assert!(!hooks.title_label.is_focusable(), "the title must not be focusable");
+        let window = gtk4::Window::builder().child(&screen.root).default_width(360).default_height(720).build();
+        window.present();
+        pump_until(|| false, Duration::from_millis(300));
+        assert!(!hooks.title_label.is_focusable(), "showing the page must not make the title focusable again");
+        assert_eq!(hooks.title_label.selection_bounds(), None, "nothing is pre-selected when the page opens");
+        assert!(!hooks.title_label.has_focus(), "focus never lands on the title");
+        window.close();
     }
 
     /// Not a `#[test]` itself — see `main.rs`'s `mod tests`. A server that sends an empty-string
