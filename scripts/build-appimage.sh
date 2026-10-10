@@ -316,7 +316,7 @@ export LDAI_UPDATE_INFORMATION="gh-releases-zsync|$GH_OWNER|$GH_REPO|latest|$APP
 )
 
 # The appimage plugin derives the output file name from the desktop file's
-# Name (e.g. "Audiobookshelf-<ver>-<arch>.AppImage"); normalize to ours. The
+# Name (e.g. "Audiobooklet-<ver>-<arch>.AppImage"); normalize to ours. The
 # output dir was cleared beforehand, so exactly one file can be present.
 produced=""
 for f in "$OUTPUT_DIR"/*.AppImage; do
@@ -344,7 +344,7 @@ if [ "$produced" != "$OUTPUT_PATH" ]; then
     mv "$produced_zsync" "$OUTPUT_PATH.zsync"
 
     # zsyncmake wrote the .zsync file's Filename/URL header fields against the pre-rename name
-    # (e.g. Audiobookshelf-<ver>-<arch>.AppImage) — the name that's actually published is the one
+    # (e.g. Audiobooklet-<ver>-<arch>.AppImage) — the name that's actually published is the one
     # we just renamed to. Left alone, a zsync client would resolve updates against a filename that
     # was never uploaded. Patch only the ASCII header (up to the first blank line); the checksum
     # block data that follows is binary and must not be touched.

@@ -54,19 +54,6 @@ Settings, in the light theme
 
 ## Installing
 
-### Upgrading from abs-app
-
-Up to 0.9.5 the app was called `abs-app` (shown as "Audiobookshelf"); it is now Audiobooklet, with
-the app ID `io.github.gdr_aislop.audiobooklet` and a new repository URL.
-
-- **.deb:** remove the old APT source (`sudo rm /etc/apt/sources.list.d/abs-app.list
-  /etc/apt/keyrings/abs-app.asc`), add the new one below, then `sudo apt install audiobooklet`,
-  which replaces the `abs-app` package.
-- **Your data:** on its first start Audiobooklet moves the old `io.github.gdr_aislop.abs-app`
-  folders (login, settings, downloads) to its own, and keeps a remembered password.
-- **Flatpak:** the new app ID makes it a separate app: install Audiobooklet, then
-  `flatpak uninstall io.github.gdr_aislop.abs-app`. Flatpak data doesn't carry over.
-
 ### Installing the Flatpak
 
 The recommended way — adds a remote once, then `flatpak update` picks up
@@ -82,7 +69,7 @@ Alternatively, download the `.flatpak` file from a
 [release](../../releases) and install it directly, with no remote added:
 
 ```sh
-flatpak install --user ./audiobooklet-<version>-<arch>.flatpak
+flatpak install --user ./audiobooklet-<version>-<arch>.flatpak   # <arch>: x86_64 or aarch64
 ```
 
 ### Installing the .deb via APT
@@ -102,7 +89,7 @@ sudo apt install audiobooklet
 This repo always carries the *latest* tagged release only (not a full
 version history) — older `.deb`s stay available from
 [past releases](../../releases) directly, via `sudo apt install
-./audiobooklet_<version>_<arch>.deb`.
+./audiobooklet_<version>-1_<arch>.deb` (`<arch>`: `amd64` or `arm64`).
 
 ### Verifying a standalone `.deb` or `.AppImage`
 
@@ -114,8 +101,8 @@ verified via its own signed `Release`/`InRelease`, with nothing extra to do):
 
 ```sh
 gpg --import audiobooklet-signing-key.asc   # once, also attached to every release
-gpg --verify audiobooklet_<version>_<arch>.deb.asc audiobooklet_<version>_<arch>.deb
-gpg --verify audiobooklet-<version>-<arch>.AppImage.asc audiobooklet-<version>-<arch>.AppImage
+gpg --verify audiobooklet_<version>-1_<arch>.deb.asc audiobooklet_<version>-1_<arch>.deb        # amd64 / arm64
+gpg --verify audiobooklet-<version>-<arch>.AppImage.asc audiobooklet-<version>-<arch>.AppImage  # x86_64 / aarch64
 ```
 
 The signing key's fingerprint is:
