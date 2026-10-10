@@ -16,18 +16,33 @@ use directories::BaseDirs;
 /// it, not assumed — which would have put this app's data under `~/.local/share/audiobookshelf/`
 /// instead of the reverse-DNS-named directory GNOME apps (and Flatpak) actually use.
 ///
-/// Matches the Flatpak manifest's `app-id` (`flatpak/io.github.gdr_aislop.abs-app.json`) exactly.
+/// Matches the Flatpak manifest's `app-id` (`flatpak/io.github.gdr_aislop.audiobooklet.json`) exactly.
 /// The GitHub owner segment uses an underscore rather than its real hyphen (`gdr-aislop`) because
 /// `flatpak-builder` rejects a hyphen in any but the last dotted segment ("Only last name segment
 /// can contain -"), even though a mid-element hyphen is otherwise valid in a `GApplication` id
 /// (`g_application_id_is_valid` only forbids a leading hyphen per element). Flatpak's stricter rule
 /// wins here so this id can stay one string across AppStream metainfo, the Flatpak manifest, and
 /// this data directory, instead of forking it per packaging format.
+pub const APP_ID: &str = "io.github.gdr_aislop.audiobooklet";
+
+/// The app ID up to 0.9.5, when the app was called abs-app. Its directories are moved to
+/// [`APP_ID`]'s on the first start after the rename — see [`AppPaths::migrate_legacy_dirs`].
+pub const LEGACY_APP_ID: &str = "io.github.gdr_aislop.abs-app";
+
 /// File-name prefix of the rolling log files in [`AppPaths::logs_dir`]. The `app` crate's
 /// logger writes with it and [`AppPaths::latest_log_file`] looks for it, so the two can't drift.
-pub const LOG_FILE_PREFIX: &str = "abs-app";
+pub const LOG_FILE_PREFIX: &str = "audiobooklet";
 
-pub const APP_ID: &str = "io.github.gdr_aislop.abs-app";
+/// What [`AppPaths::migrate_legacy_dirs`] did with one of the app's directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyDirMove {
+    /// The old directory became the new one.
+    Moved { from: PathBuf, to: PathBuf },
+    /// Both exist, so nothing was moved: the new one is in use, the old one is left for the user.
+    BothExist { legacy: PathBuf, current: PathBuf },
+    /// The move failed; the app starts with an empty new directory.
+    Failed { from: PathBuf, to: PathBuf, error: String },
+}
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -61,6 +76,47 @@ impl AppPaths {
         }
     }
 
+    /// `(old, new)` for each of the data, cache and state directories: where the app kept it
+    /// under [`LEGACY_APP_ID`], next to where it keeps it now. Duplicates (a state directory that
+    /// falls back to the data directory) are listed once.
+    pub fn legacy_pairs(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for current in [&self.data_dir, &self.cache_dir, &self.state_dir] {
+            let Some(parent) = current.parent() else { continue };
+            let pair = (parent.join(LEGACY_APP_ID), current.clone());
+            if pair.0 != pair.1 && !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+        pairs
+    }
+
+    /// Moves the directories the app used before its rename (see [`LEGACY_APP_ID`]) to the
+    /// current ones, so the login, settings and downloads carry over. Only an old directory whose
+    /// new counterpart doesn't exist yet is moved, so this is a no-op after the first start — and
+    /// must run before anything creates the new directories. The database still holds absolute
+    /// paths into the old directories; `repo::relocate::rebase_paths` rewrites those.
+    pub fn migrate_legacy_dirs(&self) -> Vec<LegacyDirMove> {
+        let mut outcomes = Vec::new();
+        for (from, to) in self.legacy_pairs() {
+            if !from.is_dir() {
+                continue;
+            }
+            if to.exists() {
+                outcomes.push(LegacyDirMove::BothExist { legacy: from, current: to });
+                continue;
+            }
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            outcomes.push(match std::fs::rename(&from, &to) {
+                Ok(()) => LegacyDirMove::Moved { from, to },
+                Err(err) => LegacyDirMove::Failed { from, to, error: err.to_string() },
+            });
+        }
+        outcomes
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -80,7 +136,7 @@ impl AppPaths {
 
     /// The newest log file in [`logs_dir`](Self::logs_dir), or `None` if there isn't one (nothing
     /// logged yet, or the directory doesn't exist). Chosen by file name, not modification time:
-    /// the rolling appender suffixes each file with its date (`abs-app.2026-10-09`), which sorts
+    /// the rolling appender suffixes each file with its date (`audiobooklet.2026-10-09`), which sorts
     /// chronologically and can't be skewed by a file being touched or restored from a backup.
     pub fn latest_log_file(&self) -> std::io::Result<Option<PathBuf>> {
         let entries = match std::fs::read_dir(self.logs_dir()) {
@@ -304,24 +360,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Written newest-date-first, so the newest *date* has the oldest mtime.
         for day in ["2026-10-09", "2026-10-07", "2026-10-08"] {
-            std::fs::write(dir.join(format!("abs-app.{day}")), day).unwrap();
+            std::fs::write(dir.join(format!("audiobooklet.{day}")), day).unwrap();
         }
-        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("abs-app.2026-10-09")));
+        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("audiobooklet.2026-10-09")));
     }
 
     #[test]
     fn latest_log_file_ignores_other_files_and_directories() {
         let (_tmp, paths) = test_paths();
         let dir = paths.logs_dir();
-        std::fs::create_dir_all(dir.join("abs-app.2099-01-01")).unwrap(); // a directory
+        std::fs::create_dir_all(dir.join("audiobooklet.2099-01-01")).unwrap(); // a directory
         std::fs::write(dir.join("other.log"), "").unwrap();
-        std::fs::write(dir.join("abs-app-old.txt"), "").unwrap();
+        std::fs::write(dir.join("audiobooklet-old.txt"), "").unwrap();
         std::fs::create_dir_all(paths.crash_dumps_dir()).unwrap();
-        std::fs::write(paths.crash_dumps_dir().join("abs-app.2099-01-01"), "").unwrap();
+        std::fs::write(paths.crash_dumps_dir().join("audiobooklet.2099-01-01"), "").unwrap();
         assert_eq!(paths.latest_log_file().unwrap(), None);
 
-        std::fs::write(dir.join("abs-app"), "undated").unwrap();
-        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("abs-app")), "the undated name is still a log");
+        std::fs::write(dir.join("audiobooklet"), "undated").unwrap();
+        assert_eq!(paths.latest_log_file().unwrap(), Some(dir.join("audiobooklet")), "the undated name is still a log");
     }
 
     #[test]
@@ -404,6 +460,59 @@ mod tests {
             assert_ne!(paths.data_dir(), paths.state_dir());
             assert_ne!(paths.cache_dir(), paths.state_dir());
         }
+    }
+
+    #[test]
+    fn migrating_moves_the_legacy_directories_once() {
+        let base = tempfile::tempdir().unwrap();
+        let (data, cache, state) = (base.path().join("share"), base.path().join("cache"), base.path().join("state"));
+        let paths = AppPaths::rooted_at(data.join(APP_ID), cache.join(APP_ID), state.join(APP_ID));
+        std::fs::create_dir_all(data.join(LEGACY_APP_ID).join("downloads")).unwrap();
+        std::fs::write(data.join(LEGACY_APP_ID).join("abs.db"), "db").unwrap();
+        std::fs::create_dir_all(state.join(LEGACY_APP_ID).join("logs")).unwrap();
+        // No legacy cache directory at all: nothing to report for it.
+
+        let outcomes = paths.migrate_legacy_dirs();
+        assert_eq!(
+            outcomes,
+            vec![
+                LegacyDirMove::Moved { from: data.join(LEGACY_APP_ID), to: data.join(APP_ID) },
+                LegacyDirMove::Moved { from: state.join(LEGACY_APP_ID), to: state.join(APP_ID) },
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(data.join(APP_ID).join("abs.db")).unwrap(), "db", "contents move along");
+        assert!(data.join(APP_ID).join("downloads").is_dir());
+        assert!(!data.join(LEGACY_APP_ID).exists(), "the old directory is gone, not copied");
+
+        assert!(paths.migrate_legacy_dirs().is_empty(), "a second start has nothing left to move");
+    }
+
+    #[test]
+    fn migrating_leaves_both_alone_when_the_new_directory_already_exists() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(base.path().join("a").join(APP_ID), base.path().join("b").join(APP_ID), base.path().join("c").join(APP_ID));
+        std::fs::create_dir_all(base.path().join("a").join(LEGACY_APP_ID)).unwrap();
+        std::fs::create_dir_all(base.path().join("a").join(APP_ID)).unwrap();
+        std::fs::write(base.path().join("a").join(APP_ID).join("new"), "").unwrap();
+
+        assert_eq!(
+            paths.migrate_legacy_dirs(),
+            vec![LegacyDirMove::BothExist { legacy: base.path().join("a").join(LEGACY_APP_ID), current: base.path().join("a").join(APP_ID) }]
+        );
+        assert!(base.path().join("a").join(APP_ID).join("new").exists(), "the directory in use is untouched");
+        assert!(base.path().join("a").join(LEGACY_APP_ID).exists(), "the old one is left for the user");
+    }
+
+    #[test]
+    fn legacy_pairs_list_a_shared_directory_once() {
+        let paths = AppPaths::rooted_at("/x/share/new", "/x/cache/new", "/x/share/new");
+        assert_eq!(
+            paths.legacy_pairs(),
+            vec![
+                (PathBuf::from("/x/share").join(LEGACY_APP_ID), PathBuf::from("/x/share/new")),
+                (PathBuf::from("/x/cache").join(LEGACY_APP_ID), PathBuf::from("/x/cache/new")),
+            ]
+        );
     }
 
     #[test]

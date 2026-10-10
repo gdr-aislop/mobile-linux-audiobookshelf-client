@@ -15,13 +15,13 @@ pub const LIBRARY: &str = "abs-library-symbolic";
 pub const SETTINGS: &str = "abs-settings-symbolic";
 
 /// Where `data/resources.gresource.xml` puts the icon directories.
-const ICONS_RESOURCE_PATH: &str = "/io/github/gdr_aislop/abs-app/icons";
+const ICONS_RESOURCE_PATH: &str = "/io/github/gdr_aislop/audiobooklet/icons";
 
 /// Makes the bundled icons available on `display`. Safe to call more than once.
 pub fn register(display: &gtk4::gdk::Display) {
     static REGISTER_RESOURCES: std::sync::Once = std::sync::Once::new();
     REGISTER_RESOURCES.call_once(|| {
-        gtk4::gio::resources_register_include!("abs-app.gresource").expect("the bundled resources are valid");
+        gtk4::gio::resources_register_include!("audiobooklet.gresource").expect("the bundled resources are valid");
     });
     let theme = gtk4::IconTheme::for_display(display);
     if !theme.resource_path().iter().any(|path| path == ICONS_RESOURCE_PATH) {

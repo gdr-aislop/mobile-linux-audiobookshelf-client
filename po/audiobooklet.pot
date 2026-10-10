@@ -1,14 +1,13 @@
 # SOME DESCRIPTIVE TITLE.
-# Copyright (C) YEAR the abs-app authors
-# This file is distributed under the same license as the abs-app package.
+# Copyright (C) YEAR the audiobooklet authors
+# This file is distributed under the same license as the audiobooklet package.
 # FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
 #
 #, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: abs-app 0.9.5\n"
-"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-"
-"audiobookshelf-client/issues\n"
+"Project-Id-Version: audiobooklet 0.9.5\n"
+"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/audiobooklet/issues\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -134,7 +133,7 @@ msgid "{context} failed — try again"
 msgstr ""
 
 #: app/src/password_keyring.rs
-msgid "Audiobookshelf account password"
+msgid "Audiobooklet — server password"
 msgstr ""
 
 #: app/src/player.rs
@@ -1103,7 +1102,7 @@ msgid "About"
 msgstr ""
 
 #: app/src/screens/settings.rs
-msgid "About Audiobookshelf"
+msgid "About Audiobooklet"
 msgstr ""
 
 #. TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
@@ -1430,33 +1429,33 @@ msgstr ""
 msgid "Syncing…"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
-msgid "Audiobookshelf"
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
+msgid "Audiobooklet"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "Audiobook Player"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "Listen to audiobooks and podcasts from your Audiobookshelf server"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "audiobook;podcast;player;streaming;"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid "Client for an Audiobookshelf server, designed for mobile Linux"
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid ""
 "GNOME-native client for an Audiobookshelf media server, designed for mobile "
 "Linux (Phosh on the Librem 5, also usable on desktop)."
 msgstr ""
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid ""
 "Browse your library, stream or play downloaded audiobooks and podcasts, and "
 "keep listening progress in sync with the server. Integrates with the desktop "

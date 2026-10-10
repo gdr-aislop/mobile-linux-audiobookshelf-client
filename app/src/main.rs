@@ -48,6 +48,9 @@ fn main() -> adw::glib::ExitCode {
     // only what's needed for that; `setup()`'s own `ensure_dirs()` call still creates every
     // directory (redundantly but harmlessly for these two).
     let paths = abs_storage::AppPaths::resolve().expect("resolve XDG application directories");
+    // The app was called abs-app up to 0.9.5: move its directories over before anything creates
+    // the new ones (logging, just below, would). Logged once logging is up.
+    let legacy_moves = paths.migrate_legacy_dirs();
     paths.ensure_early_dirs().expect("create the logging/crash-dump directories");
 
     let log_handle = crash_reporting::init_logging(&paths);
@@ -61,6 +64,24 @@ fn main() -> adw::glib::ExitCode {
         state_dir = %paths.state_dir().display(),
         "starting up"
     );
+    for outcome in &legacy_moves {
+        match outcome {
+            abs_storage::paths::LegacyDirMove::Moved { from, to } => {
+                tracing::info!(from = %from.display(), to = %to.display(), "moved the data of the app's old name over")
+            }
+            abs_storage::paths::LegacyDirMove::BothExist { legacy, current } => tracing::warn!(
+                legacy = %legacy.display(),
+                current = %current.display(),
+                "found the old name's directory next to the new one; using the new one and leaving the old one alone"
+            ),
+            abs_storage::paths::LegacyDirMove::Failed { from, to, error } => tracing::error!(
+                from = %from.display(),
+                to = %to.display(),
+                %error,
+                "couldn't move the data of the app's old name over; starting without it"
+            ),
+        }
+    }
     crash_reporting::install_panic_hook(log_handle.clone());
     // Failure here degrades to a warning inside `attach_crash_handler` itself — crash-dump
     // capture must never block the app from starting (e.g. under a sandboxed/seccomp environment
@@ -117,6 +138,17 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
     };
     widgets::cover_image::set_low_memory_mode(low_memory_mode);
 
+    // Stored download and cover paths still point into the old name's directories after they
+    // moved (see `migrate_legacy_dirs` in `main`). Cheap and idempotent, so it runs on every start:
+    // a crash between the move and this can't leave files the database no longer finds.
+    for (from, to) in paths.legacy_pairs() {
+        match abs_storage::repo::relocate::rebase_paths(&pool, &from, &to).await {
+            Ok(0) => {}
+            Ok(rows) => tracing::info!(rows, from = %from.display(), to = %to.display(), "pointed stored file paths at the moved data"),
+            Err(err) => tracing::error!(%err, from = %from.display(), "couldn't update stored file paths after the move; downloads there may look missing"),
+        }
+    }
+
     // The language comes from the database, so it is applied here rather than at the top of
     // `main`: after the database is open, but before GTK starts (GTK reads the same locale) and
     // before any UI string is built. Never fails — the worst case is an English UI.
@@ -165,7 +197,7 @@ async fn setup(paths: abs_storage::AppPaths) -> AppState {
 /// a fresh process (its own GTK init, main context, GStreamer, tempdirs), a named pass/fail, and
 /// its failure name doubles as the command to re-run it in isolation:
 ///
-///     cargo test -p abs-app -- --exact tests::home_offline_mode_toggle_filters_recently_added --ignored
+///     cargo test -p audiobooklet -- --exact tests::home_offline_mode_toggle_filters_recently_added --ignored
 ///
 /// (The per-scenario tests can't run under a plain `cargo test` themselves — that's a second
 /// GTK init on a second thread; they exist to be picked one-per-process by the driver or by hand.)
@@ -470,7 +502,7 @@ mod tests {
         }
         assert!(
             failed.is_empty(),
-            "{}/{} scenarios failed: {:?}\nre-run one in isolation with: cargo test -p abs-app -- --exact tests::<name> --ignored",
+            "{}/{} scenarios failed: {:?}\nre-run one in isolation with: cargo test -p audiobooklet -- --exact tests::<name> --ignored",
             failed.len(),
             GTK_SCENARIOS.len(),
             failed,

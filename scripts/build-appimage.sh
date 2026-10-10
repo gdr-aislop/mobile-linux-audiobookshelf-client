@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build an AppImage of abs-app for x86_64 or aarch64.
+# Build an AppImage of audiobooklet for x86_64 or aarch64.
 #
 # Works both locally (any glibc Linux with the GTK4/libadwaita/GStreamer
 # packages installed) and inside CI containers (.github/workflows/release.yml,
@@ -24,7 +24,7 @@
 #     by this script and handed to linuxdeploy via --deploy-deps-only so their
 #     own dependencies get pulled in too: GStreamer plugins, gio modules
 #     (TLS, dconf), gdk-pixbuf loaders, GTK4 modules.
-#   - The generated apprun-hooks/abs-app.sh is sourced by linuxdeploy's
+#   - The generated apprun-hooks/audiobooklet.sh is sourced by linuxdeploy's
 #     default AppRun and points the runtime at all of the above.
 #
 # Update information: LDAI_UPDATE_INFORMATION (read by linuxdeploy's bundled
@@ -36,10 +36,10 @@
 
 set -euo pipefail
 
-APP_NAME="abs-app"
-APP_ID="io.github.gdr_aislop.abs-app"
+APP_NAME="audiobooklet"
+APP_ID="io.github.gdr_aislop.audiobooklet"
 GH_OWNER="gdr-aislop"
-GH_REPO="mobile-linux-audiobookshelf-client"
+GH_REPO="audiobooklet"
 LINUXDEPLOY_VERSION="1-alpha-20251107-1" # pinned for reproducible builds
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -52,7 +52,7 @@ usage() {
     cat <<'USAGE'
 Usage: scripts/build-appimage.sh [--arch x86_64|aarch64] [--version V] [--output-dir DIR]
 
-Builds an AppImage of abs-app, bundling GTK4/libadwaita, GStreamer plugins,
+Builds an AppImage of audiobooklet, bundling GTK4/libadwaita, GStreamer plugins,
 glib schemas, pixbuf loaders and the Adwaita icon theme.
 
 Environment:
@@ -149,9 +149,9 @@ for candidate in \
 done
 
 # --- build the app (unless a prebuilt binary was supplied) ---
-BIN="${ABS_APP_BIN:-${CARGO_TARGET_DIR:-target}/release/abs-app}"
+BIN="${ABS_APP_BIN:-${CARGO_TARGET_DIR:-target}/release/audiobooklet}"
 if [ -z "${ABS_APP_BIN:-}" ]; then
-    cargo build --release -p abs-app
+    cargo build --release -p audiobooklet
 fi
 [ -x "$BIN" ] || die "binary not found at $BIN (set ABS_APP_BIN to override)"
 

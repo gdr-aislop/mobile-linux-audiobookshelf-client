@@ -48,12 +48,12 @@ fi
 
 # --- configuration ---
 
-IMAGE="abs-appimage-builder-bookworm:arm64"
+IMAGE="audiobooklet-appimage-builder-bookworm:arm64"
 DOCKERFILE="scripts/appimage-builder-bookworm-arm64.Dockerfile"
 LOG_FILE="$REPO_ROOT/build/appimage/build-aarch64.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/abs-appimage-build"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/audiobooklet-appimage-build"
 mkdir -p "$CACHE_DIR/cargo"
 
 REPO_MOUNT="$REPO_ROOT:/repo"

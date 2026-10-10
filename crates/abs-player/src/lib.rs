@@ -459,7 +459,7 @@ fn apply_stream_role_when_sink_is_ready(pipeline: &gst::Element) {
             let props = gst::Structure::builder("props").field("media.role", "music").build();
             element.set_property("stream-properties", &props);
             if element.has_property("client-name", Some(glib::Type::STRING)) {
-                element.set_property("client-name", "Audiobookshelf");
+                element.set_property("client-name", "Audiobooklet");
             }
         }
         None

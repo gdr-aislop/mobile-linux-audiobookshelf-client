@@ -1,7 +1,7 @@
 # Build environment for aarch64 AppImage builds on x86_64 hosts, used by
 # scripts/build-aarch64-appimage-on-x86.sh:
 #
-#   docker build --platform linux/arm64 -t abs-appimage-builder-bookworm:arm64 \
+#   docker build --platform linux/arm64 -t audiobooklet-appimage-builder-bookworm:arm64 \
 #       -f scripts/appimage-builder-bookworm-arm64.Dockerfile .
 #
 # Every stage inherits the --platform passed to `docker build` (there are no

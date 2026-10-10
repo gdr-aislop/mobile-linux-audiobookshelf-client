@@ -316,7 +316,7 @@ fn watch_connection(
     let Some(mut mainloop) = Mainloop::new() else {
         return ConnectionEnd::Failed("couldn't create the PulseAudio main loop".into());
     };
-    let Some(mut context) = Context::new(&mainloop, "abs-app-route-watch") else {
+    let Some(mut context) = Context::new(&mainloop, "audiobooklet-route-watch") else {
         return ConnectionEnd::Failed("couldn't create the PulseAudio context".into());
     };
 

@@ -15,12 +15,12 @@ name: Release debs, AppImages, and Flatpaks
 #   - .AppImage (scripts/build-appimage.sh; bundles GTK4/GStreamer itself, so
 #     it runs on systems without them installed) + a matching .zsync file, so
 #     AppImageUpdate/Gear Lever can delta-update it against this repo's releases
-#   - .flatpak (flatpak/io.github.gdr_aislop.abs-app.json; built against the
+#   - .flatpak (flatpak/io.github.gdr_aislop.audiobooklet.json; built against the
 #     org.gnome.Platform runtime, with GStreamer's good/libav plugins and every
 #     crates.io dependency built from source inside the sandbox)
 #
 # The two arch-specific Flatpak repos are also signed, merged, and published as a live remote on
-# GitHub Pages (combine-flatpak-repo + deploy-pages) — see flatpak/io.github.gdr_aislop.abs-app.
+# GitHub Pages (combine-flatpak-repo + deploy-pages) — see flatpak/io.github.gdr_aislop.audiobooklet.
 # flatpakrepo and README.md's "Installing the Flatpak" section. The .debs get the same treatment
 # via a minimal hand-built APT repo (build-apt-repo), published alongside the Flatpak repo under
 # the same site's /apt/ path — see README.md's "Installing the .deb via APT" section. Both reuse
@@ -94,7 +94,7 @@ jobs:
         run: ./scripts/build-l10n.sh build/l10n
 
       - name: Build .deb
-        run: cargo deb -p abs-app
+        run: cargo deb -p audiobooklet
 
       - name: Collect artifacts
         run: |
@@ -221,7 +221,7 @@ jobs:
             gpg_sign_args=(--gpg-sign="$FLATPAK_GPG_KEY_ID")
           fi
           flatpak-builder --user --force-clean --repo=build/flatpak-repo "${gpg_sign_args[@]}" \
-            build/flatpak-build flatpak/io.github.gdr_aislop.abs-app.json
+            build/flatpak-build flatpak/io.github.gdr_aislop.audiobooklet.json
           # flatpak-builder's own --gpg-sign signs the commits it makes as it builds — the repo's
           # summary file (what a client actually checks first on remote-add/update) needs its own
           # signed update, hence this separate build-update-repo call.
@@ -231,8 +231,8 @@ jobs:
           fi
           mkdir -p dist
           flatpak build-bundle build/flatpak-repo \
-            "dist/abs-app-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.flatpak" \
-            io.github.gdr_aislop.abs-app
+            "dist/audiobooklet-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.flatpak" \
+            io.github.gdr_aislop.audiobooklet
         env:
           FLATPAK_GPG_KEY_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.FLATPAK_GPG_KEY_ID || '' }}
 
@@ -298,8 +298,8 @@ jobs:
           cp -a flatpak-repos/flatpak-ostree-aarch64/refs/. flatpak-repo/refs/
           flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" \
             --generate-static-deltas --prune flatpak-repo
-          test -e flatpak-repo/refs/heads/app/io.github.gdr_aislop.abs-app/x86_64/master
-          test -e flatpak-repo/refs/heads/app/io.github.gdr_aislop.abs-app/aarch64/master
+          test -e flatpak-repo/refs/heads/app/io.github.gdr_aislop.audiobooklet/x86_64/master
+          test -e flatpak-repo/refs/heads/app/io.github.gdr_aislop.audiobooklet/aarch64/master
         env:
           FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
 
@@ -312,15 +312,15 @@ jobs:
           set -eux
           repo_url="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
           homepage_url="https://github.com/${{ github.repository }}"
-          icon_url="https://raw.githubusercontent.com/${{ github.repository }}/main/app/assets/io.github.gdr_aislop.abs-app.svg"
+          icon_url="https://raw.githubusercontent.com/${{ github.repository }}/main/app/assets/io.github.gdr_aislop.audiobooklet.svg"
           gpg_key_b64="$(gpg --export "$FLATPAK_GPG_KEY_ID" | base64 -w 0)"
           sed \
             -e "s|__REPO_URL__|$repo_url|g" \
             -e "s|__HOMEPAGE_URL__|$homepage_url|g" \
             -e "s|__ICON_URL__|$icon_url|g" \
             -e "s|__GPG_KEY__|$gpg_key_b64|g" \
-            flatpak/io.github.gdr_aislop.abs-app.flatpakrepo \
-            > flatpak-repo/io.github.gdr_aislop.abs-app.flatpakrepo
+            flatpak/io.github.gdr_aislop.audiobooklet.flatpakrepo \
+            > flatpak-repo/io.github.gdr_aislop.audiobooklet.flatpakrepo
         env:
           FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
 
@@ -365,15 +365,15 @@ jobs:
       - name: Assemble the repo
         run: |
           set -eux
-          mkdir -p apt-repo/pool/main/a/abs-app
-          cp debs/deb-arm64/*.deb debs/deb-amd64/*.deb apt-repo/pool/main/a/abs-app/
+          mkdir -p apt-repo/pool/main/a/audiobooklet
+          cp debs/deb-arm64/*.deb debs/deb-amd64/*.deb apt-repo/pool/main/a/audiobooklet/
 
           cd apt-repo
           for arch in arm64 amd64; do
             mkdir -p "dists/stable/main/binary-$arch" "work/$arch"
             cp "../debs/deb-$arch"/*.deb "work/$arch/"
             apt-ftparchive packages "work/$arch" \
-              | sed "s#^Filename: work/$arch/#Filename: pool/main/a/abs-app/#" \
+              | sed "s#^Filename: work/$arch/#Filename: pool/main/a/audiobooklet/#" \
               > "dists/stable/main/binary-$arch/Packages"
             gzip -9c "dists/stable/main/binary-$arch/Packages" > "dists/stable/main/binary-$arch/Packages.gz"
           done
@@ -385,13 +385,13 @@ jobs:
           # hashed as if it were a distributable index, which real Debian Release files never do),
           # hence writing its output to a separate file first and only concatenating after.
           {
-            echo "Origin: abs-app"
-            echo "Label: Audiobookshelf GTK4 client"
+            echo "Origin: audiobooklet"
+            echo "Label: Audiobooklet"
             echo "Suite: stable"
             echo "Codename: stable"
             echo "Architectures: arm64 amd64"
             echo "Components: main"
-            echo "Description: Audiobookshelf GTK4 client APT repository"
+            echo "Description: Audiobooklet APT repository"
           } > Release.header
           ( cd dists/stable && apt-ftparchive release . ) > Release.hashes
           cat Release.header Release.hashes > dists/stable/Release
@@ -403,7 +403,7 @@ jobs:
           cd apt-repo/dists/stable
           gpg --default-key "$SIGNING_GPG_KEY_ID" --clearsign -o InRelease Release
           gpg --default-key "$SIGNING_GPG_KEY_ID" --detach-sign --armor -o Release.gpg Release
-          gpg --armor --export "$SIGNING_GPG_KEY_ID" > ../../abs-app.asc
+          gpg --armor --export "$SIGNING_GPG_KEY_ID" > ../../audiobooklet.asc
         env:
           SIGNING_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
 
@@ -496,7 +496,7 @@ jobs:
           for f in *.deb *.AppImage; do
             gpg --batch --default-key "$SIGNING_GPG_KEY_ID" --detach-sign --armor -o "$f.asc" "$f"
           done
-          gpg --armor --export "$SIGNING_GPG_KEY_ID" > abs-app-signing-key.asc
+          gpg --armor --export "$SIGNING_GPG_KEY_ID" > audiobooklet-signing-key.asc
         env:
           SIGNING_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Compiled by build.rs into the binary; see `crate::icons`. -->
 <gresources>
-  <gresource prefix="/io/github/gdr_aislop/abs-app">
+  <gresource prefix="/io/github/gdr_aislop/audiobooklet">
     <file>icons/scalable/actions/abs-library-symbolic.svg</file>
     <file>icons/scalable/actions/abs-settings-symbolic.svg</file>
     <file>icons/scalable/actions/funnel-symbolic.svg</file>

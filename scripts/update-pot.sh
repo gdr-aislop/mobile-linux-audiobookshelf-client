@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerates po/abs-app.pot from the sources, then (unless --pot-only) merges the new template
+# Regenerates po/audiobooklet.pot from the sources, then (unless --pot-only) merges the new template
 # into every po/<lang>.po listed in po/LINGUAS so translators see new/changed strings.
 #
 #   scripts/update-pot.sh [--pot-only]
@@ -15,7 +15,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-APP_ID="io.github.gdr_aislop.abs-app"
+APP_ID="io.github.gdr_aislop.audiobooklet"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -38,9 +38,9 @@ done
     --add-comments=TRANSLATORS \
     --add-location=file \
     --sort-by-file \
-    --package-name=abs-app --package-version="$VERSION" \
-    --msgid-bugs-address="https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues" \
-    --copyright-holder="the abs-app authors" \
+    --package-name=audiobooklet --package-version="$VERSION" \
+    --msgid-bugs-address="https://github.com/gdr-aislop/audiobooklet/issues" \
+    --copyright-holder="the audiobooklet authors" \
     -o "$TMP/rs.pot" $RS_FILES)
 
 xgettext --language=Desktop --from-code=UTF-8 --add-location=file \
@@ -50,19 +50,19 @@ GETTEXTDATADIRS="$PWD/po/gettext-data" xgettext --add-location=file \
 
 # `--use-first` keeps the first occurrence's header (the Rust one, with the project metadata);
 # files appear in the order given, so the template reads: UI strings, then desktop, then metainfo.
-msgcat --use-first --add-location=file -o po/abs-app.pot "$TMP/rs.pot" "$TMP/desktop.pot" "$TMP/metainfo.pot"
+msgcat --use-first --add-location=file -o po/audiobooklet.pot "$TMP/rs.pot" "$TMP/desktop.pot" "$TMP/metainfo.pot"
 
 # xgettext writes the creation date; drop it so an unchanged tree gives an unchanged template.
-sed -i '/^"POT-Creation-Date:/d' po/abs-app.pot
+sed -i '/^"POT-Creation-Date:/d' po/audiobooklet.pot
 
-entries="$(grep -c '^msgid ' po/abs-app.pot || true)"
-echo "po/abs-app.pot: $((entries - 1)) messages"
+entries="$(grep -c '^msgid ' po/audiobooklet.pot || true)"
+echo "po/audiobooklet.pot: $((entries - 1)) messages"
 
 [ "${1:-}" = "--pot-only" ] && exit 0
 
 grep -v '^[[:space:]]*#' po/LINGUAS | grep -v '^[[:space:]]*$' | while read -r lang; do
     if [ -f "po/$lang.po" ]; then
-        msgmerge --update --backup=none --add-location=file "po/$lang.po" po/abs-app.pot 2>&1 | sed "s|^|po/$lang.po: |"
+        msgmerge --update --backup=none --add-location=file "po/$lang.po" po/audiobooklet.pot 2>&1 | sed "s|^|po/$lang.po: |"
     else
         echo "po/$lang.po is listed in po/LINGUAS but missing" >&2
         exit 1

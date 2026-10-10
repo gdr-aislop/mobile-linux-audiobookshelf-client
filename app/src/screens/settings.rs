@@ -692,7 +692,7 @@ pub fn build(
     let about_group = adw::PreferencesGroup::new();
     about_group.set_title(&tr("About"));
     let about_row = adw::ActionRow::builder()
-        .title(tr("About Audiobookshelf"))
+        .title(tr("About Audiobooklet"))
         // TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
         .subtitle(tr_args("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]))
         .build();
@@ -798,14 +798,14 @@ pub(crate) fn push_about(window: &adw::ApplicationWindow) {
     });
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("About Audiobookshelf"), "")));
+    header.set_title_widget(Some(&adw::WindowTitle::new(&tr("About Audiobooklet"), "")));
     header.pack_start(&back_button);
 
     let page = adw::PreferencesPage::new();
 
     let info_group = adw::PreferencesGroup::new();
     let version_row = adw::ActionRow::builder()
-        .title("Audiobookshelf") // i18n: ignore
+        .title(crate::application::APP_NAME)
         // TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
         .subtitle(tr_args("Version {version}", &[("version", env!("CARGO_PKG_VERSION"))]))
         .build();
@@ -843,7 +843,7 @@ pub(crate) fn push_about(window: &adw::ApplicationWindow) {
     crate::widgets::swap_content(window, &toast_overlay);
 }
 
-const WEBSITE_URL: &str = "https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client";
+const WEBSITE_URL: &str = "https://github.com/gdr-aislop/audiobooklet";
 
 /// The `host[:port]` part of a server URL — what Account/Servers rows show instead of the full
 /// scheme-and-path form (the URL in full stays on the server's Connection page).
@@ -1220,7 +1220,7 @@ pub(crate) mod tests {
         let shell_root = window.content().expect("the shell must already be showing");
         adw::prelude::ActionRowExt::activate(&screen.hooks.about_row);
         pump_until(
-            || window.content().is_some_and(|c| c != shell_root && crate::test_support::any_label_reads(&c, "Audiobookshelf")),
+            || window.content().is_some_and(|c| c != shell_root && crate::test_support::any_label_reads(&c, "Audiobooklet")),
             Duration::from_secs(2),
         );
         let about_content = window.content().expect("the About screen should be showing");

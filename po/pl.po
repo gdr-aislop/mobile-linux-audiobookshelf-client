@@ -1,11 +1,10 @@
-# Polish translation for abs-app.
-# This file is distributed under the same license as the abs-app package.
+# Polish translation for audiobooklet.
+# This file is distributed under the same license as the audiobooklet package.
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: abs-app 0.9.5\n"
-"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/mobile-linux-"
-"audiobookshelf-client/issues\n"
+"Project-Id-Version: audiobooklet 0.9.5\n"
+"Report-Msgid-Bugs-To: https://github.com/gdr-aislop/audiobooklet/issues\n"
 "PO-Revision-Date: 2026-10-09 12:00+0000\n"
 "Last-Translator: \n"
 "Language-Team: Polish\n"
@@ -132,8 +131,8 @@ msgid "{context} failed — try again"
 msgstr "{context} nie powiodło się — spróbuj ponownie"
 
 #: app/src/password_keyring.rs
-msgid "Audiobookshelf account password"
-msgstr "Hasło konta Audiobookshelf"
+msgid "Audiobooklet — server password"
+msgstr "Audiobooklet — hasło do serwera"
 
 #: app/src/player.rs
 msgid "Playback error — tap for details"
@@ -1132,8 +1131,8 @@ msgid "About"
 msgstr "O programie"
 
 #: app/src/screens/settings.rs
-msgid "About Audiobookshelf"
-msgstr "O aplikacji Audiobookshelf"
+msgid "About Audiobooklet"
+msgstr "O aplikacji Audiobooklet"
 
 #. TRANSLATORS: {version} is the app's version number, e.g. "0.9.0".
 #: app/src/screens/settings.rs
@@ -1247,7 +1246,8 @@ msgstr "Zapamiętaj hasło"
 #: app/src/screens/welcome.rs
 msgid ""
 "Signs you in again if the server ends the session. Kept in your keyring."
-msgstr "Loguje ponownie, gdy serwer zakończy sesję. Przechowywane w bazie kluczy."
+msgstr ""
+"Loguje ponownie, gdy serwer zakończy sesję. Przechowywane w bazie kluczy."
 
 #: app/src/screens/welcome.rs
 msgid "Connect"
@@ -1481,27 +1481,27 @@ msgstr "Tryb offline jest włączony — wyłącz go, aby synchronizować"
 msgid "Syncing…"
 msgstr "Synchronizowanie…"
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
-msgid "Audiobookshelf"
-msgstr "Audiobookshelf"
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
+msgid "Audiobooklet"
+msgstr "Audiobooklet"
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "Audiobook Player"
 msgstr "Odtwarzacz audiobooków"
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "Listen to audiobooks and podcasts from your Audiobookshelf server"
 msgstr "Słuchaj audiobooków i podcastów ze swojego serwera Audiobookshelf"
 
-#: app/assets/io.github.gdr_aislop.abs-app.desktop
+#: app/assets/io.github.gdr_aislop.audiobooklet.desktop
 msgid "audiobook;podcast;player;streaming;"
 msgstr "audiobook;audiobooki;książka;podcast;odtwarzacz;streaming;"
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid "Client for an Audiobookshelf server, designed for mobile Linux"
 msgstr "Klient serwera Audiobookshelf zaprojektowany dla mobilnego Linuksa"
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid ""
 "GNOME-native client for an Audiobookshelf media server, designed for mobile "
 "Linux (Phosh on the Librem 5, also usable on desktop)."
@@ -1509,7 +1509,7 @@ msgstr ""
 "Natywny dla GNOME klient serwera multimediów Audiobookshelf, zaprojektowany "
 "dla mobilnego Linuksa (Phosh na Librem 5, ale działa też na komputerze)."
 
-#: app/assets/io.github.gdr_aislop.abs-app.metainfo.xml
+#: app/assets/io.github.gdr_aislop.audiobooklet.metainfo.xml
 msgid ""
 "Browse your library, stream or play downloaded audiobooks and podcasts, and "
 "keep listening progress in sync with the server. Integrates with the desktop "

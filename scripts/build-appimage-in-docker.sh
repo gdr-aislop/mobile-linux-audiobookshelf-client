@@ -8,7 +8,7 @@
 #
 # The first invocation pulls debian:bookworm and installs the dependencies
 # into a locally cached image; later runs only re-run changed layers. The
-# cargo download cache lives in ~/.cache/abs-appimage-build/cargo, and builds
+# cargo download cache lives in ~/.cache/audiobooklet-appimage-build/cargo, and builds
 # use a target dir separate from host builds (build/appimage-target).
 #
 # All output (image build + packaging run) is teed to build/appimage/build.log
@@ -35,14 +35,14 @@ for candidate in docker podman; do
 done
 [ -n "$ENGINE" ] || die "no working docker or podman found (is the daemon running?)"
 
-IMAGE="abs-appimage-builder:bookworm"
+IMAGE="audiobooklet-appimage-builder:bookworm"
 
 LOG_FILE="$REPO_ROOT/build/appimage/build.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 : > "$LOG_FILE"
 echo "logging to $LOG_FILE" >&2
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/abs-appimage-build"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/audiobooklet-appimage-build"
 mkdir -p "$CACHE_DIR/cargo"
 
 REPO_MOUNT="$REPO_ROOT:/repo"

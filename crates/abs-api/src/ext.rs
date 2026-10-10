@@ -246,7 +246,7 @@ pub struct ConnectionOptions {
 /// recognizable in a server's logs. Deliberately not "Audiobookshelf": the project asks
 /// third-party clients not to use its name in a way that suggests affiliation
 /// (https://audiobookshelf.org/docs/faq/app#i-want-to-build-a-client-app-what-are-the-rules).
-pub const DEFAULT_USER_AGENT: &str = concat!("abs-app/", env!("CARGO_PKG_VERSION"), " (Linux)");
+pub const DEFAULT_USER_AGENT: &str = concat!("Audiobooklet/", env!("CARGO_PKG_VERSION"), " (Linux)");
 
 /// Why minting a [`Client`] with connection options failed. Unlike the plain
 /// headers/timeout-only constructors (which cannot fail beyond an invalid token), honoring a
@@ -2195,12 +2195,12 @@ mod tests {
         assert!(!err.server_may_have_acted());
     }
 
-    /// The app identifies itself as `abs-app/<version> (Linux)` unless a server's settings say
+    /// The app identifies itself as `Audiobooklet/<version> (Linux)` unless a server's settings say
     /// otherwise — never without a User-Agent (a `"-"` in the server's log), and never with the
     /// Audiobookshelf name.
     #[tokio::test]
     async fn requests_send_the_app_s_own_user_agent_unless_overridden() {
-        assert!(DEFAULT_USER_AGENT.starts_with(concat!("abs-app/", env!("CARGO_PKG_VERSION"))));
+        assert!(DEFAULT_USER_AGENT.starts_with(concat!("Audiobooklet/", env!("CARGO_PKG_VERSION"))));
         assert!(!DEFAULT_USER_AGENT.to_lowercase().contains("audiobookshelf"));
         let server = MockServer::start().await;
         Mock::given(method("POST"))

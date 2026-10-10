@@ -68,8 +68,11 @@ pub struct AppState {
 /// command-line flags (handled in `main` before any setup), main's startup diagnostics log line,
 /// and, eventually, the Settings screen's About row (docs/design/ui-spec.md) — one line a user
 /// can paste into a bug report that identifies exactly which build they're running.
+/// The app's display name — window title, version line, About page, media widgets.
+pub const APP_NAME: &str = "Audiobooklet";
+
 pub fn version_line() -> String {
-    format!("Audiobookshelf {} ({})", env!("CARGO_PKG_VERSION"), env!("ABS_APP_GIT_HASH"))
+    format!("{APP_NAME} {} ({})", env!("CARGO_PKG_VERSION"), env!("ABS_APP_GIT_HASH"))
 }
 
 /// Applies a Theme to libadwaita's global style manager — the one place that knows the
@@ -120,7 +123,7 @@ fn build_window(app: &adw::Application, state: &AppState) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Audiobookshelf") // i18n: ignore — the product name
+        .title(APP_NAME)
         .default_width(390)
         .default_height(760)
         .build();
@@ -517,7 +520,7 @@ pub(crate) mod tests {
     fn version_line_is_the_display_name_plus_a_dotted_version_plus_a_commit() {
         let line = version_line();
         let rest = line
-            .strip_prefix("Audiobookshelf ")
+            .strip_prefix("Audiobooklet ")
             .expect("version line should start with the display name");
         let (version, commit) = rest.split_once(" (").expect("version line should have a parenthesized commit after the version");
         let commit = commit.strip_suffix(')').expect("the commit part should be closed with a parenthesis");

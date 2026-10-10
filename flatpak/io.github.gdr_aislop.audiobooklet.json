@@ -1,12 +1,12 @@
 {
-    "app-id": "io.github.gdr_aislop.abs-app",
+    "app-id": "io.github.gdr_aislop.audiobooklet",
     "runtime": "org.gnome.Platform",
     "runtime-version": "47",
     "sdk": "org.gnome.Sdk",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable"
     ],
-    "command": "abs-app",
+    "command": "audiobooklet",
     "separate-locales": false,
     "finish-args": [
         "--share=network",
@@ -17,7 +17,7 @@
         "--device=dri",
         "--system-talk-name=org.freedesktop.ModemManager1",
         "--talk-name=org.freedesktop.secrets",
-        "--own-name=org.mpris.MediaPlayer2.abs-app"
+        "--own-name=org.mpris.MediaPlayer2.audiobooklet"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin"
@@ -32,17 +32,17 @@
     ],
     "modules": [
         {
-            "name": "abs-app",
+            "name": "audiobooklet",
             "buildsystem": "simple",
             "build-commands": [
-                "cargo --offline build --release -p abs-app",
-                "install -Dm755 target/release/abs-app /app/bin/abs-app",
+                "cargo --offline build --release -p audiobooklet",
+                "install -Dm755 target/release/audiobooklet /app/bin/audiobooklet",
                 "scripts/build-l10n.sh build/l10n",
-                "install -Dm644 build/l10n/io.github.gdr_aislop.abs-app.desktop /app/share/applications/io.github.gdr_aislop.abs-app.desktop",
-                "install -Dm644 app/assets/io.github.gdr_aislop.abs-app.svg /app/share/icons/hicolor/scalable/apps/io.github.gdr_aislop.abs-app.svg",
-                "install -Dm644 build/l10n/io.github.gdr_aislop.abs-app.metainfo.xml /app/share/metainfo/io.github.gdr_aislop.abs-app.metainfo.xml",
+                "install -Dm644 build/l10n/io.github.gdr_aislop.audiobooklet.desktop /app/share/applications/io.github.gdr_aislop.audiobooklet.desktop",
+                "install -Dm644 app/assets/io.github.gdr_aislop.audiobooklet.svg /app/share/icons/hicolor/scalable/apps/io.github.gdr_aislop.audiobooklet.svg",
+                "install -Dm644 build/l10n/io.github.gdr_aislop.audiobooklet.metainfo.xml /app/share/metainfo/io.github.gdr_aislop.audiobooklet.metainfo.xml",
                 "mkdir -p /app/share/locale && cp -a build/l10n/locale/. /app/share/locale/",
-                "install -Dm644 LICENSE /app/share/doc/abs-app/LICENSE"
+                "install -Dm644 LICENSE /app/share/doc/audiobooklet/LICENSE"
             ],
             "sources": [
                 {
@@ -53,7 +53,7 @@
             ],
             "build-options": {
                 "env": {
-                    "CARGO_HOME": "/run/build/abs-app/cargo"
+                    "CARGO_HOME": "/run/build/audiobooklet/cargo"
                 }
             }
         }

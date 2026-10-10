@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Audiobookshelf
+Name=Audiobooklet
 GenericName=Audiobook Player
 Comment=Listen to audiobooks and podcasts from your Audiobookshelf server
-Exec=abs-app
-Icon=io.github.gdr_aislop.abs-app
+Exec=audiobooklet
+Icon=io.github.gdr_aislop.audiobooklet
 Terminal=false
 Categories=AudioVideo;Audio;
 Keywords=audiobook;podcast;player;streaming;

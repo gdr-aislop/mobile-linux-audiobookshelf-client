@@ -12,7 +12,7 @@ members = [
 version = "0.9.5"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client"
+repository = "https://github.com/gdr-aislop/audiobooklet"
 
 [workspace.dependencies]
 # Generated API client build chain

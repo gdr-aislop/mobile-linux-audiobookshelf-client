@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- AppStream metadata, bundled into the AppImage by scripts/build-appimage.sh -->
 <component type="desktop-application">
-  <id>io.github.gdr_aislop.abs-app</id>
+  <id>io.github.gdr_aislop.audiobooklet</id>
 
-  <name>Audiobookshelf</name>
+  <name>Audiobooklet</name>
   <summary>Client for an Audiobookshelf server, designed for mobile Linux</summary>
 
   <metadata_license>CC0-1.0</metadata_license>
@@ -21,13 +21,18 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.gdr_aislop.abs-app.desktop</launchable>
+  <launchable type="desktop-id">io.github.gdr_aislop.audiobooklet.desktop</launchable>
 
-  <url type="homepage">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client</url>
-  <url type="bugtracker">https://github.com/gdr-aislop/mobile-linux-audiobookshelf-client/issues</url>
+  <!-- The app was called abs-app (shown as "Audiobookshelf") up to 0.9.5. -->
+  <replaces>
+    <id>io.github.gdr_aislop.abs-app</id>
+  </replaces>
+
+  <url type="homepage">https://github.com/gdr-aislop/audiobooklet</url>
+  <url type="bugtracker">https://github.com/gdr-aislop/audiobooklet/issues</url>
 
   <provides>
-    <binary>abs-app</binary>
+    <binary>audiobooklet</binary>
   </provides>
 
   <releases>

@@ -1,6 +1,6 @@
-# mobile-linux-audiobookshelf-client
+# Audiobooklet
 
-An [Audiobookshelf](https://audiobookshelf.org/) client for Librem 5 / Phosh.
+A client for [Audiobookshelf](https://audiobookshelf.org/) servers, for Librem 5 / Phosh.
 Offline-first, fast Rust native code, installable on PureOS Crimson as a deb.
 For other Linux phones, Appimage and Flatpak builds are available.
 
@@ -21,6 +21,8 @@ and filtering.
 
 *Free Software* - GPLv3 licensed, only makes network calls to your Audiobookshelf
 server
+
+Audiobooklet is an independent project, not affiliated with the Audiobookshelf project.
 
 ### AI disclosure
 
@@ -52,22 +54,35 @@ Settings, in the light theme
 
 ## Installing
 
+### Upgrading from abs-app
+
+Up to 0.9.5 the app was called `abs-app` (shown as "Audiobookshelf"); it is now Audiobooklet, with
+the app ID `io.github.gdr_aislop.audiobooklet` and a new repository URL.
+
+- **.deb:** remove the old APT source (`sudo rm /etc/apt/sources.list.d/abs-app.list
+  /etc/apt/keyrings/abs-app.asc`), add the new one below, then `sudo apt install audiobooklet`,
+  which replaces the `abs-app` package.
+- **Your data:** on its first start Audiobooklet moves the old `io.github.gdr_aislop.abs-app`
+  folders (login, settings, downloads) to its own, and keeps a remembered password.
+- **Flatpak:** the new app ID makes it a separate app: install Audiobooklet, then
+  `flatpak uninstall io.github.gdr_aislop.abs-app`. Flatpak data doesn't carry over.
+
 ### Installing the Flatpak
 
 The recommended way — adds a remote once, then `flatpak update` picks up
 every new tagged release automatically:
 
 ```sh
-flatpak remote-add --user --if-not-exists abs-app \
-  https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/io.github.gdr_aislop.abs-app.flatpakrepo
-flatpak install --user abs-app io.github.gdr_aislop.abs-app
+flatpak remote-add --user --if-not-exists audiobooklet \
+  https://gdr-aislop.github.io/audiobooklet/io.github.gdr_aislop.audiobooklet.flatpakrepo
+flatpak install --user audiobooklet io.github.gdr_aislop.audiobooklet
 ```
 
 Alternatively, download the `.flatpak` file from a
 [release](../../releases) and install it directly, with no remote added:
 
 ```sh
-flatpak install --user ./abs-app-<version>-<arch>.flatpak
+flatpak install --user ./audiobooklet-<version>-<arch>.flatpak
 ```
 
 ### Installing the .deb via APT
@@ -76,18 +91,18 @@ The recommended way — adds the repo once, then `apt upgrade` picks up every
 new tagged release automatically (arm64 and amd64 only):
 
 ```sh
-sudo curl -fsSL https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/apt/abs-app.asc \
-  -o /etc/apt/keyrings/abs-app.asc
-echo "deb [signed-by=/etc/apt/keyrings/abs-app.asc] https://gdr-aislop.github.io/mobile-linux-audiobookshelf-client/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/abs-app.list
+sudo curl -fsSL https://gdr-aislop.github.io/audiobooklet/apt/audiobooklet.asc \
+  -o /etc/apt/keyrings/audiobooklet.asc
+echo "deb [signed-by=/etc/apt/keyrings/audiobooklet.asc] https://gdr-aislop.github.io/audiobooklet/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/audiobooklet.list
 sudo apt update
-sudo apt install abs-app
+sudo apt install audiobooklet
 ```
 
 This repo always carries the *latest* tagged release only (not a full
 version history) — older `.deb`s stay available from
 [past releases](../../releases) directly, via `sudo apt install
-./abs-app_<version>_<arch>.deb`.
+./audiobooklet_<version>_<arch>.deb`.
 
 ### Verifying a standalone `.deb` or `.AppImage`
 
@@ -98,9 +113,9 @@ through either repo (an `apt install` from the hosted repo above is already
 verified via its own signed `Release`/`InRelease`, with nothing extra to do):
 
 ```sh
-gpg --import abs-app-signing-key.asc   # once, also attached to every release
-gpg --verify abs-app_<version>_<arch>.deb.asc abs-app_<version>_<arch>.deb
-gpg --verify abs-app-<version>-<arch>.AppImage.asc abs-app-<version>-<arch>.AppImage
+gpg --import audiobooklet-signing-key.asc   # once, also attached to every release
+gpg --verify audiobooklet_<version>_<arch>.deb.asc audiobooklet_<version>_<arch>.deb
+gpg --verify audiobooklet-<version>-<arch>.AppImage.asc audiobooklet-<version>-<arch>.AppImage
 ```
 
 The signing key's fingerprint is:
@@ -109,7 +124,7 @@ The signing key's fingerprint is:
 CC77 E444 A5CD 5384 0459  1237 08D0 546C 9455 D910
 ```
 
-Check it against `gpg --fingerprint` after importing `abs-app-signing-key.asc`, since that
+Check it against `gpg --fingerprint` after importing `audiobooklet-signing-key.asc`, since that
 file is hosted alongside the binaries it verifies and shouldn't be the only
 source trusted for the key itself.
 
@@ -127,7 +142,7 @@ source trusted for the key itself.
 ./scripts/build-aarch64-appimage-on-x86.sh
 ```
 
-Output lands in `build/appimage/abs-app-<version>-<arch>.AppImage`.
+Output lands in `build/appimage/audiobooklet-<version>-<arch>.AppImage`.
 `scripts/build-appimage.sh --help` documents environment overrides
 (`ABS_APP_BIN`, `LINUXDEPLOY`, `APPIMAGE_TOOLS_DIR`); the docker wrapper
 mirrors the CI job's package set via `scripts/appimage-builder-bookworm.Dockerfile`.
@@ -141,9 +156,9 @@ translation or adding a language is a `po/<lang>.po` file (Polish: [`po/pl.po`](
 
 ## Reporting problems
 
-When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislop.abs-app/`:
+When reporting a bug, attach the contents of `~/.local/state/io.github.gdr_aislop.audiobooklet/`:
 
-- `logs/abs-app.*` (Settings → Diagnostics → "Open latest log file" opens the
+- `logs/audiobooklet.*` (Settings → Diagnostics → "Open latest log file" opens the
   newest one) — a rotating, human-readable log file (last 7 days kept).
   A Rust panic always logs its full backtrace here, even without
   `RUST_BACKTRACE` set. By default the log is anonymized: server addresses,

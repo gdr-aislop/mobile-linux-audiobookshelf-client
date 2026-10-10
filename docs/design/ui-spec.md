@@ -1,6 +1,6 @@
-# UI/UX Design Spec — Audiobookshelf client for mobile Linux (phosh) / GTK4 + libadwaita
+# UI/UX Design Spec — Audiobooklet, a client for Audiobookshelf servers on mobile Linux (phosh) / GTK4 + libadwaita
 
-This document defines the interface for a native Audiobookshelf client targeting mobile Linux
+This document defines the interface for a native client for Audiobookshelf servers targeting mobile Linux
 (phosh, e.g. Librem 5 / PinePhone) and desktop GNOME, built with GTK4 + libadwaita in Rust.
 
 Feature scope and information architecture are informed by [Lissen](https://lissenapp.org/), an
@@ -519,7 +519,7 @@ in the mockup itself as OS-rendered, not app UI, since there's nothing here for 
   address** (used instead of the public URL whenever a short reachability probe — cached for a
   minute per session — finds it listening, so home-Wi-Fi traffic stays local and everything
   else falls back cleanly), and **Change User Agent** (empty restores the default,
-  `abs-app/<version> (Linux)`, sent on API calls and audio streams alike; it deliberately avoids
+  `Audiobooklet/<version> (Linux)`, sent on API calls and audio streams alike; it deliberately avoids
   the Audiobookshelf name, per the project's rules for third-party clients). Each row
   persists to the server's table row the moment it's saved and is picked up by the next
   connection mint — sync, downloads, playback — without any rebuild; the editors show a

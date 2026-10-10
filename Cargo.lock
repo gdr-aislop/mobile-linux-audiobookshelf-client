@@ -23,37 +23,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "abs-app"
-version = "0.9.5"
-dependencies = [
- "abs-api",
- "abs-core",
- "abs-player",
- "abs-storage",
- "base64",
- "chrono",
- "crash-handler",
- "futures",
- "gettext-rs",
- "gio",
- "gtk4",
- "hound",
- "image",
- "libadwaita",
- "minidumper",
- "oo7",
- "reqwest",
- "serde_json",
- "sqlx",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
 name = "abs-core"
 version = "0.9.5"
 dependencies = [
@@ -224,6 +193,37 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "audiobooklet"
+version = "0.9.5"
+dependencies = [
+ "abs-api",
+ "abs-core",
+ "abs-player",
+ "abs-storage",
+ "base64",
+ "chrono",
+ "crash-handler",
+ "futures",
+ "gettext-rs",
+ "gio",
+ "gtk4",
+ "hound",
+ "image",
+ "libadwaita",
+ "minidumper",
+ "oo7",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "wiremock",
+]
 
 [[package]]
 name = "autocfg"

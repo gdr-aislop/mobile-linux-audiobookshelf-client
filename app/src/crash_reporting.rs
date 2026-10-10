@@ -276,7 +276,7 @@ pub struct ClientHandles {
 /// `abs_player::init()`'s existing GStreamer-failure handling in `main.rs` — crash-dump capture
 /// is never allowed to block the app from starting.
 pub fn attach_crash_handler() -> Option<ClientHandles> {
-    let socket_name = format!("abs-app-crash-{}", std::process::id());
+    let socket_name = format!("audiobooklet-crash-{}", std::process::id());
 
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,

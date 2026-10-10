@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Builds a throwaway "pseudo" translation of po/abs-app.pot, to find UI text that was never
+"""Builds a throwaway "pseudo" translation of po/audiobooklet.pot, to find UI text that was never
 wrapped in a translation call.
 
     scripts/pseudo-locale.py OUTDIR            # needs msgfmt (GNU gettext)
-    ABS_LOCALEDIR=OUTDIR LC_ALL=en_US.UTF-8 LANGUAGE=en abs-app
+    ABS_LOCALEDIR=OUTDIR LC_ALL=en_US.UTF-8 LANGUAGE=en audiobooklet
 
 gettext ignores catalogs under the plain "C"/"C.UTF-8" locales, so the app must run under a real
 locale; if `locale -a` has no en_US.UTF-8, generate one without root:
@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 
-POT = os.path.join(os.path.dirname(__file__), "..", "po", "abs-app.pot")
+POT = os.path.join(os.path.dirname(__file__), "..", "po", "audiobooklet.pot")
 
 
 def parse(text):
@@ -74,10 +74,10 @@ def main():
         po.append("")
     lc = os.path.join(out_dir, "en", "LC_MESSAGES")
     os.makedirs(lc, exist_ok=True)
-    po_path = os.path.join(lc, "abs-app.po")
+    po_path = os.path.join(lc, "audiobooklet.po")
     with open(po_path, "w", encoding="utf-8") as f:
         f.write("\n".join(po))
-    subprocess.run(["msgfmt", "-o", os.path.join(lc, "abs-app.mo"), po_path], check=True)
+    subprocess.run(["msgfmt", "-o", os.path.join(lc, "audiobooklet.mo"), po_path], check=True)
     os.remove(po_path)
     print(f"pseudo-locale with {len(entries)} messages in {out_dir}")
 

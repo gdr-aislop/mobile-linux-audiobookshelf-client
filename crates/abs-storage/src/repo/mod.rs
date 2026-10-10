@@ -5,6 +5,7 @@ pub mod download_tracks;
 pub mod items;
 pub mod libraries;
 pub mod progress;
+pub mod relocate;
 pub mod series_books;
 pub mod servers;
 pub mod settings;

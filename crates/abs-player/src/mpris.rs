@@ -150,7 +150,9 @@ pub enum MprisError {
 /// Registers this app as an MPRIS2 media player on the session bus. Returns `Err` rather than
 /// panicking if no session bus is reachable (headless CI, a sandboxed environment with no D-Bus) —
 /// callers should log a warning and continue; MPRIS absence must never be fatal to playback.
-pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<MprisHandle, MprisError> {
+/// `bus_name` becomes `org.mpris.MediaPlayer2.{bus_name}` (it must match what a sandbox may own);
+/// `identity` is the human-readable name media widgets show.
+pub fn register(bus_name: &str, identity: &str, commands: Rc<dyn MprisCommands>) -> Result<MprisHandle, MprisError> {
     let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).map_err(MprisError::NoSessionBus)?;
 
     let node_info = gio::DBusNodeInfo::for_xml(INTROSPECTION_XML).map_err(MprisError::InvalidIntrospection)?;
@@ -158,7 +160,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
     let player_info = node_info.lookup_interface(PLAYER_IFACE).ok_or(MprisError::MissingInterface(PLAYER_IFACE))?;
 
     let state = Rc::new(RefCell::new(PlayerState::default()));
-    let app_name = app_name.to_string();
+    let identity = identity.to_string();
 
     let media_player2_registration = connection
         .register_object(OBJECT_PATH, &media_player2_info)
@@ -169,8 +171,8 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
             invocation.return_value(None);
         })
         .property({
-            let app_name = app_name.clone();
-            move |_conn, _sender, _path, _iface, property| media_player2_property(property, &app_name)
+            let identity = identity.clone();
+            move |_conn, _sender, _path, _iface, property| media_player2_property(property, &identity)
         })
         .build()
         .map_err(MprisError::RegistrationFailed)?;
@@ -206,7 +208,7 @@ pub fn register(app_name: &str, commands: Rc<dyn MprisCommands>) -> Result<Mpris
     // clients that already know the object path can still reach it directly.
     let owner_id = gio::bus_own_name_on_connection(
         &connection,
-        &format!("org.mpris.MediaPlayer2.{app_name}"),
+        &format!("org.mpris.MediaPlayer2.{bus_name}"),
         gio::BusNameOwnerFlags::NONE,
         |_conn, _name| {},
         |_conn, name| tracing::warn!(name, "couldn't own the MPRIS well-known bus name"),
@@ -313,12 +315,12 @@ fn changed_properties(state: &PlayerState) -> glib::Variant {
     changed.end()
 }
 
-fn media_player2_property(property: &str, app_name: &str) -> glib::Variant {
+fn media_player2_property(property: &str, identity: &str) -> glib::Variant {
     match property {
         "CanQuit" => false.to_variant(),
         "CanRaise" => false.to_variant(),
         "HasTrackList" => false.to_variant(),
-        "Identity" => app_name.to_variant(),
+        "Identity" => identity.to_variant(),
         "SupportedUriSchemes" => Vec::<String>::new().to_variant(),
         "SupportedMimeTypes" => Vec::<String>::new().to_variant(),
         _ => false.to_variant(),
@@ -675,7 +677,7 @@ mod tests {
     #[ignore]
     fn register_succeeds_against_a_real_session_bus() {
         let commands = Rc::new(FakeCommands::default());
-        let handle = register("AbsPlayerLiveTest", commands).expect("register should succeed with a real session bus reachable");
+        let handle = register("AbsPlayerLiveTest", "AbsPlayerLiveTest", commands).expect("register should succeed with a real session bus reachable");
         handle.update(PlayerState {
             status: PlaybackStatus::Playing,
             metadata: TrackMetadata { title: "Live Test".to_string(), artist: None, length_micros: 1, art_url: None },
@@ -706,7 +708,7 @@ mod tests {
                     }
                 };
 
-                let handle = register("AbsPlayerProxyTest", Rc::new(FakeCommands::default())).expect("a session bus is reachable");
+                let handle = register("AbsPlayerProxyTest", "AbsPlayerProxyTest", Rc::new(FakeCommands::default())).expect("a session bus is reachable");
 
                 // Its own connection, like a separate process: the proxy's calls must reach the
                 // object through the bus, not short-circuit on the registering connection.
@@ -759,7 +761,7 @@ mod tests {
         context
             .with_thread_default(|| {
                 let slot = Rc::new(RefCell::new(None));
-                let handle = register("AbsPlayerPauseTest", Rc::new(ReportingCommands(slot.clone()))).expect("a session bus is reachable");
+                let handle = register("AbsPlayerPauseTest", "AbsPlayerPauseTest", Rc::new(ReportingCommands(slot.clone()))).expect("a session bus is reachable");
                 handle.update(PlayerState { status: PlaybackStatus::Playing, ..loaded_state() });
                 *slot.borrow_mut() = Some(handle);
 

@@ -4,19 +4,19 @@
 #   scripts/build-l10n.sh OUTDIR
 #
 # Produces, under OUTDIR:
-#   locale/<lang>/LC_MESSAGES/abs-app.mo     for every language in po/LINGUAS
-#   io.github.gdr_aislop.abs-app.desktop     the .desktop file with translated Name/Comment/…
-#   io.github.gdr_aislop.abs-app.metainfo.xml  the metainfo with translated summary/description
+#   locale/<lang>/LC_MESSAGES/audiobooklet.mo     for every language in po/LINGUAS
+#   io.github.gdr_aislop.audiobooklet.desktop     the .desktop file with translated Name/Comment/…
+#   io.github.gdr_aislop.audiobooklet.metainfo.xml  the metainfo with translated summary/description
 # With an empty po/LINGUAS the last two are plain copies of the sources, so packaging can always
 # install from OUTDIR. Needs GNU gettext (msgfmt).
 #
-# For development, run the app against the result:  ABS_LOCALEDIR=OUTDIR/locale LANGUAGE=de abs-app
+# For development, run the app against the result:  ABS_LOCALEDIR=OUTDIR/locale LANGUAGE=de audiobooklet
 # (see docs/i18n.md).
 set -eu
 cd "$(dirname "$0")/.."
 
 OUT="${1:?usage: scripts/build-l10n.sh OUTDIR}"
-APP_ID="io.github.gdr_aislop.abs-app"
+APP_ID="io.github.gdr_aislop.audiobooklet"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/locale"
@@ -27,7 +27,7 @@ for lang in $languages; do
     mkdir -p "$OUT/locale/$lang/LC_MESSAGES"
     # -c: check the header and that plural forms and {placeholders}-bearing strings are well formed
     # (`--check-format` also catches a translation that dropped a %-style directive).
-    msgfmt -c --check-format -o "$OUT/locale/$lang/LC_MESSAGES/abs-app.mo" "po/$lang.po"
+    msgfmt -c --check-format -o "$OUT/locale/$lang/LC_MESSAGES/audiobooklet.mo" "po/$lang.po"
 done
 
 if [ -n "$languages" ]; then

@@ -42,8 +42,8 @@ use std::sync::Mutex;
 
 use gettextrs::LocaleCategory;
 
-/// gettext domain — the `.mo` files are `<localedir>/<lang>/LC_MESSAGES/abs-app.mo`.
-pub const DOMAIN: &str = "abs-app";
+/// gettext domain — the `.mo` files are `<localedir>/<lang>/LC_MESSAGES/audiobooklet.mo`.
+pub const DOMAIN: &str = "audiobooklet";
 
 /// The language the source strings are written in; always available, needs no catalog.
 pub const SOURCE_LANGUAGE: &str = "en";
@@ -499,13 +499,13 @@ mod tests {
         for code in ["fr", "de", "pt_BR"] {
             let dir = tmp.path().join(code).join("LC_MESSAGES");
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("abs-app.mo"), b"").unwrap();
+            std::fs::write(dir.join("audiobooklet.mo"), b"").unwrap();
         }
         // Not catalogs for this app: another domain, an alias directory, a stray file.
         std::fs::create_dir_all(tmp.path().join("es/LC_MESSAGES")).unwrap();
         std::fs::write(tmp.path().join("es/LC_MESSAGES/other.mo"), b"").unwrap();
         std::fs::create_dir_all(tmp.path().join("en.utf8/LC_MESSAGES")).unwrap();
-        std::fs::write(tmp.path().join("en.utf8/LC_MESSAGES/abs-app.mo"), b"").unwrap();
+        std::fs::write(tmp.path().join("en.utf8/LC_MESSAGES/audiobooklet.mo"), b"").unwrap();
         std::fs::write(tmp.path().join("README"), b"").unwrap();
         assert_eq!(
             available_languages_in(tmp.path()),

@@ -41,7 +41,7 @@ file. "Mini bar" is the bottom player strip; "full player" is the Now Playing sc
 ## Manual pass results — 2026-09-25
 
 A full manual pass was run against a locally-seeded Audiobookshelf server (Docker,
-`advplyr/audiobookshelf`) under Xvfb, driving the real compiled `abs-app` binary with `xdotool`
+`advplyr/audiobookshelf`) under Xvfb, driving the real compiled `audiobooklet` binary with `xdotool`
 and checking `xdotool getwindowgeometry` after every action.
 
 **One real window-shape bug was found and fixed.** On a genuinely fresh cold launch (no active
@@ -180,7 +180,7 @@ injection beyond what's noted inline. These are gaps in *pass coverage*, not kno
       then sign in without touching the switch.
       *Expected:* "Remember password" sits under the Password field, switched on, and is hidden in
       API Token mode. After signing in, the keyring (Seahorse, or `secret-tool search xdg:schema
-      io.github.gdr_aislop.abs-app.Password`) holds one item for the account. If the keyring is
+      io.github.gdr_aislop.audiobooklet.Password`) holds one item for the account. If the keyring is
       locked, the system unlock prompt may appear. Signing in again with the switch off, or
       signing out, removes the item.
       *Automated:* `welcome_connect` (switch starts on); abs-core's
@@ -958,7 +958,7 @@ Needs a real GNOME/phosh session.
 
 - [ ] **SI-1 — Shell media card appears.** While playing, open GNOME Shell's quick settings (or
       phosh's lock screen / media widget).
-      *Expected:* a media card for "Audiobookshelf" showing title, artist/author, cover art and
+      *Expected:* a media card for "Audiobooklet" showing title, artist/author, cover art and
       a live scrub position.
 
 - [ ] **SI-2 — Shell controls work.** From the shell's media card: pause, play, and drag its
@@ -1043,7 +1043,7 @@ Needs a real GNOME/phosh session.
       unplug but the app didn't act on it — the "ignored:" reason says which; seeing neither
       means the audio server itself never reported the unplug (see HW-6c, and run with
       `RUST_LOG=debug` for the per-scan sink detail behind it). Check the rotating log file
-      under `~/.local/state/io.github.gdr_aislop.abs-app/logs/abs-app.<date>`
+      under `~/.local/state/io.github.gdr_aislop.audiobooklet/logs/audiobooklet.<date>`
       (`abs_storage::AppPaths::logs_dir()`) for a run where stderr wasn't captured. Two more
       things worth checking if "paused for headphone unplug" appears but audio never actually
       stops: a `mpris` "MPRIS command received" line shortly after it means something external
@@ -1113,7 +1113,7 @@ Needs a real GNOME/phosh session.
 - [ ] **HW-12 — Wired-headset play/pause button.** Play through wired headphones, press the
       inline play/pause button on the cable.
       *Expected:* playback toggles. If it doesn't, bisect in two steps before filing it as an app
-      bug: (1) `busctl --user call org.mpris.MediaPlayer2.abs-app /org/mpris/MediaPlayer2
+      bug: (1) `busctl --user call org.mpris.MediaPlayer2.audiobooklet /org/mpris/MediaPlayer2
       org.mpris.MediaPlayer2.Player PlayPause` — if this toggles playback, the app's MPRIS side
       works and the gap is in how the shell routes the hardware button to it; (2) `sudo evtest`
       (or `sudo libinput debug-events`) while pressing the button — if no `KEY_PLAYPAUSE`/
@@ -1289,7 +1289,7 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
 
 - [ ] **SE-13 — Anonymize logs.** Open Settings → Diagnostics. Run with `RUST_LOG=debug`, point
       the app at an unreachable server (Sign in with a typo'd host) and read
-      `~/.local/state/io.github.gdr_aislop.abs-app/logs/abs-app.*` and the terminal.
+      `~/.local/state/io.github.gdr_aislop.audiobooklet/logs/audiobooklet.*` and the terminal.
       *Expected:* the "Anonymize logs" switch is on by default; the failure lines show `<url>` /
       `<server>` / `<user>` and never the host, username or a `token=` value. Turn the switch
       off and retry: real addresses appear. Restart: the switch keeps its state.
@@ -1298,7 +1298,7 @@ built (documented in `app/src/screens/downloads.rs`'s module doc).
 
 - [ ] **SE-14 — Open latest log file.** In Settings → Diagnostics, tap "Open latest log file"
       right after launching the app.
-      *Expected:* the newest `logs/abs-app.<date>` opens in the default text viewer and already
+      *Expected:* the newest `logs/audiobooklet.<date>` opens in the default text viewer and already
       contains this session's startup lines (the log is flushed first). With the logs directory
       emptied beforehand, a "No log file yet" toast appears instead; with no text handler
       installed, an "Opening the log file failed" toast.
@@ -1352,7 +1352,7 @@ button restoring the shell.
 
 - [ ] **CN-6 — User-Agent override.** Set a custom User-Agent and check the proxy/server logs.
       *Expected:* before any override, API calls, token refreshes and audio stream requests all
-      show `abs-app/<version> (Linux)` in the server's access log (not `-`, not GStreamer's
+      show `Audiobooklet/<version> (Linux)` in the server's access log (not `-`, not GStreamer's
       agent). With an override they carry the overridden value; clearing it restores the default.
       *Automated:* the user-agent editor's set/clear paths in
       `connection_advanced_rows_persist_and_edit`; abs-api's
